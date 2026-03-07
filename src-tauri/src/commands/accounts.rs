@@ -2,7 +2,7 @@ use crate::db::Database;
 use crate::models::Account;
 use tauri::State;
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn create_account(
     db: State<Database>,
     name: String,
@@ -28,7 +28,7 @@ pub fn create_account(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn get_accounts(db: State<Database>) -> Result<Vec<Account>, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
@@ -51,7 +51,7 @@ pub fn get_accounts(db: State<Database>) -> Result<Vec<Account>, String> {
     Ok(accounts)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn update_account(
     db: State<Database>,
     id: String,
@@ -87,7 +87,7 @@ pub fn update_account(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn delete_account(db: State<Database>, id: String) -> Result<(), String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM accounts WHERE id = ?1", rusqlite::params![id])

@@ -3,7 +3,7 @@ use crate::models::import_export::{ExportFilters, ImportData, ImportPreview, Imp
 use crate::services::import_export_service;
 use tauri::State;
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn export_holdings_csv(
     db: State<'_, Database>,
     filters: ExportFilters,
@@ -11,7 +11,7 @@ pub async fn export_holdings_csv(
     import_export_service::export_holdings_csv(&db, &filters)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn export_transactions_csv(
     db: State<'_, Database>,
     start_date: String,
@@ -21,7 +21,7 @@ pub async fn export_transactions_csv(
     import_export_service::export_transactions_csv(&db, &start_date, &end_date, &filters)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn get_import_template(data_type: String) -> Result<String, String> {
     let content = if data_type == "holdings" {
         import_export_service::get_holdings_template()
@@ -31,7 +31,7 @@ pub async fn get_import_template(data_type: String) -> Result<String, String> {
     Ok(content)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn parse_import_csv(
     content: String,
     data_type: String,
@@ -39,7 +39,7 @@ pub async fn parse_import_csv(
     import_export_service::parse_import_csv(&content, &data_type)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn confirm_import(
     db: State<'_, Database>,
     import_data: ImportData,

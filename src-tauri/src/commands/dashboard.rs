@@ -121,14 +121,14 @@ async fn build_holding_details(
     Ok(details)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn get_holdings_with_quotes(
     db: State<'_, Database>,
 ) -> Result<Vec<HoldingDetail>, String> {
     build_holding_details(&db).await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn get_dashboard_summary(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,

@@ -206,8 +206,9 @@ fn parse_sina_quote(symbol: &str, text: &str) -> Result<StockQuote, String> {
     // Sina format fields:
     // 0: name, 1: today_open, 2: yesterday_close, 3: current_price,
     // 4: high, 5: low, 6: bid, 7: ask, 8: volume (lots), 9: amount,
-    // 10-19: bid/ask levels, ...
-    // 31: date, 32: time
+    // 10-19: bid levels (5 price+volume pairs),
+    // 20-29: ask levels (5 price+volume pairs),
+    // 30: date, 31: time
     let name = parts[0].to_string();
     let previous_close: f64 = parts[2].parse().unwrap_or(0.0);
     let current_price: f64 = parts[3].parse().unwrap_or(0.0);

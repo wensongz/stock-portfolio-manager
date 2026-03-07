@@ -130,19 +130,20 @@ pub async fn take_daily_snapshot(
         + crate::services::exchange_rate_service::convert_currency(cn_value, "CNY", "USD", &rates)
         + crate::services::exchange_rate_service::convert_currency(hk_value, "HKD", "USD", &rates);
 
-    let daily_pnl = total_value - total_cost;
+    // cumulative_pnl: total unrealized P&L since positions were opened
+    let cumulative_pnl = total_value - total_cost;
 
-    // 5. Compute cumulative PnL (previous day's total_value as baseline)
+    // daily_pnl: change in portfolio value compared to previous day's snapshot
     let prev_total_value: f64 = {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
         conn.query_row(
-            "SELECT COALESCE(SUM(total_value), 0) FROM daily_portfolio_values WHERE date < ?1 ORDER BY date DESC LIMIT 1",
+            "SELECT COALESCE(total_value, 0) FROM daily_portfolio_values WHERE date < ?1 ORDER BY date DESC LIMIT 1",
             rusqlite::params![date_str],
             |row| row.get(0),
         )
         .unwrap_or(0.0)
     };
-    let cumulative_pnl = total_value - prev_total_value;
+    let daily_pnl = total_value - prev_total_value;
 
     let rates_json = serde_json::to_string(&rates).unwrap_or_default();
 

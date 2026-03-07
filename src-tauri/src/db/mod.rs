@@ -97,6 +97,44 @@ impl Database {
             )?;
         }
 
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS daily_portfolio_values (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL UNIQUE,
+                total_cost REAL NOT NULL DEFAULT 0,
+                total_value REAL NOT NULL DEFAULT 0,
+                us_cost REAL NOT NULL DEFAULT 0,
+                us_value REAL NOT NULL DEFAULT 0,
+                cn_cost REAL NOT NULL DEFAULT 0,
+                cn_value REAL NOT NULL DEFAULT 0,
+                hk_cost REAL NOT NULL DEFAULT 0,
+                hk_value REAL NOT NULL DEFAULT 0,
+                exchange_rates TEXT NOT NULL DEFAULT '{}',
+                daily_pnl REAL NOT NULL DEFAULT 0,
+                cumulative_pnl REAL NOT NULL DEFAULT 0
+            );
+        ")?;
+
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS daily_holding_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                market TEXT NOT NULL CHECK(market IN ('US', 'CN', 'HK')),
+                category_name TEXT,
+                shares REAL NOT NULL DEFAULT 0,
+                avg_cost REAL NOT NULL DEFAULT 0,
+                close_price REAL NOT NULL DEFAULT 0,
+                market_value REAL NOT NULL DEFAULT 0
+            );
+        ")?;
+
+        conn.execute_batch("
+            CREATE INDEX IF NOT EXISTS idx_daily_holding_snapshots_date
+            ON daily_holding_snapshots(date);
+        ")?;
+
         Ok(())
     }
 }

@@ -12,14 +12,19 @@ import {
   Tag,
   Popconfirm,
   message,
+  Tooltip,
+  Switch,
+  Spin,
 } from "antd";
-import { PlusOutlined } from "@ant-design/icons";
+import { PlusOutlined, ReloadOutlined, SyncOutlined } from "@ant-design/icons";
 import { useHoldingStore } from "../../stores/holdingStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { useCategoryStore } from "../../stores/categoryStore";
-import type { Holding, Market, Currency } from "../../types";
+import { useQuoteStore } from "../../stores/quoteStore";
+import type { Holding, HoldingWithQuote, Market, Currency } from "../../types";
+import dayjs from "dayjs";
 
-const { Title } = Typography;
+const { Title, Text } = Typography;
 
 const marketColors: Record<Market, string> = {
   US: "blue",
@@ -27,13 +32,31 @@ const marketColors: Record<Market, string> = {
   HK: "green",
 };
 
+function PnlText({ value, percent }: { value: number | null; percent: number | null }) {
+  if (value === null || value === undefined) return <span>—</span>;
+  const isPositive = value >= 0;
+  const color = isPositive ? "#3f8600" : "#cf1322";
+  const sign = isPositive ? "+" : "";
+  return (
+    <span style={{ color }}>
+      {sign}{value.toFixed(2)}
+      {percent !== null && (
+        <> ({sign}{percent.toFixed(2)}%)</>
+      )}
+    </span>
+  );
+}
+
 export default function HoldingsPage() {
-  const { holdings, loading, fetchHoldings, createHolding, updateHolding, deleteHolding } =
+  const { holdings, loading: holdingsLoading, fetchHoldings, createHolding, updateHolding, deleteHolding } =
     useHoldingStore();
   const { accounts, fetchAccounts } = useAccountStore();
   const { categories, fetchCategories } = useCategoryStore();
+  const { holdingQuotes, loading: quotesLoading, lastUpdatedAt, fetchHoldingQuotes } = useQuoteStore();
+
   const [modalOpen, setModalOpen] = useState(false);
   const [editingHolding, setEditingHolding] = useState<Holding | null>(null);
+  const [showRealtime, setShowRealtime] = useState(true);
   const [form] = Form.useForm();
 
   useEffect(() => {
@@ -41,6 +64,13 @@ export default function HoldingsPage() {
     fetchAccounts();
     fetchCategories();
   }, [fetchHoldings, fetchAccounts, fetchCategories]);
+
+  // Auto-refresh quotes every 30 seconds when realtime is enabled
+  useEffect(() => {
+    if (!showRealtime) return;
+    const { startAutoRefresh } = useQuoteStore.getState();
+    return startAutoRefresh();
+  }, [showRealtime]);
 
   const handleSubmit = async (values: {
     account_id: string;
@@ -86,14 +116,25 @@ export default function HoldingsPage() {
   const accountMap = Object.fromEntries(accounts.map((a) => [a.id, a.name]));
   const categoryMap = Object.fromEntries(categories.map((c) => [c.id, c]));
 
-  const columns = [
+  // Merge holdings with realtime quotes
+  const quoteMap = Object.fromEntries(holdingQuotes.map((h) => [h.id, h as HoldingWithQuote]));
+  const displayData: HoldingWithQuote[] = holdings.map((h) => quoteMap[h.id] ?? {
+    ...h,
+    quote: null,
+    market_value: null,
+    total_cost: null,
+    unrealized_pnl: null,
+    unrealized_pnl_percent: null,
+  });
+
+  const staticColumns = [
     {
       title: "股票代码",
       dataIndex: "symbol",
       key: "symbol",
-      render: (symbol: string, record: Holding) => (
+      render: (symbol: string, record: HoldingWithQuote) => (
         <Space>
-          <Tag color={marketColors[record.market]}>{record.market}</Tag>
+          <Tag color={marketColors[record.market as Market]}>{record.market}</Tag>
           <strong>{symbol}</strong>
         </Space>
       ),
@@ -129,31 +170,83 @@ export default function HoldingsPage() {
       title: "平均成本",
       dataIndex: "avg_cost",
       key: "avg_cost",
-      render: (v: number, record: Holding) =>
+      render: (v: number, record: HoldingWithQuote) =>
         `${record.currency} ${v.toFixed(2)}`,
     },
+  ];
+
+  const realtimeColumns = [
     {
-      title: "操作",
-      key: "action",
-      render: (_: unknown, record: Holding) => (
-        <Space>
-          <Button type="link" size="small" onClick={() => handleEdit(record)}>
-            编辑
-          </Button>
-          <Popconfirm
-            title="确认删除该持仓？"
-            onConfirm={() => handleDelete(record.id)}
-            okText="确认"
-            cancelText="取消"
-          >
-            <Button type="link" size="small" danger>
-              删除
-            </Button>
-          </Popconfirm>
-        </Space>
+      title: "实时价格",
+      key: "current_price",
+      render: (_: unknown, record: HoldingWithQuote) => {
+        if (!record.quote) return quotesLoading ? <Spin size="small" /> : <span>—</span>;
+        return (
+          <span>
+            {record.currency} {record.quote.current_price.toFixed(2)}
+          </span>
+        );
+      },
+    },
+    {
+      title: "涨跌幅",
+      key: "change_percent",
+      render: (_: unknown, record: HoldingWithQuote) => {
+        if (!record.quote) return <span>—</span>;
+        const { change, change_percent } = record.quote;
+        const isPositive = change >= 0;
+        const color = isPositive ? "#3f8600" : "#cf1322";
+        const sign = isPositive ? "+" : "";
+        return (
+          <span style={{ color }}>
+            {sign}{change.toFixed(2)} ({sign}{change_percent.toFixed(2)}%)
+          </span>
+        );
+      },
+    },
+    {
+      title: "当前市值",
+      key: "market_value",
+      render: (_: unknown, record: HoldingWithQuote) => {
+        if (record.market_value === null || record.market_value === undefined)
+          return <span>—</span>;
+        return `${record.currency} ${record.market_value.toFixed(2)}`;
+      },
+    },
+    {
+      title: "盈亏",
+      key: "unrealized_pnl",
+      render: (_: unknown, record: HoldingWithQuote) => (
+        <PnlText value={record.unrealized_pnl ?? null} percent={record.unrealized_pnl_percent ?? null} />
       ),
     },
   ];
+
+  const actionColumn = {
+    title: "操作",
+    key: "action",
+    render: (_: unknown, record: HoldingWithQuote) => (
+      <Space>
+        <Button type="link" size="small" onClick={() => handleEdit(record)}>
+          编辑
+        </Button>
+        <Popconfirm
+          title="确认删除该持仓？"
+          onConfirm={() => handleDelete(record.id)}
+          okText="确认"
+          cancelText="取消"
+        >
+          <Button type="link" size="small" danger>
+            删除
+          </Button>
+        </Popconfirm>
+      </Space>
+    ),
+  };
+
+  const columns = showRealtime
+    ? [...staticColumns, ...realtimeColumns, actionColumn]
+    : [...staticColumns, actionColumn];
 
   return (
     <div>
@@ -161,25 +254,48 @@ export default function HoldingsPage() {
         <Title level={2} className="!mb-0">
           持仓管理
         </Title>
-        <Button
-          type="primary"
-          icon={<PlusOutlined />}
-          onClick={() => {
-            setEditingHolding(null);
-            form.resetFields();
-            setModalOpen(true);
-          }}
-        >
-          新增持仓
-        </Button>
+        <Space>
+          <Space>
+            <Text type="secondary">实时行情</Text>
+            <Switch
+              checked={showRealtime}
+              onChange={setShowRealtime}
+              size="small"
+            />
+          </Space>
+          {showRealtime && (
+            <Tooltip title={lastUpdatedAt ? `上次更新: ${dayjs(lastUpdatedAt).format("HH:mm:ss")}` : "点击刷新"}>
+              <Button
+                icon={quotesLoading ? <SyncOutlined spin /> : <ReloadOutlined />}
+                onClick={fetchHoldingQuotes}
+                size="small"
+                disabled={quotesLoading}
+              >
+                刷新行情
+              </Button>
+            </Tooltip>
+          )}
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={() => {
+              setEditingHolding(null);
+              form.resetFields();
+              setModalOpen(true);
+            }}
+          >
+            新增持仓
+          </Button>
+        </Space>
       </div>
 
       <Table
-        dataSource={holdings}
+        dataSource={displayData}
         columns={columns}
         rowKey="id"
-        loading={loading}
+        loading={holdingsLoading}
         pagination={{ pageSize: 20 }}
+        scroll={{ x: showRealtime ? 1200 : undefined }}
       />
 
       <Modal
@@ -214,7 +330,7 @@ export default function HoldingsPage() {
             label="股票代码"
             rules={[{ required: true, message: "请输入股票代码" }]}
           >
-            <Input placeholder="如：AAPL, 600519.SH, 0700.HK" />
+            <Input placeholder="如：AAPL, sh600519, 0700.HK" />
           </Form.Item>
           <Form.Item
             name="name"

@@ -53,6 +53,51 @@ export interface Transaction {
   created_at: string;
 }
 
+export interface StockQuote {
+  symbol: string;
+  name: string;
+  market: Market;
+  current_price: number;
+  previous_close: number;
+  change: number;
+  change_percent: number;
+  high: number;
+  low: number;
+  volume: number;
+  updated_at: string;
+}
+
+export interface HoldingWithQuote extends Holding {
+  quote: StockQuote | null;
+  market_value: number | null;
+  total_cost: number | null;
+  unrealized_pnl: number | null;
+  unrealized_pnl_percent: number | null;
+}
+
+export interface ExchangeRates {
+  usd_cny: number;
+  usd_hkd: number;
+  cny_hkd: number;
+  updated_at: string;
+}
+
+export interface DailyPortfolioValue {
+  id: number;
+  date: string;
+  total_cost: number;
+  total_value: number;
+  us_cost: number;
+  us_value: number;
+  cn_cost: number;
+  cn_value: number;
+  hk_cost: number;
+  hk_value: number;
+  exchange_rates: string;
+  daily_pnl: number;
+  cumulative_pnl: number;
+}
+
 export interface CreateAccountPayload {
   name: string;
   market: Market;
@@ -118,3 +163,4 @@ export interface CreateTransactionPayload {
   traded_at: string;
   notes?: string;
 }
+

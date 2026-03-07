@@ -3,6 +3,7 @@ pub mod category;
 pub mod dashboard;
 pub mod holding;
 pub mod performance;
+pub mod quarterly;
 pub mod quote;
 pub mod statistics;
 pub mod transaction;
@@ -14,6 +15,11 @@ pub use holding::Holding;
 pub use performance::{
     BenchmarkDataPoint, DrawdownAnalysis, DrawdownPoint, HoldingPerformance, MonthlyReturn,
     PerformanceSummary, ReturnAttribution, ReturnDataPoint, RiskMetrics,
+};
+pub use quarterly::{
+    CategoryComparison, ComparisonOverview, HoldingChangeItem, HoldingChanges,
+    HoldingNoteHistory, MarketComparison, QuarterComparison, QuarterlyHoldingSnapshot,
+    QuarterlyNotesSummary, QuarterlySnapshot, QuarterlySnapshotDetail, QuarterlyTrends,
 };
 pub use quote::{DailyHoldingSnapshot, DailyPortfolioValue, ExchangeRates, HoldingWithQuote, StockQuote};
 pub use statistics::{AccountStatistics, CategoryStatistics, MarketStatistics, PieSlice, PnlItem, StatisticsOverview};

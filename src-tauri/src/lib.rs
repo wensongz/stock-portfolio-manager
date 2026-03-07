@@ -63,6 +63,17 @@ pub fn run() {
             commands::performance::get_holding_performance_ranking,
             commands::performance::get_risk_metrics,
             commands::performance::get_drawdown_analysis,
+            commands::quarterly::create_quarterly_snapshot,
+            commands::quarterly::get_quarterly_snapshots,
+            commands::quarterly::get_quarterly_snapshot_detail,
+            commands::quarterly::delete_quarterly_snapshot,
+            commands::quarterly::check_missing_snapshots,
+            commands::quarterly::compare_quarters,
+            commands::quarterly::update_holding_notes,
+            commands::quarterly::get_holding_notes_history,
+            commands::quarterly::update_quarterly_notes,
+            commands::quarterly::get_quarterly_notes_history,
+            commands::quarterly::get_quarterly_trends,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

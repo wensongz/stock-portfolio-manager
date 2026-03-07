@@ -10,15 +10,15 @@ mod tests {
     fn test_database_creation() {
         let db = create_test_db();
         let conn = db.conn.lock().unwrap();
-        // Verify all tables exist (including new Phase 2 tables)
+        // Verify all tables exist (including Phase 5 quarterly tables)
         let count: i32 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('accounts', 'categories', 'holdings', 'transactions', 'daily_portfolio_values', 'daily_holding_snapshots')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('accounts', 'categories', 'holdings', 'transactions', 'daily_portfolio_values', 'daily_holding_snapshots', 'quarterly_snapshots', 'quarterly_holding_snapshots')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 6);
+        assert_eq!(count, 8);
     }
 
     #[test]

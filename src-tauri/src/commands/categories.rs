@@ -2,7 +2,7 @@ use crate::db::Database;
 use crate::models::Category;
 use tauri::State;
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn create_category(
     db: State<Database>,
     name: String,
@@ -31,7 +31,7 @@ pub fn create_category(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn get_categories(db: State<Database>) -> Result<Vec<Category>, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
@@ -58,7 +58,7 @@ pub fn get_categories(db: State<Database>) -> Result<Vec<Category>, String> {
     Ok(categories)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn update_category(
     db: State<Database>,
     id: String,
@@ -96,7 +96,7 @@ pub fn update_category(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn delete_category(db: State<Database>, id: String) -> Result<(), String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     // Prevent deletion of system categories

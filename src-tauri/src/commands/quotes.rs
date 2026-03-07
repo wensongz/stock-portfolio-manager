@@ -3,14 +3,14 @@ use crate::models::{HoldingWithQuote, StockQuote};
 use crate::services::quote_service::{fetch_cn_quote, fetch_hk_quote, fetch_us_quote, fetch_quotes_batch};
 use tauri::State;
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn get_real_time_quotes(
     symbols: Vec<(String, String)>,
 ) -> Result<Vec<StockQuote>, String> {
     fetch_quotes_batch(symbols).await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn get_holding_quotes(db: State<'_, Database>) -> Result<Vec<HoldingWithQuote>, String> {
     // Load holdings from DB (synchronous)
     let holdings = {
@@ -93,17 +93,17 @@ pub async fn get_holding_quotes(db: State<'_, Database>) -> Result<Vec<HoldingWi
     Ok(result)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn get_us_quote(symbol: String) -> Result<StockQuote, String> {
     fetch_us_quote(&symbol).await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn get_hk_quote(symbol: String) -> Result<StockQuote, String> {
     fetch_hk_quote(&symbol).await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn get_cn_quote(symbol: String) -> Result<StockQuote, String> {
     fetch_cn_quote(&symbol).await
 }

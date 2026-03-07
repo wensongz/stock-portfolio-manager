@@ -4,7 +4,7 @@ use crate::services::alert_service;
 use std::collections::HashMap;
 use tauri::State;
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn create_alert(
     db: State<'_, Database>,
     holding_id: Option<String>,
@@ -17,12 +17,12 @@ pub async fn create_alert(
     alert_service::create_alert(&db, holding_id, symbol, name, market, alert_type, threshold)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn get_alerts(db: State<'_, Database>) -> Result<Vec<PriceAlert>, String> {
     alert_service::get_alerts(&db)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn update_alert(
     db: State<'_, Database>,
     id: String,
@@ -31,13 +31,13 @@ pub async fn update_alert(
     alert_service::update_alert(&db, &id, is_active)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn delete_alert(db: State<'_, Database>, id: String) -> Result<bool, String> {
     alert_service::delete_alert(&db, &id)
 }
 
 /// quotes_json: JSON object { symbol: [price, change_percent, pnl_percent] }
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn check_alerts(
     db: State<'_, Database>,
     quotes_json: serde_json::Value,

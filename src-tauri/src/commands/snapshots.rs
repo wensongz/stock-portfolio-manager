@@ -5,7 +5,7 @@ use crate::services::snapshot_service::{get_daily_values, take_daily_snapshot};
 use chrono::NaiveDate;
 use tauri::State;
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn take_snapshot(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
@@ -21,7 +21,7 @@ pub async fn take_snapshot(
     Ok(true)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn get_portfolio_history(
     db: State<'_, Database>,
     start_date: String,

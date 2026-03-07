@@ -1,11 +1,15 @@
 pub mod accounts;
+pub mod ai;
+pub mod alerts;
 pub mod categories;
 pub mod dashboard;
 pub mod exchange_rates;
 pub mod holdings;
+pub mod import_export;
 pub mod performance;
 pub mod quarterly;
 pub mod quotes;
+pub mod review;
 pub mod snapshots;
 pub mod statistics;
 pub mod transactions;

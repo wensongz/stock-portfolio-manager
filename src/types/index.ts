@@ -484,3 +484,103 @@ export interface QuarterlyTrends {
   holding_counts: number[];
 }
 
+// Phase 6: Import/Export types
+export interface ExportFilters {
+  market?: string;
+  account_id?: string;
+  category_id?: string;
+}
+
+export interface ImportError {
+  row: number;
+  column: string;
+  message: string;
+}
+
+export interface ImportPreview {
+  total_rows: number;
+  valid_rows: number;
+  error_rows: ImportError[];
+  preview_data: Record<string, unknown>[];
+  column_mapping: Record<string, string>;
+}
+
+export interface ImportData {
+  data_type: string;
+  rows: Record<string, unknown>[];
+  column_mapping: Record<string, string>;
+  account_id: string;
+}
+
+export interface ImportResult {
+  imported_count: number;
+  skipped_count: number;
+  errors: ImportError[];
+}
+
+// Phase 6: Price Alerts
+export type AlertType =
+  | "PRICE_ABOVE"
+  | "PRICE_BELOW"
+  | "CHANGE_ABOVE"
+  | "CHANGE_BELOW"
+  | "PNL_ABOVE"
+  | "PNL_BELOW";
+
+export interface PriceAlert {
+  id: string;
+  holding_id: string | null;
+  symbol: string;
+  name: string;
+  market: Market;
+  alert_type: AlertType;
+  threshold: number;
+  is_active: boolean;
+  is_triggered: boolean;
+  triggered_at: string | null;
+  created_at: string;
+}
+
+export interface TriggeredAlert {
+  alert: PriceAlert;
+  current_value: number;
+  message: string;
+}
+
+// Phase 6: Review types
+export interface QuarterlyHoldingStatus {
+  snapshot_id: string;
+  quarter: string;
+  shares: number;
+  avg_cost: number;
+  close_price: number;
+  pnl_percent: number;
+  notes: string | null;
+  decision_quality: "correct" | "wrong" | "pending" | null;
+}
+
+export interface HoldingReview {
+  symbol: string;
+  name: string;
+  market: Market;
+  is_current_holding: boolean;
+  quarterly_timeline: QuarterlyHoldingStatus[];
+}
+
+export interface DecisionStatistics {
+  total_decisions: number;
+  correct_count: number;
+  wrong_count: number;
+  pending_count: number;
+  accuracy_rate: number;
+}
+
+// Phase 6: AI Config
+export interface AiConfig {
+  provider: string;
+  api_key: string;
+  model: string;
+  base_url: string | null;
+  system_prompt: string;
+}
+

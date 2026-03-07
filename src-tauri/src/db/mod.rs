@@ -204,6 +204,39 @@ impl Database {
             ON quarterly_holding_snapshots(symbol);
         ")?;
 
+        // Add decision_quality column if not exists (migration)
+        let _ = conn.execute_batch("
+            ALTER TABLE quarterly_holding_snapshots ADD COLUMN decision_quality TEXT;
+        ");
+
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS price_alerts (
+                id TEXT PRIMARY KEY NOT NULL,
+                holding_id TEXT,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                market TEXT NOT NULL CHECK(market IN ('US', 'CN', 'HK')),
+                alert_type TEXT NOT NULL CHECK(alert_type IN ('PRICE_ABOVE', 'PRICE_BELOW', 'CHANGE_ABOVE', 'CHANGE_BELOW', 'PNL_ABOVE', 'PNL_BELOW')),
+                threshold REAL NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                is_triggered INTEGER NOT NULL DEFAULT 0,
+                triggered_at TEXT,
+                created_at TEXT NOT NULL
+            );
+        ")?;
+
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS ai_config (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                provider TEXT NOT NULL DEFAULT 'openai',
+                api_key TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT 'gpt-4',
+                base_url TEXT,
+                system_prompt TEXT NOT NULL DEFAULT '你是一位专业的投资顾问，帮助用户分析股票投资组合。',
+                updated_at TEXT NOT NULL
+            );
+        ")?;
+
         Ok(())
     }
 }

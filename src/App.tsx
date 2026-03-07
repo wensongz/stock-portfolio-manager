@@ -11,6 +11,10 @@ import QuarterlyPage from "./pages/Quarterly";
 import SnapshotDetail from "./pages/Quarterly/SnapshotDetail";
 import QuarterComparisonPage from "./pages/Quarterly/QuarterComparison";
 import TrendsPage from "./pages/Quarterly/TrendsPage";
+import ImportPage from "./pages/Import";
+import AlertsPage from "./pages/Alerts";
+import ReviewPage from "./pages/Review";
+import SettingsPage from "./pages/Settings";
 
 function App() {
   return (
@@ -28,6 +32,10 @@ function App() {
         <Route path="/quarterly/compare" element={<QuarterComparisonPage />} />
         <Route path="/quarterly/trends" element={<TrendsPage />} />
         <Route path="/quarterly/:snapshotId" element={<SnapshotDetail />} />
+        <Route path="/import" element={<ImportPage />} />
+        <Route path="/alerts" element={<AlertsPage />} />
+        <Route path="/review" element={<ReviewPage />} />
+        <Route path="/settings" element={<SettingsPage />} />
       </Routes>
     </MainLayout>
   );

@@ -74,6 +74,26 @@ pub fn run() {
             commands::quarterly::update_quarterly_notes,
             commands::quarterly::get_quarterly_notes_history,
             commands::quarterly::get_quarterly_trends,
+            // Phase 6: Import/Export
+            commands::import_export::export_holdings_csv,
+            commands::import_export::export_transactions_csv,
+            commands::import_export::get_import_template,
+            commands::import_export::parse_import_csv,
+            commands::import_export::confirm_import,
+            // Phase 6: Price Alerts
+            commands::alerts::create_alert,
+            commands::alerts::get_alerts,
+            commands::alerts::update_alert,
+            commands::alerts::delete_alert,
+            commands::alerts::check_alerts,
+            // Phase 6: Review
+            commands::review::get_holding_review,
+            commands::review::update_decision_quality,
+            commands::review::get_decision_statistics,
+            commands::review::get_reviewed_symbols,
+            // Phase 6: AI Config
+            commands::ai::get_ai_config,
+            commands::ai::update_ai_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

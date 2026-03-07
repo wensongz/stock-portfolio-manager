@@ -10,6 +10,10 @@ import {
   BarChartOutlined,
   LineChartOutlined,
   CalendarOutlined,
+  ImportOutlined,
+  BellOutlined,
+  HistoryOutlined,
+  SettingOutlined,
 } from "@ant-design/icons";
 
 const { Sider, Content } = Layout;
@@ -23,6 +27,10 @@ const menuItems = [
   { key: "/holdings", icon: <StockOutlined />, label: "持仓管理" },
   { key: "/transactions", icon: <SwapOutlined />, label: "交易记录" },
   { key: "/categories", icon: <TagsOutlined />, label: "投资类别" },
+  { key: "/import", icon: <ImportOutlined />, label: "导入导出" },
+  { key: "/alerts", icon: <BellOutlined />, label: "价格提醒" },
+  { key: "/review", icon: <HistoryOutlined />, label: "操作复盘" },
+  { key: "/settings", icon: <SettingOutlined />, label: "设置" },
 ];
 
 interface Props {
@@ -53,7 +61,6 @@ export default function MainLayout({ children }: Props) {
           theme="dark"
           mode="inline"
           selectedKeys={[
-            // Highlight parent menu item for sub-routes
             menuItems.find((item) => location.pathname.startsWith(item.key))?.key ??
               location.pathname,
           ]}

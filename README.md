@@ -1,73 +1,74 @@
-# React + TypeScript + Vite
+# 📊 Stock Portfolio Manager
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A desktop application for managing stock portfolios across US, CN, and HK markets, built with Tauri 2.0, React 18, and SQLite.
 
-Currently, two official plugins are available:
+## Features (Phase 1)
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- **Securities Account Management** — Create and manage multiple brokerage accounts per market (US/CN/HK)
+- **Investment Categories** — 4 preset categories (现金类, 分红股, 成长股, 套利) + custom categories
+- **Holdings Management** — Track stock positions with average cost, shares, and category
+- **Transaction Management** — Record buy/sell transactions with automatic holding updates (weighted average cost)
 
-## React Compiler
+## Tech Stack
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+| Layer | Technology |
+|-------|-----------|
+| Desktop Framework | Tauri 2.0 |
+| Frontend | React 18 + TypeScript + Vite |
+| UI Components | Ant Design |
+| State Management | Zustand |
+| Backend | Rust |
+| Database | SQLite (rusqlite) |
+| Date Handling | chrono (Rust) / dayjs (Frontend) |
 
-## Expanding the ESLint configuration
+## Getting Started
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+### Prerequisites
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+- [Node.js](https://nodejs.org/) (v18+)
+- [Rust](https://www.rust-lang.org/tools/install)
+- Tauri system dependencies ([see docs](https://v2.tauri.app/start/prerequisites/))
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+### Development
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+# Install frontend dependencies
+npm install
+
+# Run in development mode (starts both frontend dev server and Tauri)
+npm run tauri dev
+
+# Run Rust backend tests
+cd src-tauri && cargo test
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+### Build
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+# Build the application
+npm run tauri build
 ```
+
+## Project Structure
+
+```
+stock-portfolio-manager/
+├── src/                    # React frontend
+│   ├── api/                # Tauri command API wrappers
+│   ├── pages/              # Page components (Accounts, Categories, Holdings, Transactions)
+│   ├── types/              # TypeScript type definitions
+│   └── App.tsx             # Main app with routing
+├── src-tauri/              # Rust backend
+│   ├── src/
+│   │   ├── commands/       # Tauri command handlers
+│   │   ├── db/             # Database initialization & migrations
+│   │   ├── models/         # Data models
+│   │   └── services/       # Business logic with tests
+│   └── Cargo.toml
+└── docs/
+    └── PRD.md              # Product Requirements Document
+```
+
+## License
+
+GPL-3.0

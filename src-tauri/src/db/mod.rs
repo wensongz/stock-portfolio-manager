@@ -151,6 +151,59 @@ impl Database {
             ON benchmark_daily_prices(symbol, date);
         ")?;
 
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS quarterly_snapshots (
+                id TEXT PRIMARY KEY NOT NULL,
+                quarter TEXT NOT NULL UNIQUE,
+                snapshot_date TEXT NOT NULL,
+                total_value REAL NOT NULL DEFAULT 0,
+                total_cost REAL NOT NULL DEFAULT 0,
+                total_pnl REAL NOT NULL DEFAULT 0,
+                us_value REAL NOT NULL DEFAULT 0,
+                us_cost REAL NOT NULL DEFAULT 0,
+                cn_value REAL NOT NULL DEFAULT 0,
+                cn_cost REAL NOT NULL DEFAULT 0,
+                hk_value REAL NOT NULL DEFAULT 0,
+                hk_cost REAL NOT NULL DEFAULT 0,
+                exchange_rates TEXT NOT NULL DEFAULT '{}',
+                overall_notes TEXT,
+                created_at TEXT NOT NULL
+            );
+        ")?;
+
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS quarterly_holding_snapshots (
+                id TEXT PRIMARY KEY NOT NULL,
+                quarterly_snapshot_id TEXT NOT NULL REFERENCES quarterly_snapshots(id) ON DELETE CASCADE,
+                account_id TEXT NOT NULL,
+                account_name TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                market TEXT NOT NULL CHECK(market IN ('US', 'CN', 'HK')),
+                category_name TEXT NOT NULL DEFAULT '未分类',
+                category_color TEXT NOT NULL DEFAULT '#8B8B8B',
+                shares REAL NOT NULL DEFAULT 0,
+                avg_cost REAL NOT NULL DEFAULT 0,
+                close_price REAL NOT NULL DEFAULT 0,
+                market_value REAL NOT NULL DEFAULT 0,
+                cost_value REAL NOT NULL DEFAULT 0,
+                pnl REAL NOT NULL DEFAULT 0,
+                pnl_percent REAL NOT NULL DEFAULT 0,
+                weight REAL NOT NULL DEFAULT 0,
+                notes TEXT
+            );
+        ")?;
+
+        conn.execute_batch("
+            CREATE INDEX IF NOT EXISTS idx_quarterly_holding_snapshots_snapshot_id
+            ON quarterly_holding_snapshots(quarterly_snapshot_id);
+        ")?;
+
+        conn.execute_batch("
+            CREATE INDEX IF NOT EXISTS idx_quarterly_holding_snapshots_symbol
+            ON quarterly_holding_snapshots(symbol);
+        ")?;
+
         Ok(())
     }
 }

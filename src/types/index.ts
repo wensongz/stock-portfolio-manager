@@ -341,3 +341,146 @@ export interface CreateTransactionPayload {
   notes?: string;
 }
 
+// Phase 5: Quarterly Analysis types
+export interface QuarterlySnapshot {
+  id: string;
+  quarter: string;
+  snapshot_date: string;
+  total_value: number;
+  total_cost: number;
+  total_pnl: number;
+  us_value: number;
+  us_cost: number;
+  cn_value: number;
+  cn_cost: number;
+  hk_value: number;
+  hk_cost: number;
+  exchange_rates: string;
+  overall_notes: string | null;
+  created_at: string;
+  holding_count: number;
+}
+
+export interface QuarterlyHoldingSnapshot {
+  id: string;
+  quarterly_snapshot_id: string;
+  account_id: string;
+  account_name: string;
+  symbol: string;
+  name: string;
+  market: string;
+  category_name: string;
+  category_color: string;
+  shares: number;
+  avg_cost: number;
+  close_price: number;
+  market_value: number;
+  cost_value: number;
+  pnl: number;
+  pnl_percent: number;
+  weight: number;
+  notes: string | null;
+}
+
+export interface QuarterlySnapshotDetail {
+  snapshot: QuarterlySnapshot;
+  holdings: QuarterlyHoldingSnapshot[];
+}
+
+export interface ComparisonOverview {
+  q1_total_value: number;
+  q2_total_value: number;
+  value_change: number;
+  value_change_percent: number;
+  q1_total_cost: number;
+  q2_total_cost: number;
+  q1_pnl: number;
+  q2_pnl: number;
+  q1_holding_count: number;
+  q2_holding_count: number;
+}
+
+export interface MarketComparison {
+  market: string;
+  q1_value: number;
+  q2_value: number;
+  value_change: number;
+  value_change_percent: number;
+  q1_cost: number;
+  q2_cost: number;
+  q1_pnl: number;
+  q2_pnl: number;
+}
+
+export interface CategoryComparison {
+  category_name: string;
+  category_color: string;
+  q1_value: number;
+  q2_value: number;
+  value_change: number;
+  value_change_percent: number;
+  q1_cost: number;
+  q2_cost: number;
+  q1_pnl: number;
+  q2_pnl: number;
+}
+
+export interface HoldingChangeItem {
+  symbol: string;
+  name: string;
+  market: string;
+  category_name: string;
+  q1_shares: number | null;
+  q2_shares: number | null;
+  q1_value: number | null;
+  q2_value: number | null;
+  shares_change: number;
+  value_change: number;
+}
+
+export interface HoldingChanges {
+  new_holdings: HoldingChangeItem[];
+  closed_holdings: HoldingChangeItem[];
+  increased: HoldingChangeItem[];
+  decreased: HoldingChangeItem[];
+  unchanged: HoldingChangeItem[];
+}
+
+export interface QuarterComparison {
+  quarter1: string;
+  quarter2: string;
+  overview: ComparisonOverview;
+  by_market: MarketComparison[];
+  by_category: CategoryComparison[];
+  holding_changes: HoldingChanges;
+}
+
+export interface HoldingNoteHistory {
+  quarter: string;
+  snapshot_date: string;
+  shares: number;
+  avg_cost: number;
+  close_price: number;
+  pnl_percent: number;
+  notes: string;
+}
+
+export interface QuarterlyNotesSummary {
+  snapshot_id: string;
+  quarter: string;
+  snapshot_date: string;
+  overall_notes: string;
+  total_value: number;
+  total_pnl: number;
+}
+
+export interface QuarterlyTrends {
+  quarters: string[];
+  total_values: number[];
+  total_costs: number[];
+  total_pnls: number[];
+  market_values: Record<string, number[]>;
+  category_values: Record<string, number[]>;
+  holding_counts: number[];
+}
+

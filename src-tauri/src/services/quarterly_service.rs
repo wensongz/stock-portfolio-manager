@@ -185,12 +185,13 @@ pub async fn create_quarterly_snapshot(
     let created_at = Utc::now().to_rfc3339();
     let holding_count = holding_rows_for_insert.len();
 
-    // Persist (upsert: delete existing snapshot for this quarter, then insert)
+    // Persist (upsert: delete existing snapshot for this quarter, then insert — wrapped in transaction)
     {
-        let conn = db.conn.lock().map_err(|e| e.to_string())?;
+        let mut conn = db.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
 
         // Delete existing snapshot for this quarter
-        let old_id: Option<String> = conn
+        let old_id: Option<String> = tx
             .query_row(
                 "SELECT id FROM quarterly_snapshots WHERE quarter = ?1",
                 rusqlite::params![quarter_str],
@@ -198,12 +199,12 @@ pub async fn create_quarterly_snapshot(
             )
             .ok();
         if let Some(oid) = old_id {
-            conn.execute(
+            tx.execute(
                 "DELETE FROM quarterly_holding_snapshots WHERE quarterly_snapshot_id = ?1",
                 rusqlite::params![oid],
             )
             .map_err(|e| e.to_string())?;
-            conn.execute(
+            tx.execute(
                 "DELETE FROM quarterly_snapshots WHERE id = ?1",
                 rusqlite::params![oid],
             )
@@ -211,7 +212,7 @@ pub async fn create_quarterly_snapshot(
         }
 
         // Insert new snapshot
-        conn.execute(
+        tx.execute(
             "INSERT INTO quarterly_snapshots
              (id, quarter, snapshot_date, total_value, total_cost, total_pnl,
               us_value, us_cost, cn_value, cn_cost, hk_value, hk_cost,
@@ -245,7 +246,7 @@ pub async fn create_quarterly_snapshot(
                 0.0
             };
             let holding_snap_id = uuid::Uuid::new_v4().to_string();
-            conn.execute(
+            tx.execute(
                 "INSERT INTO quarterly_holding_snapshots
                  (id, quarterly_snapshot_id, account_id, account_name, symbol, name, market,
                   category_name, category_color, shares, avg_cost, close_price, market_value,
@@ -262,6 +263,8 @@ pub async fn create_quarterly_snapshot(
             )
             .map_err(|e| e.to_string())?;
         }
+
+        tx.commit().map_err(|e| e.to_string())?;
     }
 
     Ok(QuarterlySnapshot {

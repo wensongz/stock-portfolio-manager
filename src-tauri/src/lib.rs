@@ -55,6 +55,14 @@ pub fn run() {
             commands::statistics::get_statistics_by_market,
             commands::statistics::get_statistics_by_account,
             commands::statistics::get_statistics_by_category,
+            commands::performance::get_performance_summary,
+            commands::performance::get_return_series,
+            commands::performance::get_benchmark_return_series,
+            commands::performance::get_return_attribution,
+            commands::performance::get_monthly_returns,
+            commands::performance::get_holding_performance_ranking,
+            commands::performance::get_risk_metrics,
+            commands::performance::get_drawdown_analysis,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

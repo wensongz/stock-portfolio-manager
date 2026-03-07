@@ -246,6 +246,86 @@ export interface UpdateHoldingPayload {
   currency: Currency;
 }
 
+// Phase 4: Performance types
+export interface PerformanceSummary {
+  start_date: string;
+  end_date: string;
+  start_value: number;
+  end_value: number;
+  total_return: number;
+  annualized_return: number;
+  total_pnl: number;
+  max_drawdown: number;
+  volatility: number;
+  sharpe_ratio: number;
+}
+
+export interface ReturnDataPoint {
+  date: string;
+  cumulative_return: number;
+  daily_return: number;
+  portfolio_value: number;
+  daily_pnl: number;
+}
+
+export interface DrawdownPoint {
+  date: string;
+  drawdown: number;
+}
+
+export interface DrawdownAnalysis {
+  max_drawdown: number;
+  peak_date: string;
+  trough_date: string;
+  recovery_date: string | null;
+  drawdown_duration: number;
+  recovery_duration: number | null;
+  drawdown_series: DrawdownPoint[];
+}
+
+export interface AttributionItem {
+  name: string;
+  pnl: number;
+  contribution_percent: number;
+  weight: number;
+}
+
+export interface ReturnAttribution {
+  total_pnl: number;
+  by_market: AttributionItem[];
+  by_category: AttributionItem[];
+  by_holding: AttributionItem[];
+}
+
+export interface MonthlyReturn {
+  year: number;
+  month: number;
+  return_rate: number;
+  pnl: number;
+  start_value: number;
+  end_value: number;
+}
+
+export interface HoldingPerformance {
+  symbol: string;
+  name: string;
+  market: string;
+  category_name: string;
+  return_rate: number;
+  pnl: number;
+  start_value: number;
+  end_value: number;
+}
+
+export interface RiskMetrics {
+  daily_volatility: number;
+  annualized_volatility: number;
+  sharpe_ratio: number;
+  risk_free_rate: number;
+  max_drawdown: number;
+  calmar_ratio: number;
+}
+
 export interface CreateTransactionPayload {
   account_id: string;
   symbol: string;

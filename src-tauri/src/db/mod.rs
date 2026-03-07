@@ -135,6 +135,22 @@ impl Database {
             ON daily_holding_snapshots(date);
         ")?;
 
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS benchmark_daily_prices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                date TEXT NOT NULL,
+                close_price REAL NOT NULL DEFAULT 0,
+                change_percent REAL NOT NULL DEFAULT 0,
+                UNIQUE(symbol, date)
+            );
+        ")?;
+
+        conn.execute_batch("
+            CREATE INDEX IF NOT EXISTS idx_benchmark_daily_prices_symbol_date
+            ON benchmark_daily_prices(symbol, date);
+        ")?;
+
         Ok(())
     }
 }

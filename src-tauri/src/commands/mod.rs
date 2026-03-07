@@ -3,6 +3,7 @@ pub mod categories;
 pub mod dashboard;
 pub mod exchange_rates;
 pub mod holdings;
+pub mod performance;
 pub mod quotes;
 pub mod snapshots;
 pub mod statistics;

@@ -43,9 +43,15 @@ export default function PieChart({ data, title, centerText, height = 300 }: PieC
         radius: ["45%", "70%"],
         center: ["50%", "45%"],
         avoidLabelOverlap: true,
-        label: {
-          show: false,
-        },
+        label: centerText
+          ? {
+              show: true,
+              position: "center",
+              formatter: () => centerText,
+              fontSize: 12,
+              color: "#666",
+            }
+          : { show: false },
         emphasis: {
           label: {
             show: true,
@@ -55,17 +61,6 @@ export default function PieChart({ data, title, centerText, height = 300 }: PieC
           scale: true,
         },
         data: seriesData,
-        ...(centerText
-          ? {
-              label: {
-                show: true,
-                position: "center",
-                formatter: () => centerText,
-                fontSize: 12,
-                color: "#666",
-              },
-            }
-          : {}),
       },
     ],
   };

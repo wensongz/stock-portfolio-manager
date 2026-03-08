@@ -5,12 +5,14 @@ import type { HoldingWithQuote, StockQuote } from "../types";
 const DEFAULT_REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const STORAGE_KEY = "quote_refresh_interval_ms";
 
+const MAX_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+
 function loadRefreshInterval(): number {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved) {
       const parsed = Number(saved);
-      if (!isNaN(parsed) && parsed > 0) return parsed;
+      if (!isNaN(parsed) && parsed > 0 && parsed <= MAX_REFRESH_INTERVAL_MS) return parsed;
     }
   } catch {
     // ignore

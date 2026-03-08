@@ -105,12 +105,8 @@ pub async fn get_statistics_overview(
         .collect();
     pnl_items.sort_by(|a, b| b.pnl.partial_cmp(&a.pnl).unwrap_or(std::cmp::Ordering::Equal));
 
-    let top_gainers: Vec<PnlItem> = pnl_items.iter().take(5).cloned().collect();
-    let top_losers: Vec<PnlItem> = {
-        let mut losers = pnl_items.clone();
-        losers.sort_by(|a, b| a.pnl.partial_cmp(&b.pnl).unwrap_or(std::cmp::Ordering::Equal));
-        losers.into_iter().take(5).collect()
-    };
+    let top_gainers: Vec<PnlItem> = pnl_items.iter().filter(|i| i.pnl > 0.0).take(5).cloned().collect();
+    let top_losers: Vec<PnlItem> = pnl_items.iter().rev().filter(|i| i.pnl < 0.0).take(5).cloned().collect();
 
     let total_pnl = total_market_value - total_cost;
     let total_pnl_percent = if total_cost != 0.0 {

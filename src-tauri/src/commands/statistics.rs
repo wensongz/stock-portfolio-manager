@@ -4,6 +4,7 @@ use crate::models::{
     StatisticsOverview,
 };
 use crate::services::exchange_rate_service::{convert_currency, get_cached_rates, ExchangeRateCache};
+use crate::services::quote_service::QuoteCache;
 use crate::commands::dashboard::build_holding_details_pub;
 use tauri::State;
 
@@ -15,6 +16,7 @@ fn to_usd_value(amount: f64, currency: &str, rates: &crate::models::ExchangeRate
 pub async fn get_statistics_overview(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
+    quote_cache: State<'_, QuoteCache>,
 ) -> Result<StatisticsOverview, String> {
     let rates = get_cached_rates(&cache).await.unwrap_or_else(|_| crate::models::ExchangeRates {
         usd_cny: 7.2,
@@ -23,7 +25,7 @@ pub async fn get_statistics_overview(
         updated_at: chrono::Utc::now().to_rfc3339(),
     });
 
-    let details = build_holding_details_pub(&db).await?;
+    let details = build_holding_details_pub(&db, &quote_cache).await?;
 
     // Aggregate market distribution (values in USD for comparison)
     let mut market_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
@@ -134,6 +136,7 @@ pub async fn get_statistics_overview(
 pub async fn get_statistics_by_market(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
+    quote_cache: State<'_, QuoteCache>,
     market: String,
 ) -> Result<MarketStatistics, String> {
     let rates = get_cached_rates(&cache).await.unwrap_or_else(|_| crate::models::ExchangeRates {
@@ -143,7 +146,7 @@ pub async fn get_statistics_by_market(
         updated_at: chrono::Utc::now().to_rfc3339(),
     });
 
-    let all_details = build_holding_details_pub(&db).await?;
+    let all_details = build_holding_details_pub(&db, &quote_cache).await?;
     let details: Vec<_> = all_details
         .into_iter()
         .filter(|d| d.market == market)
@@ -214,6 +217,7 @@ pub async fn get_statistics_by_market(
 pub async fn get_statistics_by_account(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
+    quote_cache: State<'_, QuoteCache>,
     account_id: String,
 ) -> Result<AccountStatistics, String> {
     let rates = get_cached_rates(&cache).await.unwrap_or_else(|_| crate::models::ExchangeRates {
@@ -223,7 +227,7 @@ pub async fn get_statistics_by_account(
         updated_at: chrono::Utc::now().to_rfc3339(),
     });
 
-    let all_details = build_holding_details_pub(&db).await?;
+    let all_details = build_holding_details_pub(&db, &quote_cache).await?;
     let details: Vec<_> = all_details
         .into_iter()
         .filter(|d| d.account_id == account_id)
@@ -290,6 +294,7 @@ pub async fn get_statistics_by_account(
 pub async fn get_statistics_by_category(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
+    quote_cache: State<'_, QuoteCache>,
     category_id: String,
 ) -> Result<CategoryStatistics, String> {
     let rates = get_cached_rates(&cache).await.unwrap_or_else(|_| crate::models::ExchangeRates {
@@ -321,7 +326,7 @@ pub async fn get_statistics_by_category(
         None => (category_id.clone(), "未分类".to_string(), "#8B8B8B".to_string()),
     };
 
-    let all_details = build_holding_details_pub(&db).await?;
+    let all_details = build_holding_details_pub(&db, &quote_cache).await?;
     let details: Vec<_> = all_details
         .into_iter()
         .filter(|d| d.category_name == cat_name)

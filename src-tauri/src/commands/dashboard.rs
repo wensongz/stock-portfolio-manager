@@ -3,19 +3,21 @@ use crate::models::{
     DashboardSummary, ExchangeRates, HoldingDetail,
 };
 use crate::services::exchange_rate_service::{convert_currency, get_cached_rates, ExchangeRateCache};
-use crate::services::quote_service::fetch_quotes_batch;
+use crate::services::quote_service::{fetch_quotes_batch_cached, QuoteCache};
 use tauri::State;
 
 /// Build HoldingDetail records from raw holdings + quotes + account/category lookups.
 /// This is the shared implementation; call `build_holding_details_pub` from other modules.
 pub async fn build_holding_details_pub(
     db: &Database,
+    quote_cache: &QuoteCache,
 ) -> Result<Vec<HoldingDetail>, String> {
-    build_holding_details(db).await
+    build_holding_details(db, quote_cache).await
 }
 
 async fn build_holding_details(
     db: &Database,
+    quote_cache: &QuoteCache,
 ) -> Result<Vec<HoldingDetail>, String> {
     // Load holdings and lookup data in one DB operation
     struct Row {
@@ -79,7 +81,7 @@ async fn build_holding_details(
         .iter()
         .map(|r| (r.symbol.clone(), r.market.clone()))
         .collect();
-    let quotes = fetch_quotes_batch(symbols).await?;
+    let quotes = fetch_quotes_batch_cached(quote_cache, symbols).await?;
     let quote_map: std::collections::HashMap<String, f64> = quotes
         .into_iter()
         .map(|q| (q.symbol.clone(), q.current_price))
@@ -124,14 +126,16 @@ async fn build_holding_details(
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_holdings_with_quotes(
     db: State<'_, Database>,
+    quote_cache: State<'_, QuoteCache>,
 ) -> Result<Vec<HoldingDetail>, String> {
-    build_holding_details(&db).await
+    build_holding_details(&db, &quote_cache).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_dashboard_summary(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
+    quote_cache: State<'_, QuoteCache>,
     base_currency: Option<String>,
 ) -> Result<DashboardSummary, String> {
     let base = base_currency.unwrap_or_else(|| "USD".to_string());
@@ -143,7 +147,7 @@ pub async fn get_dashboard_summary(
         updated_at: chrono::Utc::now().to_rfc3339(),
     });
 
-    let details = build_holding_details(&db).await?;
+    let details = build_holding_details(&db, &quote_cache).await?;
 
     let mut us_market_value = 0.0f64;
     let mut cn_market_value = 0.0f64;

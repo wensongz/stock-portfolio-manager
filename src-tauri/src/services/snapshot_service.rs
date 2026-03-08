@@ -1,7 +1,7 @@
 use crate::db::Database;
 use crate::models::{DailyHoldingSnapshot, DailyPortfolioValue};
 use crate::services::exchange_rate_service::ExchangeRateCache;
-use crate::services::quote_service::fetch_quotes_batch;
+use crate::services::quote_service::{fetch_quotes_batch_cached, QuoteCache};
 use chrono::NaiveDate;
 
 /// Take a daily portfolio snapshot for the given date.
@@ -9,6 +9,7 @@ use chrono::NaiveDate;
 pub async fn take_daily_snapshot(
     db: &Database,
     cache: &ExchangeRateCache,
+    quote_cache: &QuoteCache,
     date: NaiveDate,
 ) -> Result<(), String> {
     let date_str = date.format("%Y-%m-%d").to_string();
@@ -68,7 +69,7 @@ pub async fn take_daily_snapshot(
         .iter()
         .map(|h| (h.symbol.clone(), h.market.clone()))
         .collect();
-    let quotes = fetch_quotes_batch(symbols).await?;
+    let quotes = fetch_quotes_batch_cached(quote_cache, symbols).await?;
     let quote_map: std::collections::HashMap<String, f64> = quotes
         .iter()
         .map(|q| (q.symbol.clone(), q.current_price))
@@ -192,6 +193,7 @@ pub async fn take_daily_snapshot(
 pub async fn auto_snapshot_check(
     db: &Database,
     cache: &ExchangeRateCache,
+    quote_cache: &QuoteCache,
 ) -> Result<(), String> {
     let today = chrono::Utc::now().date_naive();
     let today_str = today.format("%Y-%m-%d").to_string();
@@ -209,7 +211,7 @@ pub async fn auto_snapshot_check(
     };
 
     if !already_taken {
-        take_daily_snapshot(db, cache, today).await?;
+        take_daily_snapshot(db, cache, quote_cache, today).await?;
     }
 
     Ok(())

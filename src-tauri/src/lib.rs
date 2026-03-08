@@ -5,6 +5,7 @@ mod services;
 
 use db::Database;
 use services::exchange_rate_service::ExchangeRateCache;
+use services::quote_service::QuoteCache;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -22,6 +23,7 @@ pub fn run() {
                 .expect("failed to initialize database");
             app.manage(db);
             app.manage(ExchangeRateCache::new());
+            app.manage(QuoteCache::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

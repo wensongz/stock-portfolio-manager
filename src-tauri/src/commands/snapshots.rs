@@ -1,6 +1,7 @@
 use crate::db::Database;
 use crate::models::DailyPortfolioValue;
 use crate::services::exchange_rate_service::ExchangeRateCache;
+use crate::services::quote_service::QuoteCache;
 use crate::services::snapshot_service::{get_daily_values, take_daily_snapshot};
 use chrono::NaiveDate;
 use tauri::State;
@@ -9,6 +10,7 @@ use tauri::State;
 pub async fn take_snapshot(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
+    quote_cache: State<'_, QuoteCache>,
     date: Option<String>,
 ) -> Result<bool, String> {
     let target_date = match date {
@@ -17,7 +19,7 @@ pub async fn take_snapshot(
         None => chrono::Utc::now().date_naive(),
     };
 
-    take_daily_snapshot(&db, &cache, target_date).await?;
+    take_daily_snapshot(&db, &cache, &quote_cache, target_date).await?;
     Ok(true)
 }
 

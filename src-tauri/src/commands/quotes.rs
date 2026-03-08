@@ -1,17 +1,18 @@
 use crate::db::Database;
 use crate::models::{HoldingWithQuote, StockQuote};
-use crate::services::quote_service::{fetch_cn_quote, fetch_hk_quote, fetch_us_quote, fetch_quotes_batch};
+use crate::services::quote_service::{fetch_cn_quote, fetch_hk_quote, fetch_us_quote, fetch_quotes_batch_cached, QuoteCache};
 use tauri::State;
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_real_time_quotes(
+    quote_cache: State<'_, QuoteCache>,
     symbols: Vec<(String, String)>,
 ) -> Result<Vec<StockQuote>, String> {
-    fetch_quotes_batch(symbols).await
+    fetch_quotes_batch_cached(&quote_cache, symbols).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn get_holding_quotes(db: State<'_, Database>) -> Result<Vec<HoldingWithQuote>, String> {
+pub async fn get_holding_quotes(db: State<'_, Database>, quote_cache: State<'_, QuoteCache>) -> Result<Vec<HoldingWithQuote>, String> {
     // Load holdings from DB (synchronous)
     let holdings = {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
@@ -49,7 +50,7 @@ pub async fn get_holding_quotes(db: State<'_, Database>) -> Result<Vec<HoldingWi
         .iter()
         .map(|h| (h.symbol.clone(), h.market.clone()))
         .collect();
-    let quotes = fetch_quotes_batch(symbols).await?;
+    let quotes = fetch_quotes_batch_cached(&quote_cache, symbols).await?;
     let quote_map: std::collections::HashMap<String, StockQuote> = quotes
         .into_iter()
         .map(|q| (q.symbol.clone(), q))
@@ -94,16 +95,31 @@ pub async fn get_holding_quotes(db: State<'_, Database>) -> Result<Vec<HoldingWi
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn get_us_quote(symbol: String) -> Result<StockQuote, String> {
-    fetch_us_quote(&symbol).await
+pub async fn get_us_quote(quote_cache: State<'_, QuoteCache>, symbol: String) -> Result<StockQuote, String> {
+    if let Some(cached) = quote_cache.get(&symbol) {
+        return Ok(cached);
+    }
+    let quote = fetch_us_quote(&symbol).await?;
+    quote_cache.set(quote.clone());
+    Ok(quote)
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn get_hk_quote(symbol: String) -> Result<StockQuote, String> {
-    fetch_hk_quote(&symbol).await
+pub async fn get_hk_quote(quote_cache: State<'_, QuoteCache>, symbol: String) -> Result<StockQuote, String> {
+    if let Some(cached) = quote_cache.get(&symbol) {
+        return Ok(cached);
+    }
+    let quote = fetch_hk_quote(&symbol).await?;
+    quote_cache.set(quote.clone());
+    Ok(quote)
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn get_cn_quote(symbol: String) -> Result<StockQuote, String> {
-    fetch_cn_quote(&symbol).await
+pub async fn get_cn_quote(quote_cache: State<'_, QuoteCache>, symbol: String) -> Result<StockQuote, String> {
+    if let Some(cached) = quote_cache.get(&symbol) {
+        return Ok(cached);
+    }
+    let quote = fetch_cn_quote(&symbol).await?;
+    quote_cache.set(quote.clone());
+    Ok(quote)
 }

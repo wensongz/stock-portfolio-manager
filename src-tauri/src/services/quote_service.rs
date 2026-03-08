@@ -1,6 +1,124 @@
 use crate::models::StockQuote;
 use chrono::Utc;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+const QUOTE_CACHE_TTL_SECS: u64 = 60; // 1-minute cache
+
+struct CachedQuote {
+    quote: StockQuote,
+    cached_at: Instant,
+}
+
+/// In-memory cache for stock quotes, keyed by symbol.
+pub struct QuoteCache {
+    inner: Mutex<HashMap<String, CachedQuote>>,
+}
+
+impl QuoteCache {
+    pub fn new() -> Self {
+        QuoteCache {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns a cached quote if it exists and is still fresh.
+    pub fn get(&self, symbol: &str) -> Option<StockQuote> {
+        let lock = self.inner.lock().unwrap();
+        if let Some(cached) = lock.get(symbol) {
+            if cached.cached_at.elapsed() < Duration::from_secs(QUOTE_CACHE_TTL_SECS) {
+                return Some(cached.quote.clone());
+            }
+        }
+        None
+    }
+
+    /// Returns a cached quote even if stale (for offline fallback).
+    pub fn get_stale(&self, symbol: &str) -> Option<StockQuote> {
+        let lock = self.inner.lock().unwrap();
+        lock.get(symbol).map(|c| c.quote.clone())
+    }
+
+    /// Cache a single quote.
+    pub fn set(&self, quote: StockQuote) {
+        let mut lock = self.inner.lock().unwrap();
+        lock.insert(
+            quote.symbol.clone(),
+            CachedQuote {
+                quote,
+                cached_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Cache multiple quotes at once.
+    pub fn set_batch(&self, quotes: &[StockQuote]) {
+        let mut lock = self.inner.lock().unwrap();
+        let now = Instant::now();
+        for q in quotes {
+            lock.insert(
+                q.symbol.clone(),
+                CachedQuote {
+                    quote: q.clone(),
+                    cached_at: now,
+                },
+            );
+        }
+    }
+
+    /// Returns all fresh cached quotes for the given symbols, plus the list of
+    /// symbols that are missing or stale.
+    pub fn get_batch(&self, symbols: &[(String, String)]) -> (Vec<StockQuote>, Vec<(String, String)>) {
+        let lock = self.inner.lock().unwrap();
+        let ttl = Duration::from_secs(QUOTE_CACHE_TTL_SECS);
+        let mut cached = Vec::new();
+        let mut missing = Vec::new();
+        for (symbol, market) in symbols {
+            if let Some(entry) = lock.get(symbol.as_str()) {
+                if entry.cached_at.elapsed() < ttl {
+                    cached.push(entry.quote.clone());
+                    continue;
+                }
+            }
+            missing.push((symbol.clone(), market.clone()));
+        }
+        (cached, missing)
+    }
+}
+
+/// Batch fetch quotes using the cache. Only fetches symbols that are stale or
+/// missing from the cache, and updates the cache with fresh results.
+/// Falls back to stale cache entries on network errors for individual symbols.
+pub async fn fetch_quotes_batch_cached(
+    cache: &QuoteCache,
+    symbols: Vec<(String, String)>,
+) -> Result<Vec<StockQuote>, String> {
+    let (mut result, missing) = cache.get_batch(&symbols);
+
+    if missing.is_empty() {
+        return Ok(result);
+    }
+
+    let fresh = fetch_quotes_batch(missing.clone()).await?;
+    cache.set_batch(&fresh);
+    result.extend(fresh);
+
+    // For any symbols that were missing from fresh results (fetch failed),
+    // try to use stale cache as fallback
+    let fetched_symbols: std::collections::HashSet<String> =
+        result.iter().map(|q| q.symbol.clone()).collect();
+    for (symbol, _) in &missing {
+        if !fetched_symbols.contains(symbol) {
+            if let Some(stale) = cache.get_stale(symbol) {
+                result.push(stale);
+            }
+        }
+    }
+
+    Ok(result)
+}
 
 #[derive(Debug, Deserialize)]
 struct YahooChartResponse {
@@ -496,5 +614,91 @@ mod tests {
         let quote = result.unwrap();
         assert!((quote.change - 100.0).abs() < 0.001);
         assert!((quote.change_percent - 10.0).abs() < 0.001);
+    }
+
+    fn sample_quote(symbol: &str, market: &str) -> StockQuote {
+        StockQuote {
+            symbol: symbol.to_string(),
+            name: format!("Test {}", symbol),
+            market: market.to_string(),
+            current_price: 100.0,
+            previous_close: 95.0,
+            change: 5.0,
+            change_percent: 5.26,
+            high: 105.0,
+            low: 94.0,
+            volume: 1000000,
+            updated_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn test_quote_cache_empty() {
+        let cache = QuoteCache::new();
+        assert!(cache.get("AAPL").is_none());
+        assert!(cache.get_stale("AAPL").is_none());
+    }
+
+    #[test]
+    fn test_quote_cache_set_and_get() {
+        let cache = QuoteCache::new();
+        let quote = sample_quote("AAPL", "US");
+        cache.set(quote.clone());
+        let cached = cache.get("AAPL").expect("should have cached quote");
+        assert_eq!(cached.symbol, "AAPL");
+        assert!((cached.current_price - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_quote_cache_stale_fallback() {
+        let cache = QuoteCache::new();
+        let quote = sample_quote("AAPL", "US");
+        cache.set(quote);
+        let stale = cache.get_stale("AAPL").expect("should have stale quote");
+        assert_eq!(stale.symbol, "AAPL");
+    }
+
+    #[test]
+    fn test_quote_cache_set_batch() {
+        let cache = QuoteCache::new();
+        let quotes = vec![
+            sample_quote("AAPL", "US"),
+            sample_quote("GOOGL", "US"),
+            sample_quote("sh600519", "CN"),
+        ];
+        cache.set_batch(&quotes);
+        assert!(cache.get("AAPL").is_some());
+        assert!(cache.get("GOOGL").is_some());
+        assert!(cache.get("sh600519").is_some());
+        assert!(cache.get("MSFT").is_none());
+    }
+
+    #[test]
+    fn test_quote_cache_get_batch() {
+        let cache = QuoteCache::new();
+        cache.set(sample_quote("AAPL", "US"));
+        cache.set(sample_quote("GOOGL", "US"));
+
+        let symbols = vec![
+            ("AAPL".to_string(), "US".to_string()),
+            ("GOOGL".to_string(), "US".to_string()),
+            ("MSFT".to_string(), "US".to_string()),
+        ];
+        let (cached, missing) = cache.get_batch(&symbols);
+        assert_eq!(cached.len(), 2);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "MSFT");
+    }
+
+    #[test]
+    fn test_quote_cache_update_overwrites() {
+        let cache = QuoteCache::new();
+        let mut quote = sample_quote("AAPL", "US");
+        cache.set(quote.clone());
+        assert!((cache.get("AAPL").unwrap().current_price - 100.0).abs() < 0.001);
+
+        quote.current_price = 200.0;
+        cache.set(quote);
+        assert!((cache.get("AAPL").unwrap().current_price - 200.0).abs() < 0.001);
     }
 }

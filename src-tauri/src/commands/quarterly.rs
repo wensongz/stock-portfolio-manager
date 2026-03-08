@@ -4,6 +4,7 @@ use crate::models::quarterly::{
     QuarterlySnapshotDetail, QuarterlyTrends,
 };
 use crate::services::exchange_rate_service::ExchangeRateCache;
+use crate::services::quote_service::QuoteCache;
 use crate::services::quarterly_service;
 use tauri::State;
 
@@ -11,9 +12,10 @@ use tauri::State;
 pub async fn create_quarterly_snapshot(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
+    quote_cache: State<'_, QuoteCache>,
     quarter: Option<String>,
 ) -> Result<QuarterlySnapshot, String> {
-    quarterly_service::create_quarterly_snapshot(&db, &cache, quarter).await
+    quarterly_service::create_quarterly_snapshot(&db, &cache, &quote_cache, quarter).await
 }
 
 #[tauri::command(rename_all = "snake_case")]

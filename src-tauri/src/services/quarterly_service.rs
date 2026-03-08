@@ -5,7 +5,7 @@ use crate::models::quarterly::{
     QuarterlySnapshot, QuarterlySnapshotDetail, QuarterlyTrends,
 };
 use crate::services::exchange_rate_service::{convert_currency, get_cached_rates, ExchangeRateCache};
-use crate::services::quote_service::fetch_quotes_batch;
+use crate::services::quote_service::{fetch_quotes_batch_cached, QuoteCache};
 use chrono::{Datelike, NaiveDate, Utc};
 use std::collections::HashMap;
 
@@ -60,6 +60,7 @@ pub fn parse_quarter(s: &str) -> Result<(i32, u32), String> {
 pub async fn create_quarterly_snapshot(
     db: &Database,
     cache: &ExchangeRateCache,
+    quote_cache: &QuoteCache,
     quarter: Option<String>,
 ) -> Result<QuarterlySnapshot, String> {
     let today = Utc::now().date_naive();
@@ -127,7 +128,7 @@ pub async fn create_quarterly_snapshot(
 
     // Fetch prices: try to get close prices from daily_holding_snapshots around the snapshot date,
     // fall back to live quotes.
-    let price_map = get_prices_for_date(db, &rows.iter().map(|r| r.symbol.clone()).collect(), snapshot_date).await?;
+    let price_map = get_prices_for_date(db, quote_cache, &rows.iter().map(|r| r.symbol.clone()).collect(), snapshot_date).await?;
 
     // Fetch exchange rates
     let rates = get_cached_rates(cache).await.unwrap_or_else(|_| {
@@ -291,6 +292,7 @@ pub async fn create_quarterly_snapshot(
 /// Falls back to live quotes if no historical data available.
 async fn get_prices_for_date(
     db: &Database,
+    quote_cache: &QuoteCache,
     symbols: &Vec<String>,
     date: NaiveDate,
 ) -> Result<HashMap<String, f64>, String> {
@@ -353,7 +355,7 @@ async fn get_prices_for_date(
             })
             .collect();
         if !sym_market_pairs.is_empty() {
-            let quotes = fetch_quotes_batch(sym_market_pairs).await?;
+            let quotes = fetch_quotes_batch_cached(quote_cache, sym_market_pairs).await?;
             for q in quotes {
                 price_map.insert(q.symbol, q.current_price);
             }

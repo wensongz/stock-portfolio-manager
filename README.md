@@ -14,7 +14,7 @@ Built with **Tauri 2.0** + **React 18** + **TypeScript** + **Rust** + **SQLite**
 - 🖥️ Dashboard overview
 
 ### Phase 2 — 实时数据集成
-- 📡 Real-time stock quotes (Yahoo Finance for US/HK, Sina Finance for CN A-shares)
+- 📡 Real-time stock quotes (Yahoo Finance for US/HK, Tencent Finance for CN A-shares)
 - 💱 Real-time exchange rates (USD/CNY/HKD) with caching
 - 📸 Daily portfolio snapshot auto-collection (market value, cost, P&L)
 - ⏱️ Configurable refresh intervals
@@ -185,7 +185,7 @@ SQLite database is stored in the system app data directory:
 | Data | Source | Markets |
 |------|--------|---------|
 | US & HK Stock Quotes | Yahoo Finance API | 🇺🇸 US, 🇭🇰 HK |
-| CN A-Share Quotes | Sina Finance API | 🇨🇳 CN |
+| CN A-Share Quotes | Tencent Finance API | 🇨🇳 CN |
 | Exchange Rates | ExchangeRate-API | USD/CNY/HKD |
 | Benchmark Indices | Yahoo Finance API | S&P 500, NASDAQ, CSI 300, HSI |
 

@@ -145,10 +145,12 @@ pub async fn fetch_hk_quote(symbol: &str) -> Result<StockQuote, String> {
     fetch_yahoo_quote(&yahoo_symbol, "HK").await
 }
 
-/// Fetch a CN A-share stock quote from Sina Finance.
+/// Fetch a CN A-share stock quote from Tencent Finance.
 /// Symbol format: "sh600519" (Shanghai) or "sz000858" (Shenzhen).
+/// The symbol is normalised to lowercase automatically.
 pub async fn fetch_cn_quote(symbol: &str) -> Result<StockQuote, String> {
-    let url = format!("https://hq.sinajs.cn/list={}", symbol);
+    let symbol = symbol.to_lowercase();
+    let url = format!("https://qt.gtimg.cn/q={}", symbol);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -156,7 +158,6 @@ pub async fn fetch_cn_quote(symbol: &str) -> Result<StockQuote, String> {
 
     let bytes = client
         .get(&url)
-        .header("Referer", "https://finance.sina.com.cn")
         .header("User-Agent", "Mozilla/5.0")
         .send()
         .await
@@ -165,57 +166,59 @@ pub async fn fetch_cn_quote(symbol: &str) -> Result<StockQuote, String> {
         .await
         .map_err(|e| format!("Failed to read response bytes for {}: {}", symbol, e))?;
 
-    // Sina Finance returns GBK-encoded text
+    // Tencent Finance returns GBK-encoded text
     let (decoded, _, _) = GBK.decode(&bytes);
     let text = decoded.into_owned();
 
-    parse_sina_quote(symbol, &text)
+    parse_tencent_quote(&symbol, &text)
 }
 
-/// Parse Sina Finance quote response.
-/// Format: var hq_str_sh600519="贵州茅台,1700.00,1690.00,...,2024-01-15,15:00:00,...";
-fn parse_sina_quote(symbol: &str, text: &str) -> Result<StockQuote, String> {
+/// Parse Tencent Finance quote response.
+/// Format: v_sh600519="1~贵州茅台~600519~1710.50~1690.00~1700.00~...";
+///
+/// Key field indices (tilde-separated):
+///  1: name, 3: current_price, 4: previous_close, 6: volume (lots),
+///  30: datetime (YYYYMMDDHHMMSS), 31: change, 32: change_percent (%),
+///  33: high, 34: low
+fn parse_tencent_quote(symbol: &str, text: &str) -> Result<StockQuote, String> {
     let start = text
         .find('"')
-        .ok_or_else(|| format!("Invalid Sina response for {}: {}", symbol, text))?;
+        .ok_or_else(|| format!("Invalid Tencent response for {}: {}", symbol, text))?;
     let end = text
         .rfind('"')
-        .ok_or_else(|| format!("Invalid Sina response for {}: {}", symbol, text))?;
+        .ok_or_else(|| format!("Invalid Tencent response for {}: {}", symbol, text))?;
 
     if start >= end {
-        return Err(format!("Empty or invalid Sina response for {}", symbol));
+        return Err(format!("Empty or invalid Tencent response for {}", symbol));
     }
 
     let content = &text[start + 1..end];
     if content.is_empty() {
         return Err(format!(
-            "No data from Sina Finance for {}. Symbol may be invalid.",
+            "No data from Tencent Finance for {}. Symbol may be invalid.",
             symbol
         ));
     }
 
-    let parts: Vec<&str> = content.split(',').collect();
-    if parts.len() < 32 {
+    let parts: Vec<&str> = content.split('~').collect();
+    if parts.len() < 35 {
         return Err(format!(
-            "Unexpected Sina Finance data format for {}: only {} fields",
+            "Unexpected Tencent Finance data format for {}: only {} fields",
             symbol,
             parts.len()
         ));
     }
 
-    // Sina format fields:
-    // 0: name, 1: today_open, 2: yesterday_close, 3: current_price,
-    // 4: high, 5: low, 6: bid, 7: ask, 8: volume (lots), 9: amount,
-    // 10-19: bid levels (5 price+volume pairs),
-    // 20-29: ask levels (5 price+volume pairs),
-    // 30: date, 31: time
-    let name = parts[0].to_string();
-    let previous_close: f64 = parts[2].parse().unwrap_or(0.0);
+    // Tencent format fields (tilde-separated):
+    // 1: name, 3: current_price, 4: previous_close, 5: today_open,
+    // 6: volume (lots), 30: datetime (YYYYMMDDHHMMSS),
+    // 31: change, 32: change_percent (%), 33: high, 34: low
+    let name = parts[1].to_string();
     let current_price: f64 = parts[3].parse().unwrap_or(0.0);
-    let high: f64 = parts[4].parse().unwrap_or(0.0);
-    let low: f64 = parts[5].parse().unwrap_or(0.0);
-    // Volume in Sina is in lots (手, 100 shares each)
-    let volume: u64 = parts[8].parse().unwrap_or(0);
+    let previous_close: f64 = parts[4].parse().unwrap_or(0.0);
+    let volume: u64 = parts[6].parse().unwrap_or(0);
+    let high: f64 = parts[33].parse().unwrap_or(0.0);
+    let low: f64 = parts[34].parse().unwrap_or(0.0);
 
     let change = current_price - previous_close;
     let change_percent = if previous_close != 0.0 {
@@ -224,12 +227,20 @@ fn parse_sina_quote(symbol: &str, text: &str) -> Result<StockQuote, String> {
         0.0
     };
 
-    let date_str = parts.get(30).unwrap_or(&"");
-    let time_str = parts.get(31).unwrap_or(&"");
-    let updated_at = if date_str.is_empty() || *date_str == "0000-00-00" {
-        Utc::now().to_rfc3339()
+    let datetime_str = parts.get(30).unwrap_or(&"");
+    let updated_at = if datetime_str.len() >= 14 {
+        // Format: YYYYMMDDHHMMSS -> YYYY-MM-DDTHH:MM:SS+08:00
+        format!(
+            "{}-{}-{}T{}:{}:{}+08:00",
+            &datetime_str[0..4],
+            &datetime_str[4..6],
+            &datetime_str[6..8],
+            &datetime_str[8..10],
+            &datetime_str[10..12],
+            &datetime_str[12..14],
+        )
     } else {
-        format!("{}T{}+08:00", date_str, time_str)
+        Utc::now().to_rfc3339()
     };
 
     Ok(StockQuote {
@@ -272,11 +283,55 @@ pub async fn fetch_quotes_batch(
 mod tests {
     use super::*;
 
+    // Helper: build a synthetic Tencent response string with enough fields.
+    // Tencent fields (tilde-separated, 0-indexed):
+    //  0:market, 1:name, 2:code, 3:current, 4:prev_close, 5:open,
+    //  6:volume, 7-29:misc, 30:datetime, 31:change, 32:change_pct,
+    //  33:high, 34:low
+    fn make_tencent_response(
+        symbol: &str,
+        name: &str,
+        current: f64,
+        prev_close: f64,
+        high: f64,
+        low: f64,
+        volume: u64,
+        datetime: &str,
+    ) -> String {
+        // Build a slice of 45 placeholder fields, overwriting key positions.
+        let mut fields = vec!["0".to_string(); 45];
+        fields[0] = "1".to_string();
+        fields[1] = name.to_string();
+        fields[2] = symbol[2..].to_string(); // strip "sh"/"sz"
+        fields[3] = format!("{:.2}", current);
+        fields[4] = format!("{:.2}", prev_close);
+        fields[5] = format!("{:.2}", current); // open == current (irrelevant)
+        fields[6] = volume.to_string();
+        fields[30] = datetime.to_string();
+        fields[31] = format!("{:.2}", current - prev_close);
+        fields[32] = if prev_close != 0.0 {
+            format!("{:.2}", (current - prev_close) / prev_close * 100.0)
+        } else {
+            "0.00".to_string()
+        };
+        fields[33] = format!("{:.2}", high);
+        fields[34] = format!("{:.2}", low);
+        format!("v_{}=\"{}\";", symbol, fields.join("~"))
+    }
+
     #[test]
-    fn test_parse_sina_quote_valid() {
-        // Simulated Sina response for sh600519 (Kweichow Moutai)
-        let text = r#"var hq_str_sh600519="贵州茅台,1700.00,1690.00,1710.50,1720.00,1685.00,1710.00,1711.00,12345678,21000000000.00,100,1710.00,200,1710.50,300,1711.00,400,1711.50,500,1712.00,600,1709.50,700,1709.00,800,1708.50,900,1708.00,1000,1707.50,2024-01-15,15:00:00,00,贵州茅台,D,D";"#;
-        let result = parse_sina_quote("sh600519", text);
+    fn test_parse_tencent_quote_valid() {
+        let text = make_tencent_response(
+            "sh600519",
+            "贵州茅台",
+            1710.50,
+            1690.00,
+            1720.00,
+            1685.00,
+            12345,
+            "20240115150003",
+        );
+        let result = parse_tencent_quote("sh600519", &text);
         assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
         let quote = result.unwrap();
         assert_eq!(quote.symbol, "sh600519");
@@ -286,22 +341,77 @@ mod tests {
         assert!((quote.previous_close - 1690.00).abs() < 0.001);
         assert!((quote.high - 1720.00).abs() < 0.001);
         assert!((quote.low - 1685.00).abs() < 0.001);
+        assert_eq!(quote.volume, 12345);
+        assert_eq!(quote.updated_at, "2024-01-15T15:00:03+08:00");
     }
 
     #[test]
-    fn test_parse_sina_quote_empty() {
-        let text = r#"var hq_str_sh999999="";"#;
-        let result = parse_sina_quote("sh999999", text);
+    fn test_parse_tencent_quote_empty() {
+        let text = r#"v_sh999999="";"#;
+        let result = parse_tencent_quote("sh999999", text);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_parse_sina_quote_change_calculation() {
-        let text = r#"var hq_str_sh600519="贵州茅台,1700.00,1000.00,1100.00,1200.00,950.00,1100.00,1101.00,12345678,21000000000.00,100,1100.00,200,1100.50,300,1101.00,400,1101.50,500,1102.00,600,1099.50,700,1099.00,800,1098.50,900,1098.00,1000,1097.50,2024-01-15,15:00:00,00,贵州茅台,D,D";"#;
-        let result = parse_sina_quote("sh600519", text);
+    fn test_parse_tencent_quote_change_calculation() {
+        let text = make_tencent_response(
+            "sh600519",
+            "贵州茅台",
+            1100.00,
+            1000.00,
+            1200.00,
+            950.00,
+            99999,
+            "20240115150003",
+        );
+        let result = parse_tencent_quote("sh600519", &text);
         assert!(result.is_ok());
         let quote = result.unwrap();
         assert!((quote.change - 100.0).abs() < 0.001);
         assert!((quote.change_percent - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_tencent_quote_symbol_stored_as_given() {
+        // The parser stores the symbol exactly as provided. The caller
+        // (fetch_cn_quote) is responsible for lowercasing before calling here.
+        // This test confirms that a lowercase symbol is stored correctly.
+        let text = make_tencent_response(
+            "sh600519",
+            "贵州茅台",
+            1710.50,
+            1690.00,
+            1720.00,
+            1685.00,
+            12345,
+            "20240115150003",
+        );
+        let result = parse_tencent_quote("sh600519", &text);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().symbol, "sh600519");
+    }
+
+    #[test]
+    fn test_fetch_cn_quote_normalises_symbol_to_lowercase() {
+        // Verify that to_lowercase() on a mixed-case symbol produces what the
+        // API expects.  We cannot call fetch_cn_quote directly in a unit test
+        // (it makes a real network request), so we assert the string transform
+        // is correct and pass the lowercased value to the parser.
+        let mixed = "Sh600519";
+        let lower = mixed.to_lowercase();
+        assert_eq!(lower, "sh600519");
+        let text = make_tencent_response(
+            &lower,
+            "贵州茅台",
+            1710.50,
+            1690.00,
+            1720.00,
+            1685.00,
+            12345,
+            "20240115150003",
+        );
+        let result = parse_tencent_quote(&lower, &text);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().symbol, "sh600519");
     }
 }

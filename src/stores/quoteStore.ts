@@ -2,7 +2,23 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type { HoldingWithQuote, StockQuote } from "../types";
 
-const DEFAULT_REFRESH_INTERVAL_MS = 30_000; // 30 seconds
+const DEFAULT_REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const STORAGE_KEY = "quote_refresh_interval_ms";
+
+const MAX_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+
+function loadRefreshInterval(): number {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      const parsed = Number(saved);
+      if (!isNaN(parsed) && parsed > 0 && parsed <= MAX_REFRESH_INTERVAL_MS) return parsed;
+    }
+  } catch {
+    // ignore
+  }
+  return DEFAULT_REFRESH_INTERVAL_MS;
+}
 
 interface QuoteState {
   holdingQuotes: HoldingWithQuote[];
@@ -23,7 +39,7 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
   loading: false,
   error: null,
   lastUpdatedAt: null,
-  refreshIntervalMs: DEFAULT_REFRESH_INTERVAL_MS,
+  refreshIntervalMs: loadRefreshInterval(),
 
   fetchHoldingQuotes: async () => {
     set({ loading: true, error: null });
@@ -65,6 +81,11 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
   },
 
   setRefreshInterval: (ms: number) => {
+    try {
+      localStorage.setItem(STORAGE_KEY, String(ms));
+    } catch {
+      // ignore
+    }
     set({ refreshIntervalMs: ms });
   },
 

@@ -53,7 +53,7 @@ export default function HoldingsPage() {
     useHoldingStore();
   const { accounts, fetchAccounts } = useAccountStore();
   const { categories, fetchCategories } = useCategoryStore();
-  const { holdingQuotes, loading: quotesLoading, lastUpdatedAt, fetchHoldingQuotes } = useQuoteStore();
+  const { holdingQuotes, loading: quotesLoading, lastUpdatedAt, refreshIntervalMs, fetchHoldingQuotes } = useQuoteStore();
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editingHolding, setEditingHolding] = useState<Holding | null>(null);
@@ -121,12 +121,12 @@ export default function HoldingsPage() {
     fetchCategories();
   }, [fetchHoldings, fetchAccounts, fetchCategories]);
 
-  // Auto-refresh quotes every 30 seconds when realtime is enabled
+  // Auto-refresh quotes at configured interval when realtime is enabled
   useEffect(() => {
     if (!showRealtime) return;
     const { startAutoRefresh } = useQuoteStore.getState();
     return startAutoRefresh();
-  }, [showRealtime]);
+  }, [showRealtime, refreshIntervalMs]);
 
   const handleSubmit = async (values: {
     account_id: string;

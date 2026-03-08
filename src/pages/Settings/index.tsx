@@ -1,11 +1,17 @@
 import { Tabs, Typography, Space, Tag } from "antd";
 import { SettingOutlined } from "@ant-design/icons";
 import AIPage from "../AI";
+import GeneralSettings from "./GeneralSettings";
 
 const { Title } = Typography;
 
 export default function SettingsPage() {
   const items = [
+    {
+      key: "general",
+      label: "⚙️ 通用设置",
+      children: <GeneralSettings />,
+    },
     {
       key: "ai",
       label: (

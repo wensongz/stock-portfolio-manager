@@ -4,14 +4,14 @@ use crate::services::exchange_rate_service::{
 };
 use tauri::State;
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_exchange_rates(
     cache: State<'_, ExchangeRateCache>,
 ) -> Result<ExchangeRates, String> {
     get_cached_rates(&cache).await
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn convert_amount(
     amount: f64,
     from_currency: String,

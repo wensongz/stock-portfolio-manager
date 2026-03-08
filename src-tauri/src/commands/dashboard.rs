@@ -123,7 +123,7 @@ async fn build_holding_details(
     Ok(details)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_holdings_with_quotes(
     db: State<'_, Database>,
     quote_cache: State<'_, QuoteCache>,
@@ -131,7 +131,7 @@ pub async fn get_holdings_with_quotes(
     build_holding_details(&db, &quote_cache).await
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_dashboard_summary(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,

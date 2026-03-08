@@ -10,7 +10,7 @@ fn parse_date(s: &str) -> Result<chrono::NaiveDate, String> {
     crate::models::performance::parse_date(s)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_performance_summary(
     db: State<'_, Database>,
     start_date: String,
@@ -21,7 +21,7 @@ pub async fn get_performance_summary(
     performance_service::get_performance_summary(&db, start, end)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_return_series(
     db: State<'_, Database>,
     start_date: String,
@@ -32,7 +32,7 @@ pub async fn get_return_series(
     performance_service::get_return_series(&db, start, end)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_benchmark_return_series(
     db: State<'_, Database>,
     symbol: String,
@@ -46,7 +46,7 @@ pub async fn get_benchmark_return_series(
     Ok(performance_service::benchmark_to_return_series(&points))
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_return_attribution(
     db: State<'_, Database>,
     start_date: String,
@@ -57,7 +57,7 @@ pub async fn get_return_attribution(
     performance_service::get_return_attribution(&db, start, end)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_monthly_returns(
     db: State<'_, Database>,
     start_date: String,
@@ -68,7 +68,7 @@ pub async fn get_monthly_returns(
     performance_service::get_monthly_returns(&db, start, end)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_holding_performance_ranking(
     db: State<'_, Database>,
     start_date: String,
@@ -87,7 +87,7 @@ pub async fn get_holding_performance_ranking(
     )
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_risk_metrics(
     db: State<'_, Database>,
     start_date: String,
@@ -98,7 +98,7 @@ pub async fn get_risk_metrics(
     performance_service::get_risk_metrics(&db, start, end)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_drawdown_analysis(
     db: State<'_, Database>,
     start_date: String,

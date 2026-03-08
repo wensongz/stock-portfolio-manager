@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Button, Space, Typography } from "antd";
+import { useState, useEffect } from "react";
+import { Button, Space, Typography, message } from "antd";
 import MDEditor from "@uiw/react-md-editor";
 import { useQuarterlyStore } from "../../stores/quarterlyStore";
 
@@ -31,11 +31,22 @@ export default function QuarterlyNotesEditor({ snapshotId, initialNotes }: Props
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
 
+  useEffect(() => {
+    if (!editing) {
+      setNotes(initialNotes);
+    }
+  }, [initialNotes, editing]);
+
   const handleSave = async () => {
     setSaving(true);
-    await updateQuarterlyNotes(snapshotId, notes);
-    setSaving(false);
-    setEditing(false);
+    try {
+      await updateQuarterlyNotes(snapshotId, notes);
+      setEditing(false);
+    } catch (err) {
+      message.error("保存失败: " + String(err));
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleCancel = () => {

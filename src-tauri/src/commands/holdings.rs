@@ -2,7 +2,7 @@ use crate::db::Database;
 use crate::models::Holding;
 use tauri::State;
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub fn create_holding(
     db: State<Database>,
     account_id: String,
@@ -38,7 +38,7 @@ pub fn create_holding(
     })
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub fn get_holdings(
     db: State<Database>,
     account_id: Option<String>,
@@ -102,7 +102,7 @@ pub fn get_holdings(
     Ok(holdings)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub fn update_holding(
     db: State<Database>,
     id: String,
@@ -150,7 +150,7 @@ pub fn update_holding(
     })
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub fn delete_holding(db: State<Database>, id: String) -> Result<(), String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM holdings WHERE id = ?1", rusqlite::params![id])

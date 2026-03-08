@@ -12,7 +12,7 @@ fn to_usd_value(amount: f64, currency: &str, rates: &crate::models::ExchangeRate
     convert_currency(amount, currency, "USD", rates)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_statistics_overview(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
@@ -128,7 +128,7 @@ pub async fn get_statistics_overview(
     })
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_statistics_by_market(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
@@ -209,7 +209,7 @@ pub async fn get_statistics_by_market(
     })
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_statistics_by_account(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
@@ -286,7 +286,7 @@ pub async fn get_statistics_by_account(
     })
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_statistics_by_category(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,

@@ -158,6 +158,7 @@ export const useQuarterlyStore = create<QuarterlyState>((set, get) => ({
       await get().fetchSnapshots();
     } catch (err) {
       set({ error: String(err) });
+      throw err;
     }
   },
 

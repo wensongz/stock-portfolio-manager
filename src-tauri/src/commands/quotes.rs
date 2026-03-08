@@ -3,7 +3,7 @@ use crate::models::{HoldingWithQuote, StockQuote};
 use crate::services::quote_service::{fetch_cn_quote, fetch_hk_quote, fetch_us_quote, fetch_quotes_batch_cached, QuoteCache};
 use tauri::State;
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_real_time_quotes(
     quote_cache: State<'_, QuoteCache>,
     symbols: Vec<(String, String)>,
@@ -11,7 +11,7 @@ pub async fn get_real_time_quotes(
     fetch_quotes_batch_cached(&quote_cache, symbols).await
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_holding_quotes(
     db: State<'_, Database>,
     quote_cache: State<'_, QuoteCache>,
@@ -97,7 +97,7 @@ pub async fn get_holding_quotes(
     Ok(result)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_us_quote(quote_cache: State<'_, QuoteCache>, symbol: String) -> Result<StockQuote, String> {
     if let Some(cached) = quote_cache.get(&symbol) {
         return Ok(cached);
@@ -107,7 +107,7 @@ pub async fn get_us_quote(quote_cache: State<'_, QuoteCache>, symbol: String) ->
     Ok(quote)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_hk_quote(quote_cache: State<'_, QuoteCache>, symbol: String) -> Result<StockQuote, String> {
     if let Some(cached) = quote_cache.get(&symbol) {
         return Ok(cached);
@@ -117,7 +117,7 @@ pub async fn get_hk_quote(quote_cache: State<'_, QuoteCache>, symbol: String) ->
     Ok(quote)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_cn_quote(quote_cache: State<'_, QuoteCache>, symbol: String) -> Result<StockQuote, String> {
     if let Some(cached) = quote_cache.get(&symbol) {
         return Ok(cached);

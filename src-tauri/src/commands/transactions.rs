@@ -2,7 +2,7 @@ use crate::db::Database;
 use crate::models::Transaction;
 use tauri::State;
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub fn create_transaction(
     db: State<Database>,
     account_id: String,
@@ -92,7 +92,7 @@ pub fn create_transaction(
     })
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub fn get_transactions(
     db: State<Database>,
     account_id: Option<String>,
@@ -166,7 +166,7 @@ fn map_transaction(row: &rusqlite::Row<'_>) -> rusqlite::Result<Transaction> {
     })
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "camelCase")]
 pub fn delete_transaction(db: State<Database>, id: String) -> Result<(), String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     conn.execute(

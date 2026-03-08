@@ -15,12 +15,14 @@ import ImportPage from "./pages/Import";
 import AlertsPage from "./pages/Alerts";
 import ReviewPage from "./pages/Review";
 import SettingsPage from "./pages/Settings";
+import TestMDEditor from "./pages/TestMDEditor";
 
 function App() {
   return (
     <MainLayout>
       <Routes>
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
+        <Route path="/test-md" element={<TestMDEditor />} />
         <Route path="/dashboard" element={<DashboardPage />} />
         <Route path="/statistics" element={<StatisticsPage />} />
         <Route path="/performance" element={<PerformancePage />} />

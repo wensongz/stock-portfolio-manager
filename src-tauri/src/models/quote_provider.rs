@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Supported providers:
 /// - `"yahoo"`     – Yahoo Finance, supports HK / US
-/// - `"eastmoney"` – East Money (东方财富), supports CN only
+/// - `"eastmoney"` – East Money (东方财富), supports CN / HK / US
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuoteProviderConfig {
     /// Provider for US stocks: "yahoo" (default)

@@ -29,11 +29,11 @@ pub fn update_quote_provider_config(
 ) -> Result<bool, String> {
     // Validate provider values
     match config.us_provider.as_str() {
-        "yahoo" => {}
+        "yahoo" | "eastmoney" => {}
         _ => return Err(format!("Invalid US provider: {}", config.us_provider)),
     }
     match config.hk_provider.as_str() {
-        "yahoo" => {}
+        "yahoo" | "eastmoney" => {}
         _ => return Err(format!("Invalid HK provider: {}", config.hk_provider)),
     }
     if config.cn_provider != "eastmoney" {

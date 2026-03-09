@@ -403,6 +403,20 @@ pub async fn backfill_snapshots(
         }
     }
 
+    // Build sorted price vectors per symbol for forward-fill on holidays.
+    // When a market is closed (e.g. public holidays), Yahoo Finance returns no
+    // price for that date.  We carry forward the most recent closing price so
+    // that the portfolio value is still computed correctly.
+    let history_sorted: std::collections::HashMap<String, Vec<(NaiveDate, f64)>> = history_map
+        .iter()
+        .map(|(symbol, date_map)| {
+            let mut sorted: Vec<(NaiveDate, f64)> =
+                date_map.iter().map(|(d, p)| (*d, *p)).collect();
+            sorted.sort_by_key(|(d, _)| *d);
+            (symbol.clone(), sorted)
+        })
+        .collect();
+
     // 4. Get exchange rates (use current rates as approximation for all dates)
     let rates = crate::services::exchange_rate_service::get_cached_rates(cache).await?;
     let rates_json = serde_json::to_string(&rates).unwrap_or_default();
@@ -423,11 +437,16 @@ pub async fn backfill_snapshots(
         let mut has_any_price = false;
 
         for holding in &holdings {
-            // Look up the closing price for this stock on this date
+            // Look up the closing price for this stock on this date.
+            // If the exact date is missing (market holiday), forward-fill
+            // from the most recent prior trading day's closing price.
             let close_price = history_map
                 .get(&holding.symbol)
-                .and_then(|m| m.get(date))
-                .copied()
+                .and_then(|date_map| {
+                    history_sorted
+                        .get(&holding.symbol)
+                        .and_then(|sorted| forward_fill_price(date_map, sorted, date))
+                })
                 .unwrap_or_else(|| {
                     eprintln!(
                         "Warning: no historical price for {} ({}) on {}",
@@ -546,4 +565,101 @@ pub async fn backfill_snapshots(
     }
 
     Ok(count)
+}
+
+/// Look up a closing price for a stock on a given date, falling back to the
+/// most recent earlier trading day when the market was closed (forward-fill).
+/// Returns `None` only when there is no price data at or before the date.
+fn forward_fill_price(
+    history_map: &std::collections::HashMap<NaiveDate, f64>,
+    sorted_prices: &[(NaiveDate, f64)],
+    date: &NaiveDate,
+) -> Option<f64> {
+    // Fast path: exact date match
+    if let Some(&price) = history_map.get(date) {
+        return Some(price);
+    }
+    // Forward-fill from the most recent prior trading day
+    match sorted_prices.binary_search_by_key(date, |(d, _)| *d) {
+        Ok(idx) => Some(sorted_prices[idx].1),
+        Err(0) => None,
+        Err(idx) => Some(sorted_prices[idx - 1].1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_forward_fill_price_exact_match() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(), 10.0);
+        map.insert(NaiveDate::from_ymd_opt(2026, 1, 3).unwrap(), 11.0);
+        let sorted = vec![
+            (NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(), 10.0),
+            (NaiveDate::from_ymd_opt(2026, 1, 3).unwrap(), 11.0),
+        ];
+        let d = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        assert_eq!(forward_fill_price(&map, &sorted, &d), Some(10.0));
+    }
+
+    #[test]
+    fn test_forward_fill_price_holiday_uses_previous() {
+        // 2026-01-01 is a holiday; nearest prior trading day is 2025-12-31
+        let mut map = std::collections::HashMap::new();
+        map.insert(NaiveDate::from_ymd_opt(2025, 12, 31).unwrap(), 50.0);
+        map.insert(NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(), 51.0);
+        let sorted = vec![
+            (NaiveDate::from_ymd_opt(2025, 12, 31).unwrap(), 50.0),
+            (NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(), 51.0),
+        ];
+        // Query 2026-01-01 (holiday) — should forward-fill with 2025-12-31 price
+        let d = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        assert_eq!(forward_fill_price(&map, &sorted, &d), Some(50.0));
+    }
+
+    #[test]
+    fn test_forward_fill_price_no_earlier_data() {
+        let map = std::collections::HashMap::new();
+        let sorted: Vec<(NaiveDate, f64)> = vec![
+            (NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(), 20.0),
+        ];
+        // Query a date before all available data
+        let d = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        assert_eq!(forward_fill_price(&map, &sorted, &d), None);
+    }
+
+    #[test]
+    fn test_forward_fill_price_empty_data() {
+        let map = std::collections::HashMap::new();
+        let sorted: Vec<(NaiveDate, f64)> = vec![];
+        let d = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        assert_eq!(forward_fill_price(&map, &sorted, &d), None);
+    }
+
+    #[test]
+    fn test_forward_fill_price_multiple_holidays() {
+        // Simulate a long holiday: trading days on Dec 30 and Jan 5, gap in between
+        let mut map = std::collections::HashMap::new();
+        map.insert(NaiveDate::from_ymd_opt(2025, 12, 30).unwrap(), 100.0);
+        map.insert(NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(), 105.0);
+        let sorted = vec![
+            (NaiveDate::from_ymd_opt(2025, 12, 30).unwrap(), 100.0),
+            (NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(), 105.0),
+        ];
+        // All dates in the gap should forward-fill from Dec 30
+        for day in [31, 1, 2] {
+            let (y, m) = if day == 31 { (2025, 12) } else { (2026, 1) };
+            let d = NaiveDate::from_ymd_opt(y, m, day).unwrap();
+            assert_eq!(
+                forward_fill_price(&map, &sorted, &d),
+                Some(100.0),
+                "failed for date {}-{:02}-{:02}",
+                y,
+                m,
+                day
+            );
+        }
+    }
 }

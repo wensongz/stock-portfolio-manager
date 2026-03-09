@@ -64,6 +64,22 @@ fn fetch_inception_value(db: &Database) -> Result<Option<f64>, String> {
     Ok(result)
 }
 
+/// Fetch the portfolio value on the latest day strictly before `date`.
+/// Used as the baseline for cumulative-return curves so that the first
+/// visible day already shows a non-zero return.
+fn fetch_previous_day_value(db: &Database, date: NaiveDate) -> Result<Option<f64>, String> {
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let date_str = date.format("%Y-%m-%d").to_string();
+    let result = conn
+        .query_row(
+            "SELECT total_value FROM daily_portfolio_values WHERE date < ?1 ORDER BY date DESC LIMIT 1",
+            rusqlite::params![date_str],
+            |row| row.get::<_, f64>(0),
+        )
+        .ok();
+    Ok(result)
+}
+
 /// Fetch transaction dates (for TWR sub-period boundaries) in the date range.
 fn fetch_transaction_dates(
     db: &Database,
@@ -254,8 +270,8 @@ pub fn get_return_series(
     end_date: NaiveDate,
 ) -> Result<Vec<ReturnDataPoint>, String> {
     let daily = fetch_daily_values(db, start_date, end_date)?;
-    let inception_value = fetch_inception_value(db)?;
-    Ok(build_return_series(&daily, inception_value))
+    let base_value = fetch_previous_day_value(db, start_date)?;
+    Ok(build_return_series(&daily, base_value))
 }
 
 pub fn get_performance_summary(
@@ -903,11 +919,17 @@ pub async fn fetch_benchmark_history(
 }
 
 /// Build a return series for the benchmark (cumulative %).
-pub fn benchmark_to_return_series(points: &[BenchmarkDataPoint]) -> Vec<ReturnDataPoint> {
+/// When `base_price` is provided, cumulative returns are calculated relative
+/// to this price (the closing price on the day before the visible range)
+/// instead of the first element in `points`.
+pub fn benchmark_to_return_series(
+    points: &[BenchmarkDataPoint],
+    base_price: Option<f64>,
+) -> Vec<ReturnDataPoint> {
     if points.is_empty() {
         return vec![];
     }
-    let start_price = points[0].close_price;
+    let start_price = base_price.unwrap_or(points[0].close_price);
     let mut prev_price = start_price;
     points
         .iter()
@@ -1002,7 +1024,7 @@ mod tests {
 
     #[test]
     fn test_build_return_series_with_inception_value() {
-        // Simulate: inception value was 50 (portfolio created earlier)
+        // Simulate: previous day's value was 50
         // but the selected range starts when portfolio value is 100
         let daily = vec![
             (parse_date("2024-03-01").unwrap(), 100.0, 0.0),
@@ -1011,15 +1033,51 @@ mod tests {
         ];
         let series = build_return_series(&daily, Some(50.0));
         assert_eq!(series.len(), 3);
-        // cumulative_return from inception: (100 - 50) / 50 * 100 = 100%
+        // cumulative_return from base: (100 - 50) / 50 * 100 = 100%
         assert!((series[0].cumulative_return - 100.0).abs() < 1e-6);
-        // cumulative_return from inception: (105 - 50) / 50 * 100 = 110%
+        // cumulative_return from base: (105 - 50) / 50 * 100 = 110%
         assert!((series[1].cumulative_return - 110.0).abs() < 1e-6);
-        // cumulative_return from inception: (103 - 50) / 50 * 100 = 106%
+        // cumulative_return from base: (103 - 50) / 50 * 100 = 106%
         assert!((series[2].cumulative_return - 106.0).abs() < 1e-6);
         // daily_return should still be day-over-day
         assert!((series[0].daily_return - 0.0).abs() < 1e-6);
         // (105 - 100) / 100 * 100 = 5%
         assert!((series[1].daily_return - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_benchmark_to_return_series_no_base() {
+        use crate::models::performance::BenchmarkDataPoint;
+        let points = vec![
+            BenchmarkDataPoint { date: "2024-01-01".into(), close_price: 100.0, change_percent: 0.0 },
+            BenchmarkDataPoint { date: "2024-01-02".into(), close_price: 105.0, change_percent: 5.0 },
+            BenchmarkDataPoint { date: "2024-01-03".into(), close_price: 103.0, change_percent: -1.9 },
+        ];
+        let series = benchmark_to_return_series(&points, None);
+        assert_eq!(series.len(), 3);
+        // Without base_price the first point is the baseline → 0%
+        assert!((series[0].cumulative_return - 0.0).abs() < 1e-6);
+        assert!((series[1].cumulative_return - 5.0).abs() < 1e-6);
+        assert!((series[2].cumulative_return - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_benchmark_to_return_series_with_base() {
+        use crate::models::performance::BenchmarkDataPoint;
+        // Previous day close was 95 → first visible day already shows a return
+        let points = vec![
+            BenchmarkDataPoint { date: "2024-01-02".into(), close_price: 100.0, change_percent: 5.26 },
+            BenchmarkDataPoint { date: "2024-01-03".into(), close_price: 105.0, change_percent: 5.0 },
+        ];
+        let series = benchmark_to_return_series(&points, Some(95.0));
+        assert_eq!(series.len(), 2);
+        // cumulative: (100 - 95) / 95 * 100 ≈ 5.263%
+        assert!((series[0].cumulative_return - 5.263_157_894).abs() < 0.001);
+        // cumulative: (105 - 95) / 95 * 100 ≈ 10.526%
+        assert!((series[1].cumulative_return - 10.526_315_789).abs() < 0.001);
+        // daily: (100 - 95) / 95 * 100 ≈ 5.263%
+        assert!((series[0].daily_return - 5.263_157_894).abs() < 0.001);
+        // daily: (105 - 100) / 100 * 100 = 5%
+        assert!((series[1].daily_return - 5.0).abs() < 1e-6);
     }
 }

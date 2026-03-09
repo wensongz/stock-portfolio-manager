@@ -492,7 +492,8 @@ pub async fn backfill_snapshots(
             });
         }
 
-        // Skip dates where we couldn't get any prices (likely a holiday)
+        // Skip dates where no price data is available at all (e.g. date
+        // is before the earliest trading data for every holding).
         if !has_any_price {
             continue;
         }

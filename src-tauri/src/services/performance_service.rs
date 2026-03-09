@@ -54,6 +54,16 @@ fn fetch_daily_values(
         .collect()
 }
 
+/// Fetch the portfolio value on its inception (earliest) date.
+fn fetch_inception_value(db: &Database) -> Result<Option<f64>, String> {
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT total_value FROM daily_portfolio_values ORDER BY date ASC LIMIT 1")
+        .map_err(|e| e.to_string())?;
+    let result = stmt.query_row([], |row| row.get::<_, f64>(0)).ok();
+    Ok(result)
+}
+
 /// Fetch transaction dates (for TWR sub-period boundaries) in the date range.
 fn fetch_transaction_dates(
     db: &Database,
@@ -96,15 +106,19 @@ fn fetch_transaction_dates(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build a Vec<ReturnDataPoint> from the daily portfolio values.
+/// When `inception_value` is provided, cumulative returns are calculated
+/// relative to this value (the portfolio value at creation) instead of the
+/// first element in `daily_values`.
 pub fn build_return_series(
     daily_values: &[(NaiveDate, f64, f64)],
+    inception_value: Option<f64>,
 ) -> Vec<ReturnDataPoint> {
     if daily_values.is_empty() {
         return vec![];
     }
 
-    let start_value = daily_values[0].1;
-    let mut prev_value = start_value;
+    let start_value = inception_value.unwrap_or(daily_values[0].1);
+    let mut prev_value = daily_values[0].1;
     let mut result = Vec::with_capacity(daily_values.len());
 
     for (date, value, dpnl) in daily_values {
@@ -240,7 +254,8 @@ pub fn get_return_series(
     end_date: NaiveDate,
 ) -> Result<Vec<ReturnDataPoint>, String> {
     let daily = fetch_daily_values(db, start_date, end_date)?;
-    Ok(build_return_series(&daily))
+    let inception_value = fetch_inception_value(db)?;
+    Ok(build_return_series(&daily, inception_value))
 }
 
 pub fn get_performance_summary(
@@ -274,7 +289,8 @@ pub fn get_performance_summary(
     let annualised = annualise_return(twr, days);
     let total_pnl = end_value - start_value;
 
-    let return_series = build_return_series(&daily);
+    let inception_value = fetch_inception_value(db)?;
+    let return_series = build_return_series(&daily, inception_value);
     let dd_analysis = calculate_max_drawdown(&return_series);
 
     let daily_returns: Vec<f64> = return_series.iter().map(|r| r.daily_return).collect();
@@ -372,7 +388,8 @@ pub fn get_risk_metrics(
     let days = (end_date - start_date).num_days();
     let annualised = annualise_return(twr, days);
 
-    let return_series = build_return_series(&daily);
+    let inception_value = fetch_inception_value(db)?;
+    let return_series = build_return_series(&daily, inception_value);
     let daily_returns: Vec<f64> = return_series.iter().map(|r| r.daily_return).collect();
     let (daily_vol, ann_vol) = calculate_volatility(&daily_returns);
 
@@ -977,9 +994,32 @@ mod tests {
             (parse_date("2024-01-02").unwrap(), 105.0, 5.0),
             (parse_date("2024-01-03").unwrap(), 103.0, -2.0),
         ];
-        let series = build_return_series(&daily);
+        let series = build_return_series(&daily, None);
         assert_eq!(series.len(), 3);
         assert!((series[1].cumulative_return - 5.0).abs() < 1e-6);
         assert!((series[2].cumulative_return - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_build_return_series_with_inception_value() {
+        // Simulate: inception value was 50 (portfolio created earlier)
+        // but the selected range starts when portfolio value is 100
+        let daily = vec![
+            (parse_date("2024-03-01").unwrap(), 100.0, 0.0),
+            (parse_date("2024-03-02").unwrap(), 105.0, 5.0),
+            (parse_date("2024-03-03").unwrap(), 103.0, -2.0),
+        ];
+        let series = build_return_series(&daily, Some(50.0));
+        assert_eq!(series.len(), 3);
+        // cumulative_return from inception: (100 - 50) / 50 * 100 = 100%
+        assert!((series[0].cumulative_return - 100.0).abs() < 1e-6);
+        // cumulative_return from inception: (105 - 50) / 50 * 100 = 110%
+        assert!((series[1].cumulative_return - 110.0).abs() < 1e-6);
+        // cumulative_return from inception: (103 - 50) / 50 * 100 = 106%
+        assert!((series[2].cumulative_return - 106.0).abs() < 1e-6);
+        // daily_return should still be day-over-day
+        assert!((series[0].daily_return - 0.0).abs() < 1e-6);
+        // (105 - 100) / 100 * 100 = 5%
+        assert!((series[1].daily_return - 5.0).abs() < 0.01);
     }
 }

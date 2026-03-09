@@ -51,6 +51,7 @@ pub fn run() {
             commands::exchange_rates::convert_amount,
             commands::snapshots::take_snapshot,
             commands::snapshots::get_portfolio_history,
+            commands::snapshots::backfill_snapshots,
             commands::dashboard::get_dashboard_summary,
             commands::dashboard::get_holdings_with_quotes,
             commands::statistics::get_statistics_overview,

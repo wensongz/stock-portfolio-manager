@@ -451,6 +451,113 @@ pub async fn fetch_quotes_batch_with_providers(
     Ok(quotes)
 }
 
+// ---------------------------------------------------------------------------
+// Historical price fetching (Yahoo Finance)
+// ---------------------------------------------------------------------------
+
+/// Convert a holding symbol + market to a Yahoo Finance ticker for historical queries.
+pub fn to_yahoo_symbol(symbol: &str, market: &str) -> String {
+    match market {
+        "US" => symbol.to_string(),
+        "HK" => {
+            if symbol.ends_with(".HK") || symbol.ends_with(".hk") {
+                symbol.to_string()
+            } else {
+                format!("{}.HK", symbol)
+            }
+        }
+        "CN" => {
+            // CN symbols are stored as e.g. "sh600519" or "sz000858"
+            let s = symbol.to_lowercase();
+            if s.starts_with("sh") {
+                format!("{}.SS", &s[2..])
+            } else if s.starts_with("sz") {
+                format!("{}.SZ", &s[2..])
+            } else {
+                // Fallback: guess based on first digit
+                let code = s.trim_start_matches(|c: char| !c.is_ascii_digit());
+                if code.starts_with('6') || code.starts_with('9') {
+                    format!("{}.SS", code)
+                } else {
+                    format!("{}.SZ", code)
+                }
+            }
+        }
+        _ => symbol.to_string(),
+    }
+}
+
+/// Fetch historical daily closing prices for a stock from Yahoo Finance.
+/// Returns a list of (date, close_price) pairs sorted by date ascending.
+pub async fn fetch_stock_history_yahoo(
+    symbol: &str,
+    market: &str,
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+) -> Result<Vec<(chrono::NaiveDate, f64)>, String> {
+    let yahoo_sym = to_yahoo_symbol(symbol, market);
+
+    let start_ts = start_date
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp();
+    let end_ts = end_date
+        .and_hms_opt(23, 59, 59)
+        .unwrap()
+        .and_utc()
+        .timestamp();
+
+    let url = format!(
+        "https://query1.finance.yahoo.com/v8/finance/chart/{}?period1={}&period2={}&interval=1d",
+        yahoo_sym, start_ts, end_ts
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await
+        .map_err(|e| format!("fetch_stock_history_yahoo: network error for {}: {}", yahoo_sym, e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "fetch_stock_history_yahoo: HTTP {} for {}",
+            resp.status(),
+            yahoo_sym
+        ));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("fetch_stock_history_yahoo: parse error for {}: {}", yahoo_sym, e))?;
+
+    let timestamps = json["chart"]["result"][0]["timestamp"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let closes = json["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    let mut result: Vec<(chrono::NaiveDate, f64)> = Vec::new();
+    for (ts, cl) in timestamps.iter().zip(closes.iter()) {
+        if let (Some(ts_i), Some(cl_f)) = (ts.as_i64(), cl.as_f64()) {
+            if let Some(dt) = chrono::DateTime::from_timestamp(ts_i, 0) {
+                result.push((dt.date_naive(), cl_f));
+            }
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,6 +846,28 @@ mod tests {
         quote.current_price = 200.0;
         cache.set(quote);
         assert!((cache.get("AAPL").unwrap().current_price - 200.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_to_yahoo_symbol_us() {
+        assert_eq!(to_yahoo_symbol("AAPL", "US"), "AAPL");
+        assert_eq!(to_yahoo_symbol("MSFT", "US"), "MSFT");
+    }
+
+    #[test]
+    fn test_to_yahoo_symbol_hk() {
+        assert_eq!(to_yahoo_symbol("0700.HK", "HK"), "0700.HK");
+        assert_eq!(to_yahoo_symbol("00700", "HK"), "00700.HK");
+    }
+
+    #[test]
+    fn test_to_yahoo_symbol_cn() {
+        assert_eq!(to_yahoo_symbol("sh600519", "CN"), "600519.SS");
+        assert_eq!(to_yahoo_symbol("sz000858", "CN"), "000858.SZ");
+        assert_eq!(to_yahoo_symbol("SH600519", "CN"), "600519.SS");
+        // Fallback for bare codes
+        assert_eq!(to_yahoo_symbol("600519", "CN"), "600519.SS");
+        assert_eq!(to_yahoo_symbol("000858", "CN"), "000858.SZ");
     }
 
     // ---- Integration tests using real network calls ----

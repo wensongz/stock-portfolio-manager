@@ -1,9 +1,9 @@
 use crate::db::Database;
 use crate::models::{DailyHoldingSnapshot, DailyPortfolioValue};
 use crate::services::exchange_rate_service::ExchangeRateCache;
-use crate::services::quote_service::{fetch_quotes_batch_cached_with_providers, QuoteCache};
+use crate::services::quote_service::{fetch_quotes_batch_cached_with_providers, fetch_stock_history_yahoo, QuoteCache};
 use crate::services::quote_provider_service;
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 
 /// Take a daily portfolio snapshot for the given date.
 /// This is idempotent: running it twice for the same date replaces the existing record.
@@ -264,4 +264,286 @@ pub fn get_daily_values(
         .map_err(|e| e.to_string())?;
 
     Ok(values)
+}
+
+/// Backfill missing daily portfolio snapshots for the given date range.
+/// Fetches historical closing prices from Yahoo Finance, calculates portfolio
+/// values for every missing weekday, and stores them in the database.
+/// Returns the number of snapshots created.
+///
+/// **Note:** This uses *current* exchange rates for all historical dates and
+/// *current* holdings composition.  For portfolios with significant
+/// multi-currency exposure or frequently changing compositions, the
+/// back-filled values are approximate.
+pub async fn backfill_snapshots(
+    db: &Database,
+    cache: &ExchangeRateCache,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> Result<i32, String> {
+    let today = chrono::Utc::now().date_naive();
+    // Clamp end_date to today
+    let end_date = if end_date > today { today } else { end_date };
+
+    if start_date > end_date {
+        return Ok(0);
+    }
+
+    // 1. Load all current holdings
+    let holdings = {
+        let conn = db.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT h.id, h.account_id, h.symbol, h.name, h.market,
+                        h.shares, h.avg_cost, h.currency, c.name as category_name
+                 FROM holdings h
+                 LEFT JOIN categories c ON h.category_id = c.id
+                 WHERE h.shares > 0",
+            )
+            .map_err(|e| e.to_string())?;
+
+        #[derive(Debug, Clone)]
+        struct HoldingRow {
+            _id: String,
+            account_id: String,
+            symbol: String,
+            _name: String,
+            market: String,
+            shares: f64,
+            avg_cost: f64,
+            _currency: String,
+            category_name: Option<String>,
+        }
+
+        let rows = stmt.query_map([], |row| {
+            Ok(HoldingRow {
+                _id: row.get(0)?,
+                account_id: row.get(1)?,
+                symbol: row.get(2)?,
+                _name: row.get(3)?,
+                market: row.get(4)?,
+                shares: row.get(5)?,
+                avg_cost: row.get(6)?,
+                _currency: row.get(7)?,
+                category_name: row.get(8)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+
+    if holdings.is_empty() {
+        return Ok(0);
+    }
+
+    // 2. Find all weekdays in range that are missing snapshots
+    let existing_dates: std::collections::HashSet<String> = {
+        let conn = db.conn.lock().map_err(|e| e.to_string())?;
+        let start_str = start_date.format("%Y-%m-%d").to_string();
+        let end_str = end_date.format("%Y-%m-%d").to_string();
+        let mut stmt = conn
+            .prepare(
+                "SELECT date FROM daily_portfolio_values WHERE date BETWEEN ?1 AND ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![start_str, end_str], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<std::collections::HashSet<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+
+    let mut missing_dates: Vec<NaiveDate> = Vec::new();
+    let mut d = start_date;
+    while d <= end_date {
+        let wd = d.weekday();
+        if wd != chrono::Weekday::Sat && wd != chrono::Weekday::Sun {
+            let ds = d.format("%Y-%m-%d").to_string();
+            if !existing_dates.contains(&ds) {
+                missing_dates.push(d);
+            }
+        }
+        d = d.succ_opt().unwrap_or(d);
+    }
+
+    if missing_dates.is_empty() {
+        return Ok(0);
+    }
+
+    // 3. Fetch historical prices for each holding from Yahoo Finance
+    // Build a map: symbol -> { date -> close_price }
+    let mut history_map: std::collections::HashMap<
+        String,
+        std::collections::HashMap<NaiveDate, f64>,
+    > = std::collections::HashMap::new();
+
+    for holding in &holdings {
+        match fetch_stock_history_yahoo(
+            &holding.symbol,
+            &holding.market,
+            start_date,
+            end_date,
+        )
+        .await
+        {
+            Ok(prices) => {
+                let date_price_map: std::collections::HashMap<NaiveDate, f64> =
+                    prices.into_iter().collect();
+                history_map.insert(holding.symbol.clone(), date_price_map);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to fetch history for {} ({}): {}",
+                    holding.symbol, holding.market, e
+                );
+            }
+        }
+    }
+
+    // 4. Get exchange rates (use current rates as approximation for all dates)
+    let rates = crate::services::exchange_rate_service::get_cached_rates(cache).await?;
+    let rates_json = serde_json::to_string(&rates).unwrap_or_default();
+
+    // 5. For each missing date, calculate and store portfolio values
+    let mut count = 0i32;
+
+    for date in &missing_dates {
+        let date_str = date.format("%Y-%m-%d").to_string();
+
+        let mut us_cost = 0.0f64;
+        let mut us_value = 0.0f64;
+        let mut cn_cost = 0.0f64;
+        let mut cn_value = 0.0f64;
+        let mut hk_cost = 0.0f64;
+        let mut hk_value = 0.0f64;
+        let mut snapshots: Vec<DailyHoldingSnapshot> = Vec::new();
+        let mut has_any_price = false;
+
+        for holding in &holdings {
+            // Look up the closing price for this stock on this date
+            let close_price = history_map
+                .get(&holding.symbol)
+                .and_then(|m| m.get(date))
+                .copied()
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "Warning: no historical price for {} ({}) on {}",
+                        holding.symbol, holding.market, date_str
+                    );
+                    0.0
+                });
+
+            if close_price > 0.0 {
+                has_any_price = true;
+            }
+
+            let market_value = holding.shares * close_price;
+            let cost = holding.shares * holding.avg_cost;
+
+            match holding.market.as_str() {
+                "US" => {
+                    us_cost += cost;
+                    us_value += market_value;
+                }
+                "CN" => {
+                    cn_cost += cost;
+                    cn_value += market_value;
+                }
+                "HK" => {
+                    hk_cost += cost;
+                    hk_value += market_value;
+                }
+                _ => {}
+            }
+
+            snapshots.push(DailyHoldingSnapshot {
+                id: 0,
+                date: date_str.clone(),
+                account_id: holding.account_id.clone(),
+                symbol: holding.symbol.clone(),
+                market: holding.market.clone(),
+                category_name: holding.category_name.clone(),
+                shares: holding.shares,
+                avg_cost: holding.avg_cost,
+                close_price,
+                market_value,
+            });
+        }
+
+        // Skip dates where we couldn't get any prices (likely a holiday)
+        if !has_any_price {
+            continue;
+        }
+
+        let total_cost = us_cost
+            + crate::services::exchange_rate_service::convert_currency(
+                cn_cost, "CNY", "USD", &rates,
+            )
+            + crate::services::exchange_rate_service::convert_currency(
+                hk_cost, "HKD", "USD", &rates,
+            );
+        let total_value = us_value
+            + crate::services::exchange_rate_service::convert_currency(
+                cn_value, "CNY", "USD", &rates,
+            )
+            + crate::services::exchange_rate_service::convert_currency(
+                hk_value, "HKD", "USD", &rates,
+            );
+
+        let cumulative_pnl = total_value - total_cost;
+
+        let prev_total_value: f64 = {
+            let conn = db.conn.lock().map_err(|e| e.to_string())?;
+            conn.query_row(
+                "SELECT COALESCE(total_value, 0) FROM daily_portfolio_values WHERE date < ?1 ORDER BY date DESC LIMIT 1",
+                rusqlite::params![date_str],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0)
+        };
+        let daily_pnl = total_value - prev_total_value;
+
+        // Persist
+        {
+            let conn = db.conn.lock().map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT OR REPLACE INTO daily_portfolio_values
+                 (date, total_cost, total_value, us_cost, us_value, cn_cost, cn_value, hk_cost, hk_value, exchange_rates, daily_pnl, cumulative_pnl)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    date_str, total_cost, total_value,
+                    us_cost, us_value, cn_cost, cn_value, hk_cost, hk_value,
+                    rates_json, daily_pnl, cumulative_pnl
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+
+            conn.execute(
+                "DELETE FROM daily_holding_snapshots WHERE date = ?1",
+                rusqlite::params![date_str],
+            )
+            .map_err(|e| e.to_string())?;
+
+            for snap in &snapshots {
+                conn.execute(
+                    "INSERT INTO daily_holding_snapshots
+                     (date, account_id, symbol, market, category_name, shares, avg_cost, close_price, market_value)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        snap.date, snap.account_id, snap.symbol, snap.market,
+                        snap.category_name, snap.shares, snap.avg_cost,
+                        snap.close_price, snap.market_value
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+
+        count += 1;
+    }
+
+    Ok(count)
 }

@@ -139,6 +139,13 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
         endDate = range.end;
       }
 
+      // Automatically backfill missing daily snapshots using historical closing prices
+      try {
+        await invoke<number>("backfill_snapshots", { startDate, endDate });
+      } catch (err) {
+        console.warn("backfill_snapshots error (non-fatal):", err);
+      }
+
       const [summary, returnSeries, drawdown, attribution, monthlyReturns, topGainers, topLosers, riskMetrics] =
         await Promise.allSettled([
           invoke<PerformanceSummary>("get_performance_summary", { startDate, endDate }),

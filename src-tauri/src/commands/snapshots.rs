@@ -36,3 +36,20 @@ pub fn get_portfolio_history(
 
     get_daily_values(&db, start, end)
 }
+
+/// Backfill missing daily snapshots for the given date range using historical
+/// closing prices. Returns the number of snapshots created.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn backfill_snapshots(
+    db: State<'_, Database>,
+    cache: State<'_, ExchangeRateCache>,
+    start_date: String,
+    end_date: String,
+) -> Result<i32, String> {
+    let start = NaiveDate::parse_from_str(&start_date, "%Y-%m-%d")
+        .map_err(|e| format!("Invalid start_date format (expected YYYY-MM-DD): {}", e))?;
+    let end = NaiveDate::parse_from_str(&end_date, "%Y-%m-%d")
+        .map_err(|e| format!("Invalid end_date format (expected YYYY-MM-DD): {}", e))?;
+
+    crate::services::snapshot_service::backfill_snapshots(&db, &cache, start, end).await
+}

@@ -101,7 +101,7 @@ export default function ReturnChart({
       </div>
       {returnSeries.length === 0 ? (
         <div className="flex items-center justify-center" style={{ height }}>
-          <Text type="secondary">暂无数据，请先拍摄每日快照</Text>
+          <Text type="secondary">暂无数据，正在自动计算历史持仓市值…</Text>
         </div>
       ) : (
         <ReactECharts

@@ -27,6 +27,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "cookies", "gzip"] }
+url = "2"
 csv = "1"
 
 [features]

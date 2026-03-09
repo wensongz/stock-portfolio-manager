@@ -133,12 +133,54 @@ npm install
 npm run tauri dev
 ```
 
-### Build
+### Build & Package
 
 ```bash
-# Build for production
+# Build for production (generates platform-specific installers)
 npm run tauri build
 ```
+
+Build output is located in `src-tauri/target/release/bundle/`:
+
+| Platform | Output | Path |
+|----------|--------|------|
+| macOS | `.dmg` installer | `bundle/dmg/stock-portfolio-manager_<version>_<arch>.dmg` |
+| macOS | `.app` bundle | `bundle/macos/stock-portfolio-manager.app` |
+| Windows | `.msi` installer | `bundle/msi/` |
+| Linux | `.deb` / `.AppImage` | `bundle/deb/` / `bundle/appimage/` |
+
+#### Generating .dmg (macOS)
+
+On a Mac, simply run:
+
+```bash
+npm run tauri build
+```
+
+The `.dmg` file will be at:
+- Apple Silicon: `src-tauri/target/release/bundle/dmg/stock-portfolio-manager_0.1.0_aarch64.dmg`
+- Intel Mac: `src-tauri/target/release/bundle/dmg/stock-portfolio-manager_0.1.0_x64.dmg`
+
+To build for a specific architecture:
+
+```bash
+# Apple Silicon (M1/M2/M3)
+npm run tauri build -- --target aarch64-apple-darwin
+
+# Intel
+npm run tauri build -- --target x86_64-apple-darwin
+```
+
+#### Automated Builds (CI/CD)
+
+Push a version tag to trigger the GitHub Actions workflow that builds installers for all platforms:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow produces `.dmg` (macOS), `.msi` (Windows), and `.deb`/`.AppImage` (Linux) as draft release assets. You can also trigger it manually from the **Actions** tab.
 
 ### Tests
 

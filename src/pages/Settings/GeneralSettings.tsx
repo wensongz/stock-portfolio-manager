@@ -17,6 +17,7 @@ const INTERVAL_OPTIONS = [
 
 const PROVIDER_OPTIONS_US_HK = [
   { value: "yahoo", label: "Yahoo Finance（默认）" },
+  { value: "eastmoney", label: "东方财富" },
 ];
 
 const PROVIDER_OPTIONS_CN = [
@@ -86,7 +87,7 @@ export default function GeneralSettings() {
           </Form.Item>
         </Form>
         <Paragraph type="secondary">
-          各市场的行情数据来源：A股使用东方财富，港股和美股使用 Yahoo Finance。修改后将在下次刷新时生效。
+          各市场的行情数据来源：A股使用东方财富，港股和美股支持 Yahoo Finance 和东方财富。修改后将在下次刷新时生效。
         </Paragraph>
       </Card>
 

@@ -263,8 +263,11 @@ pub async fn fetch_us_quote(symbol: &str) -> Result<StockQuote, String> {
 }
 
 /// Fetch a US stock quote using the specified provider.
-pub async fn fetch_us_quote_with_provider(symbol: &str, _provider: &str) -> Result<StockQuote, String> {
-    fetch_yahoo_quote(symbol, "US").await
+pub async fn fetch_us_quote_with_provider(symbol: &str, provider: &str) -> Result<StockQuote, String> {
+    match provider {
+        "eastmoney" => fetch_eastmoney_us_quote(symbol).await,
+        _ => fetch_yahoo_quote(symbol, "US").await,
+    }
 }
 
 /// Fetch a HK stock quote using the configured provider. Appends ".HK" if not present for Yahoo.
@@ -273,13 +276,18 @@ pub async fn fetch_hk_quote(symbol: &str) -> Result<StockQuote, String> {
 }
 
 /// Fetch a HK stock quote using the specified provider.
-pub async fn fetch_hk_quote_with_provider(symbol: &str, _provider: &str) -> Result<StockQuote, String> {
-    let yahoo_symbol = if symbol.ends_with(".HK") || symbol.ends_with(".hk") {
-        symbol.to_string()
-    } else {
-        format!("{}.HK", symbol)
-    };
-    fetch_yahoo_quote(&yahoo_symbol, "HK").await
+pub async fn fetch_hk_quote_with_provider(symbol: &str, provider: &str) -> Result<StockQuote, String> {
+    match provider {
+        "eastmoney" => fetch_eastmoney_hk_quote(symbol).await,
+        _ => {
+            let yahoo_symbol = if symbol.ends_with(".HK") || symbol.ends_with(".hk") {
+                symbol.to_string()
+            } else {
+                format!("{}.HK", symbol)
+            };
+            fetch_yahoo_quote(&yahoo_symbol, "HK").await
+        }
+    }
 }
 
 /// Fetch a CN A-share stock quote using East Money.
@@ -359,7 +367,81 @@ async fn fetch_eastmoney_cn_quote(symbol: &str) -> Result<StockQuote, String> {
         .await
         .map_err(|e| format!("Failed to parse East Money response for {}: {}", symbol, e))?;
 
-    parse_eastmoney_quote(&symbol, resp)
+    parse_eastmoney_quote(&symbol, "CN", resp)
+}
+
+/// Fetch a US stock quote from East Money (东方财富).
+/// Symbol format: standard US ticker like "AAPL", "MSFT".
+async fn fetch_eastmoney_us_quote(symbol: &str) -> Result<StockQuote, String> {
+    let secid = to_eastmoney_us_secid(symbol);
+    let url = format!(
+        "https://push2.eastmoney.com/api/qt/stock/get?fltt=2&invt=2&fields=f43,f44,f45,f47,f57,f58,f60,f169,f170&secid={}",
+        secid
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await
+        .map_err(|e| format!("Network error fetching {}: {}", symbol, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "East Money API error for {}: HTTP {}",
+            symbol,
+            response.status()
+        ));
+    }
+
+    let resp: EastMoneyResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse East Money response for {}: {}", symbol, e))?;
+
+    parse_eastmoney_quote(symbol, "US", resp)
+}
+
+/// Fetch a HK stock quote from East Money (东方财富).
+/// Symbol format: "00700", "09988", or "0700.HK".
+async fn fetch_eastmoney_hk_quote(symbol: &str) -> Result<StockQuote, String> {
+    let secid = to_eastmoney_hk_secid(symbol)?;
+    let url = format!(
+        "https://push2.eastmoney.com/api/qt/stock/get?fltt=2&invt=2&fields=f43,f44,f45,f47,f57,f58,f60,f169,f170&secid={}",
+        secid
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await
+        .map_err(|e| format!("Network error fetching {}: {}", symbol, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "East Money API error for {}: HTTP {}",
+            symbol,
+            response.status()
+        ));
+    }
+
+    let resp: EastMoneyResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse East Money response for {}: {}", symbol, e))?;
+
+    parse_eastmoney_quote(symbol, "HK", resp)
 }
 
 /// Convert a symbol like "sh600519" or "sz000858" to the East Money secid
@@ -378,8 +460,28 @@ fn to_eastmoney_secid(symbol: &str) -> Result<String, String> {
     Ok(format!("{}.{}", market_id, code))
 }
 
+/// Convert a US stock ticker to East Money secid format: "105.{TICKER}".
+fn to_eastmoney_us_secid(symbol: &str) -> String {
+    format!("105.{}", symbol.to_uppercase())
+}
+
+/// Convert a HK stock symbol to East Money secid format: "116.{5-digit code}".
+/// Strips the ".HK" suffix if present and zero-pads to 5 digits.
+fn to_eastmoney_hk_secid(symbol: &str) -> Result<String, String> {
+    let code = symbol
+        .trim_end_matches(".HK")
+        .trim_end_matches(".hk");
+    // Zero-pad to 5 digits if the code is purely numeric
+    if code.chars().all(|c| c.is_ascii_digit()) {
+        let padded = format!("{:0>5}", code);
+        Ok(format!("116.{}", padded))
+    } else {
+        Err(format!("Invalid HK symbol: {}", symbol))
+    }
+}
+
 /// Parse the East Money JSON response into a `StockQuote`.
-fn parse_eastmoney_quote(symbol: &str, resp: EastMoneyResponse) -> Result<StockQuote, String> {
+fn parse_eastmoney_quote(symbol: &str, market: &str, resp: EastMoneyResponse) -> Result<StockQuote, String> {
     let data = resp
         .data
         .ok_or_else(|| format!("No data from East Money for {}. Symbol may be invalid.", symbol))?;
@@ -408,7 +510,7 @@ fn parse_eastmoney_quote(symbol: &str, resp: EastMoneyResponse) -> Result<StockQ
     Ok(StockQuote {
         symbol: symbol.to_string(),
         name,
-        market: "CN".to_string(),
+        market: market.to_string(),
         current_price,
         previous_close,
         change,
@@ -603,7 +705,7 @@ mod tests {
             20.50,
             1.21,
         );
-        let result = parse_eastmoney_quote("sh600519", resp);
+        let result = parse_eastmoney_quote("sh600519", "CN", resp);
         assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
         let quote = result.unwrap();
         assert_eq!(quote.symbol, "sh600519");
@@ -624,7 +726,7 @@ mod tests {
             rc: Some(0),
             data: None,
         };
-        let result = parse_eastmoney_quote("sh999999", resp);
+        let result = parse_eastmoney_quote("sh999999", "CN", resp);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No data from East Money"));
     }
@@ -645,7 +747,7 @@ mod tests {
                 f170: Some(1.21),
             }),
         };
-        let result = parse_eastmoney_quote("sh600519", resp);
+        let result = parse_eastmoney_quote("sh600519", "CN", resp);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Missing current price"));
     }
@@ -663,7 +765,7 @@ mod tests {
             100.00,
             10.00,
         );
-        let result = parse_eastmoney_quote("sh600519", resp);
+        let result = parse_eastmoney_quote("sh600519", "CN", resp);
         assert!(result.is_ok());
         let quote = result.unwrap();
         assert!((quote.change - 100.0).abs() < 0.001);
@@ -683,7 +785,7 @@ mod tests {
             20.50,
             1.21,
         );
-        let result = parse_eastmoney_quote("sh600519", resp);
+        let result = parse_eastmoney_quote("sh600519", "CN", resp);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().symbol, "sh600519");
     }
@@ -709,7 +811,7 @@ mod tests {
             20.50,
             1.21,
         );
-        let result = parse_eastmoney_quote(&lower, resp);
+        let result = parse_eastmoney_quote(&lower, "CN", resp);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().symbol, "sh600519");
     }
@@ -739,6 +841,70 @@ mod tests {
     }
 
     #[test]
+    fn test_to_eastmoney_us_secid() {
+        assert_eq!(to_eastmoney_us_secid("AAPL"), "105.AAPL");
+        assert_eq!(to_eastmoney_us_secid("msft"), "105.MSFT");
+        assert_eq!(to_eastmoney_us_secid("GOOGL"), "105.GOOGL");
+    }
+
+    #[test]
+    fn test_to_eastmoney_hk_secid() {
+        assert_eq!(to_eastmoney_hk_secid("00700").unwrap(), "116.00700");
+        assert_eq!(to_eastmoney_hk_secid("0700.HK").unwrap(), "116.00700");
+        assert_eq!(to_eastmoney_hk_secid("9988.HK").unwrap(), "116.09988");
+        assert_eq!(to_eastmoney_hk_secid("09988").unwrap(), "116.09988");
+        assert_eq!(to_eastmoney_hk_secid("700.hk").unwrap(), "116.00700");
+    }
+
+    #[test]
+    fn test_to_eastmoney_hk_secid_invalid() {
+        let result = to_eastmoney_hk_secid("INVALID");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_eastmoney_quote_us_market() {
+        let resp = make_eastmoney_response(
+            "AAPL",
+            "苹果",
+            195.50,
+            193.00,
+            197.00,
+            192.00,
+            50000,
+            2.50,
+            1.30,
+        );
+        let result = parse_eastmoney_quote("AAPL", "US", resp);
+        assert!(result.is_ok());
+        let quote = result.unwrap();
+        assert_eq!(quote.symbol, "AAPL");
+        assert_eq!(quote.market, "US");
+        assert!((quote.current_price - 195.50).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_eastmoney_quote_hk_market() {
+        let resp = make_eastmoney_response(
+            "00700",
+            "腾讯控股",
+            420.00,
+            415.00,
+            425.00,
+            410.00,
+            30000,
+            5.00,
+            1.20,
+        );
+        let result = parse_eastmoney_quote("00700", "HK", resp);
+        assert!(result.is_ok());
+        let quote = result.unwrap();
+        assert_eq!(quote.symbol, "00700");
+        assert_eq!(quote.market, "HK");
+        assert!((quote.current_price - 420.00).abs() < 0.001);
+    }
+
+    #[test]
     fn test_parse_eastmoney_quote_fallback_change_calculation() {
         // When f169/f170 are missing, change should be computed from price
         let resp = EastMoneyResponse {
@@ -755,7 +921,7 @@ mod tests {
                 f170: None,
             }),
         };
-        let result = parse_eastmoney_quote("sh600519", resp);
+        let result = parse_eastmoney_quote("sh600519", "CN", resp);
         assert!(result.is_ok());
         let quote = result.unwrap();
         assert!((quote.change - 100.0).abs() < 0.001);
@@ -920,6 +1086,38 @@ mod tests {
             }
             Err(e) => {
                 println!("⚠️ East Money quote failed (network issue in CI): {}", e);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_us_eastmoney() {
+        let result = fetch_eastmoney_us_quote("AAPL").await;
+        match &result {
+            Ok(quote) => {
+                assert_eq!(quote.market, "US");
+                assert!(quote.current_price > 0.0, "Price should be positive");
+                println!("✅ US quote (East Money): {} = {}", quote.name, quote.current_price);
+            }
+            Err(e) => {
+                println!("⚠️ US East Money quote failed (network issue in CI): {}", e);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_hk_eastmoney() {
+        let result = fetch_eastmoney_hk_quote("00700").await;
+        match &result {
+            Ok(quote) => {
+                assert_eq!(quote.market, "HK");
+                assert!(quote.current_price > 0.0, "Price should be positive");
+                println!("✅ HK quote (East Money): {} = {}", quote.name, quote.current_price);
+            }
+            Err(e) => {
+                println!("⚠️ HK East Money quote failed (network issue in CI): {}", e);
             }
         }
     }

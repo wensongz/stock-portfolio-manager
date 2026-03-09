@@ -333,10 +333,11 @@ fn to_xueqiu_symbol(symbol: &str, market: &str) -> String {
     match market {
         "CN" => symbol.to_uppercase(),
         "HK" => {
-            let s = symbol
-                .trim_end_matches(".HK")
-                .trim_end_matches(".hk");
-            s.to_string()
+            if symbol.to_uppercase().ends_with(".HK") {
+                symbol[..symbol.len() - 3].to_string()
+            } else {
+                symbol.to_string()
+            }
         }
         _ => symbol.to_string(),
     }

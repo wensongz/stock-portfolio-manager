@@ -32,5 +32,6 @@ pub struct HoldingDetail {
     pub cost_value: f64,
     pub pnl: f64,
     pub pnl_percent: f64,
+    pub daily_pnl: f64,
     pub currency: String,
 }

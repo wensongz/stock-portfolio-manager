@@ -128,6 +128,7 @@ export interface HoldingDetail {
   cost_value: number;
   pnl: number;
   pnl_percent: number;
+  daily_pnl: number;
   currency: Currency;
 }
 

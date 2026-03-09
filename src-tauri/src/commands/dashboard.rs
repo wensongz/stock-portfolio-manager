@@ -86,15 +86,15 @@ async fn build_holding_details(
         let config = quote_provider_service::get_quote_provider_config(db)?;
         fetch_quotes_batch_cached_with_providers(quote_cache, symbols, &config.us_provider, &config.hk_provider).await?
     };
-    let quote_map: std::collections::HashMap<String, f64> = quotes
+    let quote_map: std::collections::HashMap<String, (f64, f64)> = quotes
         .into_iter()
-        .map(|q| (q.symbol.clone(), q.current_price))
+        .map(|q| (q.symbol.clone(), (q.current_price, q.change)))
         .collect();
 
     let details = rows
         .into_iter()
         .map(|r| {
-            let current_price = *quote_map.get(&r.symbol).unwrap_or(&0.0);
+            let (current_price, change) = *quote_map.get(&r.symbol).unwrap_or(&(0.0, 0.0));
             let market_value = r.shares * current_price;
             let cost_value = r.shares * r.avg_cost;
             let pnl = market_value - cost_value;
@@ -103,6 +103,7 @@ async fn build_holding_details(
             } else {
                 0.0
             };
+            let daily_pnl = r.shares * change;
             HoldingDetail {
                 id: r.id,
                 account_id: r.account_id,
@@ -119,6 +120,7 @@ async fn build_holding_details(
                 cost_value,
                 pnl,
                 pnl_percent,
+                daily_pnl,
                 currency: r.currency,
             }
         })
@@ -178,21 +180,12 @@ pub async fn get_dashboard_summary(
         0.0
     };
 
-    // Daily PnL: difference between today's total value and yesterday's snapshot
-    let daily_pnl: f64 = {
-        let conn = db.conn.lock().map_err(|e| e.to_string())?;
-        let today = chrono::Utc::now().date_naive().format("%Y-%m-%d").to_string();
-        let prev: f64 = conn
-            .query_row(
-                "SELECT COALESCE(total_value, 0) FROM daily_portfolio_values WHERE date < ?1 ORDER BY date DESC LIMIT 1",
-                rusqlite::params![today],
-                |row| row.get(0),
-            )
-            .unwrap_or(0.0);
-        // prev is in USD; convert to base currency
-        let prev_base = convert_currency(prev, "USD", &base, &rates);
-        total_market_value - prev_base
-    };
+    // Daily PnL: sum of each holding's today price change (shares * change),
+    // converted to base currency
+    let daily_pnl: f64 = details
+        .iter()
+        .map(|d| convert_currency(d.daily_pnl, &d.currency, &base, &rates))
+        .sum();
 
     Ok(DashboardSummary {
         total_market_value,

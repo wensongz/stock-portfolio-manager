@@ -432,9 +432,8 @@ pub async fn fetch_xueqiu_quote(symbol: &str, market: &str) -> Result<StockQuote
         .map_err(|_| "Invalid URL".to_string())?;
     if let Some(jar_cookies) = jar.cookies(&xq_url) {
         if let Ok(s) = jar_cookies.to_str() {
-            let s_str: &str = s;
-            if !s_str.is_empty() {
-                cookie_parts.push(s_str.to_string());
+            if !s.is_empty() {
+                cookie_parts.push(s.to_string());
             }
         }
     }

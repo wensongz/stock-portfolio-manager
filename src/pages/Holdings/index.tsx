@@ -495,7 +495,7 @@ export default function HoldingsPage() {
             label="平均成本价"
             rules={[{ required: true, message: "请输入平均成本价" }]}
           >
-            <InputNumber min={0} precision={4} style={{ width: "100%" }} placeholder="买入均价" />
+            <InputNumber precision={4} style={{ width: "100%" }} placeholder="买入均价" />
           </Form.Item>
           <Form.Item
             name="currency"

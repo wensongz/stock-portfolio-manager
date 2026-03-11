@@ -6,6 +6,7 @@ interface PieChartProps {
   title?: string;
   centerText?: string;
   height?: number;
+  currencyCode?: string;
 }
 
 const DEFAULT_COLORS = [
@@ -13,7 +14,7 @@ const DEFAULT_COLORS = [
   "#3ba272", "#fc8452", "#9a60b4", "#ea7ccc", "#48b8d0",
 ];
 
-export default function PieChart({ data, title, centerText, height = 300 }: PieChartProps) {
+export default function PieChart({ data, title, centerText, height = 300, currencyCode = "USD" }: PieChartProps) {
   const seriesData = data.map((item, i) => ({
     name: item.name,
     value: item.value,
@@ -29,7 +30,7 @@ export default function PieChart({ data, title, centerText, height = 300 }: PieC
     tooltip: {
       trigger: "item",
       formatter: (params: { name: string; value: number; percent: number }) =>
-        `${params.name}<br/>USD ${params.value.toFixed(2)} (${params.percent}%)`,
+        `${params.name}<br/>${currencyCode} ${params.value.toFixed(2)} (${params.percent}%)`,
     },
     legend: {
       type: "scroll",

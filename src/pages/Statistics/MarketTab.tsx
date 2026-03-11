@@ -86,21 +86,21 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
             {stats.account_distribution.length > 0 && (
               <Col xs={24} md={8}>
                 <Card title="账户分布">
-                  <PieChart data={stats.account_distribution} height={260} />
+                  <PieChart data={stats.account_distribution} height={260} currencyCode={marketCurrency[selectedMarket]?.code ?? "USD"} />
                 </Card>
               </Col>
             )}
             {stats.category_distribution.length > 0 && (
               <Col xs={24} md={8}>
                 <Card title="类别分布">
-                  <PieChart data={stats.category_distribution} height={260} />
+                  <PieChart data={stats.category_distribution} height={260} currencyCode={marketCurrency[selectedMarket]?.code ?? "USD"} />
                 </Card>
               </Col>
             )}
             {stats.stock_distribution.length > 0 && (
               <Col xs={24} md={8}>
                 <Card title="个股分布">
-                  <PieChart data={stats.stock_distribution} height={260} />
+                  <PieChart data={stats.stock_distribution} height={260} currencyCode={marketCurrency[selectedMarket]?.code ?? "USD"} />
                 </Card>
               </Col>
             )}

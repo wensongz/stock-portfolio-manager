@@ -94,14 +94,14 @@ export default function AccountTab({ selectedAccountId, onAccountChange }: Props
             {stats.category_distribution.length > 0 && (
               <Col xs={24} md={12}>
                 <Card title="类别分布">
-                  <PieChart data={stats.category_distribution} height={260} />
+                  <PieChart data={stats.category_distribution} height={260} currencyCode={currencyCode} />
                 </Card>
               </Col>
             )}
             {stats.stock_distribution.length > 0 && (
               <Col xs={24} md={12}>
                 <Card title="个股分布">
-                  <PieChart data={stats.stock_distribution} height={260} />
+                  <PieChart data={stats.stock_distribution} height={260} currencyCode={currencyCode} />
                 </Card>
               </Col>
             )}

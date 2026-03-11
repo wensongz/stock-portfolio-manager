@@ -41,23 +41,23 @@ export default function TransactionsPage() {
   }, [fetchTransactions, fetchAccounts]);
 
   const handleSubmit = async (values: {
-    account_id: string;
+    accountId: string;
     symbol: string;
     name: string;
     market: Market;
-    transaction_type: TransactionType;
+    transactionType: TransactionType;
     shares: number;
     price: number;
-    total_amount: number;
+    totalAmount: number;
     commission: number;
     currency: Currency;
-    traded_at: dayjs.Dayjs;
+    tradedAt: dayjs.Dayjs;
     notes?: string;
   }) => {
     try {
       await createTransaction({
         ...values,
-        traded_at: values.traded_at.toISOString(),
+        tradedAt: values.tradedAt.toISOString(),
       });
       message.success("交易记录添加成功");
       setModalOpen(false);
@@ -187,8 +187,8 @@ export default function TransactionsPage() {
         width={640}
       >
         <Form form={form} layout="vertical" onFinish={handleSubmit}
-          initialValues={{ traded_at: dayjs(), commission: 0 }}>
-          <Form.Item name="account_id" label="证券账户"
+          initialValues={{ tradedAt: dayjs(), commission: 0 }}>
+          <Form.Item name="accountId" label="证券账户"
             rules={[{ required: true, message: "请选择账户" }]}>
             <Select placeholder="选择证券账户">
               {accounts.map((a) => (
@@ -214,7 +214,7 @@ export default function TransactionsPage() {
               <Select.Option value="HK">🇭🇰 港股</Select.Option>
             </Select>
           </Form.Item>
-          <Form.Item name="transaction_type" label="交易类型"
+          <Form.Item name="transactionType" label="交易类型"
             rules={[{ required: true, message: "请选择交易类型" }]}>
             <Select placeholder="买入 / 卖出">
               <Select.Option value="BUY">买入</Select.Option>
@@ -229,7 +229,7 @@ export default function TransactionsPage() {
             rules={[{ required: true, message: "请输入成交价格" }]}>
             <InputNumber min={0} precision={4} style={{ width: "100%" }} />
           </Form.Item>
-          <Form.Item name="total_amount" label="成交总额"
+          <Form.Item name="totalAmount" label="成交总额"
             rules={[{ required: true, message: "请输入成交总额" }]}>
             <InputNumber min={0} precision={2} style={{ width: "100%" }} />
           </Form.Item>
@@ -244,7 +244,7 @@ export default function TransactionsPage() {
               <Select.Option value="HKD">HKD 港元</Select.Option>
             </Select>
           </Form.Item>
-          <Form.Item name="traded_at" label="成交时间"
+          <Form.Item name="tradedAt" label="成交时间"
             rules={[{ required: true, message: "请选择成交时间" }]}>
             <DatePicker showTime style={{ width: "100%" }} />
           </Form.Item>

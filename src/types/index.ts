@@ -214,7 +214,7 @@ export interface CreateCategoryPayload {
   name: string;
   color: string;
   icon: string;
-  sort_order?: number;
+  sortOrder?: number;
 }
 
 export interface UpdateCategoryPayload {
@@ -222,29 +222,29 @@ export interface UpdateCategoryPayload {
   name: string;
   color: string;
   icon: string;
-  sort_order?: number;
+  sortOrder?: number;
 }
 
 export interface CreateHoldingPayload {
-  account_id: string;
+  accountId: string;
   symbol: string;
   name: string;
   market: Market;
-  category_id?: string;
+  categoryId?: string;
   shares: number;
-  avg_cost: number;
+  avgCost: number;
   currency: Currency;
 }
 
 export interface UpdateHoldingPayload {
   id: string;
-  account_id: string;
+  accountId: string;
   symbol: string;
   name: string;
   market: Market;
-  category_id?: string;
+  categoryId?: string;
   shares: number;
-  avg_cost: number;
+  avgCost: number;
   currency: Currency;
 }
 
@@ -329,17 +329,17 @@ export interface RiskMetrics {
 }
 
 export interface CreateTransactionPayload {
-  account_id: string;
+  accountId: string;
   symbol: string;
   name: string;
   market: Market;
-  transaction_type: TransactionType;
+  transactionType: TransactionType;
   shares: number;
   price: number;
-  total_amount: number;
+  totalAmount: number;
   commission: number;
   currency: Currency;
-  traded_at: string;
+  tradedAt: string;
   notes?: string;
 }
 

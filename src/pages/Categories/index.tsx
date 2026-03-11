@@ -29,7 +29,7 @@ export default function CategoriesPage() {
     fetchCategories();
   }, [fetchCategories]);
 
-  const handleSubmit = async (values: { name: string; color: string; icon: string; sort_order?: number }) => {
+  const handleSubmit = async (values: { name: string; color: string; icon: string; sortOrder?: number }) => {
     try {
       if (editingCategory) {
         await updateCategory({ id: editingCategory.id, ...values });
@@ -48,7 +48,12 @@ export default function CategoriesPage() {
 
   const handleEdit = (category: Category) => {
     setEditingCategory(category);
-    form.setFieldsValue(category);
+    form.setFieldsValue({
+      name: category.name,
+      color: category.color,
+      icon: category.icon,
+      sortOrder: category.sort_order,
+    });
     setModalOpen(true);
   };
 
@@ -178,7 +183,7 @@ export default function CategoriesPage() {
             rules={[{ required: true, message: "请输入颜色" }]}>
             <Input placeholder="#F97316" maxLength={7} />
           </Form.Item>
-          <Form.Item name="sort_order" label="排序顺序">
+          <Form.Item name="sortOrder" label="排序顺序">
             <Input type="number" placeholder="数字越小越靠前" />
           </Form.Item>
         </Form>

@@ -129,13 +129,13 @@ export default function HoldingsPage() {
   }, [showRealtime, refreshIntervalMs]);
 
   const handleSubmit = async (values: {
-    account_id: string;
+    accountId: string;
     symbol: string;
     name: string;
     market: Market;
-    category_id?: string;
+    categoryId?: string;
     shares: number;
-    avg_cost: number;
+    avgCost: number;
     currency: Currency;
   }) => {
     try {
@@ -156,7 +156,16 @@ export default function HoldingsPage() {
 
   const handleEdit = (holding: Holding) => {
     setEditingHolding(holding);
-    form.setFieldsValue(holding);
+    form.setFieldsValue({
+      accountId: holding.account_id,
+      symbol: holding.symbol,
+      name: holding.name,
+      market: holding.market,
+      categoryId: holding.category_id,
+      shares: holding.shares,
+      avgCost: holding.avg_cost,
+      currency: holding.currency,
+    });
     setModalOpen(true);
   };
 
@@ -369,7 +378,7 @@ export default function HoldingsPage() {
       >
         <Form form={form} layout="vertical" onFinish={handleSubmit}>
           <Form.Item
-            name="account_id"
+            name="accountId"
             label="所属账户"
             rules={[{ required: true, message: "请选择账户" }]}
           >
@@ -409,7 +418,7 @@ export default function HoldingsPage() {
               <Select.Option value="HK">🇭🇰 港股</Select.Option>
             </Select>
           </Form.Item>
-          <Form.Item name="category_id" label="投资类别">
+          <Form.Item name="categoryId" label="投资类别">
             <Select placeholder="选择投资类别（可选）" allowClear>
               {categories.map((c) => (
                 <Select.Option key={c.id} value={c.id}>
@@ -426,7 +435,7 @@ export default function HoldingsPage() {
             <InputNumber min={0} precision={2} style={{ width: "100%" }} placeholder="持有股数" />
           </Form.Item>
           <Form.Item
-            name="avg_cost"
+            name="avgCost"
             label="平均成本价"
             rules={[{ required: true, message: "请输入平均成本价" }]}
           >

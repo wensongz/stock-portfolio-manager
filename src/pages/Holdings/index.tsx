@@ -281,6 +281,9 @@ export default function HoldingsPage() {
     {
       title: "当前市值",
       key: "market_value",
+      sorter: (a: HoldingWithQuote, b: HoldingWithQuote) =>
+        (a.market_value ?? 0) - (b.market_value ?? 0),
+      defaultSortOrder: "descend" as const,
       render: (_: unknown, record: HoldingWithQuote) => {
         if (record.market_value === null || record.market_value === undefined)
           return <span>—</span>;

@@ -108,6 +108,7 @@ export default function HoldingsTable({ holdings, loading }: Props) {
       dataIndex: "market_value",
       key: "market_value",
       sorter: (a, b) => a.market_value - b.market_value,
+      defaultSortOrder: "descend" as const,
       render: (value: number, record: HoldingDetail) =>
         fmtMoney(value, record.currency),
       align: "right",

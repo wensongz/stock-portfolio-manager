@@ -92,6 +92,7 @@ export default function SnapshotHoldingsTable({ holdings, snapshotId, loading }:
       render: (v: number) => <Text strong>{fmt(v)}</Text>,
       sorter: (a: QuarterlyHoldingSnapshot, b: QuarterlyHoldingSnapshot) =>
         a.market_value - b.market_value,
+      defaultSortOrder: "descend" as const,
     },
     {
       title: "盈亏",

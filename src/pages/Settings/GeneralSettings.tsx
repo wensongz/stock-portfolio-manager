@@ -16,8 +16,8 @@ const INTERVAL_OPTIONS = [
 ];
 
 const PROVIDER_OPTIONS_US_HK = [
-  { value: "yahoo", label: "Yahoo Finance（默认）" },
-  { value: "eastmoney", label: "东方财富" },
+  { value: "yahoo", label: "Yahoo Finance" },
+  { value: "eastmoney", label: "东方财富（默认）" },
 ];
 
 const PROVIDER_OPTIONS_CN = [
@@ -27,8 +27,8 @@ const PROVIDER_OPTIONS_CN = [
 export default function GeneralSettings() {
   const { refreshIntervalMs, setRefreshInterval } = useQuoteStore();
   const [providerConfig, setProviderConfig] = useState<QuoteProviderConfig>({
-    us_provider: "yahoo",
-    hk_provider: "yahoo",
+    us_provider: "eastmoney",
+    hk_provider: "eastmoney",
     cn_provider: "eastmoney",
   });
 

@@ -259,7 +259,7 @@ pub async fn fetch_yahoo_quote(symbol: &str, market: &str) -> Result<StockQuote,
 
 /// Fetch a US stock quote using the configured provider.
 pub async fn fetch_us_quote(symbol: &str) -> Result<StockQuote, String> {
-    fetch_us_quote_with_provider(symbol, "yahoo").await
+    fetch_us_quote_with_provider(symbol, "eastmoney").await
 }
 
 /// Fetch a US stock quote using the specified provider.
@@ -272,7 +272,7 @@ pub async fn fetch_us_quote_with_provider(symbol: &str, provider: &str) -> Resul
 
 /// Fetch a HK stock quote using the configured provider. Appends ".HK" if not present for Yahoo.
 pub async fn fetch_hk_quote(symbol: &str) -> Result<StockQuote, String> {
-    fetch_hk_quote_with_provider(symbol, "yahoo").await
+    fetch_hk_quote_with_provider(symbol, "eastmoney").await
 }
 
 /// Fetch a HK stock quote using the specified provider.
@@ -527,7 +527,7 @@ fn parse_eastmoney_quote(symbol: &str, market: &str, resp: EastMoneyResponse) ->
 pub async fn fetch_quotes_batch(
     symbols: Vec<(String, String)>,
 ) -> Result<Vec<StockQuote>, String> {
-    fetch_quotes_batch_with_providers(symbols, "yahoo", "yahoo").await
+    fetch_quotes_batch_with_providers(symbols, "eastmoney", "eastmoney").await
 }
 
 /// Batch fetch quotes using the specified providers for US and HK markets.

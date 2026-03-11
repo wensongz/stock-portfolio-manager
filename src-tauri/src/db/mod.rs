@@ -228,8 +228,8 @@ impl Database {
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS quote_provider_config (
                 id INTEGER PRIMARY KEY DEFAULT 1,
-                us_provider TEXT NOT NULL DEFAULT 'yahoo',
-                hk_provider TEXT NOT NULL DEFAULT 'yahoo',
+                us_provider TEXT NOT NULL DEFAULT 'eastmoney',
+                hk_provider TEXT NOT NULL DEFAULT 'eastmoney',
                 cn_provider TEXT NOT NULL DEFAULT 'eastmoney',
                 updated_at TEXT NOT NULL DEFAULT ''
             );

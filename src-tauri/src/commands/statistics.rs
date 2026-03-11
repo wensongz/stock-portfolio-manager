@@ -142,17 +142,10 @@ pub async fn get_statistics_overview(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_statistics_by_market(
     db: State<'_, Database>,
-    cache: State<'_, ExchangeRateCache>,
+    _cache: State<'_, ExchangeRateCache>,
     quote_cache: State<'_, QuoteCache>,
     market: String,
 ) -> Result<MarketStatistics, String> {
-    let rates = get_cached_rates(&cache).await.unwrap_or_else(|_| crate::models::ExchangeRates {
-        usd_cny: 7.2,
-        usd_hkd: 7.8,
-        cny_hkd: 7.8 / 7.2,
-        updated_at: chrono::Utc::now().to_rfc3339(),
-    });
-
     let all_details = build_holding_details_pub(&db, &quote_cache).await?;
     let details: Vec<_> = all_details
         .into_iter()
@@ -166,20 +159,21 @@ pub async fn get_statistics_by_market(
     let mut total_market_value = 0.0f64;
     let mut total_cost = 0.0f64;
 
+    // Use native currency values directly (CN→CNY, HK→HKD, US→USD)
     for d in &details {
-        let mv_usd = to_usd_value(d.market_value, &d.currency, &rates);
-        let cv_usd = to_usd_value(d.cost_value, &d.currency, &rates);
+        let mv = d.market_value;
+        let cv = d.cost_value;
 
-        *account_map.entry(d.account_name.clone()).or_insert(0.0) += mv_usd;
+        *account_map.entry(d.account_name.clone()).or_insert(0.0) += mv;
         *category_map
             .entry((d.category_name.clone(), Some(d.category_color.clone())))
-            .or_insert(0.0) += mv_usd;
+            .or_insert(0.0) += mv;
         *stock_map
             .entry(format!("{} {}", d.symbol, d.name))
-            .or_insert(0.0) += mv_usd;
+            .or_insert(0.0) += mv;
 
-        total_market_value += mv_usd;
-        total_cost += cv_usd;
+        total_market_value += mv;
+        total_cost += cv;
     }
 
     let mut account_distribution: Vec<PieSlice> = account_map

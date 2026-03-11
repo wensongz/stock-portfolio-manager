@@ -15,6 +15,12 @@ const markets = [
   { value: "HK", label: "🇭🇰 港股" },
 ];
 
+const marketCurrency: Record<string, { code: string; symbol: string }> = {
+  US: { code: "USD", symbol: "$" },
+  CN: { code: "CNY", symbol: "¥" },
+  HK: { code: "HKD", symbol: "HK$" },
+};
+
 function pnlColor(pnl: number) {
   return pnl >= 0 ? "#22C55E" : "#EF4444";
 }
@@ -55,21 +61,21 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
           <Row gutter={[16, 16]} className="mb-4">
             <Col xs={24} sm={8}>
               <Card>
-                <Statistic title="市场总市值 (USD)" value={stats.total_market_value.toFixed(2)} prefix="$" />
+                <Statistic title={`市场总市值 (${marketCurrency[selectedMarket]?.code ?? "USD"})`} value={stats.total_market_value.toFixed(2)} prefix={marketCurrency[selectedMarket]?.symbol ?? "$"} />
               </Card>
             </Col>
             <Col xs={24} sm={8}>
               <Card>
-                <Statistic title="市场总成本 (USD)" value={stats.total_cost.toFixed(2)} prefix="$" />
+                <Statistic title={`市场总成本 (${marketCurrency[selectedMarket]?.code ?? "USD"})`} value={stats.total_cost.toFixed(2)} prefix={marketCurrency[selectedMarket]?.symbol ?? "$"} />
               </Card>
             </Col>
             <Col xs={24} sm={8}>
               <Card>
                 <Statistic
-                  title="市场总盈亏 (USD)"
+                  title={`市场总盈亏 (${marketCurrency[selectedMarket]?.code ?? "USD"})`}
                   value={`${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl.toFixed(2)}`}
                   valueStyle={{ color: pnlColor(stats.total_pnl) }}
-                  prefix="$"
+                  prefix={marketCurrency[selectedMarket]?.symbol ?? "$"}
                   suffix={`(${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl_percent.toFixed(2)}%)`}
                 />
               </Card>

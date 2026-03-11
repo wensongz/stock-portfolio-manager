@@ -635,6 +635,7 @@ pub async fn refresh_quarterly_snapshot(
 
     struct UpdateRow {
         id: String,
+        market: String,
         close_price: f64,
         market_value: f64,
         cost_value: f64,
@@ -673,6 +674,7 @@ pub async fn refresh_quarterly_snapshot(
 
         updates.push(UpdateRow {
             id: h.id.clone(),
+            market: h.market.clone(),
             close_price,
             market_value,
             cost_value,
@@ -704,8 +706,7 @@ pub async fn refresh_quarterly_snapshot(
         // Update holding snapshots
         for u in &updates {
             let weight = if total_value != 0.0 {
-                let market = holdings.iter().find(|h| h.id == u.id).map(|h| h.market.as_str()).unwrap_or("US");
-                let mv_usd = match market {
+                let mv_usd = match u.market.as_str() {
                     "CN" => convert_currency(u.market_value, "CNY", "USD", &rates),
                     "HK" => convert_currency(u.market_value, "HKD", "USD", &rates),
                     _ => u.market_value,

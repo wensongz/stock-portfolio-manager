@@ -70,6 +70,7 @@ pub fn run() {
             commands::quarterly::get_quarterly_snapshots,
             commands::quarterly::get_quarterly_snapshot_detail,
             commands::quarterly::delete_quarterly_snapshot,
+            commands::quarterly::refresh_quarterly_snapshot,
             commands::quarterly::check_missing_snapshots,
             commands::quarterly::compare_quarters,
             commands::quarterly::update_holding_notes,

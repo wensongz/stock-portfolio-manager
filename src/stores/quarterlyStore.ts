@@ -20,6 +20,7 @@ interface QuarterlyState {
 
   fetchSnapshots: () => Promise<void>;
   fetchDetail: (snapshotId: string) => Promise<void>;
+  refreshSnapshot: (snapshotId: string) => Promise<void>;
   createSnapshot: (quarter?: string) => Promise<QuarterlySnapshot | null>;
   deleteSnapshot: (snapshotId: string) => Promise<void>;
   fetchMissingQuarters: () => Promise<void>;
@@ -59,6 +60,20 @@ export const useQuarterlyStore = create<QuarterlyState>((set, get) => ({
         snapshotId,
       });
       set({ detail, loading: false });
+    } catch (err) {
+      set({ error: String(err), loading: false });
+    }
+  },
+
+  refreshSnapshot: async (snapshotId: string) => {
+    set({ loading: true, error: null });
+    try {
+      const detail = await invoke<QuarterlySnapshotDetail>("refresh_quarterly_snapshot", {
+        snapshotId,
+      });
+      set({ detail, loading: false });
+      // Also refresh the snapshots list since totals may have changed
+      await get().fetchSnapshots();
     } catch (err) {
       set({ error: String(err), loading: false });
     }

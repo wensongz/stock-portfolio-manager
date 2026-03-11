@@ -42,6 +42,16 @@ pub async fn delete_quarterly_snapshot(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+pub async fn refresh_quarterly_snapshot(
+    db: State<'_, Database>,
+    cache: State<'_, ExchangeRateCache>,
+    quote_cache: State<'_, QuoteCache>,
+    snapshot_id: String,
+) -> Result<QuarterlySnapshotDetail, String> {
+    quarterly_service::refresh_quarterly_snapshot(&db, &cache, &quote_cache, &snapshot_id).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
 pub async fn check_missing_snapshots(
     db: State<'_, Database>,
 ) -> Result<Vec<String>, String> {

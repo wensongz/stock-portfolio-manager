@@ -25,7 +25,7 @@ function fmt(val: number) {
 export default function SnapshotDetail() {
   const { snapshotId } = useParams<{ snapshotId: string }>();
   const navigate = useNavigate();
-  const { detail, loading, fetchDetail, clearDetail } = useQuarterlyStore();
+  const { detail, loading, fetchDetail, refreshSnapshot, clearDetail } = useQuarterlyStore();
 
   useEffect(() => {
     if (snapshotId) {
@@ -62,7 +62,7 @@ export default function SnapshotDetail() {
         </Space>
         <Button
           icon={<ReloadOutlined />}
-          onClick={() => snapshotId && fetchDetail(snapshotId)}
+          onClick={() => snapshotId && refreshSnapshot(snapshotId)}
           loading={loading}
           size="small"
         >

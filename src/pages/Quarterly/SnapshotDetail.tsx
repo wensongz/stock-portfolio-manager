@@ -15,6 +15,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { useQuarterlyStore } from "../../stores/quarterlyStore";
 import SnapshotHoldingsTable from "./SnapshotHoldingsTable";
 import QuarterlyNotesEditor from "./QuarterlyNotesEditor";
+import HoldingChangesTable from "./HoldingChangesTable";
 
 const { Title, Text } = Typography;
 
@@ -156,6 +157,19 @@ export default function SnapshotDetail() {
       )}
 
       <Divider />
+
+      {/* Quarterly Operations - Holding Changes vs Previous Quarter */}
+      {detail?.holding_changes && detail?.previous_quarter && (
+        <>
+          <HoldingChangesTable
+            changes={detail.holding_changes}
+            quarter1={detail.previous_quarter}
+            quarter2={snap?.quarter ?? ""}
+            title={`季度操作 (${detail.previous_quarter} → ${snap?.quarter})`}
+          />
+          <Divider />
+        </>
+      )}
 
       {/* Holdings Table */}
       {snapshotId && (

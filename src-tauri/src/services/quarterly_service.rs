@@ -53,6 +53,16 @@ pub fn parse_quarter(s: &str) -> Result<(i32, u32), String> {
     Ok((year, q))
 }
 
+/// Returns the previous quarter string (e.g., "2025-Q1" -> "2024-Q4", "2025-Q3" -> "2025-Q2").
+pub fn previous_quarter(s: &str) -> Result<String, String> {
+    let (year, q) = parse_quarter(s)?;
+    if q == 1 {
+        Ok(format!("{}-Q4", year - 1))
+    } else {
+        Ok(format!("{}-Q{}", year, q - 1))
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
@@ -418,83 +428,96 @@ pub fn get_quarterly_snapshot_detail(
     db: &Database,
     snapshot_id: &str,
 ) -> Result<QuarterlySnapshotDetail, String> {
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let (snapshot, holdings) = {
+        let conn = db.conn.lock().map_err(|e| e.to_string())?;
 
-    // Get snapshot header
-    let snapshot = conn
-        .query_row(
-            "SELECT qs.id, qs.quarter, qs.snapshot_date, qs.total_value, qs.total_cost, qs.total_pnl,
-                    qs.us_value, qs.us_cost, qs.cn_value, qs.cn_cost, qs.hk_value, qs.hk_cost,
-                    qs.exchange_rates, qs.overall_notes, qs.created_at,
-                    COUNT(qhs.id) AS holding_count
-             FROM quarterly_snapshots qs
-             LEFT JOIN quarterly_holding_snapshots qhs ON qhs.quarterly_snapshot_id = qs.id
-             WHERE qs.id = ?1
-             GROUP BY qs.id",
-            rusqlite::params![snapshot_id],
-            |row| {
-                Ok(QuarterlySnapshot {
+        // Get snapshot header
+        let snapshot = conn
+            .query_row(
+                "SELECT qs.id, qs.quarter, qs.snapshot_date, qs.total_value, qs.total_cost, qs.total_pnl,
+                        qs.us_value, qs.us_cost, qs.cn_value, qs.cn_cost, qs.hk_value, qs.hk_cost,
+                        qs.exchange_rates, qs.overall_notes, qs.created_at,
+                        COUNT(qhs.id) AS holding_count
+                 FROM quarterly_snapshots qs
+                 LEFT JOIN quarterly_holding_snapshots qhs ON qhs.quarterly_snapshot_id = qs.id
+                 WHERE qs.id = ?1
+                 GROUP BY qs.id",
+                rusqlite::params![snapshot_id],
+                |row| {
+                    Ok(QuarterlySnapshot {
+                        id: row.get(0)?,
+                        quarter: row.get(1)?,
+                        snapshot_date: row.get(2)?,
+                        total_value: row.get(3)?,
+                        total_cost: row.get(4)?,
+                        total_pnl: row.get(5)?,
+                        us_value: row.get(6)?,
+                        us_cost: row.get(7)?,
+                        cn_value: row.get(8)?,
+                        cn_cost: row.get(9)?,
+                        hk_value: row.get(10)?,
+                        hk_cost: row.get(11)?,
+                        exchange_rates: row.get(12)?,
+                        overall_notes: row.get(13)?,
+                        created_at: row.get(14)?,
+                        holding_count: row.get::<_, i64>(15)? as usize,
+                    })
+                },
+            )
+            .map_err(|e| format!("Snapshot not found: {}", e))?;
+
+        // Get holdings
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, quarterly_snapshot_id, account_id, account_name, symbol, name, market,
+                        category_name, category_color, shares, avg_cost, close_price,
+                        market_value, cost_value, pnl, pnl_percent, weight, notes
+                 FROM quarterly_holding_snapshots
+                 WHERE quarterly_snapshot_id = ?1
+                 ORDER BY market, symbol",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let holdings = stmt
+            .query_map(rusqlite::params![snapshot_id], |row| {
+                Ok(QuarterlyHoldingSnapshot {
                     id: row.get(0)?,
-                    quarter: row.get(1)?,
-                    snapshot_date: row.get(2)?,
-                    total_value: row.get(3)?,
-                    total_cost: row.get(4)?,
-                    total_pnl: row.get(5)?,
-                    us_value: row.get(6)?,
-                    us_cost: row.get(7)?,
-                    cn_value: row.get(8)?,
-                    cn_cost: row.get(9)?,
-                    hk_value: row.get(10)?,
-                    hk_cost: row.get(11)?,
-                    exchange_rates: row.get(12)?,
-                    overall_notes: row.get(13)?,
-                    created_at: row.get(14)?,
-                    holding_count: row.get::<_, i64>(15)? as usize,
+                    quarterly_snapshot_id: row.get(1)?,
+                    account_id: row.get(2)?,
+                    account_name: row.get(3)?,
+                    symbol: row.get(4)?,
+                    name: row.get(5)?,
+                    market: row.get(6)?,
+                    category_name: row.get(7)?,
+                    category_color: row.get(8)?,
+                    shares: row.get(9)?,
+                    avg_cost: row.get(10)?,
+                    close_price: row.get(11)?,
+                    market_value: row.get(12)?,
+                    cost_value: row.get(13)?,
+                    pnl: row.get(14)?,
+                    pnl_percent: row.get(15)?,
+                    weight: row.get(16)?,
+                    notes: row.get(17)?,
                 })
-            },
-        )
-        .map_err(|e| format!("Snapshot not found: {}", e))?;
-
-    // Get holdings
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, quarterly_snapshot_id, account_id, account_name, symbol, name, market,
-                    category_name, category_color, shares, avg_cost, close_price,
-                    market_value, cost_value, pnl, pnl_percent, weight, notes
-             FROM quarterly_holding_snapshots
-             WHERE quarterly_snapshot_id = ?1
-             ORDER BY market, symbol",
-        )
-        .map_err(|e| e.to_string())?;
-
-    let holdings = stmt
-        .query_map(rusqlite::params![snapshot_id], |row| {
-            Ok(QuarterlyHoldingSnapshot {
-                id: row.get(0)?,
-                quarterly_snapshot_id: row.get(1)?,
-                account_id: row.get(2)?,
-                account_name: row.get(3)?,
-                symbol: row.get(4)?,
-                name: row.get(5)?,
-                market: row.get(6)?,
-                category_name: row.get(7)?,
-                category_color: row.get(8)?,
-                shares: row.get(9)?,
-                avg_cost: row.get(10)?,
-                close_price: row.get(11)?,
-                market_value: row.get(12)?,
-                cost_value: row.get(13)?,
-                pnl: row.get(14)?,
-                pnl_percent: row.get(15)?,
-                weight: row.get(16)?,
-                notes: row.get(17)?,
             })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
 
-    Ok(QuarterlySnapshotDetail { snapshot, holdings })
+        (snapshot, holdings)
+    }; // conn lock released here
+
+    // Compute holding changes vs previous quarter
+    let prev_q = previous_quarter(&snapshot.quarter).ok();
+    let holding_changes = prev_q.as_ref().and_then(|pq| {
+        load_holdings_for_quarter(db, pq).ok().map(|prev_holdings| {
+            compute_holding_changes(&prev_holdings, &holdings)
+        })
+    });
+    let previous_quarter = if holding_changes.is_some() { prev_q } else { None };
+
+    Ok(QuarterlySnapshotDetail { snapshot, holdings, holding_changes, previous_quarter })
 }
 
 /// Delete a quarterly snapshot and its holding details.
@@ -946,6 +969,61 @@ fn load_snapshot_for_quarter(
     Ok((snapshot, holdings))
 }
 
+/// Load only the holdings for a given quarter. Used for computing holding changes.
+fn load_holdings_for_quarter(
+    db: &Database,
+    quarter: &str,
+) -> Result<Vec<QuarterlyHoldingSnapshot>, String> {
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+
+    let snapshot_id: String = conn
+        .query_row(
+            "SELECT id FROM quarterly_snapshots WHERE quarter = ?1",
+            rusqlite::params![quarter],
+            |row| row.get(0),
+        )
+        .map_err(|_| format!("No snapshot found for quarter '{}'", quarter))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, quarterly_snapshot_id, account_id, account_name, symbol, name, market,
+                    category_name, category_color, shares, avg_cost, close_price,
+                    market_value, cost_value, pnl, pnl_percent, weight, notes
+             FROM quarterly_holding_snapshots
+             WHERE quarterly_snapshot_id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let holdings = stmt
+        .query_map(rusqlite::params![snapshot_id], |row| {
+            Ok(QuarterlyHoldingSnapshot {
+                id: row.get(0)?,
+                quarterly_snapshot_id: row.get(1)?,
+                account_id: row.get(2)?,
+                account_name: row.get(3)?,
+                symbol: row.get(4)?,
+                name: row.get(5)?,
+                market: row.get(6)?,
+                category_name: row.get(7)?,
+                category_color: row.get(8)?,
+                shares: row.get(9)?,
+                avg_cost: row.get(10)?,
+                close_price: row.get(11)?,
+                market_value: row.get(12)?,
+                cost_value: row.get(13)?,
+                pnl: row.get(14)?,
+                pnl_percent: row.get(15)?,
+                weight: row.get(16)?,
+                notes: row.get(17)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    Ok(holdings)
+}
+
 fn compute_market_comparison(
     h1: &[QuarterlyHoldingSnapshot],
     h2: &[QuarterlyHoldingSnapshot],
@@ -1352,4 +1430,25 @@ pub fn get_quarterly_trends(db: &Database) -> Result<QuarterlyTrends, String> {
         category_values,
         holding_counts,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_previous_quarter() {
+        assert_eq!(previous_quarter("2025-Q2").unwrap(), "2025-Q1");
+        assert_eq!(previous_quarter("2025-Q3").unwrap(), "2025-Q2");
+        assert_eq!(previous_quarter("2025-Q4").unwrap(), "2025-Q3");
+        assert_eq!(previous_quarter("2025-Q1").unwrap(), "2024-Q4");
+        assert_eq!(previous_quarter("2000-Q1").unwrap(), "1999-Q4");
+    }
+
+    #[test]
+    fn test_previous_quarter_invalid() {
+        assert!(previous_quarter("invalid").is_err());
+        assert!(previous_quarter("2025-Q5").is_err());
+        assert!(previous_quarter("2025-Q0").is_err());
+    }
 }

@@ -7,6 +7,7 @@ interface Props {
   changes: HoldingChanges;
   quarter1: string;
   quarter2: string;
+  title?: string;
 }
 
 function fmt(v: number) {
@@ -137,7 +138,7 @@ function HoldingTable({
   );
 }
 
-export default function HoldingChangesTable({ changes, quarter1, quarter2 }: Props) {
+export default function HoldingChangesTable({ changes, quarter1, quarter2, title }: Props) {
   const tabs = [
     {
       key: "new",
@@ -227,7 +228,7 @@ export default function HoldingChangesTable({ changes, quarter1, quarter2 }: Pro
   ];
 
   return (
-    <Card size="small" title="持仓变动明细">
+    <Card size="small" title={title ?? "持仓变动明细"}>
       <Tabs items={tabs} size="small" />
     </Card>
   );

@@ -47,6 +47,8 @@ pub struct QuarterlyHoldingSnapshot {
 pub struct QuarterlySnapshotDetail {
     pub snapshot: QuarterlySnapshot,
     pub holdings: Vec<QuarterlyHoldingSnapshot>,
+    pub holding_changes: Option<HoldingChanges>,
+    pub previous_quarter: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -387,6 +387,8 @@ export interface QuarterlyHoldingSnapshot {
 export interface QuarterlySnapshotDetail {
   snapshot: QuarterlySnapshot;
   holdings: QuarterlyHoldingSnapshot[];
+  holding_changes: HoldingChanges | null;
+  previous_quarter: string | null;
 }
 
 export interface ComparisonOverview {

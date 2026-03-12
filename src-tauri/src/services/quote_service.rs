@@ -7,6 +7,42 @@ use std::time::{Duration, Instant};
 
 const QUOTE_CACHE_TTL_SECS: u64 = 60; // 60-second cache
 
+/// Cash symbol prefix used to represent cash holdings.
+/// Cash symbols follow the pattern `$CASH-{CURRENCY}`, e.g. `$CASH-USD`, `$CASH-CNY`, `$CASH-HKD`.
+pub const CASH_SYMBOL_PREFIX: &str = "$CASH-";
+
+/// All recognised cash symbols.
+pub const CASH_SYMBOLS: [&str; 3] = ["$CASH-USD", "$CASH-CNY", "$CASH-HKD"];
+
+/// Returns `true` if the symbol represents a cash holding.
+pub fn is_cash_symbol(symbol: &str) -> bool {
+    symbol.starts_with(CASH_SYMBOL_PREFIX)
+}
+
+/// Return the display name for a cash symbol, e.g. "现金 (USD)".
+pub fn cash_display_name(symbol: &str) -> String {
+    let currency = symbol.strip_prefix(CASH_SYMBOL_PREFIX).unwrap_or("USD");
+    format!("现金 ({})", currency)
+}
+
+/// Build a synthetic [`StockQuote`] for a cash symbol.
+/// Cash always has price = 1.0, zero change, zero volume.
+pub fn make_cash_quote(symbol: &str, market: &str) -> StockQuote {
+    StockQuote {
+        symbol: symbol.to_string(),
+        name: cash_display_name(symbol),
+        market: market.to_string(),
+        current_price: 1.0,
+        previous_close: 1.0,
+        change: 0.0,
+        change_percent: 0.0,
+        high: 1.0,
+        low: 1.0,
+        volume: 0,
+        updated_at: Utc::now().to_rfc3339(),
+    }
+}
+
 struct CachedQuote {
     quote: StockQuote,
     cached_at: Instant,
@@ -531,7 +567,7 @@ pub async fn fetch_quotes_batch(
 }
 
 /// Batch fetch quotes using the specified providers for US and HK markets.
-/// CN always uses East Money.
+/// CN always uses East Money. Cash symbols return synthetic quotes (price = 1.0).
 pub async fn fetch_quotes_batch_with_providers(
     symbols: Vec<(String, String)>,
     us_provider: &str,
@@ -539,6 +575,11 @@ pub async fn fetch_quotes_batch_with_providers(
 ) -> Result<Vec<StockQuote>, String> {
     let mut quotes = Vec::new();
     for (symbol, market) in symbols {
+        // Cash symbols don't need an API call – return a synthetic quote.
+        if is_cash_symbol(&symbol) {
+            quotes.push(make_cash_quote(&symbol, &market));
+            continue;
+        }
         let result = match market.as_str() {
             "US" => fetch_us_quote_with_provider(&symbol, us_provider).await,
             "HK" => fetch_hk_quote_with_provider(&symbol, hk_provider).await,
@@ -1034,6 +1075,57 @@ mod tests {
         // Fallback for bare codes
         assert_eq!(to_yahoo_symbol("600519", "CN"), "600519.SS");
         assert_eq!(to_yahoo_symbol("000858", "CN"), "000858.SZ");
+    }
+
+    // ---- Cash symbol tests ----
+
+    #[test]
+    fn test_is_cash_symbol() {
+        assert!(is_cash_symbol("$CASH-USD"));
+        assert!(is_cash_symbol("$CASH-CNY"));
+        assert!(is_cash_symbol("$CASH-HKD"));
+        assert!(!is_cash_symbol("AAPL"));
+        assert!(!is_cash_symbol("sh600519"));
+        assert!(!is_cash_symbol("CASH"));
+        assert!(!is_cash_symbol("$CASH"));
+    }
+
+    #[test]
+    fn test_cash_display_name() {
+        assert_eq!(cash_display_name("$CASH-USD"), "现金 (USD)");
+        assert_eq!(cash_display_name("$CASH-CNY"), "现金 (CNY)");
+        assert_eq!(cash_display_name("$CASH-HKD"), "现金 (HKD)");
+    }
+
+    #[test]
+    fn test_make_cash_quote() {
+        let quote = make_cash_quote("$CASH-USD", "US");
+        assert_eq!(quote.symbol, "$CASH-USD");
+        assert_eq!(quote.market, "US");
+        assert!((quote.current_price - 1.0).abs() < f64::EPSILON);
+        assert!((quote.previous_close - 1.0).abs() < f64::EPSILON);
+        assert!((quote.change).abs() < f64::EPSILON);
+        assert!((quote.change_percent).abs() < f64::EPSILON);
+        assert_eq!(quote.volume, 0);
+        assert_eq!(quote.name, "现金 (USD)");
+    }
+
+    #[tokio::test]
+    async fn test_batch_fetch_cash_symbols_no_network() {
+        // Cash symbols should return synthetic quotes without any network call.
+        let symbols = vec![
+            ("$CASH-USD".to_string(), "US".to_string()),
+            ("$CASH-CNY".to_string(), "CN".to_string()),
+            ("$CASH-HKD".to_string(), "HK".to_string()),
+        ];
+        let result = fetch_quotes_batch_with_providers(symbols, "yahoo", "yahoo").await;
+        assert!(result.is_ok());
+        let quotes = result.unwrap();
+        assert_eq!(quotes.len(), 3);
+        for q in &quotes {
+            assert!(is_cash_symbol(&q.symbol));
+            assert!((q.current_price - 1.0).abs() < f64::EPSILON);
+        }
     }
 
     // ---- Integration tests using real network calls ----

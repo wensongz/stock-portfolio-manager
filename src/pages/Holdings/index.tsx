@@ -17,7 +17,7 @@ import {
   Spin,
   AutoComplete,
 } from "antd";
-import { PlusOutlined, ReloadOutlined, SyncOutlined, FilterOutlined } from "@ant-design/icons";
+import { PlusOutlined, ReloadOutlined, SyncOutlined, FilterOutlined, DollarOutlined } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
 import { useHoldingStore } from "../../stores/holdingStore";
 import { useAccountStore } from "../../stores/accountStore";
@@ -27,6 +27,21 @@ import type { Holding, HoldingWithQuote, Market, Currency, StockQuote } from "..
 import dayjs from "dayjs";
 
 const { Title, Text } = Typography;
+
+/** Cash symbol prefix – must match the backend constant. */
+const CASH_SYMBOL_PREFIX = "$CASH-";
+
+/** Map market → cash symbol */
+const MARKET_CASH_SYMBOL: Record<Market, string> = {
+  US: "$CASH-USD",
+  CN: "$CASH-CNY",
+  HK: "$CASH-HKD",
+};
+
+/** Returns true if the symbol represents a cash holding. */
+function isCashSymbol(symbol: string): boolean {
+  return symbol.startsWith(CASH_SYMBOL_PREFIX);
+}
 
 const marketColors: Record<Market, string> = {
   US: "blue",
@@ -57,9 +72,11 @@ export default function HoldingsPage() {
   const { holdingQuotes, loading: quotesLoading, lastUpdatedAt, refreshIntervalMs, fetchHoldingQuotes } = useQuoteStore();
 
   const [modalOpen, setModalOpen] = useState(false);
+  const [cashModalOpen, setCashModalOpen] = useState(false);
   const [editingHolding, setEditingHolding] = useState<Holding | null>(null);
   const [showRealtime, setShowRealtime] = useState(true);
   const [form] = Form.useForm();
+  const [cashForm] = Form.useForm();
   const [fetchingName, setFetchingName] = useState(false);
   const [filterAccountId, setFilterAccountId] = useState<string | undefined>(undefined);
   const [filterMarket, setFilterMarket] = useState<Market | undefined>(undefined);
@@ -112,6 +129,8 @@ export default function HoldingsPage() {
   const fetchStockName = useCallback(
     async (symbol: string) => {
       if (!symbol || !symbol.trim()) return;
+      // Cash symbols don't need an API call for the name.
+      if (isCashSymbol(symbol.trim())) return;
       const market: Market | undefined = form.getFieldValue("market");
       if (!market) return;
 
@@ -199,6 +218,37 @@ export default function HoldingsPage() {
     }
   };
 
+  /** Submit handler for the "Add Cash" modal. */
+  const handleCashSubmit = async (values: { accountId: string; amount: number }) => {
+    try {
+      const account = accounts.find((a) => a.id === values.accountId);
+      if (!account) {
+        message.error("账户不存在");
+        return;
+      }
+      const market = account.market as Market;
+      const currency = marketToCurrency[market];
+      const cashSymbol = MARKET_CASH_SYMBOL[market];
+      // Find the "现金类" category if available
+      const cashCategory = categories.find((c) => c.name === "现金类");
+      await createHolding({
+        accountId: values.accountId,
+        symbol: cashSymbol,
+        name: `现金 (${currency})`,
+        market,
+        categoryId: cashCategory?.id,
+        shares: values.amount,
+        avgCost: 1,
+        currency,
+      });
+      message.success("现金持仓创建成功");
+      setCashModalOpen(false);
+      cashForm.resetFields();
+    } catch (err) {
+      message.error(`操作失败: ${err}`);
+    }
+  };
+
   const handleEdit = (holding: Holding) => {
     setEditingHolding(holding);
     form.setFieldsValue({
@@ -251,7 +301,9 @@ export default function HoldingsPage() {
       key: "symbol",
       render: (symbol: string, record: HoldingWithQuote) => (
         <Space>
-          <Tag color={marketColors[record.market as Market]}>{record.market}</Tag>
+          <Tag color={isCashSymbol(symbol) ? "gold" : marketColors[record.market as Market]}>
+            {isCashSymbol(symbol) ? "💵" : record.market}
+          </Tag>
           <strong>{symbol}</strong>
         </Space>
       ),
@@ -278,17 +330,20 @@ export default function HoldingsPage() {
       },
     },
     {
-      title: "持仓股数",
+      title: "持仓数量/金额",
       dataIndex: "shares",
       key: "shares",
-      render: (v: number) => v.toLocaleString(),
+      render: (v: number, record: HoldingWithQuote) =>
+        isCashSymbol(record.symbol)
+          ? `${record.currency} ${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+          : v.toLocaleString(),
     },
     {
       title: "平均成本",
       dataIndex: "avg_cost",
       key: "avg_cost",
       render: (v: number, record: HoldingWithQuote) =>
-        `${record.currency} ${v.toFixed(3)}`,
+        isCashSymbol(record.symbol) ? "—" : `${record.currency} ${v.toFixed(3)}`,
     },
   ];
 
@@ -416,6 +471,18 @@ export default function HoldingsPage() {
             }}
           >
             新增持仓
+          </Button>
+          <Button
+            icon={<DollarOutlined />}
+            onClick={() => {
+              cashForm.resetFields();
+              if (filterAccountId) {
+                cashForm.setFieldsValue({ accountId: filterAccountId });
+              }
+              setCashModalOpen(true);
+            }}
+          >
+            添加现金
           </Button>
         </Space>
       </div>
@@ -560,6 +627,43 @@ export default function HoldingsPage() {
               <Select.Option value="CNY">CNY 人民币</Select.Option>
               <Select.Option value="HKD">HKD 港元</Select.Option>
             </Select>
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* Add Cash Modal */}
+      <Modal
+        title="添加现金"
+        open={cashModalOpen}
+        onOk={() => cashForm.submit()}
+        onCancel={() => {
+          setCashModalOpen(false);
+          cashForm.resetFields();
+        }}
+        okText="确认"
+        cancelText="取消"
+        width={480}
+      >
+        <Form form={cashForm} layout="vertical" onFinish={handleCashSubmit}>
+          <Form.Item
+            name="accountId"
+            label="所属账户"
+            rules={[{ required: true, message: "请选择账户" }]}
+          >
+            <Select placeholder="选择证券账户">
+              {accounts.map((a) => (
+                <Select.Option key={a.id} value={a.id}>
+                  [{a.market}] {a.name}
+                </Select.Option>
+              ))}
+            </Select>
+          </Form.Item>
+          <Form.Item
+            name="amount"
+            label="现金金额"
+            rules={[{ required: true, message: "请输入现金金额" }]}
+          >
+            <InputNumber min={0} precision={2} style={{ width: "100%" }} placeholder="如：10000" />
           </Form.Item>
         </Form>
       </Modal>

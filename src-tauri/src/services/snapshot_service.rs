@@ -385,10 +385,11 @@ pub async fn backfill_snapshots(
         // Cash holdings have a constant price of 1.0 – no history fetch needed.
         if crate::services::quote_service::is_cash_symbol(&holding.symbol) {
             // Populate every missing date with price = 1.0 so forward-fill works
-            let cash_prices: std::collections::HashMap<NaiveDate, f64> = missing_dates
-                .iter()
-                .map(|d| (*d, 1.0))
-                .collect();
+            let mut cash_prices =
+                std::collections::HashMap::with_capacity(missing_dates.len());
+            for d in &missing_dates {
+                cash_prices.insert(*d, 1.0);
+            }
             history_map.insert(holding.symbol.clone(), cash_prices);
             continue;
         }

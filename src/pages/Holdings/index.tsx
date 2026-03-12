@@ -43,6 +43,12 @@ function isCashSymbol(symbol: string): boolean {
   return symbol.startsWith(CASH_SYMBOL_PREFIX);
 }
 
+/** Shared formatting options for displaying currency amounts. */
+const CURRENCY_FORMAT_OPTIONS: Intl.NumberFormatOptions = {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+};
+
 const marketColors: Record<Market, string> = {
   US: "blue",
   CN: "red",
@@ -335,7 +341,7 @@ export default function HoldingsPage() {
       key: "shares",
       render: (v: number, record: HoldingWithQuote) =>
         isCashSymbol(record.symbol)
-          ? `${record.currency} ${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+          ? `${record.currency} ${v.toLocaleString(undefined, CURRENCY_FORMAT_OPTIONS)}`
           : v.toLocaleString(),
     },
     {

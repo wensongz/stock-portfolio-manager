@@ -20,8 +20,11 @@ pub fn is_cash_symbol(symbol: &str) -> bool {
 }
 
 /// Return the display name for a cash symbol, e.g. "现金 (USD)".
+/// Panics if the symbol does not start with [`CASH_SYMBOL_PREFIX`].
 pub fn cash_display_name(symbol: &str) -> String {
-    let currency = symbol.strip_prefix(CASH_SYMBOL_PREFIX).unwrap_or("USD");
+    let currency = symbol
+        .strip_prefix(CASH_SYMBOL_PREFIX)
+        .expect("cash_display_name called with non-cash symbol");
     format!("现金 ({})", currency)
 }
 

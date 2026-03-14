@@ -67,6 +67,12 @@ export interface StockQuote {
   updated_at: string;
 }
 
+export interface StockMetadata {
+  symbol: string;
+  name: string;
+  market: string;
+}
+
 export interface HoldingWithQuote extends Holding {
   quote: StockQuote | null;
   market_value: number | null;

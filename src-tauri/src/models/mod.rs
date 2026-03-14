@@ -29,7 +29,10 @@ pub use quarterly::{
     HoldingNoteHistory, MarketComparison, QuarterComparison, QuarterlyHoldingSnapshot,
     QuarterlyNotesSummary, QuarterlySnapshot, QuarterlySnapshotDetail, QuarterlyTrends,
 };
-pub use quote::{DailyHoldingSnapshot, DailyPortfolioValue, ExchangeRates, HoldingWithQuote, StockQuote};
+pub use quote::{
+    DailyHoldingSnapshot, DailyPortfolioValue, ExchangeRates, HoldingWithQuote, StockMetadata,
+    StockQuote,
+};
 pub use quote_provider::QuoteProviderConfig;
 pub use review::{DecisionStatistics, HoldingReview, QuarterlyHoldingStatus};
 pub use statistics::{AccountStatistics, CategoryStatistics, MarketStatistics, PieSlice, PnlItem, StatisticsOverview};

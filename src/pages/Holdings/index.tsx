@@ -23,7 +23,7 @@ import { useHoldingStore } from "../../stores/holdingStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { useCategoryStore } from "../../stores/categoryStore";
 import { useQuoteStore } from "../../stores/quoteStore";
-import type { Holding, HoldingWithQuote, Market, Currency, StockQuote } from "../../types";
+import type { Holding, HoldingWithQuote, Market, Currency, StockQuote, StockMetadata } from "../../types";
 import dayjs from "dayjs";
 
 const { Title, Text } = Typography;
@@ -87,6 +87,8 @@ export default function HoldingsPage() {
   const [filterAccountId, setFilterAccountId] = useState<string | undefined>(undefined);
   const [filterMarket, setFilterMarket] = useState<Market | undefined>(undefined);
   const [symbolSearch, setSymbolSearch] = useState("");
+  const [searchOptions, setSearchOptions] = useState<{ value: string; label: string; metadata: StockMetadata }[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
 
   // Derive unique stock symbols from existing holdings for autocomplete
   const symbolOptions = useMemo(() => {
@@ -103,15 +105,48 @@ export default function HoldingsPage() {
 
   // Filter autocomplete options: show only when input >= 3 characters
   const filteredSymbolOptions = useMemo(() => {
-    if (symbolSearch.length < 3) return [];
-    const search = symbolSearch.toLowerCase();
-    return symbolOptions
-      .filter((o) => o.symbol.toLowerCase().includes(search))
-      .map((o) => ({
-        value: o.symbol,
-        label: `${o.symbol} - ${o.name}`,
-      }));
-  }, [symbolSearch, symbolOptions]);
+    // Combine local holdings symbols with remote search results
+    const localOptions = symbolSearch.length >= 3
+      ? symbolOptions
+          .filter((o) => o.symbol.toLowerCase().includes(symbolSearch.toLowerCase()))
+          .map((o) => ({
+            value: o.symbol,
+            label: `${o.symbol} - ${o.name} (已有)`,
+            metadata: { symbol: o.symbol, name: o.name, market: o.market } as StockMetadata,
+          }))
+      : [];
+
+    // Filter out duplicates from searchOptions if they already exist in localOptions
+    const uniqueSearchOptions = searchOptions.filter(
+      (so) => !localOptions.some((lo) => lo.value === so.value)
+    );
+
+    return [...localOptions, ...uniqueSearchOptions];
+  }, [symbolSearch, symbolOptions, searchOptions]);
+
+  const handleSearch = useCallback(async (value: string) => {
+    setSymbolSearch(value);
+    if (value.length < 2) {
+      setSearchOptions([]);
+      return;
+    }
+
+    setIsSearching(true);
+    try {
+      const results = await invoke<StockMetadata[]>("search_stocks_info", { keyword: value });
+      setSearchOptions(
+        results.map((r) => ({
+          value: r.symbol,
+          label: `${r.symbol} - ${r.name} (${r.market})`,
+          metadata: r,
+        }))
+      );
+    } catch (err) {
+      console.error("Failed to search stocks:", err);
+    } finally {
+      setIsSearching(false);
+    }
+  }, []);
 
   const marketToCurrency: Record<Market, Currency> = {
     US: "USD",
@@ -171,17 +206,18 @@ export default function HoldingsPage() {
   );
 
   const handleSymbolSelect = useCallback(
-    (symbol: string) => {
-      const match = symbolOptions.find((o) => o.symbol === symbol);
+    (value: string) => {
+      const match = filteredSymbolOptions.find((o) => o.value === value);
       if (match) {
         form.setFieldsValue({
-          name: match.name,
-          market: match.market,
-          currency: match.currency,
+          symbol: match.metadata.symbol,
+          name: match.metadata.name,
+          market: match.metadata.market,
+          currency: marketToCurrency[match.metadata.market as Market],
         });
       }
     },
-    [symbolOptions, form],
+    [filteredSymbolOptions, form, marketToCurrency],
   );
 
   useEffect(() => {
@@ -569,15 +605,19 @@ export default function HoldingsPage() {
           <Form.Item
             name="symbol"
             label="股票代码"
-            rules={[{ required: true, message: "请输入股票代码" }]}
+            rules={[{ required: true, message: "请请输入股票代码" }]}
           >
             <AutoComplete
               options={filteredSymbolOptions}
-              onSearch={setSymbolSearch}
+              onSearch={handleSearch}
               onSelect={handleSymbolSelect}
               onBlur={handleSymbolBlur}
-              placeholder="如：AAPL, sh600519, 0700.HK"
-            />
+            >
+              <Input
+                placeholder="如：AAPL, sh600519, 0700.HK"
+                suffix={isSearching ? <Spin size="small" /> : undefined}
+              />
+            </AutoComplete>
           </Form.Item>
           <Form.Item
             name="name"

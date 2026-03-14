@@ -1,6 +1,9 @@
 use crate::db::Database;
-use crate::models::{HoldingWithQuote, StockQuote};
-use crate::services::quote_service::{fetch_cn_quote, fetch_hk_quote_with_provider, fetch_us_quote_with_provider, fetch_quotes_batch_cached_with_providers, QuoteCache};
+use crate::models::{HoldingWithQuote, StockQuote, StockMetadata};
+use crate::services::quote_service::{
+    fetch_cn_quote, fetch_hk_quote_with_provider, fetch_quotes_batch_cached_with_providers,
+    fetch_us_quote_with_provider, search_stocks, QuoteCache,
+};
 use crate::services::quote_provider_service;
 use tauri::State;
 
@@ -131,4 +134,9 @@ pub async fn get_cn_quote(quote_cache: State<'_, QuoteCache>, symbol: String) ->
     let quote = fetch_cn_quote(&symbol).await?;
     quote_cache.set(quote.clone());
     Ok(quote)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn search_stocks_info(keyword: String) -> Result<Vec<StockMetadata>, String> {
+    search_stocks(&keyword).await
 }

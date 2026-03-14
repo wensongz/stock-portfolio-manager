@@ -47,6 +47,7 @@ pub fn run() {
             commands::quotes::get_us_quote,
             commands::quotes::get_hk_quote,
             commands::quotes::get_cn_quote,
+            commands::quotes::search_stocks_info,
             commands::exchange_rates::get_exchange_rates,
             commands::exchange_rates::convert_amount,
             commands::snapshots::take_snapshot,

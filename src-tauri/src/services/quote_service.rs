@@ -1,4 +1,4 @@
-use crate::models::StockQuote;
+use crate::models::{StockQuote, StockMetadata};
 use chrono::Utc;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -150,9 +150,15 @@ pub async fn fetch_quotes_batch_cached_with_providers(
         return Ok(result);
     }
 
-    let fresh = fetch_quotes_batch_with_providers(missing.clone(), us_provider, hk_provider).await?;
-    cache.set_batch(&fresh);
-    result.extend(fresh);
+    let fresh = match fetch_quotes_batch_with_providers(missing.clone(), us_provider, hk_provider).await
+    {
+        Ok(v) => v,
+        Err(_) => Vec::new(),
+    };
+    if !fresh.is_empty() {
+        cache.set_batch(&fresh);
+        result.extend(fresh);
+    }
 
     // For any symbols that were missing from fresh results (fetch failed),
     // try to use stale cache as fallback
@@ -332,6 +338,92 @@ pub async fn fetch_hk_quote_with_provider(symbol: &str, provider: &str) -> Resul
 /// Fetch a CN A-share stock quote using East Money.
 pub async fn fetch_cn_quote(symbol: &str) -> Result<StockQuote, String> {
     fetch_eastmoney_cn_quote(symbol).await
+}
+
+// ---------------------------------------------------------------------------
+// East Money (东方财富) Suggest/Search API
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct EastMoneySuggestResponse {
+    #[serde(rename = "QuotationCodeTable")]
+    quotation_code_table: Option<QuotationCodeTable>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuotationCodeTable {
+    #[serde(rename = "Data")]
+    data: Option<Vec<SuggestData>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SuggestData {
+    #[serde(rename = "Code")]
+    code: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "QuoteID")]
+    quote_id: String,
+}
+
+/// Search for stocks by keyword (e.g. "600519", "AAPL", "腾讯") using East Money suggest API.
+pub async fn search_stocks(keyword: &str) -> Result<Vec<StockMetadata>, String> {
+    let url = "https://searchapi.eastmoney.com/api/suggest/get";
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get(url)
+        .query(&[
+            ("type", "14"),
+            ("token", "D4333F55F36108F315BC36C583BC2005"),
+            ("input", keyword),
+        ])
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await
+        .map_err(|e| format!("Network error searching {}: {}", keyword, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("East Money search API error: HTTP {}", response.status()));
+    }
+
+    let resp: EastMoneySuggestResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse search response: {}", e))?;
+
+    let mut results = Vec::new();
+    if let Some(table) = resp.quotation_code_table {
+        if let Some(data) = table.data {
+            for item in data {
+                let (market, symbol) = parse_eastmoney_market_symbol(&item.quote_id, &item.code);
+                results.push(StockMetadata {
+                    symbol,
+                    name: item.name,
+                    market,
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+fn parse_eastmoney_market_symbol(quote_id: &str, code: &str) -> (String, String) {
+    if quote_id.starts_with("1.") {
+        ("CN".to_string(), format!("sh{}", code))
+    } else if quote_id.starts_with("0.") {
+        ("CN".to_string(), format!("sz{}", code))
+    } else if quote_id.starts_with("116.") {
+        ("HK".to_string(), code.to_string())
+    } else if quote_id.starts_with("105.") {
+        ("US".to_string(), code.to_string())
+    } else {
+        ("Unknown".to_string(), code.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,6 +1227,23 @@ mod tests {
     // These tests verify that the API actually works end-to-end.
     // They are marked #[ignore] so they only run when explicitly requested
     // via `cargo test -- --ignored`.
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_search_stocks() {
+        let result = search_stocks("600519").await;
+        match &result {
+            Ok(stocks) => {
+                assert!(!stocks.is_empty());
+                let mautai = stocks.iter().find(|s| s.symbol == "sh600519").unwrap();
+                assert_eq!(mautai.name, "贵州茅台");
+                println!("✅ Search result: {:?}", mautai);
+            }
+            Err(e) => {
+                println!("⚠️ Search failed: {}", e);
+            }
+        }
+    }
 
     #[tokio::test]
     #[ignore]

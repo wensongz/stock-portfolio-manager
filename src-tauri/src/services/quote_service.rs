@@ -127,6 +127,17 @@ impl QuoteCache {
     }
 }
 
+/// Deduplicate a list of (symbol, market) pairs, keeping only the first
+/// occurrence of each symbol.  This avoids redundant API calls when the same
+/// stock is held in multiple accounts.
+fn deduplicate_symbols(symbols: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    symbols
+        .into_iter()
+        .filter(|(symbol, _)| seen.insert(symbol.clone()))
+        .collect()
+}
+
 /// Batch fetch quotes using the cache. Only fetches symbols that are stale or
 /// missing from the cache, and updates the cache with fresh results.
 /// Falls back to stale cache entries on network errors for individual symbols.
@@ -138,13 +149,18 @@ pub async fn fetch_quotes_batch_cached(
 }
 
 /// Batch fetch quotes using the cache with specified providers.
+/// Duplicate symbols are automatically deduplicated so that each symbol is
+/// looked up and fetched only once, even when held in multiple accounts.
 pub async fn fetch_quotes_batch_cached_with_providers(
     cache: &QuoteCache,
     symbols: Vec<(String, String)>,
     us_provider: &str,
     hk_provider: &str,
 ) -> Result<Vec<StockQuote>, String> {
-    let (mut result, missing) = cache.get_batch(&symbols);
+    // Deduplicate symbols so we only look up / fetch each symbol once.
+    let unique_symbols = deduplicate_symbols(symbols);
+
+    let (mut result, missing) = cache.get_batch(&unique_symbols);
 
     if missing.is_empty() {
         return Ok(result);
@@ -571,13 +587,18 @@ pub async fn fetch_quotes_batch(
 
 /// Batch fetch quotes using the specified providers for US and HK markets.
 /// CN always uses East Money. Cash symbols return synthetic quotes (price = 1.0).
+/// Duplicate symbols are automatically deduplicated so that each symbol is fetched only once.
 pub async fn fetch_quotes_batch_with_providers(
     symbols: Vec<(String, String)>,
     us_provider: &str,
     hk_provider: &str,
 ) -> Result<Vec<StockQuote>, String> {
+    // Deduplicate symbols so we only fetch each symbol once,
+    // even if it appears in multiple accounts.
+    let unique_symbols = deduplicate_symbols(symbols);
+
     let mut quotes = Vec::new();
-    for (symbol, market) in symbols {
+    for (symbol, market) in unique_symbols {
         // Cash symbols don't need an API call – return a synthetic quote.
         if is_cash_symbol(&symbol) {
             quotes.push(make_cash_quote(&symbol, &market));
@@ -1044,6 +1065,46 @@ mod tests {
         assert_eq!(cached.len(), 2);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].0, "MSFT");
+    }
+
+    #[test]
+    fn test_fetch_quotes_batch_with_providers_deduplicates_symbols() {
+        // Verify that duplicate symbols (same stock in multiple accounts) are
+        // deduplicated before fetching.  We use cash symbols ($CASH-*) which
+        // return synthetic quotes without any network call.
+        let symbols = vec![
+            ("$CASH-USD".to_string(), "US".to_string()),
+            ("$CASH-USD".to_string(), "US".to_string()), // duplicate
+            ("$CASH-CNY".to_string(), "CN".to_string()),
+            ("$CASH-CNY".to_string(), "CN".to_string()), // duplicate
+            ("$CASH-HKD".to_string(), "HK".to_string()),
+        ];
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let quotes = rt.block_on(fetch_quotes_batch_with_providers(symbols, "eastmoney", "eastmoney")).unwrap();
+        // Should only return 3 unique quotes, not 5
+        assert_eq!(quotes.len(), 3);
+        let syms: Vec<&str> = quotes.iter().map(|q| q.symbol.as_str()).collect();
+        assert!(syms.contains(&"$CASH-USD"));
+        assert!(syms.contains(&"$CASH-CNY"));
+        assert!(syms.contains(&"$CASH-HKD"));
+    }
+
+    #[test]
+    fn test_fetch_quotes_batch_cached_deduplicates_symbols() {
+        // Verify that the cached batch fetch also deduplicates symbols.
+        let cache = QuoteCache::new();
+        let symbols = vec![
+            ("$CASH-USD".to_string(), "US".to_string()),
+            ("$CASH-USD".to_string(), "US".to_string()), // duplicate
+            ("$CASH-CNY".to_string(), "CN".to_string()),
+            ("$CASH-CNY".to_string(), "CN".to_string()), // duplicate
+        ];
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let quotes = rt.block_on(fetch_quotes_batch_cached_with_providers(
+            &cache, symbols, "eastmoney", "eastmoney",
+        )).unwrap();
+        // Should only return 2 unique quotes, not 4
+        assert_eq!(quotes.len(), 2);
     }
 
     #[test]

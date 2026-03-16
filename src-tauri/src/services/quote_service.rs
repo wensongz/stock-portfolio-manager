@@ -2,7 +2,7 @@ use crate::models::StockQuote;
 use chrono::Utc;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const QUOTE_CACHE_TTL_SECS: u64 = 60; // 60-second cache
@@ -354,18 +354,39 @@ pub async fn fetch_cn_quote(symbol: &str) -> Result<StockQuote, String> {
 // East Money (东方财富) API
 // ---------------------------------------------------------------------------
 
+/// Shared storage for the East Money HTTP client.
+/// Wrapped in `Mutex<Option<…>>` so the client can be lazily created *and*
+/// reset when a network error indicates the underlying connection is broken.
+static EASTMONEY_CLIENT: Mutex<Option<reqwest::Client>> = Mutex::new(None);
+
+/// Build a fresh `reqwest::Client` configured for the East Money API.
+fn build_eastmoney_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("failed to build East Money HTTP client")
+}
+
 /// Return a shared `reqwest::Client` for all East Money API requests.
-/// The client is created once and reused across all calls so that the
-/// underlying TCP connection(s) to `push2.eastmoney.com` are pooled and
-/// reused, reducing latency and server load.
-fn eastmoney_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .expect("failed to build East Money HTTP client")
-    })
+/// The client is created lazily and reused across calls so that the
+/// underlying TCP connection(s) to `push2.eastmoney.com` are pooled.
+/// If a network error occurs the caller should invoke
+/// [`reset_eastmoney_client`] so that the next call rebuilds the client
+/// with fresh connections.
+fn eastmoney_client() -> reqwest::Client {
+    let mut guard = EASTMONEY_CLIENT
+        .lock()
+        .expect("eastmoney client lock poisoned");
+    guard.get_or_insert_with(build_eastmoney_client).clone()
+}
+
+/// Reset the shared East Money client so the next call to
+/// [`eastmoney_client`] will build a fresh one.
+fn reset_eastmoney_client() {
+    let mut guard = EASTMONEY_CLIENT
+        .lock()
+        .expect("eastmoney client lock poisoned");
+    *guard = None;
 }
 
 /// East Money API response for a single stock quote.
@@ -416,7 +437,10 @@ async fn fetch_eastmoney_cn_quote(symbol: &str) -> Result<StockQuote, String> {
         .header("User-Agent", "Mozilla/5.0")
         .send()
         .await
-        .map_err(|e| format!("Network error fetching {}: {}", symbol, e))?;
+        .map_err(|e| {
+            reset_eastmoney_client();
+            format!("Network error fetching {}: {}", symbol, e)
+        })?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -448,7 +472,10 @@ async fn fetch_eastmoney_us_quote(symbol: &str) -> Result<StockQuote, String> {
         .header("User-Agent", "Mozilla/5.0")
         .send()
         .await
-        .map_err(|e| format!("Network error fetching {}: {}", symbol, e))?;
+        .map_err(|e| {
+            reset_eastmoney_client();
+            format!("Network error fetching {}: {}", symbol, e)
+        })?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -480,7 +507,10 @@ async fn fetch_eastmoney_hk_quote(symbol: &str) -> Result<StockQuote, String> {
         .header("User-Agent", "Mozilla/5.0")
         .send()
         .await
-        .map_err(|e| format!("Network error fetching {}: {}", symbol, e))?;
+        .map_err(|e| {
+            reset_eastmoney_client();
+            format!("Network error fetching {}: {}", symbol, e)
+        })?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -1278,9 +1308,17 @@ mod tests {
     }
 
     #[test]
-    fn test_eastmoney_client_returns_same_instance() {
-        let c1 = eastmoney_client() as *const reqwest::Client;
-        let c2 = eastmoney_client() as *const reqwest::Client;
-        assert!(std::ptr::eq(c1, c2), "eastmoney_client() should return the same instance");
+    fn test_eastmoney_client_returns_usable_client() {
+        // Obtaining the client twice should succeed without panic.
+        let _c1 = eastmoney_client();
+        let _c2 = eastmoney_client();
+    }
+
+    #[test]
+    fn test_eastmoney_client_rebuilds_after_reset() {
+        // Client can be obtained, then reset, then obtained again.
+        let _c1 = eastmoney_client();
+        reset_eastmoney_client();
+        let _c2 = eastmoney_client();
     }
 }

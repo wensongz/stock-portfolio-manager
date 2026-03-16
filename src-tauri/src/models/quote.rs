@@ -16,6 +16,13 @@ pub struct StockQuote {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StockMetadata {
+    pub symbol: String,
+    pub name: String,
+    pub market: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HoldingWithQuote {
     pub id: String,
     pub account_id: String,

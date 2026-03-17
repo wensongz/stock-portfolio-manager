@@ -27,8 +27,8 @@ interface QuoteState {
   error: string | null;
   lastUpdatedAt: string | null;
   refreshIntervalMs: number;
-  fetchHoldingQuotes: () => Promise<void>;
-  fetchQuotes: (symbols: [string, string][]) => Promise<void>;
+  fetchHoldingQuotes: (refreshSymbols?: [string, string][]) => Promise<void>;
+  fetchQuotes: (symbols: [string, string][], forceRefresh?: boolean) => Promise<void>;
   setRefreshInterval: (ms: number) => void;
   startAutoRefresh: () => () => void;
 }
@@ -41,10 +41,12 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
   lastUpdatedAt: null,
   refreshIntervalMs: loadRefreshInterval(),
 
-  fetchHoldingQuotes: async () => {
+  fetchHoldingQuotes: async (refreshSymbols?: [string, string][]) => {
     set({ loading: true, error: null });
     try {
-      const holdingQuotes = await invoke<HoldingWithQuote[]>("get_holding_quotes");
+      const holdingQuotes = await invoke<HoldingWithQuote[]>("get_holding_quotes", {
+        ...(refreshSymbols !== undefined ? { refreshSymbols } : {}),
+      });
       const quotes: Record<string, StockQuote> = {};
       holdingQuotes.forEach((h) => {
         if (h.quote) {
@@ -62,10 +64,13 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
     }
   },
 
-  fetchQuotes: async (symbols: [string, string][]) => {
+  fetchQuotes: async (symbols: [string, string][], forceRefresh?: boolean) => {
     set({ loading: true, error: null });
     try {
-      const quoteList = await invoke<StockQuote[]>("get_real_time_quotes", { symbols });
+      const quoteList = await invoke<StockQuote[]>("get_real_time_quotes", {
+        symbols,
+        forceRefresh: forceRefresh ?? false,
+      });
       const quotes: Record<string, StockQuote> = { ...get().quotes };
       quoteList.forEach((q) => {
         quotes[q.symbol] = q;

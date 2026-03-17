@@ -368,7 +368,7 @@ async fn get_prices_for_date(
         if !sym_market_pairs.is_empty() {
             let quotes = {
                 let config = quote_provider_service::get_quote_provider_config(db)?;
-                fetch_quotes_batch_cached_with_providers(quote_cache, sym_market_pairs, &config.us_provider, &config.hk_provider).await?
+                fetch_quotes_batch_cached_with_providers(quote_cache, sym_market_pairs, &config.us_provider, &config.hk_provider, true).await?
             };
             for q in quotes {
                 price_map.insert(q.symbol, q.current_price);
@@ -615,6 +615,7 @@ pub async fn refresh_quarterly_snapshot(
                 sym_market_pairs,
                 &config.us_provider,
                 &config.hk_provider,
+                true,
             )
             .await?;
             for q in quotes {

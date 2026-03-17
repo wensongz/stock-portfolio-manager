@@ -84,7 +84,7 @@ async fn build_holding_details(
         .collect();
     let quotes = {
         let config = quote_provider_service::get_quote_provider_config(db)?;
-        fetch_quotes_batch_cached_with_providers(quote_cache, symbols, &config.us_provider, &config.hk_provider).await?
+        fetch_quotes_batch_cached_with_providers(quote_cache, symbols, &config.us_provider, &config.hk_provider, false).await?
     };
     let quote_map: std::collections::HashMap<String, (f64, f64)> = quotes
         .into_iter()

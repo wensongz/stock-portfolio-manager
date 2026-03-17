@@ -5,8 +5,6 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const QUOTE_CACHE_TTL_SECS: u64 = 60; // 60-second cache
-
 /// Cash symbol prefix used to represent cash holdings.
 /// Cash symbols follow the pattern `$CASH-{CURRENCY}`, e.g. `$CASH-USD`, `$CASH-CNY`, `$CASH-HKD`.
 pub const CASH_SYMBOL_PREFIX: &str = "$CASH-";
@@ -63,15 +61,11 @@ impl QuoteCache {
         }
     }
 
-    /// Returns a cached quote if it exists and is still fresh.
+    /// Returns a cached quote if it exists (no TTL – the cache is only
+    /// refreshed when the caller explicitly requests it).
     pub fn get(&self, symbol: &str) -> Option<StockQuote> {
         let lock = self.inner.lock().unwrap();
-        if let Some(cached) = lock.get(symbol) {
-            if cached.cached_at.elapsed() < Duration::from_secs(QUOTE_CACHE_TTL_SECS) {
-                return Some(cached.quote.clone());
-            }
-        }
-        None
+        lock.get(symbol).map(|c| c.quote.clone())
     }
 
     /// Returns a cached quote even if stale (for offline fallback).
@@ -107,21 +101,18 @@ impl QuoteCache {
         }
     }
 
-    /// Returns all fresh cached quotes for the given symbols, plus the list of
-    /// symbols that are missing or stale.
+    /// Returns all cached quotes for the given symbols, plus the list of
+    /// symbols that are missing from the cache.
     pub fn get_batch(&self, symbols: &[(String, String)]) -> (Vec<StockQuote>, Vec<(String, String)>) {
         let lock = self.inner.lock().unwrap();
-        let ttl = Duration::from_secs(QUOTE_CACHE_TTL_SECS);
         let mut cached = Vec::new();
         let mut missing = Vec::new();
         for (symbol, market) in symbols {
             if let Some(entry) = lock.get(symbol.as_str()) {
-                if entry.cached_at.elapsed() < ttl {
-                    cached.push(entry.quote.clone());
-                    continue;
-                }
+                cached.push(entry.quote.clone());
+            } else {
+                missing.push((symbol.clone(), market.clone()));
             }
-            missing.push((symbol.clone(), market.clone()));
         }
         (cached, missing)
     }
@@ -138,27 +129,52 @@ fn deduplicate_symbols(symbols: Vec<(String, String)>) -> Vec<(String, String)> 
         .collect()
 }
 
-/// Batch fetch quotes using the cache. Only fetches symbols that are stale or
+/// Batch fetch quotes using the cache. Only fetches symbols that are
 /// missing from the cache, and updates the cache with fresh results.
 /// Falls back to stale cache entries on network errors for individual symbols.
+/// When `force_refresh` is true the cache is bypassed and all symbols are
+/// fetched from the upstream API.
 pub async fn fetch_quotes_batch_cached(
     cache: &QuoteCache,
     symbols: Vec<(String, String)>,
+    force_refresh: bool,
 ) -> Result<Vec<StockQuote>, String> {
-    fetch_quotes_batch_cached_with_providers(cache, symbols, "yahoo", "yahoo").await
+    fetch_quotes_batch_cached_with_providers(cache, symbols, "yahoo", "yahoo", force_refresh).await
 }
 
 /// Batch fetch quotes using the cache with specified providers.
 /// Duplicate symbols are automatically deduplicated so that each symbol is
 /// looked up and fetched only once, even when held in multiple accounts.
+/// When `force_refresh` is true the cache is bypassed and all symbols are
+/// fetched from the upstream API.
 pub async fn fetch_quotes_batch_cached_with_providers(
     cache: &QuoteCache,
     symbols: Vec<(String, String)>,
     us_provider: &str,
     hk_provider: &str,
+    force_refresh: bool,
 ) -> Result<Vec<StockQuote>, String> {
     // Deduplicate symbols so we only look up / fetch each symbol once.
     let unique_symbols = deduplicate_symbols(symbols);
+
+    if force_refresh {
+        // Force refresh: fetch all symbols from the upstream API.
+        let fresh = fetch_quotes_batch_with_providers(unique_symbols.clone(), us_provider, hk_provider).await?;
+        cache.set_batch(&fresh);
+
+        // Fall back to stale cache for any symbols that failed to fetch
+        let fetched_symbols: std::collections::HashSet<String> =
+            fresh.iter().map(|q| q.symbol.clone()).collect();
+        let mut result = fresh;
+        for (symbol, _) in &unique_symbols {
+            if !fetched_symbols.contains(symbol) {
+                if let Some(stale) = cache.get_stale(symbol) {
+                    result.push(stale);
+                }
+            }
+        }
+        return Ok(result);
+    }
 
     let (mut result, missing) = cache.get_batch(&unique_symbols);
 
@@ -1366,7 +1382,7 @@ mod tests {
         ];
         let rt = tokio::runtime::Runtime::new().unwrap();
         let quotes = rt.block_on(fetch_quotes_batch_cached_with_providers(
-            &cache, symbols, "eastmoney", "eastmoney",
+            &cache, symbols, "eastmoney", "eastmoney", false,
         )).unwrap();
         // Should only return 2 unique quotes, not 4
         assert_eq!(quotes.len(), 2);
@@ -1382,6 +1398,50 @@ mod tests {
         quote.current_price = 200.0;
         cache.set(quote);
         assert!((cache.get("AAPL").unwrap().current_price - 200.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_quote_cache_no_ttl_expiry() {
+        // Verify that cached quotes do not expire based on time.
+        // get() should return the cached quote regardless of when it was stored.
+        let cache = QuoteCache::new();
+        let quote = sample_quote("AAPL", "US");
+        cache.set(quote);
+        // Immediately retrievable
+        assert!(cache.get("AAPL").is_some());
+        // get_batch should also return it (not as "missing")
+        let (cached, missing) = cache.get_batch(&[("AAPL".to_string(), "US".to_string())]);
+        assert_eq!(cached.len(), 1);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_fetch_quotes_batch_cached_force_refresh() {
+        // Verify that force_refresh=true bypasses the cache and fetches from API.
+        // We use cash symbols ($CASH-*) which return synthetic quotes.
+        let cache = QuoteCache::new();
+
+        // Pre-populate cache
+        let initial_quote = sample_quote("$CASH-USD", "US");
+        cache.set(initial_quote);
+
+        let symbols = vec![("$CASH-USD".to_string(), "US".to_string())];
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // With force_refresh=false, should return cached data
+        let quotes = rt.block_on(fetch_quotes_batch_cached_with_providers(
+            &cache, symbols.clone(), "eastmoney", "eastmoney", false,
+        )).unwrap();
+        assert_eq!(quotes.len(), 1);
+        // Cached quote has price 100.0 (from sample_quote)
+        assert!((quotes[0].current_price - 100.0).abs() < 0.001);
+
+        // With force_refresh=true, should fetch fresh data (cash quote has price 1.0)
+        let quotes = rt.block_on(fetch_quotes_batch_cached_with_providers(
+            &cache, symbols, "eastmoney", "eastmoney", true,
+        )).unwrap();
+        assert_eq!(quotes.len(), 1);
+        assert!((quotes[0].current_price - 1.0).abs() < 0.001);
     }
 
     #[test]

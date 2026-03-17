@@ -53,13 +53,19 @@ pub fn run() {
                 let symbols: Vec<(String, String)> = {
                     let conn = match db.conn.lock() {
                         Ok(c) => c,
-                        Err(_) => return,
+                        Err(e) => {
+                            eprintln!("Background refresh: failed to acquire DB lock: {}", e);
+                            return;
+                        }
                     };
                     let mut stmt = match conn
                         .prepare("SELECT DISTINCT symbol, market FROM holdings")
                     {
                         Ok(s) => s,
-                        Err(_) => return,
+                        Err(e) => {
+                            eprintln!("Background refresh: failed to prepare query: {}", e);
+                            return;
+                        }
                     };
                     let rows = match stmt.query_map([], |row| {
                         Ok((
@@ -68,7 +74,10 @@ pub fn run() {
                         ))
                     }) {
                         Ok(r) => r,
-                        Err(_) => return,
+                        Err(e) => {
+                            eprintln!("Background refresh: failed to query holdings: {}", e);
+                            return;
+                        }
                     };
                     rows.filter_map(|r| r.ok()).collect()
                 };

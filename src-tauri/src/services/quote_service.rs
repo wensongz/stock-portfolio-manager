@@ -440,6 +440,23 @@ async fn send_eastmoney_request(url: &str, symbol: &str) -> Result<reqwest::Resp
     Err(last_err)
 }
 
+/// Maximum number of characters to include in error messages as a response
+/// body preview for debugging failed East Money API responses.
+const EASTMONEY_RESPONSE_PREVIEW_LEN: usize = 200;
+
+/// Parse the raw response body text into an [`EastMoneyResponse`].
+/// On failure the error message includes a preview of the raw body for
+/// easier debugging.
+fn parse_eastmoney_body(body: &str, symbol: &str) -> Result<EastMoneyResponse, String> {
+    serde_json::from_str(body).map_err(|e| {
+        let preview: String = body.chars().take(EASTMONEY_RESPONSE_PREVIEW_LEN).collect();
+        format!(
+            "Failed to parse East Money response for {}: {}. Response preview: {}",
+            symbol, e, preview
+        )
+    })
+}
+
 /// East Money API response for a single stock quote.
 #[derive(Debug, Deserialize)]
 struct EastMoneyResponse {
@@ -450,6 +467,9 @@ struct EastMoneyResponse {
 /// Inner data of an East Money quote response.
 /// Field names follow the East Money API convention (f43, f44, …).
 /// With `fltt=2` the numeric fields are returned as floats/integers directly.
+/// All numeric fields use `f64` so they can accept both JSON integers and
+/// JSON floats (e.g. `30279` and `30279.0`) — serde rejects JSON floats
+/// when deserializing as `u64`.
 #[derive(Debug, Deserialize)]
 struct EastMoneyData {
     /// Current price
@@ -458,8 +478,9 @@ struct EastMoneyData {
     f44: Option<f64>,
     /// Day low
     f45: Option<f64>,
-    /// Volume (lots / 手)
-    f47: Option<u64>,
+    /// Volume (lots / 手) — stored as f64 because the API may return
+    /// the value with a decimal point (e.g. `30279.0`).
+    f47: Option<f64>,
     /// Stock code (e.g. "600519")
     f57: Option<String>,
     /// Stock name (e.g. "贵州茅台")
@@ -493,10 +514,12 @@ async fn fetch_eastmoney_cn_quote(symbol: &str) -> Result<StockQuote, String> {
         ));
     }
 
-    let resp: EastMoneyResponse = response
-        .json()
+    let body = response
+        .text()
         .await
-        .map_err(|e| format!("Failed to parse East Money response for {}: {}", symbol, e))?;
+        .map_err(|e| format!("Failed to read East Money response body for {}: {}", symbol, e))?;
+
+    let resp = parse_eastmoney_body(&body, &symbol)?;
 
     parse_eastmoney_quote(&symbol, "CN", resp)
 }
@@ -520,10 +543,12 @@ async fn fetch_eastmoney_us_quote(symbol: &str) -> Result<StockQuote, String> {
         ));
     }
 
-    let resp: EastMoneyResponse = response
-        .json()
+    let body = response
+        .text()
         .await
-        .map_err(|e| format!("Failed to parse East Money response for {}: {}", symbol, e))?;
+        .map_err(|e| format!("Failed to read East Money response body for {}: {}", symbol, e))?;
+
+    let resp = parse_eastmoney_body(&body, symbol)?;
 
     parse_eastmoney_quote(symbol, "US", resp)
 }
@@ -547,10 +572,12 @@ async fn fetch_eastmoney_hk_quote(symbol: &str) -> Result<StockQuote, String> {
         ));
     }
 
-    let resp: EastMoneyResponse = response
-        .json()
+    let body = response
+        .text()
         .await
-        .map_err(|e| format!("Failed to parse East Money response for {}: {}", symbol, e))?;
+        .map_err(|e| format!("Failed to read East Money response body for {}: {}", symbol, e))?;
+
+    let resp = parse_eastmoney_body(&body, symbol)?;
 
     parse_eastmoney_quote(symbol, "HK", resp)
 }
@@ -616,7 +643,7 @@ fn parse_eastmoney_quote(symbol: &str, market: &str, resp: EastMoneyResponse) ->
 
     let high = data.f44.unwrap_or(0.0);
     let low = data.f45.unwrap_or(0.0);
-    let volume = data.f47.unwrap_or(0);
+    let volume = data.f47.unwrap_or(0.0) as u64;
 
     Ok(StockQuote {
         symbol: symbol.to_string(),
@@ -793,7 +820,7 @@ mod tests {
         prev_close: f64,
         high: f64,
         low: f64,
-        volume: u64,
+        volume: f64,
         change: f64,
         change_pct: f64,
     ) -> EastMoneyResponse {
@@ -822,7 +849,7 @@ mod tests {
             1690.00,
             1720.00,
             1685.00,
-            12345,
+            12345.0,
             20.50,
             1.21,
         );
@@ -860,7 +887,7 @@ mod tests {
                 f43: None,
                 f44: Some(1720.00),
                 f45: Some(1685.00),
-                f47: Some(12345),
+                f47: Some(12345.0),
                 f57: Some("600519".to_string()),
                 f58: Some("贵州茅台".to_string()),
                 f60: Some(1690.00),
@@ -882,7 +909,7 @@ mod tests {
             1000.00,
             1200.00,
             950.00,
-            99999,
+            99999.0,
             100.00,
             10.00,
         );
@@ -902,7 +929,7 @@ mod tests {
             1690.00,
             1720.00,
             1685.00,
-            12345,
+            12345.0,
             20.50,
             1.21,
         );
@@ -928,7 +955,7 @@ mod tests {
             1690.00,
             1720.00,
             1685.00,
-            12345,
+            12345.0,
             20.50,
             1.21,
         );
@@ -992,7 +1019,7 @@ mod tests {
             193.00,
             197.00,
             192.00,
-            50000,
+            50000.0,
             2.50,
             1.30,
         );
@@ -1013,7 +1040,7 @@ mod tests {
             415.00,
             425.00,
             410.00,
-            30000,
+            30000.0,
             5.00,
             1.20,
         );
@@ -1034,7 +1061,7 @@ mod tests {
                 f43: Some(1100.00),
                 f44: Some(1200.00),
                 f45: Some(950.00),
-                f47: Some(99999),
+                f47: Some(99999.0),
                 f57: Some("600519".to_string()),
                 f58: Some("贵州茅台".to_string()),
                 f60: Some(1000.00),
@@ -1047,6 +1074,154 @@ mod tests {
         let quote = result.unwrap();
         assert!((quote.change - 100.0).abs() < 0.001);
         assert!((quote.change_percent - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_eastmoney_data_deserialize_float_volume() {
+        // The API may return volume as a JSON float (e.g. 30279.0).
+        // serde rejects JSON floats when the target type is u64, so
+        // f47 must be declared as f64 to accept both forms.
+        let json = r#"{
+            "rc": 0,
+            "data": {
+                "f43": 1516.0,
+                "f44": 1519.0,
+                "f45": 1508.0,
+                "f47": 30279.0,
+                "f57": "600519",
+                "f58": "贵州茅台",
+                "f60": 1513.0,
+                "f169": 3.0,
+                "f170": 0.2
+            }
+        }"#;
+        let resp: EastMoneyResponse = serde_json::from_str(json).expect("should parse");
+        let data = resp.data.unwrap();
+        assert!((data.f47.unwrap() - 30279.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_eastmoney_data_deserialize_integer_volume() {
+        // The API may also return volume as a JSON integer.
+        let json = r#"{
+            "rc": 0,
+            "data": {
+                "f43": 1516.0,
+                "f44": 1519.0,
+                "f45": 1508.0,
+                "f47": 30279,
+                "f57": "600519",
+                "f58": "贵州茅台",
+                "f60": 1513.0,
+                "f169": 3.0,
+                "f170": 0.2
+            }
+        }"#;
+        let resp: EastMoneyResponse = serde_json::from_str(json).expect("should parse");
+        let data = resp.data.unwrap();
+        assert!((data.f47.unwrap() - 30279.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_eastmoney_data_deserialize_numeric_values() {
+        // Normal case: all numeric fields are numbers.
+        let json = r#"{
+            "rc": 0,
+            "data": {
+                "f43": 1710.50,
+                "f44": 1720.00,
+                "f45": 1685.00,
+                "f47": 12345,
+                "f57": "600519",
+                "f58": "贵州茅台",
+                "f60": 1690.00,
+                "f169": 20.50,
+                "f170": 1.21
+            }
+        }"#;
+        let resp: EastMoneyResponse = serde_json::from_str(json).expect("should parse");
+        let data = resp.data.unwrap();
+        assert!((data.f43.unwrap() - 1710.50).abs() < 0.001);
+        assert!((data.f47.unwrap() - 12345.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_eastmoney_data_deserialize_integer_prices() {
+        // f43 may be an integer (no decimal) when the price is round.
+        let json = r#"{
+            "rc": 0,
+            "data": {
+                "f43": 1700,
+                "f44": 1720,
+                "f45": 1685,
+                "f47": 12345,
+                "f57": "600519",
+                "f58": "贵州茅台",
+                "f60": 1690,
+                "f169": 10,
+                "f170": 0
+            }
+        }"#;
+        let resp: EastMoneyResponse = serde_json::from_str(json).expect("should parse");
+        let data = resp.data.unwrap();
+        assert!((data.f43.unwrap() - 1700.0).abs() < 0.001);
+        assert!((data.f60.unwrap() - 1690.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_eastmoney_data_deserialize_null_data() {
+        let json = r#"{"rc": 0, "data": null}"#;
+        let resp: EastMoneyResponse = serde_json::from_str(json).expect("should parse");
+        assert!(resp.data.is_none());
+    }
+
+    #[test]
+    fn test_eastmoney_response_with_extra_fields() {
+        // The real API returns extra fields (rt, svr, lt, full, dlmkts).
+        // Our struct should ignore them gracefully.
+        let json = r#"{
+            "rc": 0,
+            "rt": 4,
+            "svr": 2887254139,
+            "lt": 1,
+            "full": 1,
+            "dlmkts": "",
+            "data": {
+                "f43": 1516.0,
+                "f44": 1519.0,
+                "f45": 1508.0,
+                "f47": 30279,
+                "f57": "600519",
+                "f58": "贵州茅台",
+                "f60": 1513.0,
+                "f169": 3.0,
+                "f170": 0.2
+            }
+        }"#;
+        let resp: EastMoneyResponse = serde_json::from_str(json).expect("should parse");
+        assert_eq!(resp.rc, Some(0));
+        let data = resp.data.unwrap();
+        assert!((data.f43.unwrap() - 1516.0).abs() < 0.001);
+        assert!((data.f47.unwrap() - 30279.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_eastmoney_volume_converts_to_u64() {
+        // The parse function should convert f64 volume to u64 correctly.
+        let resp = make_eastmoney_response(
+            "600519",
+            "贵州茅台",
+            1516.0,
+            1513.0,
+            1519.0,
+            1508.0,
+            30279.0,
+            3.0,
+            0.2,
+        );
+        let result = parse_eastmoney_quote("sh600519", "CN", resp);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().volume, 30279);
     }
 
     fn sample_quote(symbol: &str, market: &str) -> StockQuote {

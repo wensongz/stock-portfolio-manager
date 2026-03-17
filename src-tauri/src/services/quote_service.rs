@@ -470,6 +470,23 @@ where
     }
 }
 
+/// Maximum number of characters to include in error messages as a response
+/// body preview for debugging failed East Money API responses.
+const EASTMONEY_RESPONSE_PREVIEW_LEN: usize = 200;
+
+/// Parse the raw response body text into an [`EastMoneyResponse`].
+/// On failure the error message includes a preview of the raw body for
+/// easier debugging.
+fn parse_eastmoney_body(body: &str, symbol: &str) -> Result<EastMoneyResponse, String> {
+    serde_json::from_str(body).map_err(|e| {
+        let preview: String = body.chars().take(EASTMONEY_RESPONSE_PREVIEW_LEN).collect();
+        format!(
+            "Failed to parse East Money response for {}: {}. Response preview: {}",
+            symbol, e, preview
+        )
+    })
+}
+
 /// East Money API response for a single stock quote.
 #[derive(Debug, Deserialize)]
 struct EastMoneyResponse {
@@ -537,13 +554,7 @@ async fn fetch_eastmoney_cn_quote(symbol: &str) -> Result<StockQuote, String> {
         .await
         .map_err(|e| format!("Failed to read East Money response body for {}: {}", symbol, e))?;
 
-    let resp: EastMoneyResponse = serde_json::from_str(&body).map_err(|e| {
-        let preview: String = body.chars().take(200).collect();
-        format!(
-            "Failed to parse East Money response for {}: {}. Response preview: {}",
-            symbol, e, preview
-        )
-    })?;
+    let resp = parse_eastmoney_body(&body, &symbol)?;
 
     parse_eastmoney_quote(&symbol, "CN", resp)
 }
@@ -572,13 +583,7 @@ async fn fetch_eastmoney_us_quote(symbol: &str) -> Result<StockQuote, String> {
         .await
         .map_err(|e| format!("Failed to read East Money response body for {}: {}", symbol, e))?;
 
-    let resp: EastMoneyResponse = serde_json::from_str(&body).map_err(|e| {
-        let preview: String = body.chars().take(200).collect();
-        format!(
-            "Failed to parse East Money response for {}: {}. Response preview: {}",
-            symbol, e, preview
-        )
-    })?;
+    let resp = parse_eastmoney_body(&body, symbol)?;
 
     parse_eastmoney_quote(symbol, "US", resp)
 }
@@ -607,13 +612,7 @@ async fn fetch_eastmoney_hk_quote(symbol: &str) -> Result<StockQuote, String> {
         .await
         .map_err(|e| format!("Failed to read East Money response body for {}: {}", symbol, e))?;
 
-    let resp: EastMoneyResponse = serde_json::from_str(&body).map_err(|e| {
-        let preview: String = body.chars().take(200).collect();
-        format!(
-            "Failed to parse East Money response for {}: {}. Response preview: {}",
-            symbol, e, preview
-        )
-    })?;
+    let resp = parse_eastmoney_body(&body, symbol)?;
 
     parse_eastmoney_quote(symbol, "HK", resp)
 }

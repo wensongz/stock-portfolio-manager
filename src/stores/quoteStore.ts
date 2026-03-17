@@ -101,15 +101,27 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
     // The backend spawns a background task on startup to refresh the cache
     // from upstream APIs and emits a "quotes-refreshed" event when done.
     fetchHoldingQuotes([]);
+
+    // Listen for the backend "quotes-refreshed" event so the UI picks up
+    // freshly-updated prices without a manual refresh.
+    let unlistenFn: (() => void) | null = null;
+    let cancelled = false;
+
+    listen("quotes-refreshed", () => {
+      useQuoteStore.getState().fetchHoldingQuotes([]);
+    }).then((fn) => {
+      if (cancelled) {
+        fn();
+      } else {
+        unlistenFn = fn;
+      }
+    });
+
     // No periodic auto-refresh – quotes are only refreshed when the user
     // explicitly clicks the refresh button.
-    return () => {};
+    return () => {
+      cancelled = true;
+      if (unlistenFn) unlistenFn();
+    };
   },
 }));
-
-// Listen for the backend "quotes-refreshed" event emitted after the
-// startup background refresh completes.  Re-fetch from cache so the UI
-// picks up the freshly-updated prices without a manual refresh.
-listen("quotes-refreshed", () => {
-  useQuoteStore.getState().fetchHoldingQuotes([]);
-});

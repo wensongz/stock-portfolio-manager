@@ -247,6 +247,22 @@ impl Database {
             );
         ")?;
 
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS cached_quotes (
+                symbol TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                market TEXT NOT NULL,
+                current_price REAL NOT NULL DEFAULT 0,
+                previous_close REAL NOT NULL DEFAULT 0,
+                change REAL NOT NULL DEFAULT 0,
+                change_percent REAL NOT NULL DEFAULT 0,
+                high REAL NOT NULL DEFAULT 0,
+                low REAL NOT NULL DEFAULT 0,
+                volume INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+        ")?;
+
         Ok(())
     }
 }

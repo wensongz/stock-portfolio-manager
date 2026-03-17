@@ -24,6 +24,90 @@ pub fn run() {
             app.manage(db);
             app.manage(ExchangeRateCache::new());
             app.manage(QuoteCache::new());
+
+            // Load persisted quote cache from the database so the UI can
+            // render immediately with the last-known prices.
+            {
+                let db = app.state::<Database>();
+                let cache = app.state::<QuoteCache>();
+                match services::quote_service::load_quotes_from_db(&db) {
+                    Ok(quotes) if !quotes.is_empty() => {
+                        cache.set_batch(&quotes);
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("Failed to load cached quotes from DB: {}", e),
+                }
+            }
+
+            // Spawn a background task to refresh holding quotes from the API.
+            // This runs after startup so the UI is not blocked.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Small delay to let the window finish loading.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                let db = handle.state::<Database>();
+                let cache = handle.state::<QuoteCache>();
+
+                // Collect all holding symbols.
+                let symbols: Vec<(String, String)> = {
+                    let conn = match db.conn.lock() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("Background refresh: failed to acquire DB lock: {}", e);
+                            return;
+                        }
+                    };
+                    let mut stmt = match conn
+                        .prepare("SELECT DISTINCT symbol, market FROM holdings")
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("Background refresh: failed to prepare query: {}", e);
+                            return;
+                        }
+                    };
+                    let rows = match stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                        ))
+                    }) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("Background refresh: failed to query holdings: {}", e);
+                            return;
+                        }
+                    };
+                    rows.filter_map(|r| r.ok()).collect()
+                };
+
+                if symbols.is_empty() {
+                    return;
+                }
+
+                // Determine quote providers.
+                let config = services::quote_provider_service::get_quote_provider_config(&db)
+                    .unwrap_or_default();
+
+                // Force-refresh all holding quotes from the upstream API.
+                match services::quote_service::fetch_quotes_batch_cached_with_providers(
+                    &cache,
+                    symbols,
+                    &config.us_provider,
+                    &config.hk_provider,
+                    true,
+                )
+                .await
+                {
+                    Ok(quotes) => {
+                        // Persist the freshly fetched quotes to the database.
+                        let _ = services::quote_service::save_quotes_to_db(&db, &quotes);
+                    }
+                    Err(e) => eprintln!("Background quote refresh failed: {}", e),
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

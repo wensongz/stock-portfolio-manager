@@ -1,6 +1,6 @@
 use crate::db::Database;
 use crate::models::{HoldingWithQuote, StockQuote};
-use crate::services::quote_service::{fetch_cn_quote, fetch_hk_quote_with_provider, fetch_us_quote_with_provider, fetch_quotes_batch_cached_with_providers, QuoteCache};
+use crate::services::quote_service::{fetch_cn_quote, fetch_hk_quote_with_provider, fetch_us_quote_with_provider, fetch_quotes_batch_cached_with_providers, save_quotes_to_db, QuoteCache};
 use crate::services::quote_provider_service;
 use tauri::State;
 
@@ -12,7 +12,12 @@ pub async fn get_real_time_quotes(
     force_refresh: Option<bool>,
 ) -> Result<Vec<StockQuote>, String> {
     let config = quote_provider_service::get_quote_provider_config(&db)?;
-    fetch_quotes_batch_cached_with_providers(&quote_cache, symbols, &config.us_provider, &config.hk_provider, force_refresh.unwrap_or(false)).await
+    let quotes = fetch_quotes_batch_cached_with_providers(&quote_cache, symbols, &config.us_provider, &config.hk_provider, force_refresh.unwrap_or(false)).await?;
+    // Persist freshly fetched quotes to the database
+    if let Err(e) = save_quotes_to_db(&db, &quotes) {
+        eprintln!("Failed to persist quotes to DB: {}", e);
+    }
+    Ok(quotes)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -91,6 +96,10 @@ pub async fn get_holding_quotes(
             ).await?
         }
     };
+    // Persist freshly fetched quotes to the database
+    if let Err(e) = save_quotes_to_db(&db, &quotes) {
+        eprintln!("Failed to persist quotes to DB: {}", e);
+    }
     let quote_map: std::collections::HashMap<String, StockQuote> = quotes
         .into_iter()
         .map(|q| (q.symbol.clone(), q))
@@ -142,6 +151,9 @@ pub async fn get_us_quote(db: State<'_, Database>, quote_cache: State<'_, QuoteC
     let config = quote_provider_service::get_quote_provider_config(&db)?;
     let quote = fetch_us_quote_with_provider(&symbol, &config.us_provider).await?;
     quote_cache.set(quote.clone());
+    if let Err(e) = save_quotes_to_db(&db, &[quote.clone()]) {
+        eprintln!("Failed to persist quote to DB: {}", e);
+    }
     Ok(quote)
 }
 
@@ -153,15 +165,21 @@ pub async fn get_hk_quote(db: State<'_, Database>, quote_cache: State<'_, QuoteC
     let config = quote_provider_service::get_quote_provider_config(&db)?;
     let quote = fetch_hk_quote_with_provider(&symbol, &config.hk_provider).await?;
     quote_cache.set(quote.clone());
+    if let Err(e) = save_quotes_to_db(&db, &[quote.clone()]) {
+        eprintln!("Failed to persist quote to DB: {}", e);
+    }
     Ok(quote)
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub async fn get_cn_quote(quote_cache: State<'_, QuoteCache>, symbol: String) -> Result<StockQuote, String> {
+pub async fn get_cn_quote(db: State<'_, Database>, quote_cache: State<'_, QuoteCache>, symbol: String) -> Result<StockQuote, String> {
     if let Some(cached) = quote_cache.get(&symbol) {
         return Ok(cached);
     }
     let quote = fetch_cn_quote(&symbol).await?;
     quote_cache.set(quote.clone());
+    if let Err(e) = save_quotes_to_db(&db, &[quote.clone()]) {
+        eprintln!("Failed to persist quote to DB: {}", e);
+    }
     Ok(quote)
 }

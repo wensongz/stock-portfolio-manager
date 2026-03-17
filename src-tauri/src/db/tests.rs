@@ -10,15 +10,15 @@ mod tests {
     fn test_database_creation() {
         let db = create_test_db();
         let conn = db.conn.lock().unwrap();
-        // Verify all tables exist (including Phase 5 quarterly tables)
+        // Verify all tables exist (including Phase 5 quarterly tables + cached_quotes)
         let count: i32 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('accounts', 'categories', 'holdings', 'transactions', 'daily_portfolio_values', 'daily_holding_snapshots', 'quarterly_snapshots', 'quarterly_holding_snapshots')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('accounts', 'categories', 'holdings', 'transactions', 'daily_portfolio_values', 'daily_holding_snapshots', 'quarterly_snapshots', 'quarterly_holding_snapshots', 'cached_quotes')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 8);
+        assert_eq!(count, 9);
     }
 
     #[test]
@@ -235,5 +235,114 @@ mod tests {
         };
         let result = crate::services::quote_provider_service::update_quote_provider_config(&db, &config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cached_quotes_table_exists() {
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cached_quotes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_save_and_load_cached_quotes() {
+        let db = create_test_db();
+        let quotes = vec![
+            crate::models::StockQuote {
+                symbol: "AAPL".to_string(),
+                name: "Apple Inc.".to_string(),
+                market: "US".to_string(),
+                current_price: 175.50,
+                previous_close: 174.0,
+                change: 1.50,
+                change_percent: 0.86,
+                high: 176.0,
+                low: 173.0,
+                volume: 50000000,
+                updated_at: "2024-01-15T16:00:00Z".to_string(),
+            },
+            crate::models::StockQuote {
+                symbol: "sh600519".to_string(),
+                name: "贵州茅台".to_string(),
+                market: "CN".to_string(),
+                current_price: 1800.0,
+                previous_close: 1790.0,
+                change: 10.0,
+                change_percent: 0.56,
+                high: 1810.0,
+                low: 1785.0,
+                volume: 3000000,
+                updated_at: "2024-01-15T15:00:00Z".to_string(),
+            },
+        ];
+
+        let save_result = crate::services::quote_service::save_quotes_to_db(&db, &quotes);
+        assert!(save_result.is_ok());
+
+        let loaded = crate::services::quote_service::load_quotes_from_db(&db).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        let aapl = loaded.iter().find(|q| q.symbol == "AAPL").unwrap();
+        assert_eq!(aapl.name, "Apple Inc.");
+        assert!((aapl.current_price - 175.50).abs() < 0.001);
+        assert_eq!(aapl.volume, 50000000);
+
+        let moutai = loaded.iter().find(|q| q.symbol == "sh600519").unwrap();
+        assert_eq!(moutai.name, "贵州茅台");
+        assert!((moutai.current_price - 1800.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cached_quotes_upsert() {
+        let db = create_test_db();
+        let quote = crate::models::StockQuote {
+            symbol: "AAPL".to_string(),
+            name: "Apple Inc.".to_string(),
+            market: "US".to_string(),
+            current_price: 175.50,
+            previous_close: 174.0,
+            change: 1.50,
+            change_percent: 0.86,
+            high: 176.0,
+            low: 173.0,
+            volume: 50000000,
+            updated_at: "2024-01-15T16:00:00Z".to_string(),
+        };
+        crate::services::quote_service::save_quotes_to_db(&db, &[quote]).unwrap();
+
+        // Update with new price
+        let updated_quote = crate::models::StockQuote {
+            symbol: "AAPL".to_string(),
+            name: "Apple Inc.".to_string(),
+            market: "US".to_string(),
+            current_price: 180.0,
+            previous_close: 175.50,
+            change: 4.50,
+            change_percent: 2.56,
+            high: 181.0,
+            low: 175.0,
+            volume: 60000000,
+            updated_at: "2024-01-16T16:00:00Z".to_string(),
+        };
+        crate::services::quote_service::save_quotes_to_db(&db, &[updated_quote]).unwrap();
+
+        let loaded = crate::services::quote_service::load_quotes_from_db(&db).unwrap();
+        assert_eq!(loaded.len(), 1); // Should be 1 row, not 2
+        assert!((loaded[0].current_price - 180.0).abs() < 0.001);
+        assert_eq!(loaded[0].volume, 60000000);
+    }
+
+    #[test]
+    fn test_load_cached_quotes_empty() {
+        let db = create_test_db();
+        let loaded = crate::services::quote_service::load_quotes_from_db(&db).unwrap();
+        assert!(loaded.is_empty());
     }
 }

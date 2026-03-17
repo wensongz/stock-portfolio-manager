@@ -96,7 +96,11 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
 
   startAutoRefresh: () => {
     const { fetchHoldingQuotes, refreshIntervalMs } = get();
-    fetchHoldingQuotes();
+    // First call with empty list: loads holdings with DB-cached quotes instantly
+    // (no API calls), then follow up with a full refresh from the API.
+    fetchHoldingQuotes([]).then(() => {
+      fetchHoldingQuotes();
+    });
     const id = setInterval(() => {
       get().fetchHoldingQuotes();
     }, refreshIntervalMs);

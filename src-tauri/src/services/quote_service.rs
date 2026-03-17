@@ -359,8 +359,18 @@ pub async fn fetch_cn_quote(symbol: &str) -> Result<StockQuote, String> {
 /// reset when a network error indicates the underlying connection is broken.
 static EASTMONEY_CLIENT: Mutex<Option<reqwest::Client>> = Mutex::new(None);
 
+/// Tracks the number of successful requests made on the current East Money
+/// client.  After [`EASTMONEY_REQUESTS_PER_CONNECTION`] successful requests
+/// the client is proactively reset so that the next request opens a fresh
+/// TCP connection.
+static EASTMONEY_REQUEST_COUNT: Mutex<u32> = Mutex::new(0);
+
 /// Maximum number of retry attempts for transient East Money API failures.
 const EASTMONEY_MAX_RETRIES: u32 = 2;
+
+/// Number of successful requests to send on a single East Money connection
+/// before proactively closing it and opening a new one.
+const EASTMONEY_REQUESTS_PER_CONNECTION: u32 = 10;
 
 /// Build a fresh `reqwest::Client` configured for the East Money API.
 ///
@@ -407,12 +417,17 @@ fn eastmoney_client() -> reqwest::Client {
 }
 
 /// Reset the shared East Money client so the next call to
-/// [`eastmoney_client`] will build a fresh one.
+/// [`eastmoney_client`] will build a fresh one.  Also resets the request
+/// counter back to zero.
 fn reset_eastmoney_client() {
     let mut guard = EASTMONEY_CLIENT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = None;
+    let mut count = EASTMONEY_REQUEST_COUNT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *count = 0;
 }
 
 /// Send a GET request to the East Money API with retry on transient failures.
@@ -420,12 +435,31 @@ fn reset_eastmoney_client() {
 /// On a connection-level error the shared client is reset so that the next
 /// call to [`eastmoney_client`] builds a fresh one.  The request is retried
 /// up to [`EASTMONEY_MAX_RETRIES`] times with a short delay between attempts.
+///
+/// After every [`EASTMONEY_REQUESTS_PER_CONNECTION`] successful requests the
+/// client is proactively reset so the next request opens a fresh TCP
+/// connection.  This avoids issues with long-lived connections being silently
+/// dropped by upstream proxies or load-balancers.
 async fn send_eastmoney_request(url: &str, symbol: &str) -> Result<reqwest::Response, String> {
     let mut last_err = String::new();
     for attempt in 0..=EASTMONEY_MAX_RETRIES {
         let result = eastmoney_client().get(url).send().await;
         match result {
-            Ok(resp) => return Ok(resp),
+            Ok(resp) => {
+                // Track successful requests and rotate the connection when
+                // the threshold is reached.
+                let should_reset = {
+                    let mut count = EASTMONEY_REQUEST_COUNT
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *count += 1;
+                    *count >= EASTMONEY_REQUESTS_PER_CONNECTION
+                };
+                if should_reset {
+                    reset_eastmoney_client();
+                }
+                return Ok(resp);
+            }
             Err(e) => {
                 if e.is_connect() || e.is_request() {
                     reset_eastmoney_client();
@@ -1537,5 +1571,61 @@ mod tests {
             .build()
             .expect("should build request");
         assert_eq!(req.method(), reqwest::Method::GET);
+    }
+
+    #[test]
+    fn test_eastmoney_request_count_resets_with_client() {
+        // Resetting the client should also zero the request counter.
+        {
+            let mut count = EASTMONEY_REQUEST_COUNT
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *count = 5;
+        }
+        reset_eastmoney_client();
+        {
+            let count = EASTMONEY_REQUEST_COUNT
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(*count, 0, "Counter should be zero after reset");
+        }
+    }
+
+    #[test]
+    fn test_eastmoney_connection_rotation_threshold() {
+        // Verify the rotation threshold constant and that the counter
+        // correctly triggers a client reset when it reaches the threshold.
+        assert_eq!(EASTMONEY_REQUESTS_PER_CONNECTION, 10);
+
+        // Start with a clean state.
+        reset_eastmoney_client();
+
+        // Simulate 9 successful requests – the client should still exist.
+        {
+            let mut count = EASTMONEY_REQUEST_COUNT
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *count = 9;
+            assert!(*count < EASTMONEY_REQUESTS_PER_CONNECTION);
+        }
+
+        // After the 10th request the counter should trigger a reset.
+        {
+            let mut count = EASTMONEY_REQUEST_COUNT
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *count += 1;
+            assert!(*count >= EASTMONEY_REQUESTS_PER_CONNECTION);
+        }
+        // Perform the reset (mirrors the logic in send_eastmoney_request).
+        reset_eastmoney_client();
+        {
+            let count = EASTMONEY_REQUEST_COUNT
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(*count, 0, "Counter should be zero after rotation");
+        }
+        // A new client should be obtainable after rotation.
+        let _client = eastmoney_client();
     }
 }

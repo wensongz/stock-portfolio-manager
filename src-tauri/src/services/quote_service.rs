@@ -382,7 +382,7 @@ fn build_eastmoney_client() -> reqwest::Client {
     default_headers.insert(
         header::USER_AGENT,
         header::HeaderValue::from_static(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)"
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
     );
     reqwest::Client::builder()
@@ -432,7 +432,7 @@ async fn send_eastmoney_request(url: &str, symbol: &str) -> Result<reqwest::Resp
                 }
                 last_err = format!("Network error fetching {}: {}", symbol, e);
                 if attempt < EASTMONEY_MAX_RETRIES {
-                    tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt + 1))).await;
+                    tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
                 }
             }
         }

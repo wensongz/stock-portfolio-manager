@@ -30,7 +30,7 @@ interface QuoteState {
   fetchHoldingQuotes: (refreshSymbols?: [string, string][]) => Promise<void>;
   fetchQuotes: (symbols: [string, string][], forceRefresh?: boolean) => Promise<void>;
   setRefreshInterval: (ms: number) => void;
-  startAutoRefresh: () => () => void;
+  startAutoRefresh: (getVisibleSymbols?: () => [string, string][]) => () => void;
 }
 
 export const useQuoteStore = create<QuoteState>((set, get) => ({
@@ -94,7 +94,7 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
     set({ refreshIntervalMs: ms });
   },
 
-  startAutoRefresh: () => {
+  startAutoRefresh: (getVisibleSymbols?: () => [string, string][]) => {
     const { fetchHoldingQuotes, refreshIntervalMs } = get();
     // First call with empty list: loads holdings with DB-cached quotes instantly
     // (no API calls), then follow up with a full refresh from the API.
@@ -102,7 +102,12 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
       fetchHoldingQuotes();
     });
     const id = setInterval(() => {
-      get().fetchHoldingQuotes();
+      const symbols = getVisibleSymbols?.();
+      if (symbols && symbols.length > 0) {
+        get().fetchHoldingQuotes(symbols);
+      } else {
+        get().fetchHoldingQuotes();
+      }
     }, refreshIntervalMs);
     return () => clearInterval(id);
   },

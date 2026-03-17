@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import {
   Typography,
   Button,
@@ -87,6 +87,7 @@ export default function HoldingsPage() {
   const [filterAccountId, setFilterAccountId] = useState<string | undefined>(undefined);
   const [filterMarket, setFilterMarket] = useState<Market | undefined>(undefined);
   const [symbolSearch, setSymbolSearch] = useState("");
+  const displayDataRef = useRef<HoldingWithQuote[]>([]);
 
   // Derive unique stock symbols from existing holdings for autocomplete
   const symbolOptions = useMemo(() => {
@@ -194,7 +195,17 @@ export default function HoldingsPage() {
   useEffect(() => {
     if (!showRealtime) return;
     const { startAutoRefresh } = useQuoteStore.getState();
-    return startAutoRefresh();
+    return startAutoRefresh(() => {
+      const seen = new Set<string>();
+      const symbols: [string, string][] = [];
+      for (const h of displayDataRef.current) {
+        if (!seen.has(h.symbol)) {
+          seen.add(h.symbol);
+          symbols.push([h.symbol, h.market]);
+        }
+      }
+      return symbols;
+    });
   }, [showRealtime, refreshIntervalMs]);
 
   const handleSubmit = async (values: {
@@ -299,6 +310,7 @@ export default function HoldingsPage() {
     if (filterMarket && h.market !== filterMarket) return false;
     return true;
   });
+  displayDataRef.current = displayData;
 
   // Extract unique (symbol, market) pairs from the visible holdings for
   // targeted refresh – only these symbols will be force-refreshed from the API.

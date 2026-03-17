@@ -75,7 +75,7 @@ export default function HoldingsPage() {
     useHoldingStore();
   const { accounts, fetchAccounts } = useAccountStore();
   const { categories, fetchCategories } = useCategoryStore();
-  const { holdingQuotes, loading: quotesLoading, lastUpdatedAt, refreshIntervalMs, fetchHoldingQuotes } = useQuoteStore();
+  const { holdingQuotes, loading: quotesLoading, lastUpdatedAt, fetchHoldingQuotes } = useQuoteStore();
 
   const [modalOpen, setModalOpen] = useState(false);
   const [cashModalOpen, setCashModalOpen] = useState(false);
@@ -191,22 +191,14 @@ export default function HoldingsPage() {
     fetchCategories();
   }, [fetchHoldings, fetchAccounts, fetchCategories]);
 
-  // Auto-refresh quotes at configured interval when realtime is enabled
+  // Load holdings with cached quotes when realtime display is enabled.
+  // No periodic auto-refresh – the backend refreshes the cache on startup
+  // and the user can click the refresh button for on-demand updates.
   useEffect(() => {
     if (!showRealtime) return;
     const { startAutoRefresh } = useQuoteStore.getState();
-    return startAutoRefresh(() => {
-      const seen = new Set<string>();
-      const symbols: [string, string][] = [];
-      for (const h of displayDataRef.current) {
-        if (!seen.has(h.symbol)) {
-          seen.add(h.symbol);
-          symbols.push([h.symbol, h.market]);
-        }
-      }
-      return symbols;
-    });
-  }, [showRealtime, refreshIntervalMs]);
+    return startAutoRefresh();
+  }, [showRealtime]);
 
   const handleSubmit = async (values: {
     accountId: string;

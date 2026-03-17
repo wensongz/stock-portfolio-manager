@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { HoldingWithQuote, StockQuote } from "../types";
 
 const DEFAULT_REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -30,7 +31,7 @@ interface QuoteState {
   fetchHoldingQuotes: (refreshSymbols?: [string, string][]) => Promise<void>;
   fetchQuotes: (symbols: [string, string][], forceRefresh?: boolean) => Promise<void>;
   setRefreshInterval: (ms: number) => void;
-  startAutoRefresh: (getVisibleSymbols?: () => [string, string][]) => () => void;
+  startAutoRefresh: () => () => void;
 }
 
 export const useQuoteStore = create<QuoteState>((set, get) => ({
@@ -94,21 +95,33 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
     set({ refreshIntervalMs: ms });
   },
 
-  startAutoRefresh: (getVisibleSymbols?: () => [string, string][]) => {
-    const { fetchHoldingQuotes, refreshIntervalMs } = get();
-    // First call with empty list: loads holdings with DB-cached quotes instantly
-    // (no API calls), then follow up with a full refresh from the API.
-    fetchHoldingQuotes([]).then(() => {
-      fetchHoldingQuotes();
-    });
-    const id = setInterval(() => {
-      const symbols = getVisibleSymbols?.();
-      if (symbols && symbols.length > 0) {
-        get().fetchHoldingQuotes(symbols);
+  startAutoRefresh: () => {
+    const { fetchHoldingQuotes } = get();
+    // Load holdings with DB-cached quotes only (no API calls).
+    // The backend spawns a background task on startup to refresh the cache
+    // from upstream APIs and emits a "quotes-refreshed" event when done.
+    fetchHoldingQuotes([]);
+
+    // Listen for the backend "quotes-refreshed" event so the UI picks up
+    // freshly-updated prices without a manual refresh.
+    let unlistenFn: (() => void) | null = null;
+    let cancelled = false;
+
+    listen("quotes-refreshed", () => {
+      useQuoteStore.getState().fetchHoldingQuotes([]);
+    }).then((fn) => {
+      if (cancelled) {
+        fn();
       } else {
-        get().fetchHoldingQuotes();
+        unlistenFn = fn;
       }
-    }, refreshIntervalMs);
-    return () => clearInterval(id);
+    });
+
+    // No periodic auto-refresh – quotes are only refreshed when the user
+    // explicitly clicks the refresh button.
+    return () => {
+      cancelled = true;
+      if (unlistenFn) unlistenFn();
+    };
   },
 }));

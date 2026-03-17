@@ -6,7 +6,7 @@ mod services;
 use db::Database;
 use services::exchange_rate_service::ExchangeRateCache;
 use services::quote_service::QuoteCache;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -103,6 +103,8 @@ pub fn run() {
                     Ok(quotes) => {
                         // Persist the freshly fetched quotes to the database.
                         let _ = services::quote_service::save_quotes_to_db(&db, &quotes);
+                        // Notify the frontend so it can re-render with fresh prices.
+                        let _ = handle.emit("quotes-refreshed", ());
                     }
                     Err(e) => eprintln!("Background quote refresh failed: {}", e),
                 }

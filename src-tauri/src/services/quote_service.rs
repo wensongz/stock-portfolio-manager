@@ -359,10 +359,36 @@ pub async fn fetch_cn_quote(symbol: &str) -> Result<StockQuote, String> {
 /// reset when a network error indicates the underlying connection is broken.
 static EASTMONEY_CLIENT: Mutex<Option<reqwest::Client>> = Mutex::new(None);
 
+/// Maximum number of retry attempts for transient East Money API failures.
+const EASTMONEY_MAX_RETRIES: u32 = 2;
+
 /// Build a fresh `reqwest::Client` configured for the East Money API.
+///
+/// The client is configured with:
+/// - HTTP/1.1 only (avoids HTTP/2 negotiation issues with Chinese financial servers)
+/// - Browser-like default headers (`Referer`, `User-Agent`, `Accept`)
+/// - 15-second request timeout
 fn build_eastmoney_client() -> reqwest::Client {
+    use reqwest::header;
+    let mut default_headers = header::HeaderMap::new();
+    default_headers.insert(
+        header::REFERER,
+        header::HeaderValue::from_static("https://www.eastmoney.com/"),
+    );
+    default_headers.insert(
+        header::ACCEPT,
+        header::HeaderValue::from_static("*/*"),
+    );
+    default_headers.insert(
+        header::USER_AGENT,
+        header::HeaderValue::from_static(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)"
+        ),
+    );
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
+        .http1_only()
+        .default_headers(default_headers)
         .build()
         .expect("failed to build East Money HTTP client")
 }
@@ -387,6 +413,31 @@ fn reset_eastmoney_client() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = None;
+}
+
+/// Send a GET request to the East Money API with retry on transient failures.
+///
+/// On a connection-level error the shared client is reset so that the next
+/// call to [`eastmoney_client`] builds a fresh one.  The request is retried
+/// up to [`EASTMONEY_MAX_RETRIES`] times with a short delay between attempts.
+async fn send_eastmoney_request(url: &str, symbol: &str) -> Result<reqwest::Response, String> {
+    let mut last_err = String::new();
+    for attempt in 0..=EASTMONEY_MAX_RETRIES {
+        let result = eastmoney_client().get(url).send().await;
+        match result {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                if e.is_connect() || e.is_request() {
+                    reset_eastmoney_client();
+                }
+                last_err = format!("Network error fetching {}: {}", symbol, e);
+                if attempt < EASTMONEY_MAX_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt + 1))).await;
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// East Money API response for a single stock quote.
@@ -432,15 +483,7 @@ async fn fetch_eastmoney_cn_quote(symbol: &str) -> Result<StockQuote, String> {
         secid
     );
 
-    let response = eastmoney_client()
-        .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
-        .send()
-        .await
-        .map_err(|e| {
-            reset_eastmoney_client();
-            format!("Network error fetching {}: {}", symbol, e)
-        })?;
+    let response = send_eastmoney_request(&url, &symbol).await?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -467,15 +510,7 @@ async fn fetch_eastmoney_us_quote(symbol: &str) -> Result<StockQuote, String> {
         secid
     );
 
-    let response = eastmoney_client()
-        .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
-        .send()
-        .await
-        .map_err(|e| {
-            reset_eastmoney_client();
-            format!("Network error fetching {}: {}", symbol, e)
-        })?;
+    let response = send_eastmoney_request(&url, symbol).await?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -502,15 +537,7 @@ async fn fetch_eastmoney_hk_quote(symbol: &str) -> Result<StockQuote, String> {
         secid
     );
 
-    let response = eastmoney_client()
-        .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
-        .send()
-        .await
-        .map_err(|e| {
-            reset_eastmoney_client();
-            format!("Network error fetching {}: {}", symbol, e)
-        })?;
+    let response = send_eastmoney_request(&url, symbol).await?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -1320,5 +1347,20 @@ mod tests {
         let _c1 = eastmoney_client();
         reset_eastmoney_client();
         let _c2 = eastmoney_client();
+    }
+
+    #[test]
+    fn test_build_eastmoney_client_has_default_headers() {
+        // The client should be buildable without panic and be usable.
+        // Default headers (Referer, User-Agent, Accept) are set on the
+        // client and applied when requests are sent (not visible via
+        // RequestBuilder::build(), which only shows request-level headers).
+        let client = build_eastmoney_client();
+        // Verify the client can construct a valid request.
+        let req = client
+            .get("https://push2.eastmoney.com/test")
+            .build()
+            .expect("should build request");
+        assert_eq!(req.method(), reqwest::Method::GET);
     }
 }

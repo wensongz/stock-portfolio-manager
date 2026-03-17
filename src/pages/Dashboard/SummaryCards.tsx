@@ -24,9 +24,6 @@ function fmt(value: number, currency: string) {
 }
 
 export default function SummaryCards({ summary, loading, error }: Props) {
-  if (loading) {
-    return <Skeleton active />;
-  }
   if (error) {
     return (
       <Alert
@@ -36,6 +33,9 @@ export default function SummaryCards({ summary, loading, error }: Props) {
         showIcon
       />
     );
+  }
+  if (loading && !summary) {
+    return <Skeleton active />;
   }
   if (!summary) {
     return null;

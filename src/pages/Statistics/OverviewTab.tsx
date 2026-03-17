@@ -13,7 +13,7 @@ function pnlColor(pnl: number) {
 }
 
 export default function OverviewTab({ overview, loading }: Props) {
-  if (loading) {
+  if (loading && !overview) {
     return (
       <div className="flex justify-center py-16">
         <Spin size="large" />

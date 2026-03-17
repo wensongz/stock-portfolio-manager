@@ -300,6 +300,20 @@ export default function HoldingsPage() {
     return true;
   });
 
+  // Extract unique (symbol, market) pairs from the visible holdings for
+  // targeted refresh – only these symbols will be force-refreshed from the API.
+  const handleRefreshQuotes = useCallback(() => {
+    const seen = new Set<string>();
+    const symbols: [string, string][] = [];
+    for (const h of displayData) {
+      if (!seen.has(h.symbol)) {
+        seen.add(h.symbol);
+        symbols.push([h.symbol, h.market]);
+      }
+    }
+    fetchHoldingQuotes(symbols);
+  }, [displayData, fetchHoldingQuotes]);
+
   const staticColumns = [
     {
       title: "股票代码",
@@ -448,7 +462,7 @@ export default function HoldingsPage() {
             <Tooltip title={lastUpdatedAt ? `上次更新: ${dayjs(lastUpdatedAt).format("HH:mm:ss")}` : "点击刷新"}>
               <Button
                 icon={quotesLoading ? <SyncOutlined spin /> : <ReloadOutlined />}
-                onClick={() => fetchHoldingQuotes(true)}
+                onClick={handleRefreshQuotes}
                 size="small"
                 disabled={quotesLoading}
               >

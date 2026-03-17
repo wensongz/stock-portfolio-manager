@@ -27,7 +27,7 @@ interface QuoteState {
   error: string | null;
   lastUpdatedAt: string | null;
   refreshIntervalMs: number;
-  fetchHoldingQuotes: (forceRefresh?: boolean) => Promise<void>;
+  fetchHoldingQuotes: (refreshSymbols?: [string, string][]) => Promise<void>;
   fetchQuotes: (symbols: [string, string][], forceRefresh?: boolean) => Promise<void>;
   setRefreshInterval: (ms: number) => void;
   startAutoRefresh: () => () => void;
@@ -41,11 +41,11 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
   lastUpdatedAt: null,
   refreshIntervalMs: loadRefreshInterval(),
 
-  fetchHoldingQuotes: async (forceRefresh?: boolean) => {
+  fetchHoldingQuotes: async (refreshSymbols?: [string, string][]) => {
     set({ loading: true, error: null });
     try {
       const holdingQuotes = await invoke<HoldingWithQuote[]>("get_holding_quotes", {
-        forceRefresh: forceRefresh ?? false,
+        ...(refreshSymbols !== undefined ? { refreshSymbols } : {}),
       });
       const quotes: Record<string, StockQuote> = {};
       holdingQuotes.forEach((h) => {
@@ -96,9 +96,9 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
 
   startAutoRefresh: () => {
     const { fetchHoldingQuotes, refreshIntervalMs } = get();
-    fetchHoldingQuotes(true);
+    fetchHoldingQuotes();
     const id = setInterval(() => {
-      get().fetchHoldingQuotes(true);
+      get().fetchHoldingQuotes();
     }, refreshIntervalMs);
     return () => clearInterval(id);
   },

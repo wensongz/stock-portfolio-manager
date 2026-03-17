@@ -19,7 +19,7 @@ pub async fn get_real_time_quotes(
 pub async fn get_holding_quotes(
     db: State<'_, Database>,
     quote_cache: State<'_, QuoteCache>,
-    force_refresh: Option<bool>,
+    refresh_symbols: Option<Vec<(String, String)>>,
 ) -> Result<Vec<HoldingWithQuote>, String> {
     let config = quote_provider_service::get_quote_provider_config(&db)?;
     // Load holdings from DB (synchronous)
@@ -54,12 +54,43 @@ pub async fn get_holding_quotes(
         result
     };
 
-    // Fetch quotes for all holdings
-    let symbols: Vec<(String, String)> = holdings
+    // Fetch quotes for all holdings.
+    // When refresh_symbols is provided, only those symbols are force-refreshed
+    // from the upstream API; all other quotes come from cache.
+    // When refresh_symbols is None, ALL symbols are force-refreshed.
+    let all_symbols: Vec<(String, String)> = holdings
         .iter()
         .map(|h| (h.symbol.clone(), h.market.clone()))
         .collect();
-    let quotes = fetch_quotes_batch_cached_with_providers(&quote_cache, symbols, &config.us_provider, &config.hk_provider, force_refresh.unwrap_or(false)).await?;
+
+    let quotes = match refresh_symbols {
+        Some(ref symbols) if !symbols.is_empty() => {
+            // Targeted refresh: force-refresh only the specified symbols
+            fetch_quotes_batch_cached_with_providers(
+                &quote_cache, symbols.clone(),
+                &config.us_provider, &config.hk_provider, true,
+            ).await?;
+            // Then load all quotes from cache (the refreshed ones are now fresh)
+            fetch_quotes_batch_cached_with_providers(
+                &quote_cache, all_symbols,
+                &config.us_provider, &config.hk_provider, false,
+            ).await?
+        }
+        Some(_) => {
+            // Empty list: no refresh needed, just use cache
+            fetch_quotes_batch_cached_with_providers(
+                &quote_cache, all_symbols,
+                &config.us_provider, &config.hk_provider, false,
+            ).await?
+        }
+        None => {
+            // No list provided: full refresh of all symbols
+            fetch_quotes_batch_cached_with_providers(
+                &quote_cache, all_symbols,
+                &config.us_provider, &config.hk_provider, true,
+            ).await?
+        }
+    };
     let quote_map: std::collections::HashMap<String, StockQuote> = quotes
         .into_iter()
         .map(|q| (q.symbol.clone(), q))

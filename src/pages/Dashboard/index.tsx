@@ -1,7 +1,9 @@
-import { useEffect } from "react";
-import { Typography, Select, Divider, Card, Row, Col, Statistic, Spin, Alert } from "antd";
+import { useCallback, useEffect } from "react";
+import { Typography, Select, Divider, Card, Row, Col, Statistic, Spin, Alert, Button, Tooltip } from "antd";
+import { ReloadOutlined, SyncOutlined } from "@ant-design/icons";
 import { useDashboardStore } from "../../stores/dashboardStore";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
+import { useQuoteStore } from "../../stores/quoteStore";
 import type { Currency } from "../../types";
 import SummaryCards from "./SummaryCards";
 import HoldingsTable from "./HoldingsTable";
@@ -15,6 +17,7 @@ export default function DashboardPage() {
     useDashboardStore();
   const { rates, loading: ratesLoading, error: ratesError, baseCurrency, fetchRates, setBaseCurrency } =
     useExchangeRateStore();
+  const { loading: quotesLoading, lastUpdatedAt, fetchHoldingQuotes } = useQuoteStore();
 
   useEffect(() => {
     fetchRates();
@@ -27,6 +30,12 @@ export default function DashboardPage() {
     fetchSummary(currency);
   };
 
+  const handleRefreshQuotes = useCallback(async () => {
+    await fetchHoldingQuotes();
+    fetchSummary(baseCurrency);
+    fetchHoldingDetails();
+  }, [fetchHoldingQuotes, fetchSummary, fetchHoldingDetails, baseCurrency]);
+
   return (
     <div>
       <div className="flex justify-between items-center mb-4">
@@ -34,6 +43,16 @@ export default function DashboardPage() {
           📊 仪表盘
         </Title>
         <div className="flex items-center gap-2">
+          <Tooltip title={lastUpdatedAt ? `上次更新: ${dayjs(lastUpdatedAt).format("HH:mm:ss")}` : "点击刷新行情"}>
+            <Button
+              icon={quotesLoading ? <SyncOutlined spin /> : <ReloadOutlined />}
+              onClick={handleRefreshQuotes}
+              size="small"
+              disabled={quotesLoading}
+            >
+              刷新行情
+            </Button>
+          </Tooltip>
           <Text type="secondary">基准货币:</Text>
           <Select
             value={baseCurrency}

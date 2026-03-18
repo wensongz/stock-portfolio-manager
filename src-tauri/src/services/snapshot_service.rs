@@ -1,7 +1,7 @@
 use crate::db::Database;
 use crate::models::{DailyHoldingSnapshot, DailyPortfolioValue};
 use crate::services::exchange_rate_service::ExchangeRateCache;
-use crate::services::quote_service::{fetch_quotes_batch_cached_with_providers, fetch_stock_history_yahoo, QuoteCache};
+use crate::services::quote_service::{fetch_quotes_batch_cached_with_providers, fetch_stock_history, QuoteCache};
 use crate::services::quote_provider_service;
 use chrono::{Datelike, NaiveDate};
 
@@ -373,13 +373,15 @@ pub async fn backfill_snapshots(
         return Ok(0);
     }
 
-    // 3. Fetch historical prices for each holding from Yahoo Finance
+    // 3. Fetch historical prices for each holding using the configured provider
     // Build a map: symbol -> { date -> close_price }
     // Cash symbols skip API calls – their price is always 1.0.
     let mut history_map: std::collections::HashMap<
         String,
         std::collections::HashMap<NaiveDate, f64>,
     > = std::collections::HashMap::new();
+
+    let config = quote_provider_service::get_quote_provider_config(db)?;
 
     for holding in &holdings {
         // Cash holdings have a constant price of 1.0 – no history fetch needed.
@@ -394,11 +396,19 @@ pub async fn backfill_snapshots(
             continue;
         }
 
-        match fetch_stock_history_yahoo(
+        // CN (A-shares) always uses East Money; other unknown markets default to it as well.
+        let provider = match holding.market.as_str() {
+            "US" => config.us_provider.as_str(),
+            "HK" => config.hk_provider.as_str(),
+            _ => "eastmoney",
+        };
+
+        match fetch_stock_history(
             &holding.symbol,
             &holding.market,
             start_date,
             end_date,
+            provider,
         )
         .await
         {
@@ -417,8 +427,8 @@ pub async fn backfill_snapshots(
     }
 
     // Build sorted price vectors per symbol for forward-fill on holidays.
-    // When a market is closed (e.g. public holidays), Yahoo Finance returns no
-    // price for that date.  We carry forward the most recent closing price so
+    // When a market is closed (e.g. public holidays), the data provider returns
+    // no price for that date.  We carry forward the most recent closing price so
     // that the portfolio value is still computed correctly.
     let history_sorted: std::collections::HashMap<String, Vec<(NaiveDate, f64)>> = history_map
         .iter()

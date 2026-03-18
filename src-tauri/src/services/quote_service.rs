@@ -716,7 +716,7 @@ pub async fn fetch_quotes_batch_with_providers(
 }
 
 // ---------------------------------------------------------------------------
-// Historical price fetching (Yahoo Finance)
+// Historical price fetching
 // ---------------------------------------------------------------------------
 
 /// Convert a holding symbol + market to a Yahoo Finance ticker for historical queries.
@@ -814,6 +814,86 @@ pub async fn fetch_stock_history_yahoo(
         }
     }
     Ok(result)
+}
+
+/// Fetch historical daily closing prices for a stock from East Money (东方财富).
+/// Returns a list of (date, close_price) pairs sorted by date ascending.
+pub async fn fetch_stock_history_eastmoney(
+    symbol: &str,
+    market: &str,
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+) -> Result<Vec<(chrono::NaiveDate, f64)>, String> {
+    let secid = match market {
+        "HK" => to_eastmoney_hk_secid(symbol)?,
+        "US" => to_eastmoney_us_secid(symbol),
+        "CN" => to_eastmoney_secid(&symbol.to_lowercase())?,
+        _ => return Err(format!("Unsupported market '{}' for East Money history", market)),
+    };
+
+    let beg = start_date.format("%Y%m%d").to_string();
+    let end = end_date.format("%Y%m%d").to_string();
+
+    let url = format!(
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt=101&fqt=0&beg={}&end={}",
+        secid, beg, end
+    );
+
+    let resp = send_eastmoney_request(&url, symbol).await?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "fetch_stock_history_eastmoney: HTTP {} for {}",
+            resp.status(),
+            symbol
+        ));
+    }
+
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("fetch_stock_history_eastmoney: read error for {}: {}", symbol, e))?;
+
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("fetch_stock_history_eastmoney: parse error for {}: {}", symbol, e))?;
+
+    // East Money kline response: data.klines is an array of CSV strings
+    // Each line: "date,open,close,high,low,volume,amount,amplitude,change_pct,change_amt,turnover"
+    let klines = json["data"]["klines"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    let mut result: Vec<(chrono::NaiveDate, f64)> = Vec::new();
+    for kline in &klines {
+        if let Some(line) = kline.as_str() {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 3 {
+                if let Ok(date) = chrono::NaiveDate::parse_from_str(parts[0], "%Y-%m-%d") {
+                    if let Ok(close) = parts[2].parse::<f64>() {
+                        result.push((date, close));
+                    }
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Fetch historical daily closing prices using the appropriate provider
+/// based on the market and the configured provider name.
+/// Falls back to Yahoo Finance for unknown providers.
+pub async fn fetch_stock_history(
+    symbol: &str,
+    market: &str,
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+    provider: &str,
+) -> Result<Vec<(chrono::NaiveDate, f64)>, String> {
+    match provider {
+        "eastmoney" => fetch_stock_history_eastmoney(symbol, market, start_date, end_date).await,
+        _ => fetch_stock_history_yahoo(symbol, market, start_date, end_date).await,
+    }
 }
 
 #[cfg(test)]
@@ -1583,5 +1663,73 @@ mod tests {
             .build()
             .expect("should build request");
         assert_eq!(req.method(), reqwest::Method::GET);
+    }
+
+    // ---- East Money history parsing tests ----
+
+    #[test]
+    fn test_parse_eastmoney_kline_response() {
+        // Simulate the East Money kline API response format
+        let json_str = r#"{
+            "rc": 0,
+            "data": {
+                "code": "00700",
+                "klines": [
+                    "2024-01-02,350.00,355.00,358.00,349.00,10000000,3550000000.00,2.58,1.43,5.00,0.50",
+                    "2024-01-03,356.00,352.00,357.00,351.00,12000000,4272000000.00,1.69,-0.84,-3.00,0.60",
+                    "2024-01-04,351.00,360.00,362.00,350.00,15000000,5400000000.00,3.41,2.27,8.00,0.75"
+                ]
+            }
+        }"#;
+
+        let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let klines = json["data"]["klines"].as_array().cloned().unwrap_or_default();
+
+        let mut result: Vec<(chrono::NaiveDate, f64)> = Vec::new();
+        for kline in &klines {
+            if let Some(line) = kline.as_str() {
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.len() >= 3 {
+                    if let Ok(date) = chrono::NaiveDate::parse_from_str(parts[0], "%Y-%m-%d") {
+                        if let Ok(close) = parts[2].parse::<f64>() {
+                            result.push((date, close));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(
+            result[0].0,
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()
+        );
+        assert!((result[0].1 - 355.0).abs() < f64::EPSILON);
+        assert_eq!(
+            result[1].0,
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 3).unwrap()
+        );
+        assert!((result[1].1 - 352.0).abs() < f64::EPSILON);
+        assert_eq!(
+            result[2].0,
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 4).unwrap()
+        );
+        assert!((result[2].1 - 360.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_eastmoney_kline_empty() {
+        let json_str = r#"{"rc": 0, "data": {"code": "00700", "klines": []}}"#;
+        let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let klines = json["data"]["klines"].as_array().cloned().unwrap_or_default();
+        assert!(klines.is_empty());
+    }
+
+    #[test]
+    fn test_parse_eastmoney_kline_null_data() {
+        let json_str = r#"{"rc": 0, "data": null}"#;
+        let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let klines = json["data"]["klines"].as_array().cloned().unwrap_or_default();
+        assert!(klines.is_empty());
     }
 }

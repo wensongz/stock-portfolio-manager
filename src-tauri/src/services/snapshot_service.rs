@@ -396,6 +396,7 @@ pub async fn backfill_snapshots(
             continue;
         }
 
+        // CN (A-shares) always uses East Money; other unknown markets default to it as well.
         let provider = match holding.market.as_str() {
             "US" => config.us_provider.as_str(),
             "HK" => config.hk_provider.as_str(),

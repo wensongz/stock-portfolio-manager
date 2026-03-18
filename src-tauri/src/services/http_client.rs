@@ -63,8 +63,7 @@ pub fn eastmoney_client() -> &'static reqwest::Client {
             ),
         );
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .http1_only()
+            .timeout(Duration::from_secs(18))
             .pool_max_idle_per_host(5)
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60))

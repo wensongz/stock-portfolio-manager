@@ -345,4 +345,250 @@ mod tests {
         let loaded = crate::services::quote_service::load_quotes_from_db(&db).unwrap();
         assert!(loaded.is_empty());
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Transaction cost-basis and data integrity tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Helper: create an account and a holding, returning (account_id, holding_id).
+    fn setup_account_and_holding(conn: &rusqlite::Connection, symbol: &str, shares: f64, avg_cost: f64) -> (String, String) {
+        let acct_id = uuid::Uuid::new_v4().to_string();
+        let holding_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO accounts (id, name, market, created_at, updated_at) VALUES (?1, 'Test', 'US', ?2, ?2)",
+            rusqlite::params![acct_id, now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO holdings (id, account_id, symbol, name, market, shares, avg_cost, currency, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3, 'US', ?4, ?5, 'USD', ?6, ?6)",
+            rusqlite::params![holding_id, acct_id, symbol, shares, avg_cost, now],
+        ).unwrap();
+        (acct_id, holding_id)
+    }
+
+    /// Simulate a transaction and update holdings the same way create_transaction does.
+    /// Returns Ok(new_shares, new_avg_cost) or Err if validation fails.
+    fn simulate_transaction(
+        conn: &rusqlite::Connection,
+        acct_id: &str,
+        symbol: &str,
+        tx_type: &str,
+        shares: f64,
+        price: f64,
+    ) -> Result<(f64, f64), String> {
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+
+        let result = (|| -> Result<(f64, f64), String> {
+            let holding_id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM holdings WHERE account_id = ?1 AND symbol = ?2",
+                    rusqlite::params![acct_id, symbol],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            if let Some(ref hid) = holding_id {
+                let (current_shares, current_avg_cost): (f64, f64) = conn
+                    .query_row(
+                        "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
+                        rusqlite::params![hid],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|e| e.to_string())?;
+
+                // Guard against selling more shares than held
+                if tx_type == "SELL" && shares > current_shares {
+                    return Err(format!(
+                        "Cannot sell {} shares of {}: only {} shares held",
+                        shares, symbol, current_shares
+                    ));
+                }
+
+                let (new_shares, new_avg_cost) = if tx_type == "BUY" {
+                    let total_shares = current_shares + shares;
+                    let new_avg = if total_shares > 0.0 {
+                        (current_shares * current_avg_cost + shares * price) / total_shares
+                    } else {
+                        price
+                    };
+                    (total_shares, new_avg)
+                } else {
+                    (current_shares - shares, current_avg_cost)
+                };
+
+                let now = chrono::Utc::now().to_rfc3339();
+                conn.execute(
+                    "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
+                    rusqlite::params![hid, new_shares, new_avg_cost, now],
+                )
+                .map_err(|e| e.to_string())?;
+
+                let tx_id = uuid::Uuid::new_v4().to_string();
+                let total_amount = shares * price;
+                conn.execute(
+                    "INSERT INTO transactions (id, holding_id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, notes, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?4, 'US', ?5, ?6, ?7, ?8, 0, 'USD', ?9, NULL, ?9)",
+                    rusqlite::params![tx_id, hid, acct_id, symbol, tx_type, shares, price, total_amount, now],
+                )
+                .map_err(|e| e.to_string())?;
+
+                Ok((new_shares, new_avg_cost))
+            } else {
+                Err("Holding not found".to_string())
+            }
+        })();
+
+        match &result {
+            Ok(_) => conn.execute_batch("COMMIT").map_err(|e| e.to_string())?,
+            Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
+        }
+        result
+    }
+
+    #[test]
+    fn test_buy_updates_avg_cost_correctly() {
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        // Start with 100 shares at $10
+        let (acct_id, _) = setup_account_and_holding(&conn, "AAPL", 100.0, 10.0);
+
+        // Buy 100 more shares at $20
+        let (new_shares, new_avg) = simulate_transaction(&conn, &acct_id, "AAPL", "BUY", 100.0, 20.0).unwrap();
+
+        assert!((new_shares - 200.0).abs() < 1e-9);
+        // Weighted avg: (100*10 + 100*20) / 200 = 15.0
+        assert!((new_avg - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_multiple_buys_avg_cost() {
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        // Start with 50 shares at $100
+        let (acct_id, _) = setup_account_and_holding(&conn, "MSFT", 50.0, 100.0);
+
+        // Buy 30 at $120
+        let (shares, avg) = simulate_transaction(&conn, &acct_id, "MSFT", "BUY", 30.0, 120.0).unwrap();
+        assert!((shares - 80.0).abs() < 1e-9);
+        // (50*100 + 30*120) / 80 = (5000 + 3600) / 80 = 107.5
+        assert!((avg - 107.5).abs() < 1e-9);
+
+        // Buy 20 more at $90
+        let (shares2, avg2) = simulate_transaction(&conn, &acct_id, "MSFT", "BUY", 20.0, 90.0).unwrap();
+        assert!((shares2 - 100.0).abs() < 1e-9);
+        // (80*107.5 + 20*90) / 100 = (8600 + 1800) / 100 = 104.0
+        assert!((avg2 - 104.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_sell_preserves_avg_cost() {
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let (acct_id, _) = setup_account_and_holding(&conn, "GOOG", 100.0, 150.0);
+
+        // Sell 30 shares — avg_cost should remain 150
+        let (new_shares, new_avg) = simulate_transaction(&conn, &acct_id, "GOOG", "SELL", 30.0, 200.0).unwrap();
+        assert!((new_shares - 70.0).abs() < 1e-9);
+        assert!((new_avg - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_sell_all_shares() {
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let (acct_id, _) = setup_account_and_holding(&conn, "TSLA", 50.0, 200.0);
+
+        // Sell exactly all shares
+        let (new_shares, new_avg) = simulate_transaction(&conn, &acct_id, "TSLA", "SELL", 50.0, 250.0).unwrap();
+        assert!((new_shares - 0.0).abs() < 1e-9);
+        assert!((new_avg - 200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_sell_more_than_held_is_rejected() {
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let (acct_id, _) = setup_account_and_holding(&conn, "NVDA", 100.0, 50.0);
+
+        // Try to sell 150 shares when only 100 held
+        let result = simulate_transaction(&conn, &acct_id, "NVDA", "SELL", 150.0, 60.0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Cannot sell 150 shares"));
+
+        // Verify holding is unchanged (rollback worked)
+        let (shares, avg): (f64, f64) = conn
+            .query_row(
+                "SELECT shares, avg_cost FROM holdings WHERE account_id = ?1 AND symbol = 'NVDA'",
+                rusqlite::params![acct_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!((shares - 100.0).abs() < 1e-9);
+        assert!((avg - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_transaction_atomicity_on_failure() {
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let (acct_id, _) = setup_account_and_holding(&conn, "AMZN", 100.0, 180.0);
+
+        // Attempt an invalid sell
+        let result = simulate_transaction(&conn, &acct_id, "AMZN", "SELL", 200.0, 190.0);
+        assert!(result.is_err());
+
+        // Verify no transaction was recorded
+        let tx_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE account_id = ?1 AND symbol = 'AMZN'",
+                rusqlite::params![acct_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tx_count, 0);
+
+        // Verify holding unchanged
+        let (shares,): (f64,) = conn
+            .query_row(
+                "SELECT shares FROM holdings WHERE account_id = ?1 AND symbol = 'AMZN'",
+                rusqlite::params![acct_id],
+                |row| Ok((row.get(0)?,)),
+            )
+            .unwrap();
+        assert!((shares - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_buy_then_sell_sequence() {
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let (acct_id, _) = setup_account_and_holding(&conn, "META", 0.0, 0.0);
+
+        // Buy 100 at $300
+        let (s1, a1) = simulate_transaction(&conn, &acct_id, "META", "BUY", 100.0, 300.0).unwrap();
+        assert!((s1 - 100.0).abs() < 1e-9);
+        assert!((a1 - 300.0).abs() < 1e-9);
+
+        // Buy 50 at $350
+        let (s2, a2) = simulate_transaction(&conn, &acct_id, "META", "BUY", 50.0, 350.0).unwrap();
+        assert!((s2 - 150.0).abs() < 1e-9);
+        // (100*300 + 50*350) / 150 = 47500/150 ≈ 316.67
+        assert!((a2 - 316.666_666_667).abs() < 0.001);
+
+        // Sell 80 at $400 — avg_cost stays at ~316.67
+        let (s3, a3) = simulate_transaction(&conn, &acct_id, "META", "SELL", 80.0, 400.0).unwrap();
+        assert!((s3 - 70.0).abs() < 1e-9);
+        assert!((a3 - 316.666_666_667).abs() < 0.001);
+
+        // Verify 3 transactions recorded
+        let tx_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE account_id = ?1 AND symbol = 'META'",
+                rusqlite::params![acct_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tx_count, 3);
+    }
 }

@@ -1075,4 +1075,188 @@ mod tests {
         // daily: (105 - 100) / 100 * 100 = 5%
         assert!((series[1].daily_return - 5.0).abs() < 1e-6);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Additional performance calculation tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_twr_single_period_no_cash_flow() {
+        // Simple case: one period, 10% return
+        let periods = vec![
+            SubPeriod { start_value: 1000.0, end_value: 1100.0, cash_flow: 0.0 },
+        ];
+        let twr = calculate_twr_from_periods(&periods);
+        assert!((twr - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_twr_with_cash_flow() {
+        // Period 1: start 1000, end 1100, no CF → +10%
+        // Period 2: start 1600 (1100 + 500 deposit), end 1760, CF=500 → (1760 - 1600 - 500) / 1600 is wrong
+        // Actually: period_return = (end - start - CF) / start = (1760 - 1600 - 500) / 1600 = -0.2125
+        // Wait, SubPeriod.period_return says (end_value - start_value - cash_flow) / start_value
+        // So period 2 start_value should be the value BEFORE the cash flow
+        // Let's say: start=1100, deposit 500 brings it to 1600 as end_value, cash_flow=500
+        // period_return = (1600 - 1100 - 500) / 1100 = 0.0
+        // That makes sense — the growth was entirely from the deposit
+        let periods = vec![
+            SubPeriod { start_value: 1000.0, end_value: 1100.0, cash_flow: 0.0 },
+            SubPeriod { start_value: 1100.0, end_value: 1600.0, cash_flow: 500.0 },
+        ];
+        let twr = calculate_twr_from_periods(&periods);
+        // TWR = (1 + 0.10) * (1 + 0.0) - 1 = 0.10
+        assert!((twr - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_twr_with_loss() {
+        let periods = vec![
+            SubPeriod { start_value: 1000.0, end_value: 900.0, cash_flow: 0.0 },
+            SubPeriod { start_value: 900.0, end_value: 810.0, cash_flow: 0.0 },
+        ];
+        let twr = calculate_twr_from_periods(&periods);
+        // (900/1000) * (810/900) - 1 = 0.9 * 0.9 - 1 = -0.19
+        assert!((twr - (-0.19)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_twr_empty_periods() {
+        let twr = calculate_twr_from_periods(&[]);
+        // product of empty iterator is 1.0, so 1.0 - 1.0 = 0.0
+        assert!((twr - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_twr_zero_start_value_returns_zero() {
+        let periods = vec![
+            SubPeriod { start_value: 0.0, end_value: 100.0, cash_flow: 0.0 },
+        ];
+        let twr = calculate_twr_from_periods(&periods);
+        // period_return returns 0.0 when start_value is 0, so TWR = (1+0) - 1 = 0
+        assert!((twr - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_annualise_return_half_year() {
+        // 5% return in 182.5 days → annualised ≈ (1.05)^2 - 1 ≈ 10.25%
+        let ar = annualise_return(0.05, 183);
+        // (1.05)^(365/183) - 1 ≈ 0.10189
+        assert!(ar > 0.10 && ar < 0.11);
+    }
+
+    #[test]
+    fn test_annualise_return_zero_days() {
+        assert_eq!(annualise_return(0.10, 0), 0.0);
+        assert_eq!(annualise_return(0.10, -5), 0.0);
+    }
+
+    #[test]
+    fn test_volatility_constant_returns() {
+        // All same returns → variance = 0
+        let returns = vec![1.0, 1.0, 1.0, 1.0, 1.0];
+        let (dv, av) = calculate_volatility(&returns);
+        assert!((dv - 0.0).abs() < 1e-9);
+        assert!((av - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_volatility_single_return() {
+        let (dv, av) = calculate_volatility(&[5.0]);
+        assert_eq!(dv, 0.0);
+        assert_eq!(av, 0.0);
+    }
+
+    #[test]
+    fn test_volatility_empty() {
+        let (dv, av) = calculate_volatility(&[]);
+        assert_eq!(dv, 0.0);
+        assert_eq!(av, 0.0);
+    }
+
+    #[test]
+    fn test_sharpe_ratio_basic() {
+        // 15% annual return, 4.5% risk-free, 10% vol → Sharpe = (0.15 - 0.045) / 0.10 = 1.05
+        let sharpe = calculate_sharpe(0.15, 0.045, 0.10);
+        assert!((sharpe - 1.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_sharpe_ratio_zero_vol() {
+        let sharpe = calculate_sharpe(0.15, 0.045, 0.0);
+        assert_eq!(sharpe, 0.0);
+    }
+
+    #[test]
+    fn test_sharpe_ratio_negative_excess_return() {
+        // Return below risk-free → negative Sharpe
+        let sharpe = calculate_sharpe(0.02, 0.045, 0.10);
+        assert!(sharpe < 0.0);
+        assert!((sharpe - (-0.25)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_max_drawdown_no_drawdown() {
+        // Monotonically increasing portfolio
+        let series: Vec<ReturnDataPoint> = vec![
+            ReturnDataPoint { date: "2024-01-01".into(), cumulative_return: 0.0, daily_return: 0.0, portfolio_value: 100.0, daily_pnl: 0.0 },
+            ReturnDataPoint { date: "2024-01-02".into(), cumulative_return: 5.0, daily_return: 5.0, portfolio_value: 105.0, daily_pnl: 5.0 },
+            ReturnDataPoint { date: "2024-01-03".into(), cumulative_return: 10.0, daily_return: 5.0, portfolio_value: 110.0, daily_pnl: 5.0 },
+        ];
+        let dd = calculate_max_drawdown(&series);
+        assert!((dd.max_drawdown - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_max_drawdown_empty() {
+        let dd = calculate_max_drawdown(&[]);
+        assert!((dd.max_drawdown - 0.0).abs() < 1e-9);
+        assert_eq!(dd.drawdown_duration, 0);
+    }
+
+    #[test]
+    fn test_max_drawdown_with_recovery() {
+        let series: Vec<ReturnDataPoint> = vec![
+            ReturnDataPoint { date: "2024-01-01".into(), cumulative_return: 0.0, daily_return: 0.0, portfolio_value: 100.0, daily_pnl: 0.0 },
+            ReturnDataPoint { date: "2024-01-02".into(), cumulative_return: 20.0, daily_return: 20.0, portfolio_value: 120.0, daily_pnl: 20.0 },
+            ReturnDataPoint { date: "2024-01-03".into(), cumulative_return: 0.0, daily_return: -16.67, portfolio_value: 100.0, daily_pnl: -20.0 },
+            ReturnDataPoint { date: "2024-01-04".into(), cumulative_return: 25.0, daily_return: 25.0, portfolio_value: 125.0, daily_pnl: 25.0 },
+        ];
+        let dd = calculate_max_drawdown(&series);
+        // Peak=120, trough=100 → (100-120)/120 = -16.67%
+        assert!((dd.max_drawdown - (-16.666_666_667)).abs() < 0.01);
+        assert_eq!(dd.peak_date, "2024-01-02");
+        assert_eq!(dd.trough_date, "2024-01-03");
+        // Recovery at day 4 when value=125 >= peak of 120
+        assert_eq!(dd.recovery_date, Some("2024-01-04".to_string()));
+    }
+
+    #[test]
+    fn test_build_return_series_empty() {
+        let series = build_return_series(&[], None);
+        assert!(series.is_empty());
+    }
+
+    #[test]
+    fn test_build_return_series_single_point() {
+        let daily = vec![
+            (parse_date("2024-01-01").unwrap(), 100.0, 0.0),
+        ];
+        let series = build_return_series(&daily, None);
+        assert_eq!(series.len(), 1);
+        assert!((series[0].cumulative_return - 0.0).abs() < 1e-6);
+        assert!((series[0].daily_return - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_build_return_series_zero_start_value() {
+        let daily = vec![
+            (parse_date("2024-01-01").unwrap(), 0.0, 0.0),
+            (parse_date("2024-01-02").unwrap(), 100.0, 100.0),
+        ];
+        let series = build_return_series(&daily, None);
+        // With zero start, cumulative_return should be 0.0 (guarded by if start_value > 0.0)
+        assert!((series[0].cumulative_return - 0.0).abs() < 1e-6);
+        assert!((series[1].cumulative_return - 0.0).abs() < 1e-6);
+    }
 }

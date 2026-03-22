@@ -22,7 +22,85 @@ pub fn create_transaction(
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
 
-    // Find existing holding for this symbol/account
+    // Wrap the entire operation in a SQLite transaction for atomicity
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+
+    let result = (|| -> Result<(Option<String>,), String> {
+        // Find existing holding for this symbol/account
+        let holding_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM holdings WHERE account_id = ?1 AND symbol = ?2",
+                rusqlite::params![account_id, symbol],
+                |row| row.get(0),
+            )
+            .ok();
+
+        // Update holding shares and avg_cost based on transaction type
+        if let Some(ref hid) = holding_id {
+            let (current_shares, current_avg_cost): (f64, f64) = conn
+                .query_row(
+                    "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
+                    rusqlite::params![hid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|e| e.to_string())?;
+
+            // Guard against selling more shares than currently held
+            if transaction_type == "SELL" && shares > current_shares {
+                return Err(format!(
+                    "Cannot sell {} shares of {}: only {} shares held",
+                    shares, symbol, current_shares
+                ));
+            }
+
+            let (new_shares, new_avg_cost) = if transaction_type == "BUY" {
+                let total_shares = current_shares + shares;
+                let new_avg = if total_shares > 0.0 {
+                    (current_shares * current_avg_cost + shares * price) / total_shares
+                } else {
+                    price
+                };
+                (total_shares, new_avg)
+            } else {
+                // SELL: shares decrease, avg_cost unchanged
+                (current_shares - shares, current_avg_cost)
+            };
+
+            let updated_at = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
+                rusqlite::params![hid, new_shares, new_avg_cost, updated_at],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        conn.execute(
+            "INSERT INTO transactions (id, holding_id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, notes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            rusqlite::params![
+                id, holding_id, account_id, symbol, name, market,
+                transaction_type, shares, price, total_amount, commission,
+                currency, traded_at, notes, now
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+
+        Ok((holding_id,))
+    })();
+
+    // Commit or rollback based on result
+    match result {
+        Ok((holding_id,)) => {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+            let _ = holding_id; // used below
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    }
+
+    // Re-fetch holding_id for the response (after commit)
     let holding_id: Option<String> = conn
         .query_row(
             "SELECT id FROM holdings WHERE account_id = ?1 AND symbol = ?2",
@@ -30,48 +108,6 @@ pub fn create_transaction(
             |row| row.get(0),
         )
         .ok();
-
-    // Update holding shares and avg_cost based on transaction type
-    if let Some(ref hid) = holding_id {
-        let (current_shares, current_avg_cost): (f64, f64) = conn
-            .query_row(
-                "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
-                rusqlite::params![hid],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|e| e.to_string())?;
-
-        let (new_shares, new_avg_cost) = if transaction_type == "BUY" {
-            let total_shares = current_shares + shares;
-            let new_avg = if total_shares > 0.0 {
-                (current_shares * current_avg_cost + shares * price) / total_shares
-            } else {
-                price
-            };
-            (total_shares, new_avg)
-        } else {
-            // SELL: shares decrease, avg_cost unchanged
-            (current_shares - shares, current_avg_cost)
-        };
-
-        let updated_at = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
-            rusqlite::params![hid, new_shares, new_avg_cost, updated_at],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-
-    conn.execute(
-        "INSERT INTO transactions (id, holding_id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, notes, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-        rusqlite::params![
-            id, holding_id, account_id, symbol, name, market,
-            transaction_type, shares, price, total_amount, commission,
-            currency, traded_at, notes, now
-        ],
-    )
-    .map_err(|e| e.to_string())?;
 
     Ok(Transaction {
         id,

@@ -45,7 +45,7 @@ pub fn update_quote_provider_config(
     let conn = db.conn.lock().unwrap();
     let now = Utc::now().to_rfc3339();
 
-    // Normalise empty / whitespace-only cookie strings to NULL.
+    // Normalize empty / whitespace-only cookie strings to NULL.
     let cookie = config
         .xueqiu_cookie
         .as_deref()

@@ -699,25 +699,60 @@ static XUEQIU_TOKEN_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// Xueqiu requires an `xq_a_token` cookie which is set when visiting the
 /// homepage.  This function visits `https://xueqiu.com` once to acquire the
 /// cookie, and remembers the result via [`XUEQIU_TOKEN_INITIALIZED`].
+///
+/// The homepage request uses browser page-load headers (`Accept: text/html`)
+/// rather than API-style headers to ensure the server returns a full page
+/// response that sets the session cookie.
 async fn ensure_xueqiu_token() -> Result<(), String> {
     if XUEQIU_TOKEN_INITIALIZED.load(Ordering::SeqCst) {
         return Ok(());
     }
 
     let client = http_client::xueqiu_client();
+    // Override the default Accept header for the homepage visit.
+    // The Xueqiu client's default Accept is "application/json, text/plain, */*"
+    // which is suitable for API calls, but the homepage may only issue the
+    // xq_a_token cookie when it sees a normal browser page-load request.
     let resp = client
         .get("https://xueqiu.com")
+        .header(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
         .send()
         .await
         .map_err(|e| format!("Failed to initialize Xueqiu token: {}", e))?;
 
-    if resp.status().is_success() || resp.status().is_redirection() {
+    let status = resp.status();
+
+    // Log Set-Cookie headers for diagnosis (helps debug token issues).
+    let cookie_names: Vec<String> = resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| {
+            v.to_str().ok().and_then(|s| s.split('=').next().map(String::from))
+        })
+        .collect();
+    if cookie_names.is_empty() {
+        eprintln!(
+            "Xueqiu token init: homepage returned HTTP {} but no Set-Cookie headers in final response (cookies may have been set during redirects)",
+            status
+        );
+    } else {
+        eprintln!(
+            "Xueqiu token init: homepage returned HTTP {}, cookies received: {:?}",
+            status, cookie_names
+        );
+    }
+
+    if status.is_success() || status.is_redirection() {
         XUEQIU_TOKEN_INITIALIZED.store(true, Ordering::SeqCst);
         Ok(())
     } else {
         Err(format!(
             "Failed to initialize Xueqiu token: HTTP {}",
-            resp.status()
+            status
         ))
     }
 }
@@ -728,7 +763,7 @@ fn reset_xueqiu_token() {
 }
 
 /// Maximum number of retry attempts for transient Xueqiu API failures.
-const XUEQIU_MAX_RETRIES: u32 = 1;
+const XUEQIU_MAX_RETRIES: u32 = 2;
 
 /// Send a GET request to the Xueqiu API with token management and retry.
 ///
@@ -744,7 +779,14 @@ async fn send_xueqiu_request(url: &str, symbol: &str) -> Result<reqwest::Respons
         let result = client.get(url).send().await;
         match result {
             Ok(resp) if resp.status() == reqwest::StatusCode::BAD_REQUEST && attempt < XUEQIU_MAX_RETRIES => {
-                // Token likely expired – refresh and retry
+                // Log the 400 response for diagnosis before retrying.
+                eprintln!(
+                    "Xueqiu API returned 400 for {} (attempt {}/{}), refreshing token and retrying",
+                    symbol, attempt + 1, XUEQIU_MAX_RETRIES + 1
+                );
+                // Token likely expired – refresh and retry after a short delay
+                // to allow the new session cookie to propagate.
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 reset_xueqiu_token();
                 ensure_xueqiu_token().await?;
             }
@@ -912,10 +954,17 @@ async fn fetch_xueqiu_cn_quote(symbol: &str) -> Result<StockQuote, String> {
     let response = send_xueqiu_request(&url, symbol).await?;
 
     if !response.status().is_success() {
+        let status = response.status();
+        let body_preview = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
+            .collect::<String>();
         return Err(format!(
-            "Xueqiu API error for {}: HTTP {}",
-            symbol,
-            response.status()
+            "Xueqiu API error for {}: HTTP {}. Response: {}",
+            symbol, status, body_preview
         ));
     }
 
@@ -939,10 +988,17 @@ async fn fetch_xueqiu_us_quote(symbol: &str) -> Result<StockQuote, String> {
     let response = send_xueqiu_request(&url, symbol).await?;
 
     if !response.status().is_success() {
+        let status = response.status();
+        let body_preview = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
+            .collect::<String>();
         return Err(format!(
-            "Xueqiu API error for {}: HTTP {}",
-            symbol,
-            response.status()
+            "Xueqiu API error for {}: HTTP {}. Response: {}",
+            symbol, status, body_preview
         ));
     }
 
@@ -966,10 +1022,17 @@ async fn fetch_xueqiu_hk_quote(symbol: &str) -> Result<StockQuote, String> {
     let response = send_xueqiu_request(&url, symbol).await?;
 
     if !response.status().is_success() {
+        let status = response.status();
+        let body_preview = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
+            .collect::<String>();
         return Err(format!(
-            "Xueqiu API error for {}: HTTP {}",
-            symbol,
-            response.status()
+            "Xueqiu API error for {}: HTTP {}. Response: {}",
+            symbol, status, body_preview
         ));
     }
 

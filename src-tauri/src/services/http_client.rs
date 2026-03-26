@@ -20,6 +20,12 @@ static GENERAL_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// Global HTTP client configured specifically for the East Money API.
 static EASTMONEY_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+/// Global HTTP client configured specifically for the Xueqiu (雪球) API.
+/// Built with `cookie_store(true)` so that the `xq_a_token` session cookie
+/// obtained from the Xueqiu homepage is automatically stored and sent on
+/// subsequent API requests.
+static XUEQIU_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
 /// Return a shared general-purpose `reqwest::Client`.
 ///
 /// The client is created once on first call and reused for the lifetime of the
@@ -73,6 +79,46 @@ pub fn eastmoney_client() -> &'static reqwest::Client {
     })
 }
 
+/// Return a shared `reqwest::Client` for Xueqiu (雪球) API requests.
+///
+/// The client is created once on first call and reused for the lifetime of
+/// the process.  It is configured with:
+/// - Cookie store enabled (so `xq_a_token` is persisted across requests)
+/// - Browser-like default headers (`Referer`, `User-Agent`, `Accept`)
+/// - 15-second request timeout
+pub fn xueqiu_client() -> &'static reqwest::Client {
+    XUEQIU_CLIENT.get_or_init(|| {
+        let mut default_headers = header::HeaderMap::new();
+        default_headers.insert(
+            header::REFERER,
+            header::HeaderValue::from_static("https://xueqiu.com/"),
+        );
+        default_headers.insert(
+            header::ACCEPT,
+            header::HeaderValue::from_static("application/json, text/plain, */*"),
+        );
+        default_headers.insert(
+            header::USER_AGENT,
+            header::HeaderValue::from_static(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            ),
+        );
+        default_headers.insert(
+            "X-Requested-With",
+            header::HeaderValue::from_static("XMLHttpRequest"),
+        );
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .pool_max_idle_per_host(5)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(60))
+            .cookie_store(true)
+            .default_headers(default_headers)
+            .build()
+            .expect("failed to build Xueqiu HTTP client")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +154,23 @@ mod tests {
         let client = eastmoney_client();
         let req = client
             .get("https://push2.eastmoney.com/test")
+            .build()
+            .expect("should build request");
+        assert_eq!(req.method(), reqwest::Method::GET);
+    }
+
+    #[test]
+    fn test_xueqiu_client_returns_same_instance() {
+        let c1 = xueqiu_client();
+        let c2 = xueqiu_client();
+        assert!(std::ptr::eq(c1, c2));
+    }
+
+    #[test]
+    fn test_xueqiu_client_can_build_request() {
+        let client = xueqiu_client();
+        let req = client
+            .get("https://stock.xueqiu.com/v5/stock/quote.json?symbol=SH600519")
             .build()
             .expect("should build request");
         assert_eq!(req.method(), reqwest::Method::GET);

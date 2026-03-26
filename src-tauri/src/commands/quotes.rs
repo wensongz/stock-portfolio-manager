@@ -1,6 +1,6 @@
 use crate::db::Database;
 use crate::models::{HoldingWithQuote, StockQuote};
-use crate::services::quote_service::{fetch_cn_quote, fetch_hk_quote_with_provider, fetch_us_quote_with_provider, fetch_quotes_batch_cached_with_providers, save_quotes_to_db, QuoteCache};
+use crate::services::quote_service::{fetch_cn_quote_with_provider, fetch_hk_quote_with_provider, fetch_us_quote_with_provider, fetch_quotes_batch_cached_with_providers, save_quotes_to_db, QuoteCache};
 use crate::services::quote_provider_service;
 use tauri::State;
 
@@ -12,7 +12,7 @@ pub async fn get_real_time_quotes(
     force_refresh: Option<bool>,
 ) -> Result<Vec<StockQuote>, String> {
     let config = quote_provider_service::get_quote_provider_config(&db)?;
-    let quotes = fetch_quotes_batch_cached_with_providers(&quote_cache, symbols, &config.us_provider, &config.hk_provider, force_refresh.unwrap_or(false)).await?;
+    let quotes = fetch_quotes_batch_cached_with_providers(&quote_cache, symbols, &config.us_provider, &config.hk_provider, &config.cn_provider, force_refresh.unwrap_or(false)).await?;
     // Persist freshly fetched quotes to the database
     if let Err(e) = save_quotes_to_db(&db, &quotes) {
         eprintln!("Failed to persist quotes to DB: {}", e);
@@ -73,26 +73,26 @@ pub async fn get_holding_quotes(
             // Targeted refresh: force-refresh only the specified symbols
             fetch_quotes_batch_cached_with_providers(
                 &quote_cache, symbols.clone(),
-                &config.us_provider, &config.hk_provider, true,
+                &config.us_provider, &config.hk_provider, &config.cn_provider, true,
             ).await?;
             // Then load all quotes from cache (the refreshed ones are now fresh)
             fetch_quotes_batch_cached_with_providers(
                 &quote_cache, all_symbols,
-                &config.us_provider, &config.hk_provider, false,
+                &config.us_provider, &config.hk_provider, &config.cn_provider, false,
             ).await?
         }
         Some(_) => {
             // Empty list: no refresh needed, just use cache
             fetch_quotes_batch_cached_with_providers(
                 &quote_cache, all_symbols,
-                &config.us_provider, &config.hk_provider, false,
+                &config.us_provider, &config.hk_provider, &config.cn_provider, false,
             ).await?
         }
         None => {
             // No list provided: full refresh of all symbols
             fetch_quotes_batch_cached_with_providers(
                 &quote_cache, all_symbols,
-                &config.us_provider, &config.hk_provider, true,
+                &config.us_provider, &config.hk_provider, &config.cn_provider, true,
             ).await?
         }
     };
@@ -176,7 +176,8 @@ pub async fn get_cn_quote(db: State<'_, Database>, quote_cache: State<'_, QuoteC
     if let Some(cached) = quote_cache.get(&symbol) {
         return Ok(cached);
     }
-    let quote = fetch_cn_quote(&symbol).await?;
+    let config = quote_provider_service::get_quote_provider_config(&db)?;
+    let quote = fetch_cn_quote_with_provider(&symbol, &config.cn_provider).await?;
     quote_cache.set(quote.clone());
     if let Err(e) = save_quotes_to_db(&db, &[quote.clone()]) {
         eprintln!("Failed to persist quote to DB: {}", e);

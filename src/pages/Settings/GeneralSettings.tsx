@@ -18,10 +18,12 @@ const INTERVAL_OPTIONS = [
 const PROVIDER_OPTIONS_US_HK = [
   { value: "yahoo", label: "Yahoo Finance" },
   { value: "eastmoney", label: "东方财富（默认）" },
+  { value: "xueqiu", label: "雪球" },
 ];
 
 const PROVIDER_OPTIONS_CN = [
   { value: "eastmoney", label: "东方财富（默认）" },
+  { value: "xueqiu", label: "雪球" },
 ];
 
 export default function GeneralSettings() {
@@ -82,12 +84,11 @@ export default function GeneralSettings() {
               value={providerConfig.cn_provider}
               onChange={(v) => handleProviderChange("cn_provider", v)}
               options={PROVIDER_OPTIONS_CN}
-              disabled
             />
           </Form.Item>
         </Form>
         <Paragraph type="secondary">
-          各市场的行情数据来源：A股使用东方财富，港股和美股支持 Yahoo Finance 和东方财富。修改后将在下次刷新时生效。
+          各市场的行情数据来源：A股支持东方财富和雪球，港股和美股支持 Yahoo Finance、东方财富和雪球。修改后将在下次刷新时生效。
         </Paragraph>
       </Card>
 

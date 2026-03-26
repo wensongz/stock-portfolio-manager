@@ -96,6 +96,7 @@ pub fn run() {
                     symbols,
                     &config.us_provider,
                     &config.hk_provider,
+                    &config.cn_provider,
                     true,
                 )
                 .await

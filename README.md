@@ -1,6 +1,7 @@
 # Stock Portfolio Manager
 
-A macOS desktop application for managing personal stock portfolios across US, CN (A-shares), and HK markets.
+An desktop application for managing personal stock portfolios across US, CN (A-shares), and HK markets. 
+It can run on MacOS, Windows and Linux.
 
 Built with **Tauri 2.0** + **React 18** + **TypeScript** + **Rust** + **SQLite**.
 

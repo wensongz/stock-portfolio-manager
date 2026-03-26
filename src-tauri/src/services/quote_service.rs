@@ -393,10 +393,22 @@ pub async fn fetch_us_quote(symbol: &str) -> Result<StockQuote, String> {
 }
 
 /// Fetch a US stock quote using the specified provider.
+/// When the Xueqiu provider is selected but fails, automatically falls back
+/// to the default provider (eastmoney) so that transient Xueqiu errors do
+/// not leave the user without data.
 pub async fn fetch_us_quote_with_provider(symbol: &str, provider: &str) -> Result<StockQuote, String> {
     match provider {
         "eastmoney" => fetch_eastmoney_us_quote(symbol).await,
-        "xueqiu" => fetch_xueqiu_us_quote(symbol).await,
+        "xueqiu" => match fetch_xueqiu_us_quote(symbol).await {
+            Ok(q) => Ok(q),
+            Err(e) => {
+                eprintln!(
+                    "Warning: Xueqiu failed for {} (US), falling back to eastmoney: {}",
+                    symbol, e
+                );
+                fetch_eastmoney_us_quote(symbol).await
+            }
+        },
         _ => fetch_yahoo_quote(symbol, "US").await,
     }
 }
@@ -407,10 +419,22 @@ pub async fn fetch_hk_quote(symbol: &str) -> Result<StockQuote, String> {
 }
 
 /// Fetch a HK stock quote using the specified provider.
+/// When the Xueqiu provider is selected but fails, automatically falls back
+/// to eastmoney so that transient Xueqiu errors do not leave the user
+/// without data.
 pub async fn fetch_hk_quote_with_provider(symbol: &str, provider: &str) -> Result<StockQuote, String> {
     match provider {
         "eastmoney" => fetch_eastmoney_hk_quote(symbol).await,
-        "xueqiu" => fetch_xueqiu_hk_quote(symbol).await,
+        "xueqiu" => match fetch_xueqiu_hk_quote(symbol).await {
+            Ok(q) => Ok(q),
+            Err(e) => {
+                eprintln!(
+                    "Warning: Xueqiu failed for {} (HK), falling back to eastmoney: {}",
+                    symbol, e
+                );
+                fetch_eastmoney_hk_quote(symbol).await
+            }
+        },
         _ => {
             let yahoo_symbol = if symbol.ends_with(".HK") || symbol.ends_with(".hk") {
                 symbol.to_string()
@@ -428,9 +452,21 @@ pub async fn fetch_cn_quote(symbol: &str) -> Result<StockQuote, String> {
 }
 
 /// Fetch a CN A-share stock quote using the specified provider.
+/// When the Xueqiu provider is selected but fails, automatically falls back
+/// to eastmoney so that transient Xueqiu errors do not leave the user
+/// without data.
 pub async fn fetch_cn_quote_with_provider(symbol: &str, provider: &str) -> Result<StockQuote, String> {
     match provider {
-        "xueqiu" => fetch_xueqiu_cn_quote(symbol).await,
+        "xueqiu" => match fetch_xueqiu_cn_quote(symbol).await {
+            Ok(q) => Ok(q),
+            Err(e) => {
+                eprintln!(
+                    "Warning: Xueqiu failed for {} (CN), falling back to eastmoney: {}",
+                    symbol, e
+                );
+                fetch_eastmoney_cn_quote(symbol).await
+            }
+        },
         // Default to eastmoney for CN
         _ => fetch_eastmoney_cn_quote(symbol).await,
     }
@@ -728,7 +764,7 @@ fn reset_xueqiu_token() {
 }
 
 /// Maximum number of retry attempts for transient Xueqiu API failures.
-const XUEQIU_MAX_RETRIES: u32 = 1;
+const XUEQIU_MAX_RETRIES: u32 = 2;
 
 /// Send a GET request to the Xueqiu API with token management and retry.
 ///
@@ -744,7 +780,9 @@ async fn send_xueqiu_request(url: &str, symbol: &str) -> Result<reqwest::Respons
         let result = client.get(url).send().await;
         match result {
             Ok(resp) if resp.status() == reqwest::StatusCode::BAD_REQUEST && attempt < XUEQIU_MAX_RETRIES => {
-                // Token likely expired – refresh and retry
+                // Token likely expired – refresh and retry after a short delay
+                // to allow the new session cookie to propagate.
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 reset_xueqiu_token();
                 ensure_xueqiu_token().await?;
             }
@@ -912,10 +950,17 @@ async fn fetch_xueqiu_cn_quote(symbol: &str) -> Result<StockQuote, String> {
     let response = send_xueqiu_request(&url, symbol).await?;
 
     if !response.status().is_success() {
+        let status = response.status();
+        let body_preview = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
+            .collect::<String>();
         return Err(format!(
-            "Xueqiu API error for {}: HTTP {}",
-            symbol,
-            response.status()
+            "Xueqiu API error for {}: HTTP {}. Response: {}",
+            symbol, status, body_preview
         ));
     }
 
@@ -939,10 +984,17 @@ async fn fetch_xueqiu_us_quote(symbol: &str) -> Result<StockQuote, String> {
     let response = send_xueqiu_request(&url, symbol).await?;
 
     if !response.status().is_success() {
+        let status = response.status();
+        let body_preview = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
+            .collect::<String>();
         return Err(format!(
-            "Xueqiu API error for {}: HTTP {}",
-            symbol,
-            response.status()
+            "Xueqiu API error for {}: HTTP {}. Response: {}",
+            symbol, status, body_preview
         ));
     }
 
@@ -966,10 +1018,17 @@ async fn fetch_xueqiu_hk_quote(symbol: &str) -> Result<StockQuote, String> {
     let response = send_xueqiu_request(&url, symbol).await?;
 
     if !response.status().is_success() {
+        let status = response.status();
+        let body_preview = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
+            .collect::<String>();
         return Err(format!(
-            "Xueqiu API error for {}: HTTP {}",
-            symbol,
-            response.status()
+            "Xueqiu API error for {}: HTTP {}. Response: {}",
+            symbol, status, body_preview
         ));
     }
 

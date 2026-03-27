@@ -397,7 +397,10 @@ pub async fn fetch_us_quote_with_provider(symbol: &str, provider: &str) -> Resul
     match provider {
         "eastmoney" => fetch_eastmoney_us_quote(symbol).await,
         "xueqiu" => fetch_xueqiu_us_quote(symbol).await,
-        _ => fetch_yahoo_quote(symbol, "US").await,
+        _ => {
+            let yahoo_symbol = to_yahoo_symbol(symbol, "US");
+            fetch_yahoo_quote(&yahoo_symbol, "US").await
+        }
     }
 }
 
@@ -625,9 +628,17 @@ fn to_eastmoney_secid(symbol: &str) -> Result<String, String> {
     Ok(format!("{}.{}", market_id, code))
 }
 
-/// Convert a US stock ticker to East Money secid format: "105.{TICKER}".
+/// Convert a US stock ticker to East Money secid format.
+/// Regular tickers use "105.{TICKER}" (e.g., "105.AAPL").
+/// Tickers with hyphens use "106.{TICKER}" with hyphens replaced by underscores
+/// (e.g., "BRK-B" → "106.BRK_B").
 fn to_eastmoney_us_secid(symbol: &str) -> String {
-    format!("105.{}", symbol.to_uppercase())
+    let upper = symbol.to_uppercase();
+    if upper.contains('-') {
+        format!("106.{}", upper.replace('-', "_"))
+    } else {
+        format!("105.{}", upper)
+    }
 }
 
 /// Convert a HK stock symbol to East Money secid format: "116.{5-digit code}".
@@ -982,6 +993,12 @@ fn to_xueqiu_cn_symbol(symbol: &str) -> Result<String, String> {
     }
 }
 
+/// Convert a US stock symbol to Xueqiu format.
+/// Replaces hyphens with dots (e.g., "BRK-B" → "BRK.B") and converts to uppercase.
+fn to_xueqiu_us_symbol(symbol: &str) -> String {
+    symbol.to_uppercase().replace('-', ".")
+}
+
 /// Convert a HK stock symbol to Xueqiu format.
 /// Strips the ".HK" suffix if present and zero-pads to 5 digits.
 fn to_xueqiu_hk_symbol(symbol: &str) -> Result<String, String> {
@@ -1032,7 +1049,7 @@ async fn fetch_xueqiu_cn_quote(symbol: &str) -> Result<StockQuote, String> {
 
 /// Fetch a US stock quote from Xueqiu (雪球).
 async fn fetch_xueqiu_us_quote(symbol: &str) -> Result<StockQuote, String> {
-    let xueqiu_symbol = symbol.to_uppercase();
+    let xueqiu_symbol = to_xueqiu_us_symbol(symbol);
     let url = format!(
         "https://stock.xueqiu.com/v5/stock/quote.json?symbol={}&extend=detail",
         xueqiu_symbol
@@ -1147,7 +1164,10 @@ pub async fn fetch_quotes_batch_with_providers(
 /// Convert a holding symbol + market to a Yahoo Finance ticker for historical queries.
 pub fn to_yahoo_symbol(symbol: &str, market: &str) -> String {
     match market {
-        "US" => symbol.to_string(),
+        "US" => {
+            // Yahoo Finance uses hyphens in US symbols (e.g., "BRK-B"), convert dots to hyphens.
+            symbol.replace('.', "-")
+        }
         "HK" => {
             if symbol.ends_with(".HK") || symbol.ends_with(".hk") {
                 symbol.to_string()
@@ -1507,6 +1527,10 @@ mod tests {
         assert_eq!(to_eastmoney_us_secid("AAPL"), "105.AAPL");
         assert_eq!(to_eastmoney_us_secid("msft"), "105.MSFT");
         assert_eq!(to_eastmoney_us_secid("GOOGL"), "105.GOOGL");
+        // Hyphens should be converted to underscores with prefix 106
+        assert_eq!(to_eastmoney_us_secid("BRK-B"), "106.BRK_B");
+        assert_eq!(to_eastmoney_us_secid("BRK-A"), "106.BRK_A");
+        assert_eq!(to_eastmoney_us_secid("BF-B"), "106.BF_B");
     }
 
     #[test]
@@ -1912,6 +1936,12 @@ mod tests {
     fn test_to_yahoo_symbol_us() {
         assert_eq!(to_yahoo_symbol("AAPL", "US"), "AAPL");
         assert_eq!(to_yahoo_symbol("MSFT", "US"), "MSFT");
+        // Dots should be converted to hyphens for Yahoo
+        assert_eq!(to_yahoo_symbol("BRK.B", "US"), "BRK-B");
+        assert_eq!(to_yahoo_symbol("BRK.A", "US"), "BRK-A");
+        assert_eq!(to_yahoo_symbol("BF.B", "US"), "BF-B");
+        // Hyphens should remain unchanged
+        assert_eq!(to_yahoo_symbol("BRK-B", "US"), "BRK-B");
     }
 
     #[test]
@@ -2160,6 +2190,19 @@ mod tests {
     }
 
     // ---- Xueqiu symbol conversion tests ----
+
+    #[test]
+    fn test_to_xueqiu_us_symbol() {
+        // Hyphens should be converted to dots
+        assert_eq!(to_xueqiu_us_symbol("BRK-B"), "BRK.B");
+        assert_eq!(to_xueqiu_us_symbol("BRK-A"), "BRK.A");
+        assert_eq!(to_xueqiu_us_symbol("BF-B"), "BF.B");
+        // Already dot format should remain unchanged
+        assert_eq!(to_xueqiu_us_symbol("BRK.B"), "BRK.B");
+        // Simple symbols without hyphens should just uppercase
+        assert_eq!(to_xueqiu_us_symbol("AAPL"), "AAPL");
+        assert_eq!(to_xueqiu_us_symbol("aapl"), "AAPL");
+    }
 
     #[test]
     fn test_to_xueqiu_cn_symbol_shanghai() {

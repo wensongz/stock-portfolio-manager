@@ -818,8 +818,15 @@ async fn send_xueqiu_request(url: &str, symbol: &str) -> Result<reqwest::Respons
         let mut req = client.get(url);
 
         // Attach the user-provided cookie if configured.
+        // The user may supply just the token value or the full "xq_a_token=…"
+        // string.  Normalize so that the header always contains the key.
         if let Some(ref cookie) = get_xueqiu_user_cookie() {
-            req = req.header(reqwest::header::COOKIE, cookie.as_str());
+            let header_value = if cookie.starts_with("xq_a_token=") {
+                cookie.clone()
+            } else {
+                format!("xq_a_token={}", cookie)
+            };
+            req = req.header(reqwest::header::COOKIE, header_value);
         }
 
         let result = req.send().await;

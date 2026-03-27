@@ -114,11 +114,11 @@ export default function GeneralSettings() {
           <Form layout="vertical" style={{ maxWidth: 600 }}>
             <Form.Item
               label="雪球 Cookie"
-              extra="从浏览器中复制雪球的 Cookie，粘贴到此处。步骤：登录 xueqiu.com → 按 F12 打开开发者工具 → Application → Cookies → 复制 xq_a_token 的值，格式如：xq_a_token=xxx"
+              extra="从浏览器中复制雪球的 Cookie，粘贴到此处。步骤：登录 xueqiu.com → 按 F12 打开开发者工具 → Application → Cookies → 找到 xq_a_token，复制其值"
             >
               <Input.TextArea
                 rows={3}
-                placeholder="xq_a_token=your_token_value"
+                placeholder="粘贴 xq_a_token 的值"
                 value={providerConfig.xueqiu_cookie ?? ""}
                 onChange={(e) =>
                   setProviderConfig({ ...providerConfig, xueqiu_cookie: e.target.value || null })

@@ -227,10 +227,13 @@ SQLite database is stored in the system app data directory:
 
 | Data | Source | Markets |
 |------|--------|---------|
-| US & HK Stock Quotes | Yahoo Finance API | 🇺🇸 US, 🇭🇰 HK |
-| CN A-Share Quotes | Tencent Finance API | 🇨🇳 CN |
+| US Stock Quotes | Xueqiu API, Yahoo Finance API | 🇺🇸 US |
+| US & HK Stock Quotes | Xueqiu API, Yahoo Finance API | 🇭🇰 HK |
+| CN A-Share Quotes | Xueqiu API, EastMoney API | 🇨🇳 CN |
 | Exchange Rates | ExchangeRate-API | USD/CNY/HKD |
 | Benchmark Indices | Yahoo Finance API | S&P 500, NASDAQ, CSI 300, HSI |
+
+You need to configure Xueqiu cookie in the setting in order to access Xueqiu API.
 
 ## License
 

@@ -909,6 +909,23 @@ struct XueqiuQuote {
     volume: Option<f64>,
 }
 
+/// Xueqiu kline (historical candlestick) API response wrapper.
+#[derive(Debug, Deserialize)]
+struct XueqiuKlineResponse {
+    data: Option<XueqiuKlineData>,
+    error_code: Option<i32>,
+    error_description: Option<String>,
+}
+
+/// Inner data of a Xueqiu kline response.
+#[derive(Debug, Deserialize)]
+struct XueqiuKlineData {
+    /// Column names, e.g. ["timestamp", "volume", "open", "high", "low", "close", ...]
+    column: Option<Vec<String>>,
+    /// Each item is one trading day: values in the same order as `column`.
+    item: Option<Vec<Vec<serde_json::Value>>>,
+}
+
 /// Parse a Xueqiu JSON response body into a [`XueqiuResponse`].
 fn parse_xueqiu_body(body: &str, symbol: &str) -> Result<XueqiuResponse, String> {
     serde_json::from_str(body).map_err(|e| {
@@ -1325,10 +1342,130 @@ pub async fn fetch_stock_history_eastmoney(
     Ok(result)
 }
 
+/// Fetch historical daily closing prices for a stock from Xueqiu (雪球).
+/// Uses the Xueqiu kline API (`/v5/stock/chart/kline.json`).
+/// Returns a list of (date, close_price) pairs sorted by date ascending.
+pub async fn fetch_stock_history_xueqiu(
+    symbol: &str,
+    market: &str,
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+) -> Result<Vec<(chrono::NaiveDate, f64)>, String> {
+    let xueqiu_symbol = match market {
+        "CN" => to_xueqiu_cn_symbol(symbol)?,
+        "HK" => to_xueqiu_hk_symbol(symbol)?,
+        _ => to_xueqiu_us_symbol(symbol),
+    };
+
+    // Request enough items to cover the full date range.
+    // Calendar days + a buffer for weekends and holidays ensures we always
+    // get at least as many trading days as the range contains.
+    let calendar_days = (end_date - start_date).num_days() + 10;
+    let count = calendar_days.max(30);
+
+    // begin is the first millisecond of the day *after* end_date so that the
+    // API includes all trading sessions that fall on end_date itself.
+    let begin_ts = end_date
+        .succ_opt()
+        .unwrap_or(end_date)
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+
+    let url = format!(
+        "https://stock.xueqiu.com/v5/stock/chart/kline.json?symbol={}&begin={}&period=day&type=before_trading_time&count=-{}&indicator=kline",
+        xueqiu_symbol, begin_ts, count
+    );
+
+    let response = send_xueqiu_request(&url, symbol).await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_preview = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
+            .collect::<String>();
+        return Err(format!(
+            "fetch_stock_history_xueqiu: HTTP {} for {}. Response: {}",
+            status, symbol, body_preview
+        ));
+    }
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("fetch_stock_history_xueqiu: read error for {}: {}", symbol, e))?;
+
+    let resp: XueqiuKlineResponse = serde_json::from_str(&body).map_err(|e| {
+        let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
+        format!(
+            "fetch_stock_history_xueqiu: parse error for {}: {}. Preview: {}",
+            symbol, e, preview
+        )
+    })?;
+
+    if let Some(err_code) = resp.error_code {
+        if err_code != 0 {
+            let desc = resp.error_description.unwrap_or_default();
+            return Err(format!(
+                "fetch_stock_history_xueqiu: API error for {}: code={}, message={}",
+                symbol, err_code, desc
+            ));
+        }
+    }
+
+    let data = resp
+        .data
+        .ok_or_else(|| format!("fetch_stock_history_xueqiu: no data for {}", symbol))?;
+
+    let columns = data.column.unwrap_or_default();
+    let ts_idx = columns
+        .iter()
+        .position(|c| c == "timestamp")
+        .ok_or_else(|| {
+            format!(
+                "fetch_stock_history_xueqiu: missing 'timestamp' column for {}",
+                symbol
+            )
+        })?;
+    let close_idx = columns
+        .iter()
+        .position(|c| c == "close")
+        .ok_or_else(|| {
+            format!(
+                "fetch_stock_history_xueqiu: missing 'close' column for {}",
+                symbol
+            )
+        })?;
+
+    let items = data.item.unwrap_or_default();
+    let mut result: Vec<(chrono::NaiveDate, f64)> = Vec::new();
+
+    for item in &items {
+        let ts_ms = item.get(ts_idx).and_then(|v| v.as_i64());
+        let close = item.get(close_idx).and_then(|v| v.as_f64());
+
+        if let (Some(ts_ms), Some(close_price)) = (ts_ms, close) {
+            if let Some(dt) = chrono::DateTime::from_timestamp(ts_ms / 1000, 0) {
+                let date = dt.date_naive();
+                if date >= start_date && date <= end_date {
+                    result.push((date, close_price));
+                }
+            }
+        }
+    }
+
+    result.sort_by_key(|(d, _)| *d);
+    Ok(result)
+}
+
 /// Fetch historical daily closing prices using the appropriate provider
 /// based on the market and the configured provider name.
 /// Falls back to Yahoo Finance for unknown providers.
-/// Note: Xueqiu provider falls back to East Money for historical data.
 pub async fn fetch_stock_history(
     symbol: &str,
     market: &str,
@@ -1337,7 +1474,8 @@ pub async fn fetch_stock_history(
     provider: &str,
 ) -> Result<Vec<(chrono::NaiveDate, f64)>, String> {
     match provider {
-        "eastmoney" | "xueqiu" => fetch_stock_history_eastmoney(symbol, market, start_date, end_date).await,
+        "xueqiu" => fetch_stock_history_xueqiu(symbol, market, start_date, end_date).await,
+        "eastmoney" => fetch_stock_history_eastmoney(symbol, market, start_date, end_date).await,
         _ => fetch_stock_history_yahoo(symbol, market, start_date, end_date).await,
     }
 }

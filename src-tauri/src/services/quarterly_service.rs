@@ -195,7 +195,11 @@ pub async fn create_quarterly_snapshot(
     let rates_json = serde_json::to_string(&rates).unwrap_or_default();
     let snapshot_id = uuid::Uuid::new_v4().to_string();
     let created_at = Utc::now().to_rfc3339();
-    let holding_count = holding_rows_for_insert.len();
+    let holding_count = holding_rows_for_insert
+        .iter()
+        .map(|(row, _, _, _)| &row.symbol)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
 
     // Persist (upsert: delete existing snapshot for this quarter, then insert — wrapped in transaction)
     {
@@ -387,7 +391,7 @@ pub fn get_quarterly_snapshots(db: &Database) -> Result<Vec<QuarterlySnapshot>, 
             "SELECT qs.id, qs.quarter, qs.snapshot_date, qs.total_value, qs.total_cost, qs.total_pnl,
                     qs.us_value, qs.us_cost, qs.cn_value, qs.cn_cost, qs.hk_value, qs.hk_cost,
                     qs.exchange_rates, qs.overall_notes, qs.created_at,
-                    COUNT(qhs.id) AS holding_count
+                    COUNT(DISTINCT qhs.symbol) AS holding_count
              FROM quarterly_snapshots qs
              LEFT JOIN quarterly_holding_snapshots qhs ON qhs.quarterly_snapshot_id = qs.id
              GROUP BY qs.id
@@ -437,7 +441,7 @@ pub fn get_quarterly_snapshot_detail(
                 "SELECT qs.id, qs.quarter, qs.snapshot_date, qs.total_value, qs.total_cost, qs.total_pnl,
                         qs.us_value, qs.us_cost, qs.cn_value, qs.cn_cost, qs.hk_value, qs.hk_cost,
                         qs.exchange_rates, qs.overall_notes, qs.created_at,
-                        COUNT(qhs.id) AS holding_count
+                        COUNT(DISTINCT qhs.symbol) AS holding_count
                  FROM quarterly_snapshots qs
                  LEFT JOIN quarterly_holding_snapshots qhs ON qhs.quarterly_snapshot_id = qs.id
                  WHERE qs.id = ?1
@@ -864,8 +868,8 @@ pub fn compare_quarters(
         q2_total_cost: snap2.total_cost,
         q1_pnl: snap1.total_pnl,
         q2_pnl: snap2.total_pnl,
-        q1_holding_count: h1.len(),
-        q2_holding_count: h2.len(),
+        q1_holding_count: h1.iter().map(|h| &h.symbol).collect::<std::collections::HashSet<_>>().len(),
+        q2_holding_count: h2.iter().map(|h| &h.symbol).collect::<std::collections::HashSet<_>>().len(),
     };
 
     // By market
@@ -1415,7 +1419,7 @@ pub fn get_quarterly_trends(db: &Database) -> Result<QuarterlyTrends, String> {
         .iter()
         .map(|snap| {
             conn.query_row(
-                "SELECT COUNT(*) FROM quarterly_holding_snapshots WHERE quarterly_snapshot_id = ?1",
+                "SELECT COUNT(DISTINCT symbol) FROM quarterly_holding_snapshots WHERE quarterly_snapshot_id = ?1",
                 rusqlite::params![snap.id],
                 |row| row.get::<_, i64>(0),
             )

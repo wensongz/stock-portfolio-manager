@@ -1374,7 +1374,7 @@ pub async fn fetch_stock_history_xueqiu(
         .timestamp_millis();
 
     let url = format!(
-        "https://stock.xueqiu.com/v5/stock/chart/kline.json?symbol={}&begin={}&period=day&type=before_trading_time&count=-{}&indicator=kline",
+        "https://stock.xueqiu.com/v5/stock/chart/kline.json?symbol={}&begin={}&period=day&type=before&count=-{}&indicator=kline",
         xueqiu_symbol, begin_ts, count
     );
 

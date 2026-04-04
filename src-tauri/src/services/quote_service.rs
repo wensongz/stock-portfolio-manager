@@ -1446,7 +1446,12 @@ pub async fn fetch_stock_history_xueqiu(
     let mut result: Vec<(chrono::NaiveDate, f64)> = Vec::new();
 
     for item in &items {
-        let ts_ms = item.get(ts_idx).and_then(|v| v.as_i64());
+        // Xueqiu may return timestamps as JSON floats (e.g. 1692892800000.0)
+        // instead of integers, so try as_i64() first, then fall back to
+        // as_f64() with a cast.
+        let ts_ms = item
+            .get(ts_idx)
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
         let close = item.get(close_idx).and_then(|v| v.as_f64());
 
         if let (Some(ts_ms), Some(close_price)) = (ts_ms, close) {
@@ -1459,6 +1464,21 @@ pub async fn fetch_stock_history_xueqiu(
         }
     }
 
+    if items.len() > 0 && result.is_empty() {
+        // Log a diagnostic when the API returned items but none survived
+        // parsing or date filtering – helps diagnose future issues.
+        let preview: String = items
+            .iter()
+            .take(2)
+            .map(|row| format!("{:?}", row))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "fetch_stock_history_xueqiu: {} items received for {} but none matched date range {}/{}. First items: [{}]",
+            items.len(), symbol, start_date, end_date, preview
+        );
+    }
+
     result.sort_by_key(|(d, _)| *d);
     Ok(result)
 }
@@ -1466,6 +1486,8 @@ pub async fn fetch_stock_history_xueqiu(
 /// Fetch historical daily closing prices using the appropriate provider
 /// based on the market and the configured provider name.
 /// Falls back to Yahoo Finance for unknown providers.
+/// When Xueqiu is selected but returns an error or empty results, East Money
+/// is used as an automatic fallback.
 pub async fn fetch_stock_history(
     symbol: &str,
     market: &str,
@@ -1474,7 +1496,25 @@ pub async fn fetch_stock_history(
     provider: &str,
 ) -> Result<Vec<(chrono::NaiveDate, f64)>, String> {
     match provider {
-        "xueqiu" => fetch_stock_history_xueqiu(symbol, market, start_date, end_date).await,
+        "xueqiu" => {
+            match fetch_stock_history_xueqiu(symbol, market, start_date, end_date).await {
+                Ok(prices) if !prices.is_empty() => Ok(prices),
+                Ok(_empty) => {
+                    eprintln!(
+                        "fetch_stock_history: Xueqiu returned empty history for {} ({}), falling back to eastmoney",
+                        symbol, market
+                    );
+                    fetch_stock_history_eastmoney(symbol, market, start_date, end_date).await
+                }
+                Err(e) => {
+                    eprintln!(
+                        "fetch_stock_history: Xueqiu history failed for {} ({}): {}, falling back to eastmoney",
+                        symbol, market, e
+                    );
+                    fetch_stock_history_eastmoney(symbol, market, start_date, end_date).await
+                }
+            }
+        }
         "eastmoney" => fetch_stock_history_eastmoney(symbol, market, start_date, end_date).await,
         _ => fetch_stock_history_yahoo(symbol, market, start_date, end_date).await,
     }
@@ -2724,5 +2764,124 @@ mod tests {
                 println!("⚠️ HK Xueqiu quote failed (network issue in CI): {}", e);
             }
         }
+    }
+
+    // ── Xueqiu kline response parsing tests ────────────────────────────
+
+    /// Helper: parse a raw Xueqiu kline JSON body into (date, close) pairs
+    /// using the same logic as `fetch_stock_history_xueqiu`.
+    fn parse_xueqiu_kline_body(
+        body: &str,
+        start_date: chrono::NaiveDate,
+        end_date: chrono::NaiveDate,
+    ) -> Result<Vec<(chrono::NaiveDate, f64)>, String> {
+        let resp: XueqiuKlineResponse =
+            serde_json::from_str(body).map_err(|e| format!("parse error: {}", e))?;
+        let data = resp
+            .data
+            .ok_or_else(|| "no data".to_string())?;
+        let columns = data.column.unwrap_or_default();
+        let ts_idx = columns
+            .iter()
+            .position(|c| c == "timestamp")
+            .ok_or("missing timestamp column")?;
+        let close_idx = columns
+            .iter()
+            .position(|c| c == "close")
+            .ok_or("missing close column")?;
+        let items = data.item.unwrap_or_default();
+        let mut result = Vec::new();
+        for item in &items {
+            let ts_ms = item
+                .get(ts_idx)
+                .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
+            let close = item.get(close_idx).and_then(|v| v.as_f64());
+            if let (Some(ts_ms), Some(close_price)) = (ts_ms, close) {
+                if let Some(dt) = chrono::DateTime::from_timestamp(ts_ms / 1000, 0) {
+                    let date = dt.date_naive();
+                    if date >= start_date && date <= end_date {
+                        result.push((date, close_price));
+                    }
+                }
+            }
+        }
+        result.sort_by_key(|(d, _)| *d);
+        Ok(result)
+    }
+
+    #[test]
+    fn test_parse_xueqiu_kline_integer_timestamps() {
+        // Timestamps as JSON integers (the straightforward case).
+        let body = r#"{
+            "data": {
+                "column": ["timestamp", "volume", "open", "high", "low", "close"],
+                "item": [
+                    [1724544000000, 1000, 100.0, 105.0, 99.0, 103.0],
+                    [1724630400000, 2000, 103.0, 108.0, 102.0, 107.0]
+                ]
+            },
+            "error_code": 0,
+            "error_description": ""
+        }"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2024, 8, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end).unwrap();
+        assert_eq!(result.len(), 2);
+        assert!((result[0].1 - 103.0).abs() < 0.001);
+        assert!((result[1].1 - 107.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_xueqiu_kline_float_timestamps() {
+        // Timestamps as JSON floats (e.g. 1724544000000.0).
+        // This is the case that previously caused all items to be silently skipped.
+        let body = r#"{
+            "data": {
+                "column": ["timestamp", "volume", "open", "high", "low", "close"],
+                "item": [
+                    [1724544000000.0, 1000, 100.0, 105.0, 99.0, 103.0],
+                    [1724630400000.0, 2000, 103.0, 108.0, 102.0, 107.0]
+                ]
+            },
+            "error_code": 0,
+            "error_description": ""
+        }"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2024, 8, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end).unwrap();
+        assert_eq!(result.len(), 2, "Float timestamps must be parsed correctly");
+        assert!((result[0].1 - 103.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_xueqiu_kline_empty_items() {
+        let body = r#"{
+            "data": {
+                "column": ["timestamp", "volume", "open", "high", "low", "close"],
+                "item": []
+            },
+            "error_code": 0,
+            "error_description": ""
+        }"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2024, 8, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_xueqiu_kline_missing_column() {
+        let body = r#"{
+            "data": {
+                "column": ["time", "volume", "open", "high", "low", "price"],
+                "item": [[1724544000000, 1000, 100.0, 105.0, 99.0, 103.0]]
+            },
+            "error_code": 0,
+            "error_description": ""
+        }"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2024, 8, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end);
+        assert!(result.is_err(), "Should error when expected columns are missing");
     }
 }

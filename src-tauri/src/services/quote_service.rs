@@ -1373,52 +1373,82 @@ pub async fn fetch_stock_history_xueqiu(
         xueqiu_symbol, begin_ts, count
     );
 
-    let response = send_xueqiu_request(&url, symbol).await?;
+    // The Xueqiu kline API may return HTTP 200 with an empty response
+    // (no `column` field) when the session token is stale or insufficient.
+    // This differs from the HTTP 400 that `send_xueqiu_request` already
+    // retries on.  We therefore wrap the request + initial parsing in a
+    // retry loop that refreshes the token on this specific pattern.
+    const MAX_KLINE_AUTH_RETRIES: u32 = 1;
+    let mut body;
+    let mut columns: Vec<String>;
+    let mut data: XueqiuKlineData;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_preview = response
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
-            .collect::<String>();
-        return Err(format!(
-            "fetch_stock_history_xueqiu: HTTP {} for {}. Response: {}",
-            status, symbol, body_preview
-        ));
-    }
+    let mut kline_attempt = 0u32;
+    loop {
+        let response = send_xueqiu_request(&url, symbol).await?;
 
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("fetch_stock_history_xueqiu: read error for {}: {}", symbol, e))?;
-
-    let resp: XueqiuKlineResponse = serde_json::from_str(&body).map_err(|e| {
-        let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
-        format!(
-            "fetch_stock_history_xueqiu: parse error for {}: {}. Preview: {}",
-            symbol, e, preview
-        )
-    })?;
-
-    if let Some(err_code) = resp.error_code {
-        if err_code != 0 {
-            let desc = resp.error_description.unwrap_or_default();
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_preview = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(XUEQIU_RESPONSE_PREVIEW_LEN)
+                .collect::<String>();
             return Err(format!(
-                "fetch_stock_history_xueqiu: API error for {}: code={}, message={}",
-                symbol, err_code, desc
+                "fetch_stock_history_xueqiu: HTTP {} for {}. Response: {}",
+                status, symbol, body_preview
             ));
         }
-    }
 
-    let data = resp
-        .data
-        .ok_or_else(|| format!("fetch_stock_history_xueqiu: no data for {}", symbol))?;
+        body = response
+            .text()
+            .await
+            .map_err(|e| format!("fetch_stock_history_xueqiu: read error for {}: {}", symbol, e))?;
 
-    let columns = data.column.unwrap_or_default();
-    if columns.is_empty() {
+        let resp: XueqiuKlineResponse = serde_json::from_str(&body).map_err(|e| {
+            let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
+            format!(
+                "fetch_stock_history_xueqiu: parse error for {}: {}. Preview: {}",
+                symbol, e, preview
+            )
+        })?;
+
+        if let Some(err_code) = resp.error_code {
+            if err_code != 0 {
+                let desc = resp.error_description.unwrap_or_default();
+                return Err(format!(
+                    "fetch_stock_history_xueqiu: API error for {}: code={}, message={}",
+                    symbol, err_code, desc
+                ));
+            }
+        }
+
+        data = resp
+            .data
+            .ok_or_else(|| format!("fetch_stock_history_xueqiu: no data for {}", symbol))?;
+
+        columns = data.column.take().unwrap_or_default();
+        if !columns.is_empty() {
+            // Got valid kline data with column definitions – proceed.
+            break;
+        }
+
+        // Empty/missing `column` indicates an auth-related soft failure
+        // (HTTP 200 but the server withheld data).  Refresh the token
+        // and retry once before giving up.
+        if kline_attempt < MAX_KLINE_AUTH_RETRIES {
+            eprintln!(
+                "fetch_stock_history_xueqiu: empty 'column' for {} (attempt {}/{}), refreshing token and retrying",
+                symbol, kline_attempt + 1, MAX_KLINE_AUTH_RETRIES + 1
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            reset_xueqiu_token();
+            kline_attempt += 1;
+            continue;
+        }
+
         let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
         return Err(format!(
             "fetch_stock_history_xueqiu: empty or missing 'column' field for {}. URL: {} Response preview: {}",

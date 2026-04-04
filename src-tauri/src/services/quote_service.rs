@@ -1421,8 +1421,8 @@ pub async fn fetch_stock_history_xueqiu(
     if columns.is_empty() {
         let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
         return Err(format!(
-            "fetch_stock_history_xueqiu: empty or missing 'column' field for {}. Response preview: {}",
-            symbol, preview
+            "fetch_stock_history_xueqiu: empty or missing 'column' field for {}. URL: {} Response preview: {}",
+            symbol, url, preview
         ));
     }
     let ts_idx = columns

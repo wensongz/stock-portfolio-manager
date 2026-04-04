@@ -1378,7 +1378,45 @@ pub async fn fetch_stock_history_xueqiu(
         xueqiu_symbol, begin_ts, count
     );
 
-    let response = send_xueqiu_request(&url, symbol).await?;
+    // The kline endpoint may return HTTP 200 with a non-kline response
+    // (e.g. {"data":{"items":[],"items_size":0}}) when the session token
+    // is insufficient.  Unlike the quote endpoint which returns HTTP 400,
+    // this failure is invisible to send_xueqiu_request's retry logic.
+    // We therefore retry once with a refreshed token when we detect this
+    // pattern (missing `column` field in an otherwise successful response).
+    let mut last_err = String::new();
+    for attempt in 0..=1u32 {
+        if attempt > 0 {
+            eprintln!(
+                "fetch_stock_history_xueqiu: auth issue detected for {}, refreshing token and retrying (attempt {}/2)",
+                symbol, attempt + 1
+            );
+            reset_xueqiu_token();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        match fetch_stock_history_xueqiu_once(&url, symbol, start_date, end_date).await {
+            Ok(result) => return Ok(result),
+            Err(e) if e.contains("authentication issue") && attempt == 0 => {
+                last_err = e;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err)
+}
+
+/// Single attempt to fetch kline data from Xueqiu.  Returns an error
+/// containing "authentication issue" when the response is missing the
+/// expected `column` field (indicating insufficient auth).
+async fn fetch_stock_history_xueqiu_once(
+    url: &str,
+    symbol: &str,
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+) -> Result<Vec<(chrono::NaiveDate, f64)>, String> {
+    let response = send_xueqiu_request(url, symbol).await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1426,7 +1464,7 @@ pub async fn fetch_stock_history_xueqiu(
     if columns.is_empty() {
         let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
         return Err(format!(
-            "fetch_stock_history_xueqiu: empty or missing 'column' field for {} (authentication issue?). Response preview: {}",
+            "fetch_stock_history_xueqiu: empty or missing 'column' field for {} (authentication issue). Response preview: {}",
             symbol, preview
         ));
     }
@@ -2948,6 +2986,24 @@ mod tests {
         assert!(
             err.contains("empty or missing"),
             "Error should mention empty or missing column: {}",
+            err
+        );
+    }
+
+    /// Test the exact unauthenticated kline response pattern where Xueqiu
+    /// returns `{"data":{"items":[],"items_size":0}}` instead of the expected
+    /// `{"data":{"column":[...],"item":[...]}}` format.
+    #[test]
+    fn test_parse_xueqiu_kline_unauthenticated_response() {
+        let body = r#"{"data":{"items":[],"items_size":0},"error_code":0,"error_description":""}"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2024, 8, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end);
+        assert!(result.is_err(), "Unauthenticated response should be detected as error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("empty or missing"),
+            "Error should indicate missing column: {}",
             err
         );
     }

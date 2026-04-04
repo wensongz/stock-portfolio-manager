@@ -1423,13 +1423,20 @@ pub async fn fetch_stock_history_xueqiu(
         .ok_or_else(|| format!("fetch_stock_history_xueqiu: no data for {}", symbol))?;
 
     let columns = data.column.unwrap_or_default();
+    if columns.is_empty() {
+        let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
+        return Err(format!(
+            "fetch_stock_history_xueqiu: empty or missing 'column' field for {} (authentication issue?). Response preview: {}",
+            symbol, preview
+        ));
+    }
     let ts_idx = columns
         .iter()
         .position(|c| c == "timestamp")
         .ok_or_else(|| {
             format!(
-                "fetch_stock_history_xueqiu: missing 'timestamp' column for {}",
-                symbol
+                "fetch_stock_history_xueqiu: missing 'timestamp' column for {}, got columns: {:?}",
+                symbol, columns
             )
         })?;
     let close_idx = columns
@@ -1437,8 +1444,8 @@ pub async fn fetch_stock_history_xueqiu(
         .position(|c| c == "close")
         .ok_or_else(|| {
             format!(
-                "fetch_stock_history_xueqiu: missing 'close' column for {}",
-                symbol
+                "fetch_stock_history_xueqiu: missing 'close' column for {}, got columns: {:?}",
+                symbol, columns
             )
         })?;
 
@@ -2781,14 +2788,17 @@ mod tests {
             .data
             .ok_or_else(|| "no data".to_string())?;
         let columns = data.column.unwrap_or_default();
+        if columns.is_empty() {
+            return Err("empty or missing 'column' field".to_string());
+        }
         let ts_idx = columns
             .iter()
             .position(|c| c == "timestamp")
-            .ok_or("missing timestamp column")?;
+            .ok_or_else(|| format!("missing timestamp column, got: {:?}", columns))?;
         let close_idx = columns
             .iter()
             .position(|c| c == "close")
-            .ok_or("missing close column")?;
+            .ok_or_else(|| format!("missing close column, got: {:?}", columns))?;
         let items = data.item.unwrap_or_default();
         let mut result = Vec::new();
         for item in &items {
@@ -2883,5 +2893,62 @@ mod tests {
         let end = chrono::NaiveDate::from_ymd_opt(2024, 8, 31).unwrap();
         let result = parse_xueqiu_kline_body(body, start, end);
         assert!(result.is_err(), "Should error when expected columns are missing");
+    }
+
+    /// Test with the exact JSON structure returned by the live Xueqiu API,
+    /// including the `symbol` field in data, 12 columns, and null values in
+    /// items.  This reproduces the real-world response format to catch any
+    /// deserialization issues.
+    #[test]
+    fn test_parse_xueqiu_kline_real_api_response() {
+        let body = r#"{
+          "data": {
+            "symbol": "SH600519",
+            "column": [
+              "timestamp", "volume", "open", "high", "low", "close",
+              "chg", "percent", "turnoverrate", "amount",
+              "volume_post", "amount_post"
+            ],
+            "item": [
+              [1772985600000, 3744162, 1390, 1404.9, 1383.2, 1397, -5, -0.36, 0.3, 5220095639, null, null],
+              [1773072000000, 2462592, 1404.9, 1409.49, 1398, 1401.88, 4.88, 0.35, 0.2, 3457808916, null, null],
+              [1773158400000, 2445673, 1402.99, 1405.99, 1398.02, 1400, -1.88, -0.13, 0.2, 3425363892, null, null]
+            ]
+          },
+          "error_code": 0,
+          "error_description": ""
+        }"#;
+        // March 2026 dates to cover the timestamps above
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end).unwrap();
+        assert_eq!(result.len(), 3, "All three items should be parsed");
+        // Verify close prices
+        assert!((result[0].1 - 1397.0).abs() < 0.01);
+        assert!((result[1].1 - 1401.88).abs() < 0.01);
+        assert!((result[2].1 - 1400.0).abs() < 0.01);
+    }
+
+    /// Test that a response with `data` present but missing `column` field
+    /// (as might happen with insufficient authentication) gives a clear error.
+    #[test]
+    fn test_parse_xueqiu_kline_missing_column_field() {
+        let body = r#"{
+            "data": {
+                "symbol": "SH600519"
+            },
+            "error_code": 0,
+            "error_description": ""
+        }"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2024, 8, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end);
+        assert!(result.is_err(), "Should error when column field is absent");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("empty or missing"),
+            "Error should mention empty or missing column: {}",
+            err
+        );
     }
 }

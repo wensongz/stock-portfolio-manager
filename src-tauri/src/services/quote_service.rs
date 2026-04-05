@@ -883,15 +883,20 @@ async fn send_xueqiu_request(url: &str, symbol: &str) -> Result<reqwest::Respons
         let mut req = client.get(url);
 
         // Attach the user-provided cookie if configured.
-        // The user may supply just the token value or the full "xq_a_token=…"
-        // string.  Normalize so that the header always contains the key.
+        // The user may supply:
+        //   1. A full cookie string with multiple cookies (contains ";")
+        //   2. Just the xq_a_token value
+        //   3. "xq_a_token=<value>"
+        // We pass the full string as-is when it looks like a multi-cookie string.
         //
         // When no user cookie is configured, attach the auto-obtained token
         // explicitly via the Cookie header.  This ensures the cookie reaches
         // `stock.xueqiu.com` even if the cookie jar restricts it to the
         // exact `xueqiu.com` host (RFC 6265 domain-matching rules).
         if let Some(ref cookie) = get_xueqiu_user_cookie() {
-            let header_value = if cookie.starts_with("xq_a_token=") {
+            let header_value = if cookie.contains(';') || cookie.contains("xq_id_token") || cookie.contains("xq_r_token") {
+                cookie.clone()
+            } else if cookie.starts_with("xq_a_token=") {
                 cookie.clone()
             } else {
                 format!("xq_a_token={}", cookie)
@@ -1456,10 +1461,20 @@ pub async fn fetch_stock_history_xueqiu(
             let client = http_client::xueqiu_client();
             let mut req = client.get(&url);
 
-            // Attach cookie – same logic as send_xueqiu_request.
+            // Attach cookie – for kline API we need the full cookie string
+            // (not just xq_a_token). The user-provided cookie may be:
+            //   1. A full cookie string with multiple cookies separated by "; "
+            //   2. Just the xq_a_token value
+            //   3. "xq_a_token=<value>"
+            // We pass whatever the user provided as-is if it looks like a full
+            // cookie string (contains ";" or multiple "=").
             let cookie_header: Option<String>;
             if let Some(ref cookie) = get_xueqiu_user_cookie() {
-                let hv = if cookie.starts_with("xq_a_token=") {
+                // If the user supplied a full cookie string (contains ";"),
+                // use it verbatim.  Otherwise treat it as just xq_a_token.
+                let hv = if cookie.contains(';') || cookie.contains("xq_id_token") || cookie.contains("xq_r_token") {
+                    cookie.clone()
+                } else if cookie.starts_with("xq_a_token=") {
                     cookie.clone()
                 } else {
                     format!("xq_a_token={}", cookie)

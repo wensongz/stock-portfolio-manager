@@ -114,11 +114,11 @@ export default function GeneralSettings() {
           <Form layout="vertical" style={{ maxWidth: 600 }}>
             <Form.Item
               label="雪球 Cookie"
-              extra="从浏览器中复制雪球的 Cookie，粘贴到此处。步骤：登录 xueqiu.com → 按 F12 打开开发者工具 → Application → Cookies → 找到 xq_a_token，复制其值"
+              extra="从浏览器中复制雪球的完整 Cookie 字符串。步骤：登录 xueqiu.com → 按 F12 → Network → 刷新页面 → 点击任意请求 → 复制 Request Headers 中的 Cookie 值（完整字符串，包含 xq_a_token、xq_id_token 等多个字段）"
             >
               <Input.TextArea
                 rows={3}
-                placeholder="粘贴 xq_a_token 的值"
+                placeholder="粘贴完整 Cookie 字符串，例如：xq_a_token=xxx; xq_id_token=xxx; xq_r_token=xxx; xqat=xxx; u=xxx"
                 value={providerConfig.xueqiu_cookie ?? ""}
                 onChange={(e) =>
                   setProviderConfig({ ...providerConfig, xueqiu_cookie: e.target.value || null })
@@ -128,7 +128,7 @@ export default function GeneralSettings() {
             </Form.Item>
           </Form>
           <Paragraph type="secondary">
-            雪球 API 需要登录后的 Cookie 才能访问。如果遇到 400 错误，请在浏览器中登录雪球账号，然后将 Cookie 粘贴到上方输入框中。Cookie 可能会过期，届时需要重新获取。
+            雪球历史行情 API 需要完整的登录 Cookie（包括 xq_a_token、xq_id_token、xq_r_token、xqat 等）。仅提供 xq_a_token 可能不足以获取历史K线数据。Cookie 可能会过期，届时需要重新获取。
           </Paragraph>
         </Card>
       )}

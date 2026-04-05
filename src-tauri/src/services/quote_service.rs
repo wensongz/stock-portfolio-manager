@@ -1462,14 +1462,11 @@ pub async fn fetch_stock_history_xueqiu(
             let mut req = client.get(&url);
 
             // TEMPORARY HARDCODED COOKIES FOR TESTING
-            // Testing whether the kline API requires the full set of cookies
-            // (xq_a_token + xq_id_token + xq_r_token + xqat + u) rather
-            // than just xq_a_token.
+            // Round 2: testing with only xq_a_token + xq_id_token + xq_r_token
+            // (removed xqat and u which appear redundant — xqat == xq_a_token)
             let hardcoded_cookie = "xq_a_token=6a7dc04b2c6770dc8e3f21e3d334831ca6192560; \
                 xq_id_token=eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJ1aWQiOjkwOTU4OTA2OTcsImlzcyI6InVjIiwiZXhwIjoxNzc2OTI5NTg0LCJjdG0iOjE3NzQzMzc2Mjg3MjEsImNpZCI6ImQ5ZDBuNEFadXAifQ.BNGh2OqeZcWfT3LS7th5alyuU5gVRU4-kipzFx0ex0x_b8DMgiglKGGM-yWrVOyJo-yWsM8QX3tqH59AQbvNb4t7upfrpcypSkB7yeJ8eS5-fr39RLVToYMyT2pRlAkU6NAM_jQms5_XijsOSaLy1RbzrHbHcM7SIDM7M0h9ZI8XjHrIPQ6PN4BluE2IFgllptH8qf4XUzA00Gwm8n2cAdCUW1tkR5eDz1555Z2_5s1WnLYuWBGItYNUNsgPpMw81ROIGIURaCndrv168W2kilKDUIsmdJvVVrnaBNaTajQd5neA8RVvDOOkvbzoQHllbLS8zWk0xTHZZfm5Ltko1Q; \
-                xq_r_token=5f1c93d4453297dd81c951d2b629160b60659c89; \
-                xqat=6a7dc04b2c6770dc8e3f21e3d334831ca6192560; \
-                u=9095890697";
+                xq_r_token=5f1c93d4453297dd81c951d2b629160b60659c89";
             req = req.header(reqwest::header::COOKIE, hardcoded_cookie);
             let cookie_header: Option<String> = Some(hardcoded_cookie.to_string());
 

@@ -203,6 +203,157 @@ fn map_transaction(row: &rusqlite::Row<'_>) -> rusqlite::Result<Transaction> {
 }
 
 #[tauri::command(rename_all = "camelCase")]
+pub fn update_transaction(
+    db: State<Database>,
+    id: String,
+    account_id: String,
+    symbol: String,
+    name: String,
+    market: String,
+    transaction_type: String,
+    shares: f64,
+    price: f64,
+    total_amount: f64,
+    commission: f64,
+    currency: String,
+    traded_at: String,
+    notes: Option<String>,
+) -> Result<Transaction, String> {
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+
+    // Fetch the original transaction to reverse holding impact
+    let old_txn: Transaction = conn
+        .query_row(
+            "SELECT id, holding_id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, notes, created_at FROM transactions WHERE id = ?1",
+            rusqlite::params![id],
+            map_transaction,
+        )
+        .map_err(|e| format!("Transaction not found: {}", e))?;
+
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+
+    let result = (|| -> Result<Option<String>, String> {
+        // 1) Reverse the old transaction's impact on its holding
+        if let Some(ref old_hid) = old_txn.holding_id {
+            let (cur_shares, cur_avg_cost): (f64, f64) = conn
+                .query_row(
+                    "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
+                    rusqlite::params![old_hid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|e| e.to_string())?;
+
+            let (rev_shares, rev_avg_cost) = if old_txn.transaction_type == "BUY" {
+                // Reverse a BUY: subtract shares
+                let new_shares = cur_shares - old_txn.shares;
+                let new_avg = if new_shares > 0.0 {
+                    let total_cost = cur_shares * cur_avg_cost - old_txn.shares * old_txn.price;
+                    total_cost / new_shares
+                } else {
+                    0.0
+                };
+                (new_shares, new_avg)
+            } else {
+                // Reverse a SELL: add shares back, avg_cost unchanged
+                (cur_shares + old_txn.shares, cur_avg_cost)
+            };
+
+            let updated_at = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
+                rusqlite::params![old_hid, rev_shares, rev_avg_cost, updated_at],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        // 2) Apply the new transaction's impact on its holding
+        let holding_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM holdings WHERE account_id = ?1 AND symbol = ?2",
+                rusqlite::params![account_id, symbol],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(ref hid) = holding_id {
+            let (cur_shares, cur_avg_cost): (f64, f64) = conn
+                .query_row(
+                    "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
+                    rusqlite::params![hid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|e| e.to_string())?;
+
+            if transaction_type == "SELL" && shares > cur_shares {
+                return Err(format!(
+                    "Cannot sell {} shares of {}: only {} shares held",
+                    shares, symbol, cur_shares
+                ));
+            }
+
+            let (new_shares, new_avg_cost) = if transaction_type == "BUY" {
+                let total_shares = cur_shares + shares;
+                let new_avg = if total_shares > 0.0 {
+                    (cur_shares * cur_avg_cost + shares * price) / total_shares
+                } else {
+                    price
+                };
+                (total_shares, new_avg)
+            } else {
+                (cur_shares - shares, cur_avg_cost)
+            };
+
+            let updated_at = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
+                rusqlite::params![hid, new_shares, new_avg_cost, updated_at],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        // 3) Update the transaction row
+        conn.execute(
+            "UPDATE transactions SET holding_id = ?2, account_id = ?3, symbol = ?4, name = ?5, market = ?6, transaction_type = ?7, shares = ?8, price = ?9, total_amount = ?10, commission = ?11, currency = ?12, traded_at = ?13, notes = ?14 WHERE id = ?1",
+            rusqlite::params![
+                id, holding_id, account_id, symbol, name, market,
+                transaction_type, shares, price, total_amount, commission,
+                currency, traded_at, notes
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+
+        Ok(holding_id)
+    })();
+
+    match result {
+        Ok(holding_id) => {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+            Ok(Transaction {
+                id,
+                holding_id,
+                account_id,
+                symbol,
+                name,
+                market,
+                transaction_type,
+                shares,
+                price,
+                total_amount,
+                commission,
+                currency,
+                traded_at,
+                notes,
+                created_at: old_txn.created_at,
+            })
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+#[tauri::command(rename_all = "camelCase")]
 pub fn delete_transaction(db: State<Database>, id: String) -> Result<(), String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     conn.execute(

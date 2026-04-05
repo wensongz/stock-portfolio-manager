@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
-import type { Transaction, CreateTransactionPayload } from "../types";
+import type { Transaction, CreateTransactionPayload, UpdateTransactionPayload } from "../types";
 
 interface TransactionState {
   transactions: Transaction[];
@@ -8,6 +8,7 @@ interface TransactionState {
   error: string | null;
   fetchTransactions: (filters?: { accountId?: string; symbol?: string }) => Promise<void>;
   createTransaction: (payload: CreateTransactionPayload) => Promise<Transaction>;
+  updateTransaction: (payload: UpdateTransactionPayload) => Promise<Transaction>;
   deleteTransaction: (id: string) => Promise<void>;
 }
 
@@ -32,6 +33,16 @@ export const useTransactionStore = create<TransactionState>((set) => ({
   createTransaction: async (payload) => {
     const transaction = await invoke<Transaction>("create_transaction", { ...payload });
     set((state) => ({ transactions: [transaction, ...state.transactions] }));
+    return transaction;
+  },
+
+  updateTransaction: async (payload) => {
+    const transaction = await invoke<Transaction>("update_transaction", { ...payload });
+    set((state) => ({
+      transactions: state.transactions.map((t) =>
+        t.id === transaction.id ? transaction : t
+      ),
+    }));
     return transaction;
   },
 

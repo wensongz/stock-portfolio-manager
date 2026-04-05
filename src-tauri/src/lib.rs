@@ -133,6 +133,7 @@ pub fn run() {
             commands::holdings::delete_holding,
             commands::transactions::create_transaction,
             commands::transactions::get_transactions,
+            commands::transactions::update_transaction,
             commands::transactions::delete_transaction,
             commands::quotes::get_real_time_quotes,
             commands::quotes::get_holding_quotes,

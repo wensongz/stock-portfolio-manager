@@ -343,6 +343,22 @@ export interface CreateTransactionPayload {
   notes?: string;
 }
 
+export interface UpdateTransactionPayload {
+  id: string;
+  accountId: string;
+  symbol: string;
+  name: string;
+  market: Market;
+  transactionType: TransactionType;
+  shares: number;
+  price: number;
+  totalAmount: number;
+  commission: number;
+  currency: Currency;
+  tradedAt: string;
+  notes?: string;
+}
+
 // Phase 5: Quarterly Analysis types
 export interface QuarterlySnapshot {
   id: string;

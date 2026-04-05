@@ -244,10 +244,10 @@ impl Database {
         let _ = conn.execute_batch("
             ALTER TABLE quote_provider_config ADD COLUMN xueqiu_u TEXT;
         ");
-        // Copy xueqiu_cookie data to xueqiu_u if not already set.
-        let _ = conn.execute_batch("
-            UPDATE quote_provider_config SET xueqiu_u = xueqiu_cookie WHERE xueqiu_cookie IS NOT NULL AND xueqiu_u IS NULL;
-        ");
+        // NOTE: xueqiu_cookie (xq_a_token) and xueqiu_u (user ID) are
+        // different values – do NOT copy one into the other.  Users who
+        // previously only had xueqiu_cookie set will need to enter their
+        // u value separately via the settings UI.
 
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS ai_config (

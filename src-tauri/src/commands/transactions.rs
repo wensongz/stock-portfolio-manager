@@ -6,12 +6,12 @@ use tauri::State;
 /// Compute the cash delta for a transaction.
 /// BUY  → cash decreases by total_amount + commission (money leaves the account).
 /// SELL → cash increases by total_amount - commission (money enters the account).
+/// Panics if `transaction_type` is not `"BUY"` or `"SELL"`.
 pub(crate) fn cash_delta(transaction_type: &str, total_amount: f64, commission: f64) -> f64 {
-    if transaction_type == "BUY" {
-        -(total_amount + commission)
-    } else {
-        // SELL
-        total_amount - commission
+    match transaction_type {
+        "BUY" => -(total_amount + commission),
+        "SELL" => total_amount - commission,
+        other => panic!("Unexpected transaction_type for cash_delta: {}", other),
     }
 }
 

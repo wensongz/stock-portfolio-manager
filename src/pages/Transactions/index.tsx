@@ -15,14 +15,14 @@ import {
   DatePicker,
   AutoComplete,
 } from "antd";
-import { PlusOutlined, EditOutlined } from "@ant-design/icons";
+import { PlusOutlined, EditOutlined, FilterOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { invoke } from "@tauri-apps/api/core";
 import { useTransactionStore } from "../../stores/transactionStore";
 import { useAccountStore } from "../../stores/accountStore";
 import type { Transaction, Market, Currency, TransactionType, Holding, StockQuote } from "../../types";
 
-const { Title } = Typography;
+const { Title, Text } = Typography;
 
 const marketColors: Record<Market, string> = {
   US: "blue",
@@ -60,6 +60,7 @@ export default function TransactionsPage() {
   const [form] = Form.useForm();
   const [accountHoldings, setAccountHoldings] = useState<Holding[]>([]);
   const [symbolSearching, setSymbolSearching] = useState(false);
+  const [filterAccountId, setFilterAccountId] = useState<string | undefined>(undefined);
 
   useEffect(() => {
     fetchTransactions();
@@ -224,6 +225,12 @@ export default function TransactionsPage() {
 
   const accountMap = Object.fromEntries(accounts.map((a) => [a.id, a.name]));
 
+  // Apply account filter
+  const displayData = useMemo(() => {
+    if (!filterAccountId) return transactions;
+    return transactions.filter((t) => t.account_id === filterAccountId);
+  }, [transactions, filterAccountId]);
+
   const columns = [
     {
       title: "日期",
@@ -317,6 +324,10 @@ export default function TransactionsPage() {
             setEditingTransaction(null);
             form.resetFields();
             setAccountHoldings([]);
+            if (filterAccountId) {
+              form.setFieldsValue({ accountId: filterAccountId });
+              handleAccountChange(filterAccountId);
+            }
             setModalOpen(true);
           }}
         >
@@ -324,8 +335,30 @@ export default function TransactionsPage() {
         </Button>
       </div>
 
+      <div className="mb-4">
+        <Space size="middle">
+          <Space>
+            <FilterOutlined />
+            <Text type="secondary">按账户:</Text>
+            <Select
+              value={filterAccountId}
+              onChange={setFilterAccountId}
+              placeholder="全部账户"
+              allowClear
+              style={{ width: 180 }}
+            >
+              {accounts.map((a) => (
+                <Select.Option key={a.id} value={a.id}>
+                  [{a.market}] {a.name}
+                </Select.Option>
+              ))}
+            </Select>
+          </Space>
+        </Space>
+      </div>
+
       <Table
-        dataSource={transactions}
+        dataSource={displayData}
         columns={columns}
         rowKey="id"
         loading={loading}

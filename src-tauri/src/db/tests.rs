@@ -204,6 +204,7 @@ mod tests {
             hk_provider: "yahoo".to_string(),
             cn_provider: "eastmoney".to_string(),
             xueqiu_cookie: None,
+            xueqiu_u: None,
         };
         let result = crate::services::quote_provider_service::update_quote_provider_config(&db, &config);
         assert!(result.is_ok());
@@ -222,6 +223,7 @@ mod tests {
             hk_provider: "yahoo".to_string(),
             cn_provider: "eastmoney".to_string(),
             xueqiu_cookie: None,
+            xueqiu_u: None,
         };
         let result = crate::services::quote_provider_service::update_quote_provider_config(&db, &config);
         assert!(result.is_err());
@@ -235,6 +237,7 @@ mod tests {
             hk_provider: "yahoo".to_string(),
             cn_provider: "yahoo".to_string(),
             xueqiu_cookie: None,
+            xueqiu_u: None,
         };
         let result = crate::services::quote_provider_service::update_quote_provider_config(&db, &config);
         assert!(result.is_err());
@@ -248,6 +251,7 @@ mod tests {
             hk_provider: "eastmoney".to_string(),
             cn_provider: "eastmoney".to_string(),
             xueqiu_cookie: Some("xq_a_token=abc123".to_string()),
+            xueqiu_u: None,
         };
         let result = crate::services::quote_provider_service::update_quote_provider_config(&db, &config);
         assert!(result.is_ok());
@@ -257,19 +261,37 @@ mod tests {
     }
 
     #[test]
-    fn test_quote_provider_config_xueqiu_cookie_empty_normalized_to_none() {
+    fn test_quote_provider_config_xueqiu_u_round_trip() {
         let db = create_test_db();
         let config = crate::models::quote_provider::QuoteProviderConfig {
-            us_provider: "eastmoney".to_string(),
+            us_provider: "xueqiu".to_string(),
             hk_provider: "eastmoney".to_string(),
             cn_provider: "eastmoney".to_string(),
-            xueqiu_cookie: Some("   ".to_string()),
+            xueqiu_cookie: None,
+            xueqiu_u: Some("9095890697".to_string()),
         };
         let result = crate::services::quote_provider_service::update_quote_provider_config(&db, &config);
         assert!(result.is_ok());
 
         let loaded = crate::services::quote_provider_service::get_quote_provider_config(&db).unwrap();
-        assert_eq!(loaded.xueqiu_cookie, None);
+        assert_eq!(loaded.xueqiu_u, Some("9095890697".to_string()));
+    }
+
+    #[test]
+    fn test_quote_provider_config_xueqiu_u_empty_normalized_to_none() {
+        let db = create_test_db();
+        let config = crate::models::quote_provider::QuoteProviderConfig {
+            us_provider: "eastmoney".to_string(),
+            hk_provider: "eastmoney".to_string(),
+            cn_provider: "eastmoney".to_string(),
+            xueqiu_cookie: None,
+            xueqiu_u: Some("   ".to_string()),
+        };
+        let result = crate::services::quote_provider_service::update_quote_provider_config(&db, &config);
+        assert!(result.is_ok());
+
+        let loaded = crate::services::quote_provider_service::get_quote_provider_config(&db).unwrap();
+        assert_eq!(loaded.xueqiu_u, None);
     }
 
     #[test]

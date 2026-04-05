@@ -6,7 +6,7 @@ pub fn get_quote_provider_config(db: &Database) -> Result<QuoteProviderConfig, S
     let conn = db.conn.lock().unwrap();
 
     let result = conn.query_row(
-        "SELECT us_provider, hk_provider, cn_provider, xueqiu_cookie FROM quote_provider_config WHERE id = 1",
+        "SELECT us_provider, hk_provider, cn_provider, xueqiu_cookie, xueqiu_u FROM quote_provider_config WHERE id = 1",
         [],
         |row| {
             Ok(QuoteProviderConfig {
@@ -14,6 +14,7 @@ pub fn get_quote_provider_config(db: &Database) -> Result<QuoteProviderConfig, S
                 hk_provider: row.get(1)?,
                 cn_provider: row.get(2)?,
                 xueqiu_cookie: row.get(3)?,
+                xueqiu_u: row.get(4)?,
             })
         },
     );
@@ -45,28 +46,36 @@ pub fn update_quote_provider_config(
     let conn = db.conn.lock().unwrap();
     let now = Utc::now().to_rfc3339();
 
-    // Normalize empty / whitespace-only cookie strings to NULL.
-    let cookie = config
+    // Normalize empty / whitespace-only values to NULL.
+    let xueqiu_cookie = config
         .xueqiu_cookie
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let xueqiu_u = config
+        .xueqiu_u
         .as_deref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
     conn.execute(
-        "INSERT INTO quote_provider_config (id, us_provider, hk_provider, cn_provider, xueqiu_cookie, updated_at)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO quote_provider_config (id, us_provider, hk_provider, cn_provider, xueqiu_cookie, xueqiu_u, updated_at)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(id) DO UPDATE SET
            us_provider = excluded.us_provider,
            hk_provider = excluded.hk_provider,
            cn_provider = excluded.cn_provider,
            xueqiu_cookie = excluded.xueqiu_cookie,
+           xueqiu_u = excluded.xueqiu_u,
            updated_at = excluded.updated_at",
         rusqlite::params![
             config.us_provider,
             config.hk_provider,
             config.cn_provider,
-            cookie,
+            xueqiu_cookie,
+            xueqiu_u,
             now
         ],
     )

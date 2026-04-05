@@ -705,29 +705,52 @@ fn parse_eastmoney_quote(symbol: &str, market: &str, resp: EastMoneyResponse) ->
 /// Whether the Xueqiu client has obtained a session cookie from the homepage.
 static XUEQIU_TOKEN_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// User-provided Xueqiu cookie string (from a logged-in browser session).
-/// When set, this takes priority over the automatic homepage token fetch.
+/// User-provided Xueqiu cookie string (e.g. `xq_a_token=xxx`).
+/// When set, this replaces the auto-obtained xq_a_token in API requests.
 static XUEQIU_USER_COOKIE: Mutex<Option<String>> = Mutex::new(None);
 
-/// Set (or clear) the user-provided Xueqiu cookie.
+/// User-provided Xueqiu `u` cookie value (user ID from a logged-in browser session).
+/// When set, it is appended alongside `xq_a_token` in the Cookie header
+/// to authenticate kline API requests.
+static XUEQIU_USER_U: Mutex<Option<String>> = Mutex::new(None);
+
+/// Auto-obtained `xq_a_token` value extracted from the homepage response.
 ///
-/// After calling this, subsequent Xueqiu API requests will include this cookie
-/// in the `Cookie` header, bypassing the automatic homepage token fetch.
+/// The Xueqiu cookie jar may not send cookies set by `xueqiu.com` to the
+/// API subdomain `stock.xueqiu.com` if the cookie lacks a `Domain` attribute
+/// (RFC 6265 restricts such cookies to the exact host).  By storing the token
+/// explicitly we can attach it via the `Cookie` header on every API request,
+/// guaranteeing it reaches the API regardless of cookie-jar domain matching.
+static XUEQIU_AUTO_COOKIE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Set (or clear) the user-provided Xueqiu cookie string.
 pub fn set_xueqiu_user_cookie(cookie: Option<String>) {
     let cookie = cookie
         .as_deref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let mut guard = XUEQIU_USER_COOKIE.lock().unwrap();
-    *guard = cookie;
-    // Reset the automatic token so the next request picks up the new cookie.
-    XUEQIU_TOKEN_INITIALIZED.store(false, Ordering::SeqCst);
+    *XUEQIU_USER_COOKIE.lock().unwrap() = cookie;
 }
 
 /// Return a clone of the current user-provided Xueqiu cookie, if any.
 fn get_xueqiu_user_cookie() -> Option<String> {
     XUEQIU_USER_COOKIE.lock().unwrap().clone()
+}
+
+/// Set (or clear) the user-provided Xueqiu `u` cookie value.
+pub fn set_xueqiu_user_u(u_value: Option<String>) {
+    let u_value = u_value
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    *XUEQIU_USER_U.lock().unwrap() = u_value;
+}
+
+/// Return a clone of the current user-provided Xueqiu `u` cookie value, if any.
+fn get_xueqiu_user_u() -> Option<String> {
+    XUEQIU_USER_U.lock().unwrap().clone()
 }
 
 /// Ensure the Xueqiu HTTP client has a valid session token.
@@ -748,18 +771,15 @@ async fn ensure_xueqiu_token() -> Result<(), String> {
         return Ok(());
     }
 
-    // When the user has provided a cookie from their browser, skip the
-    // homepage visit – the cookie will be attached directly to each request.
+    // If a user-provided cookie is configured, skip the homepage visit
+    // entirely – authentication is handled via the explicit Cookie header
+    // built in build_xueqiu_cookie_header().
     if get_xueqiu_user_cookie().is_some() {
         XUEQIU_TOKEN_INITIALIZED.store(true, Ordering::SeqCst);
         return Ok(());
     }
 
     let client = http_client::xueqiu_client();
-    // Override the default Accept header for the homepage visit.
-    // The Xueqiu client's default Accept is "application/json, text/plain, */*"
-    // which is suitable for API calls, but the homepage may only issue the
-    // xq_a_token cookie when it sees a normal browser page-load request.
     let resp = client
         .get("https://xueqiu.com")
         .header(
@@ -772,25 +792,32 @@ async fn ensure_xueqiu_token() -> Result<(), String> {
 
     let status = resp.status();
 
-    // Log Set-Cookie headers for diagnosis (helps debug token issues).
-    let cookie_names: Vec<String> = resp
-        .headers()
-        .get_all(reqwest::header::SET_COOKIE)
-        .iter()
-        .filter_map(|v| {
-            v.to_str().ok().and_then(|s| s.split('=').next().map(String::from))
-        })
-        .collect();
-    if cookie_names.is_empty() {
-        eprintln!(
-            "Xueqiu token init: homepage returned HTTP {} but no Set-Cookie headers in final response (cookies may have been set during redirects)",
-            status
-        );
-    } else {
-        eprintln!(
-            "Xueqiu token init: homepage returned HTTP {}, cookies received: {:?}",
-            status, cookie_names
-        );
+    // Extract `xq_a_token` from Set-Cookie headers so we can attach it
+    // explicitly to API requests (see XUEQIU_AUTO_COOKIE doc comment).
+    let mut auto_token: Option<String> = None;
+    for header_val in resp.headers().get_all(reqwest::header::SET_COOKIE).iter() {
+        if let Ok(s) = header_val.to_str() {
+            if s.starts_with("xq_a_token=") {
+                let val_start = "xq_a_token=".len();
+                let val_end = s[val_start..].find(';').map(|i| val_start + i).unwrap_or(s.len());
+                let token_value = &s[val_start..val_end];
+                if !token_value.is_empty() {
+                    auto_token = Some(token_value.to_string());
+                }
+            }
+        }
+    }
+    if auto_token.is_none() {
+        for cookie in resp.cookies() {
+            if cookie.name() == "xq_a_token" && !cookie.value().is_empty() {
+                auto_token = Some(cookie.value().to_string());
+                break;
+            }
+        }
+    }
+
+    if let Some(ref token) = auto_token {
+        *XUEQIU_AUTO_COOKIE.lock().unwrap() = Some(token.clone());
     }
 
     if status.is_success() || status.is_redirection() {
@@ -807,6 +834,48 @@ async fn ensure_xueqiu_token() -> Result<(), String> {
 /// Reset the Xueqiu session token so that the next API call will re-fetch it.
 fn reset_xueqiu_token() {
     XUEQIU_TOKEN_INITIALIZED.store(false, Ordering::SeqCst);
+    *XUEQIU_AUTO_COOKIE.lock().unwrap() = None;
+}
+
+/// Build the cookie header for Xueqiu API requests.
+///
+/// Priority: user-provided cookie > auto-obtained xq_a_token.
+/// When the user has configured a `u` cookie value, it is appended so
+/// that the kline API returns authenticated data.
+///
+/// The user may enter either the raw `xq_a_token` value (e.g. `6a7dc04b...`)
+/// or a full cookie string (e.g. `xq_a_token=6a7dc04b...`).  Both forms are
+/// handled correctly.
+fn build_xueqiu_cookie_header() -> Option<String> {
+    let user_cookie = get_xueqiu_user_cookie();
+    let auto_token = XUEQIU_AUTO_COOKIE.lock().unwrap().clone();
+    let u_value = get_xueqiu_user_u();
+
+    // Start with the base cookie: prefer user-provided, fall back to auto.
+    let base = if let Some(ref uc) = user_cookie {
+        // If the user entered a raw token value (no '=' sign), wrap it.
+        if uc.contains('=') {
+            Some(uc.clone())
+        } else {
+            Some(format!("xq_a_token={}", uc))
+        }
+    } else {
+        auto_token.map(|t| format!("xq_a_token={}", t))
+    };
+
+    match (base, u_value) {
+        (Some(b), Some(u)) => {
+            // Append u= if not already present in the base cookie.
+            if b.contains(&format!("u={}", u)) {
+                Some(b)
+            } else {
+                Some(format!("{}; u={}", b, u))
+            }
+        }
+        (Some(b), None) => Some(b),
+        (None, Some(u)) => Some(format!("u={}", u)),
+        (None, None) => None,
+    }
 }
 
 /// Maximum number of retry attempts for transient Xueqiu API failures.
@@ -816,9 +885,6 @@ const XUEQIU_MAX_RETRIES: u32 = 2;
 ///
 /// If the initial request returns HTTP 400 (which indicates an expired or
 /// missing session token), the token is refreshed and the request is retried.
-///
-/// When a user-provided cookie is available it is attached as a `Cookie`
-/// header on every request, taking priority over the automatic cookie jar.
 async fn send_xueqiu_request(url: &str, symbol: &str) -> Result<reqwest::Response, String> {
     ensure_xueqiu_token().await?;
 
@@ -828,28 +894,13 @@ async fn send_xueqiu_request(url: &str, symbol: &str) -> Result<reqwest::Respons
     for attempt in 0..=XUEQIU_MAX_RETRIES {
         let mut req = client.get(url);
 
-        // Attach the user-provided cookie if configured.
-        // The user may supply just the token value or the full "xq_a_token=…"
-        // string.  Normalize so that the header always contains the key.
-        if let Some(ref cookie) = get_xueqiu_user_cookie() {
-            let header_value = if cookie.starts_with("xq_a_token=") {
-                cookie.clone()
-            } else {
-                format!("xq_a_token={}", cookie)
-            };
-            req = req.header(reqwest::header::COOKIE, header_value);
+        if let Some(cookie) = build_xueqiu_cookie_header() {
+            req = req.header(reqwest::header::COOKIE, cookie);
         }
 
         let result = req.send().await;
         match result {
             Ok(resp) if resp.status() == reqwest::StatusCode::BAD_REQUEST && attempt < XUEQIU_MAX_RETRIES => {
-                // Log the 400 response for diagnosis before retrying.
-                eprintln!(
-                    "Xueqiu API returned 400 for {} (attempt {}/{}), refreshing token and retrying",
-                    symbol, attempt + 1, XUEQIU_MAX_RETRIES + 1
-                );
-                // Token likely expired – refresh and retry after a short delay
-                // to allow the new session cookie to propagate.
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 reset_xueqiu_token();
                 ensure_xueqiu_token().await?;
@@ -1363,15 +1414,10 @@ pub async fn fetch_stock_history_xueqiu(
     let calendar_days = (end_date - start_date).num_days() + 10;
     let count = calendar_days.max(30);
 
-    // begin is the first millisecond of the day *after* end_date so that the
-    // API includes all trading sessions that fall on end_date itself.
-    let begin_ts = end_date
-        .succ_opt()
-        .unwrap_or(end_date)
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
-        .timestamp_millis();
+    // The Xueqiu kline API `begin` parameter must be the current timestamp
+    // in milliseconds. The API returns `count` trading days of data going
+    // backwards from `begin` when `type=before`.
+    let begin_ts = chrono::Utc::now().timestamp_millis();
 
     let url = format!(
         "https://stock.xueqiu.com/v5/stock/chart/kline.json?symbol={}&begin={}&period=day&type=before&count=-{}&indicator=kline",
@@ -1418,18 +1464,28 @@ pub async fn fetch_stock_history_xueqiu(
         }
     }
 
-    let data = resp
+    let mut data = resp
         .data
         .ok_or_else(|| format!("fetch_stock_history_xueqiu: no data for {}", symbol))?;
 
-    let columns = data.column.unwrap_or_default();
+    let columns = data.column.take().unwrap_or_default();
+    if columns.is_empty() {
+        let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
+        return Err(format!(
+            "fetch_stock_history_xueqiu: empty or missing 'column' field for {}. \
+             The Xueqiu kline API requires a `u` cookie value. \
+             Provide it in Settings → Quote Provider → 雪球用户ID. \
+             URL: {} Response preview: {}",
+            symbol, url, preview
+        ));
+    }
     let ts_idx = columns
         .iter()
         .position(|c| c == "timestamp")
         .ok_or_else(|| {
             format!(
-                "fetch_stock_history_xueqiu: missing 'timestamp' column for {}",
-                symbol
+                "fetch_stock_history_xueqiu: missing 'timestamp' column for {}, got columns: {:?}",
+                symbol, columns
             )
         })?;
     let close_idx = columns
@@ -1437,8 +1493,8 @@ pub async fn fetch_stock_history_xueqiu(
         .position(|c| c == "close")
         .ok_or_else(|| {
             format!(
-                "fetch_stock_history_xueqiu: missing 'close' column for {}",
-                symbol
+                "fetch_stock_history_xueqiu: missing 'close' column for {}, got columns: {:?}",
+                symbol, columns
             )
         })?;
 
@@ -1446,7 +1502,12 @@ pub async fn fetch_stock_history_xueqiu(
     let mut result: Vec<(chrono::NaiveDate, f64)> = Vec::new();
 
     for item in &items {
-        let ts_ms = item.get(ts_idx).and_then(|v| v.as_i64());
+        // Xueqiu may return timestamps as JSON floats (e.g. 1692892800000.0)
+        // instead of integers, so try as_i64() first, then fall back to
+        // as_f64() with rounding.
+        let ts_ms = item
+            .get(ts_idx)
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64)));
         let close = item.get(close_idx).and_then(|v| v.as_f64());
 
         if let (Some(ts_ms), Some(close_price)) = (ts_ms, close) {
@@ -1459,6 +1520,21 @@ pub async fn fetch_stock_history_xueqiu(
         }
     }
 
+    if !items.is_empty() && result.is_empty() {
+        // Log a diagnostic when the API returned items but none survived
+        // parsing or date filtering – helps diagnose future issues.
+        let preview: String = items
+            .iter()
+            .take(2)
+            .map(|row| format!("{:?}", row))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "fetch_stock_history_xueqiu: {} items received for {} but none matched date range {}/{}. First items: [{}]",
+            items.len(), symbol, start_date, end_date, preview
+        );
+    }
+
     result.sort_by_key(|(d, _)| *d);
     Ok(result)
 }
@@ -1466,6 +1542,8 @@ pub async fn fetch_stock_history_xueqiu(
 /// Fetch historical daily closing prices using the appropriate provider
 /// based on the market and the configured provider name.
 /// Falls back to Yahoo Finance for unknown providers.
+/// When Xueqiu is selected but returns an error or empty results, East Money
+/// is used as an automatic fallback.
 pub async fn fetch_stock_history(
     symbol: &str,
     market: &str,
@@ -1474,8 +1552,76 @@ pub async fn fetch_stock_history(
     provider: &str,
 ) -> Result<Vec<(chrono::NaiveDate, f64)>, String> {
     match provider {
-        "xueqiu" => fetch_stock_history_xueqiu(symbol, market, start_date, end_date).await,
-        "eastmoney" => fetch_stock_history_eastmoney(symbol, market, start_date, end_date).await,
+        "xueqiu" => {
+            match fetch_stock_history_xueqiu(symbol, market, start_date, end_date).await {
+                Ok(prices) if !prices.is_empty() => Ok(prices),
+                Ok(_empty) => {
+                    eprintln!(
+                        "fetch_stock_history: Xueqiu returned empty history for {} ({}), falling back to eastmoney",
+                        symbol, market
+                    );
+                    match fetch_stock_history_eastmoney(symbol, market, start_date, end_date).await {
+                        Ok(prices) if !prices.is_empty() => Ok(prices),
+                        Ok(_empty) => {
+                            eprintln!(
+                                "fetch_stock_history: EastMoney also returned empty history for {} ({}), falling back to yahoo",
+                                symbol, market
+                            );
+                            fetch_stock_history_yahoo(symbol, market, start_date, end_date).await
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "fetch_stock_history: EastMoney fallback also failed for {} ({}): {}, falling back to yahoo",
+                                symbol, market, e
+                            );
+                            fetch_stock_history_yahoo(symbol, market, start_date, end_date).await
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "fetch_stock_history: Xueqiu history failed for {} ({}): {}, falling back to eastmoney",
+                        symbol, market, e
+                    );
+                    match fetch_stock_history_eastmoney(symbol, market, start_date, end_date).await {
+                        Ok(prices) if !prices.is_empty() => Ok(prices),
+                        Ok(_empty) => {
+                            eprintln!(
+                                "fetch_stock_history: EastMoney also returned empty history for {} ({}), falling back to yahoo",
+                                symbol, market
+                            );
+                            fetch_stock_history_yahoo(symbol, market, start_date, end_date).await
+                        }
+                        Err(e2) => {
+                            eprintln!(
+                                "fetch_stock_history: EastMoney fallback also failed for {} ({}): {}, falling back to yahoo",
+                                symbol, market, e2
+                            );
+                            fetch_stock_history_yahoo(symbol, market, start_date, end_date).await
+                        }
+                    }
+                }
+            }
+        }
+        "eastmoney" => {
+            match fetch_stock_history_eastmoney(symbol, market, start_date, end_date).await {
+                Ok(prices) if !prices.is_empty() => Ok(prices),
+                Ok(_empty) => {
+                    eprintln!(
+                        "fetch_stock_history: EastMoney returned empty history for {} ({}), falling back to yahoo",
+                        symbol, market
+                    );
+                    fetch_stock_history_yahoo(symbol, market, start_date, end_date).await
+                }
+                Err(e) => {
+                    eprintln!(
+                        "fetch_stock_history: EastMoney history failed for {} ({}): {}, falling back to yahoo",
+                        symbol, market, e
+                    );
+                    fetch_stock_history_yahoo(symbol, market, start_date, end_date).await
+                }
+            }
+        }
         _ => fetch_stock_history_yahoo(symbol, market, start_date, end_date).await,
     }
 }
@@ -2724,5 +2870,201 @@ mod tests {
                 println!("⚠️ HK Xueqiu quote failed (network issue in CI): {}", e);
             }
         }
+    }
+
+    // ── Xueqiu kline response parsing tests ────────────────────────────
+
+    /// Helper: parse a raw Xueqiu kline JSON body into (date, close) pairs
+    /// using the same logic as `fetch_stock_history_xueqiu`.
+    fn parse_xueqiu_kline_body(
+        body: &str,
+        start_date: chrono::NaiveDate,
+        end_date: chrono::NaiveDate,
+    ) -> Result<Vec<(chrono::NaiveDate, f64)>, String> {
+        let resp: XueqiuKlineResponse =
+            serde_json::from_str(body).map_err(|e| format!("parse error: {}", e))?;
+        let data = resp
+            .data
+            .ok_or_else(|| "no data".to_string())?;
+        let columns = data.column.unwrap_or_default();
+        if columns.is_empty() {
+            return Err("empty or missing 'column' field".to_string());
+        }
+        let ts_idx = columns
+            .iter()
+            .position(|c| c == "timestamp")
+            .ok_or_else(|| format!("missing timestamp column, got: {:?}", columns))?;
+        let close_idx = columns
+            .iter()
+            .position(|c| c == "close")
+            .ok_or_else(|| format!("missing close column, got: {:?}", columns))?;
+        let items = data.item.unwrap_or_default();
+        let mut result = Vec::new();
+        for item in &items {
+            let ts_ms = item
+                .get(ts_idx)
+                .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64)));
+            let close = item.get(close_idx).and_then(|v| v.as_f64());
+            if let (Some(ts_ms), Some(close_price)) = (ts_ms, close) {
+                if let Some(dt) = chrono::DateTime::from_timestamp(ts_ms / 1000, 0) {
+                    let date = dt.date_naive();
+                    if date >= start_date && date <= end_date {
+                        result.push((date, close_price));
+                    }
+                }
+            }
+        }
+        result.sort_by_key(|(d, _)| *d);
+        Ok(result)
+    }
+
+    #[test]
+    fn test_parse_xueqiu_kline_integer_timestamps() {
+        // Timestamps as JSON integers (the straightforward case).
+        let body = r#"{
+            "data": {
+                "column": ["timestamp", "volume", "open", "high", "low", "close"],
+                "item": [
+                    [1724544000000, 1000, 100.0, 105.0, 99.0, 103.0],
+                    [1724630400000, 2000, 103.0, 108.0, 102.0, 107.0]
+                ]
+            },
+            "error_code": 0,
+            "error_description": ""
+        }"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2024, 8, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end).unwrap();
+        assert_eq!(result.len(), 2);
+        assert!((result[0].1 - 103.0).abs() < 0.001);
+        assert!((result[1].1 - 107.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_xueqiu_kline_float_timestamps() {
+        // Timestamps as JSON floats (e.g. 1724544000000.0).
+        // This is the case that previously caused all items to be silently skipped.
+        let body = r#"{
+            "data": {
+                "column": ["timestamp", "volume", "open", "high", "low", "close"],
+                "item": [
+                    [1724544000000.0, 1000, 100.0, 105.0, 99.0, 103.0],
+                    [1724630400000.0, 2000, 103.0, 108.0, 102.0, 107.0]
+                ]
+            },
+            "error_code": 0,
+            "error_description": ""
+        }"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2024, 8, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end).unwrap();
+        assert_eq!(result.len(), 2, "Float timestamps must be parsed correctly");
+        assert!((result[0].1 - 103.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_xueqiu_kline_empty_items() {
+        let body = r#"{
+            "data": {
+                "column": ["timestamp", "volume", "open", "high", "low", "close"],
+                "item": []
+            },
+            "error_code": 0,
+            "error_description": ""
+        }"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2024, 8, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_xueqiu_kline_missing_column() {
+        let body = r#"{
+            "data": {
+                "column": ["time", "volume", "open", "high", "low", "price"],
+                "item": [[1724544000000, 1000, 100.0, 105.0, 99.0, 103.0]]
+            },
+            "error_code": 0,
+            "error_description": ""
+        }"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2024, 8, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end);
+        assert!(result.is_err(), "Should error when expected columns are missing");
+    }
+
+    /// Test with the exact JSON structure returned by the live Xueqiu API,
+    /// including the `symbol` field in data, 12 columns, and null values in
+    /// items.  This reproduces the real-world response format to catch any
+    /// deserialization issues.
+    #[test]
+    fn test_parse_xueqiu_kline_real_api_response() {
+        let body = r#"{
+          "data": {
+            "symbol": "SH600519",
+            "column": [
+              "timestamp", "volume", "open", "high", "low", "close",
+              "chg", "percent", "turnoverrate", "amount",
+              "volume_post", "amount_post"
+            ],
+            "item": [
+              [1772985600000, 3744162, 1390, 1404.9, 1383.2, 1397, -5, -0.36, 0.3, 5220095639, null, null],
+              [1773072000000, 2462592, 1404.9, 1409.49, 1398, 1401.88, 4.88, 0.35, 0.2, 3457808916, null, null],
+              [1773158400000, 2445673, 1402.99, 1405.99, 1398.02, 1400, -1.88, -0.13, 0.2, 3425363892, null, null]
+            ]
+          },
+          "error_code": 0,
+          "error_description": ""
+        }"#;
+        // March 2026 dates to cover the timestamps above
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end).unwrap();
+        assert_eq!(result.len(), 3, "All three items should be parsed");
+        // Verify close prices
+        assert!((result[0].1 - 1397.0).abs() < 0.01);
+        assert!((result[1].1 - 1401.88).abs() < 0.01);
+        assert!((result[2].1 - 1400.0).abs() < 0.01);
+    }
+
+    /// Test that a response with `data` present but missing `column` field
+    /// (as might happen with insufficient authentication) gives a clear error.
+    #[test]
+    fn test_parse_xueqiu_kline_missing_column_field() {
+        let body = r#"{
+            "data": {
+                "symbol": "SH600519"
+            },
+            "error_code": 0,
+            "error_description": ""
+        }"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2024, 8, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end);
+        assert!(result.is_err(), "Should error when column field is absent");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("empty or missing"),
+            "Error should mention empty or missing column: {}",
+            err
+        );
+    }
+
+    /// Test parsing a kline response that has `items`/`items_size` fields
+    /// but no `column`/`item` fields (e.g. when API returns empty data).
+    #[test]
+    fn test_parse_xueqiu_kline_empty_data_response() {
+        let body = r#"{"data":{"items":[],"items_size":0},"error_code":0,"error_description":""}"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2024, 8, 31).unwrap();
+        let result = parse_xueqiu_kline_body(body, start, end);
+        assert!(result.is_err(), "Response without column field should be an error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("empty or missing"),
+            "Error should indicate missing column: {}",
+            err
+        );
     }
 }

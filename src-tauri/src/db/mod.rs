@@ -240,6 +240,15 @@ impl Database {
             ALTER TABLE quote_provider_config ADD COLUMN xueqiu_cookie TEXT;
         ");
 
+        // Add xueqiu_u column if not exists (migration)
+        let _ = conn.execute_batch("
+            ALTER TABLE quote_provider_config ADD COLUMN xueqiu_u TEXT;
+        ");
+        // NOTE: xueqiu_cookie (xq_a_token) and xueqiu_u (user ID) are
+        // different values – do NOT copy one into the other.  Users who
+        // previously only had xueqiu_cookie set will need to enter their
+        // u value separately via the settings UI.
+
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS ai_config (
                 id INTEGER PRIMARY KEY DEFAULT 1,

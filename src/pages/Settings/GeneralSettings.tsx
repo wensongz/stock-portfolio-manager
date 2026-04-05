@@ -33,6 +33,7 @@ export default function GeneralSettings() {
     hk_provider: "xueqiu",
     cn_provider: "xueqiu",
     xueqiu_cookie: null,
+    xueqiu_u: null,
   });
 
   useEffect(() => {
@@ -68,6 +69,17 @@ export default function GeneralSettings() {
       await invoke("update_quote_provider_config", { config: updated });
       setProviderConfig(updated);
       message.success("雪球 Cookie 已更新");
+    } catch (err) {
+      message.error("更新失败: " + String(err));
+    }
+  };
+
+  const handleUValueSave = async (uValue: string) => {
+    const updated = { ...providerConfig, xueqiu_u: uValue || null };
+    try {
+      await invoke("update_quote_provider_config", { config: updated });
+      setProviderConfig(updated);
+      message.success("雪球用户 ID 已更新");
     } catch (err) {
       message.error("更新失败: " + String(err));
     }
@@ -111,14 +123,13 @@ export default function GeneralSettings() {
 
       {isXueqiuUsed && (
         <Card title="雪球 Cookie 设置">
-          <Form layout="vertical" style={{ maxWidth: 600 }}>
+          <Form layout="vertical" style={{ maxWidth: 400 }}>
             <Form.Item
               label="雪球 Cookie"
-              extra="从浏览器中复制雪球的 Cookie，粘贴到此处。步骤：登录 xueqiu.com → 按 F12 打开开发者工具 → Application → Cookies → 找到 xq_a_token，复制其值"
+              extra="登录 xueqiu.com → F12 → Application → Cookies → 复制 xq_a_token 的值"
             >
-              <Input.TextArea
-                rows={3}
-                placeholder="粘贴 xq_a_token 的值"
+              <Input
+                placeholder="例如：xq_a_token=6a7dc04b2c6770dc8e..."
                 value={providerConfig.xueqiu_cookie ?? ""}
                 onChange={(e) =>
                   setProviderConfig({ ...providerConfig, xueqiu_cookie: e.target.value || null })
@@ -126,9 +137,22 @@ export default function GeneralSettings() {
                 onBlur={(e) => handleCookieSave(e.target.value)}
               />
             </Form.Item>
+            <Form.Item
+              label="雪球用户 ID (u)"
+              extra="同上位置，找到 u 的值"
+            >
+              <Input
+                placeholder="例如：9095890697"
+                value={providerConfig.xueqiu_u ?? ""}
+                onChange={(e) =>
+                  setProviderConfig({ ...providerConfig, xueqiu_u: e.target.value || null })
+                }
+                onBlur={(e) => handleUValueSave(e.target.value)}
+              />
+            </Form.Item>
           </Form>
           <Paragraph type="secondary">
-            雪球 API 需要登录后的 Cookie 才能访问。如果遇到 400 错误，请在浏览器中登录雪球账号，然后将 Cookie 粘贴到上方输入框中。Cookie 可能会过期，届时需要重新获取。
+            雪球历史行情 API 需要 Cookie 和用户 ID 才能获取数据。两者都需要填写。Cookie 和用户 ID 可能会过期，届时需要重新获取。
           </Paragraph>
         </Card>
       )}

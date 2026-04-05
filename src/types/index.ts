@@ -596,5 +596,6 @@ export interface QuoteProviderConfig {
   hk_provider: QuoteProvider;
   cn_provider: QuoteProvider;
   xueqiu_cookie?: string | null;
+  xueqiu_u?: string | null;
 }
 

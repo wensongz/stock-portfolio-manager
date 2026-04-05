@@ -93,7 +93,7 @@ interface PerformanceState {
 }
 
 export const usePerformanceStore = create<PerformanceState>((set, get) => ({
-  timeRange: "1Y",
+  timeRange: "1M",
   customStart: null,
   customEnd: null,
   selectedBenchmarks: [],

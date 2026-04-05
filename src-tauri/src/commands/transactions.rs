@@ -1,6 +1,66 @@
 use crate::db::Database;
 use crate::models::Transaction;
+use crate::services::quote_service::{cash_display_name, CASH_SYMBOL_PREFIX};
 use tauri::State;
+
+/// Compute the cash delta for a transaction.
+/// BUY  → cash decreases by total_amount + commission (money leaves the account).
+/// SELL → cash increases by total_amount - commission (money enters the account).
+pub(crate) fn cash_delta(transaction_type: &str, total_amount: f64, commission: f64) -> f64 {
+    if transaction_type == "BUY" {
+        -(total_amount + commission)
+    } else {
+        // SELL
+        total_amount - commission
+    }
+}
+
+/// Find or create the cash holding for the given account and currency,
+/// then adjust its `shares` (i.e. cash balance) by `delta`.
+/// `conn` must already be inside a SQLite transaction.
+pub(crate) fn adjust_cash_holding(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    currency: &str,
+    market: &str,
+    delta: f64,
+) -> Result<(), String> {
+    let cash_symbol = format!("{}{}", CASH_SYMBOL_PREFIX, currency);
+
+    let existing: Option<(String, f64)> = conn
+        .query_row(
+            "SELECT id, shares FROM holdings WHERE account_id = ?1 AND symbol = ?2",
+            rusqlite::params![account_id, cash_symbol],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let updated_at = chrono::Utc::now().to_rfc3339();
+
+    if let Some((cash_id, current_shares)) = existing {
+        let new_shares = current_shares + delta;
+        conn.execute(
+            "UPDATE holdings SET shares = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![cash_id, new_shares, updated_at],
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        // Cash holding does not exist yet – create it
+        let cash_id = uuid::Uuid::new_v4().to_string();
+        let cash_name = cash_display_name(&cash_symbol);
+        conn.execute(
+            "INSERT INTO holdings (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 1.0, ?7, ?8, ?9)",
+            rusqlite::params![
+                cash_id, account_id, cash_symbol, cash_name, market,
+                delta, currency, updated_at, updated_at
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
 
 #[tauri::command(rename_all = "camelCase")]
 pub fn create_transaction(
@@ -84,6 +144,10 @@ pub fn create_transaction(
             ],
         )
         .map_err(|e| e.to_string())?;
+
+        // Auto-update cash holding for the account
+        let delta = cash_delta(&transaction_type, total_amount, commission);
+        adjust_cash_holding(&conn, &account_id, &currency, &market, delta)?;
 
         Ok((holding_id,))
     })();
@@ -266,6 +330,10 @@ pub fn update_transaction(
             .map_err(|e| e.to_string())?;
         }
 
+        // Reverse the old transaction's cash impact
+        let old_cash_delta = cash_delta(&old_txn.transaction_type, old_txn.total_amount, old_txn.commission);
+        adjust_cash_holding(&conn, &old_txn.account_id, &old_txn.currency, &old_txn.market, -old_cash_delta)?;
+
         // 2) Apply the new transaction's impact on its holding
         let holding_id: Option<String> = conn
             .query_row(
@@ -310,6 +378,10 @@ pub fn update_transaction(
             )
             .map_err(|e| e.to_string())?;
         }
+
+        // Apply the new transaction's cash impact
+        let new_cash_delta = cash_delta(&transaction_type, total_amount, commission);
+        adjust_cash_holding(&conn, &account_id, &currency, &market, new_cash_delta)?;
 
         // 3) Update the transaction row
         conn.execute(
@@ -356,10 +428,40 @@ pub fn update_transaction(
 #[tauri::command(rename_all = "camelCase")]
 pub fn delete_transaction(db: State<Database>, id: String) -> Result<(), String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "DELETE FROM transactions WHERE id = ?1",
-        rusqlite::params![id],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+
+    // Fetch the transaction so we can reverse its cash impact
+    let txn: Transaction = conn
+        .query_row(
+            "SELECT id, holding_id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, notes, created_at FROM transactions WHERE id = ?1",
+            rusqlite::params![id],
+            map_transaction,
+        )
+        .map_err(|e| format!("Transaction not found: {}", e))?;
+
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+
+    let result = (|| -> Result<(), String> {
+        conn.execute(
+            "DELETE FROM transactions WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Reverse cash impact of the deleted transaction
+        let delta = cash_delta(&txn.transaction_type, txn.total_amount, txn.commission);
+        adjust_cash_holding(&conn, &txn.account_id, &txn.currency, &txn.market, -delta)?;
+
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }

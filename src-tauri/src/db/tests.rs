@@ -648,4 +648,218 @@ mod tests {
             .unwrap();
         assert_eq!(tx_count, 3);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Cash auto-update tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Helper to read the cash holding's `shares` for the given account + currency.
+    fn get_cash_balance(conn: &rusqlite::Connection, acct_id: &str, currency: &str) -> Option<f64> {
+        let cash_symbol = format!("$CASH-{}", currency);
+        conn.query_row(
+            "SELECT shares FROM holdings WHERE account_id = ?1 AND symbol = ?2",
+            rusqlite::params![acct_id, cash_symbol],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    #[test]
+    fn test_cash_delta_buy() {
+        use crate::commands::transactions::cash_delta;
+        // BUY: cash decreases by total_amount + commission
+        let delta = cash_delta("BUY", 1000.0, 5.0);
+        assert!((delta - (-1005.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cash_delta_sell() {
+        use crate::commands::transactions::cash_delta;
+        // SELL: cash increases by total_amount - commission
+        let delta = cash_delta("SELL", 2000.0, 10.0);
+        assert!((delta - 1990.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_adjust_cash_creates_holding_when_missing() {
+        use crate::commands::transactions::adjust_cash_holding;
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let acct_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO accounts (id, name, market, created_at, updated_at) VALUES (?1, 'Test', 'US', ?2, ?2)",
+            rusqlite::params![acct_id, now],
+        ).unwrap();
+
+        // No cash holding exists yet
+        assert!(get_cash_balance(&conn, &acct_id, "USD").is_none());
+
+        // Adjust cash by +5000
+        adjust_cash_holding(&conn, &acct_id, "USD", "US", 5000.0).unwrap();
+
+        let balance = get_cash_balance(&conn, &acct_id, "USD").unwrap();
+        assert!((balance - 5000.0).abs() < 1e-9);
+
+        // Verify fields
+        let (name, market, avg_cost, currency): (String, String, f64, String) = conn
+            .query_row(
+                "SELECT name, market, avg_cost, currency FROM holdings WHERE account_id = ?1 AND symbol = '$CASH-USD'",
+                rusqlite::params![acct_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "现金 (USD)");
+        assert_eq!(market, "US");
+        assert!((avg_cost - 1.0).abs() < 1e-9);
+        assert_eq!(currency, "USD");
+    }
+
+    #[test]
+    fn test_adjust_cash_updates_existing_holding() {
+        use crate::commands::transactions::adjust_cash_holding;
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let acct_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO accounts (id, name, market, created_at, updated_at) VALUES (?1, 'Test', 'US', ?2, ?2)",
+            rusqlite::params![acct_id, now],
+        ).unwrap();
+        // Pre-create a cash holding with 10000
+        let cash_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO holdings (id, account_id, symbol, name, market, shares, avg_cost, currency, created_at, updated_at)
+             VALUES (?1, ?2, '$CASH-USD', '现金 (USD)', 'US', 10000.0, 1.0, 'USD', ?3, ?3)",
+            rusqlite::params![cash_id, acct_id, now],
+        ).unwrap();
+
+        // Deduct 3000
+        adjust_cash_holding(&conn, &acct_id, "USD", "US", -3000.0).unwrap();
+        let balance = get_cash_balance(&conn, &acct_id, "USD").unwrap();
+        assert!((balance - 7000.0).abs() < 1e-9);
+
+        // Add 500
+        adjust_cash_holding(&conn, &acct_id, "USD", "US", 500.0).unwrap();
+        let balance2 = get_cash_balance(&conn, &acct_id, "USD").unwrap();
+        assert!((balance2 - 7500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_buy_transaction_decreases_cash() {
+        use crate::commands::transactions::{adjust_cash_holding, cash_delta};
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let (acct_id, _) = setup_account_and_holding(&conn, "AAPL", 0.0, 0.0);
+
+        // Seed cash: 50000 USD
+        adjust_cash_holding(&conn, &acct_id, "USD", "US", 50000.0).unwrap();
+
+        // Simulate BUY: 100 shares at $150, commission $10
+        let total_amount = 15000.0;
+        let commission = 10.0;
+        let delta = cash_delta("BUY", total_amount, commission);
+        adjust_cash_holding(&conn, &acct_id, "USD", "US", delta).unwrap();
+
+        // Cash should be 50000 - 15010 = 34990
+        let balance = get_cash_balance(&conn, &acct_id, "USD").unwrap();
+        assert!((balance - 34990.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_sell_transaction_increases_cash() {
+        use crate::commands::transactions::{adjust_cash_holding, cash_delta};
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let (acct_id, _) = setup_account_and_holding(&conn, "AAPL", 100.0, 150.0);
+
+        // Seed cash: 10000 USD
+        adjust_cash_holding(&conn, &acct_id, "USD", "US", 10000.0).unwrap();
+
+        // Simulate SELL: 50 shares at $200, commission $8
+        let total_amount = 10000.0;
+        let commission = 8.0;
+        let delta = cash_delta("SELL", total_amount, commission);
+        adjust_cash_holding(&conn, &acct_id, "USD", "US", delta).unwrap();
+
+        // Cash should be 10000 + (10000 - 8) = 19992
+        let balance = get_cash_balance(&conn, &acct_id, "USD").unwrap();
+        assert!((balance - 19992.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cash_auto_created_on_first_buy() {
+        use crate::commands::transactions::{adjust_cash_holding, cash_delta};
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let (acct_id, _) = setup_account_and_holding(&conn, "TSLA", 0.0, 0.0);
+
+        // No cash holding exists
+        assert!(get_cash_balance(&conn, &acct_id, "USD").is_none());
+
+        // BUY creates cash holding with negative balance
+        let delta = cash_delta("BUY", 5000.0, 5.0);
+        adjust_cash_holding(&conn, &acct_id, "USD", "US", delta).unwrap();
+
+        let balance = get_cash_balance(&conn, &acct_id, "USD").unwrap();
+        assert!((balance - (-5005.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cny_cash_holding() {
+        use crate::commands::transactions::adjust_cash_holding;
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let acct_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO accounts (id, name, market, created_at, updated_at) VALUES (?1, 'CN Account', 'CN', ?2, ?2)",
+            rusqlite::params![acct_id, now],
+        ).unwrap();
+
+        adjust_cash_holding(&conn, &acct_id, "CNY", "CN", 100000.0).unwrap();
+
+        let balance = get_cash_balance(&conn, &acct_id, "CNY").unwrap();
+        assert!((balance - 100000.0).abs() < 1e-9);
+
+        // Verify symbol and name
+        let (symbol, name): (String, String) = conn
+            .query_row(
+                "SELECT symbol, name FROM holdings WHERE account_id = ?1 AND symbol LIKE '$CASH-%'",
+                rusqlite::params![acct_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(symbol, "$CASH-CNY");
+        assert_eq!(name, "现金 (CNY)");
+    }
+
+    #[test]
+    fn test_buy_sell_sequence_updates_cash() {
+        use crate::commands::transactions::{adjust_cash_holding, cash_delta};
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let (acct_id, _) = setup_account_and_holding(&conn, "GOOG", 0.0, 0.0);
+
+        // Start with 100000 cash
+        adjust_cash_holding(&conn, &acct_id, "USD", "US", 100000.0).unwrap();
+
+        // BUY: 50 shares at $100, commission $5 → cash -= 5005
+        let d1 = cash_delta("BUY", 5000.0, 5.0);
+        adjust_cash_holding(&conn, &acct_id, "USD", "US", d1).unwrap();
+        let b1 = get_cash_balance(&conn, &acct_id, "USD").unwrap();
+        assert!((b1 - 94995.0).abs() < 1e-9);
+
+        // BUY: 30 shares at $120, commission $3 → cash -= 3603
+        let d2 = cash_delta("BUY", 3600.0, 3.0);
+        adjust_cash_holding(&conn, &acct_id, "USD", "US", d2).unwrap();
+        let b2 = get_cash_balance(&conn, &acct_id, "USD").unwrap();
+        assert!((b2 - 91392.0).abs() < 1e-9);
+
+        // SELL: 20 shares at $150, commission $4 → cash += 2996
+        let d3 = cash_delta("SELL", 3000.0, 4.0);
+        adjust_cash_holding(&conn, &acct_id, "USD", "US", d3).unwrap();
+        let b3 = get_cash_balance(&conn, &acct_id, "USD").unwrap();
+        assert!((b3 - 94388.0).abs() < 1e-9);
+    }
 }

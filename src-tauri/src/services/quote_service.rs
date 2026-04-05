@@ -863,6 +863,22 @@ async fn send_xueqiu_request(url: &str, symbol: &str) -> Result<reqwest::Respons
     let client = http_client::xueqiu_client();
     let mut last_err = String::new();
 
+    // Log which cookie source is active (once per call, not per retry).
+    let is_quote_api = url.contains("/v5/stock/quote.json");
+    if is_quote_api {
+        let cookie_source = if get_xueqiu_user_cookie().is_some() {
+            "user-provided"
+        } else if XUEQIU_AUTO_COOKIE.lock().unwrap().is_some() {
+            "auto-obtained"
+        } else {
+            "NONE"
+        };
+        eprintln!(
+            "--- Xueqiu QUOTE request for {}: cookie source={}, url={}",
+            symbol, cookie_source, url
+        );
+    }
+
     for attempt in 0..=XUEQIU_MAX_RETRIES {
         let mut req = client.get(url);
 
@@ -1433,7 +1449,69 @@ pub async fn fetch_stock_history_xueqiu(
 
     let mut kline_attempt = 0u32;
     loop {
-        let response = send_xueqiu_request(&url, symbol).await?;
+        // --- Verbose kline request debug logging ---
+        // Build the request manually so we can inspect exactly what is sent.
+        let response = {
+            ensure_xueqiu_token().await?;
+            let client = http_client::xueqiu_client();
+            let mut req = client.get(&url);
+
+            // Attach cookie – same logic as send_xueqiu_request.
+            let cookie_header: Option<String>;
+            if let Some(ref cookie) = get_xueqiu_user_cookie() {
+                let hv = if cookie.starts_with("xq_a_token=") {
+                    cookie.clone()
+                } else {
+                    format!("xq_a_token={}", cookie)
+                };
+                req = req.header(reqwest::header::COOKIE, &hv);
+                cookie_header = Some(hv);
+            } else if let Some(ref auto_token) = *XUEQIU_AUTO_COOKIE.lock().unwrap() {
+                let hv = format!("xq_a_token={}", auto_token);
+                req = req.header(reqwest::header::COOKIE, &hv);
+                cookie_header = Some(hv);
+            } else {
+                cookie_header = None;
+            }
+
+            // Build the final request so we can log ALL its headers.
+            let built_req = req.build().map_err(|e| {
+                format!("fetch_stock_history_xueqiu: failed to build request: {}", e)
+            })?;
+
+            // Log complete request details.
+            eprintln!("=== Xueqiu kline DEBUG REQUEST (attempt {}) ===", kline_attempt + 1);
+            eprintln!("  URL: {}", built_req.url());
+            eprintln!("  Method: {}", built_req.method());
+            for (name, value) in built_req.headers().iter() {
+                eprintln!("  Req Header: {}: {}", name, value.to_str().unwrap_or("<non-utf8>"));
+            }
+            if let Some(ref ch) = cookie_header {
+                // Log whether it was user-provided or auto-obtained.
+                let source = if get_xueqiu_user_cookie().is_some() {
+                    "user-provided"
+                } else {
+                    "auto-obtained"
+                };
+                eprintln!("  Cookie source: {}, value length: {}", source, ch.len());
+            } else {
+                eprintln!("  Cookie: NONE (no user cookie and no auto-obtained token)");
+            }
+
+            let resp = client
+                .execute(built_req)
+                .await
+                .map_err(|e| format!("Network error fetching {} from Xueqiu: {}", symbol, e))?;
+
+            // Log complete response details.
+            eprintln!("=== Xueqiu kline DEBUG RESPONSE (attempt {}) ===", kline_attempt + 1);
+            eprintln!("  Status: {}", resp.status());
+            for (name, value) in resp.headers().iter() {
+                eprintln!("  Resp Header: {}: {}", name, value.to_str().unwrap_or("<non-utf8>"));
+            }
+
+            resp
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1454,6 +1532,18 @@ pub async fn fetch_stock_history_xueqiu(
             .text()
             .await
             .map_err(|e| format!("fetch_stock_history_xueqiu: read error for {}: {}", symbol, e))?;
+
+        // Log the full response body for debugging.
+        eprintln!(
+            "  Resp Body (len={}): {}",
+            body.len(),
+            if body.len() <= 500 {
+                body.clone()
+            } else {
+                format!("{}…(truncated)", &body[..500])
+            }
+        );
+        eprintln!("=== END Xueqiu kline DEBUG ===");
 
         let resp: XueqiuKlineResponse = serde_json::from_str(&body).map_err(|e| {
             let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();

@@ -240,6 +240,11 @@ impl Database {
             ALTER TABLE quote_provider_config ADD COLUMN xueqiu_cookie TEXT;
         ");
 
+        // Rename xueqiu_cookie → xueqiu_u (migration)
+        let _ = conn.execute_batch("
+            ALTER TABLE quote_provider_config ADD COLUMN xueqiu_u TEXT;
+        ");
+
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS ai_config (
                 id INTEGER PRIMARY KEY DEFAULT 1,

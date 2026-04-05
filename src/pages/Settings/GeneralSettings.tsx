@@ -32,7 +32,7 @@ export default function GeneralSettings() {
     us_provider: "xueqiu",
     hk_provider: "xueqiu",
     cn_provider: "xueqiu",
-    xueqiu_cookie: null,
+    xueqiu_u: null,
   });
 
   useEffect(() => {
@@ -62,12 +62,12 @@ export default function GeneralSettings() {
     }
   };
 
-  const handleCookieSave = async (cookieValue: string) => {
-    const updated = { ...providerConfig, xueqiu_cookie: cookieValue || null };
+  const handleUValueSave = async (uValue: string) => {
+    const updated = { ...providerConfig, xueqiu_u: uValue || null };
     try {
       await invoke("update_quote_provider_config", { config: updated });
       setProviderConfig(updated);
-      message.success("雪球 Cookie 已更新");
+      message.success("雪球用户 ID 已更新");
     } catch (err) {
       message.error("更新失败: " + String(err));
     }
@@ -110,25 +110,24 @@ export default function GeneralSettings() {
       </Card>
 
       {isXueqiuUsed && (
-        <Card title="雪球 Cookie 设置">
-          <Form layout="vertical" style={{ maxWidth: 600 }}>
+        <Card title="雪球用户 ID 设置">
+          <Form layout="vertical" style={{ maxWidth: 400 }}>
             <Form.Item
-              label="雪球 Cookie"
-              extra="从浏览器中复制雪球的完整 Cookie 字符串。步骤：登录 xueqiu.com → 按 F12 → Network → 刷新页面 → 点击任意请求 → 复制 Request Headers 中的 Cookie 值（完整字符串，包含 xq_a_token、xq_id_token 等多个字段）"
+              label="雪球用户 ID (u)"
+              extra="登录 xueqiu.com → 按 F12 → Application → Cookies → 找到 u 的值"
             >
-              <Input.TextArea
-                rows={3}
-                placeholder="粘贴完整 Cookie 字符串，例如：xq_a_token=xxx; xq_id_token=xxx; xq_r_token=xxx; xqat=xxx; u=xxx"
-                value={providerConfig.xueqiu_cookie ?? ""}
+              <Input
+                placeholder="例如：9095890697"
+                value={providerConfig.xueqiu_u ?? ""}
                 onChange={(e) =>
-                  setProviderConfig({ ...providerConfig, xueqiu_cookie: e.target.value || null })
+                  setProviderConfig({ ...providerConfig, xueqiu_u: e.target.value || null })
                 }
-                onBlur={(e) => handleCookieSave(e.target.value)}
+                onBlur={(e) => handleUValueSave(e.target.value)}
               />
             </Form.Item>
           </Form>
           <Paragraph type="secondary">
-            雪球历史行情 API 需要完整的登录 Cookie（包括 xq_a_token、xq_id_token、xq_r_token、xqat 等）。仅提供 xq_a_token 可能不足以获取历史K线数据。Cookie 可能会过期，届时需要重新获取。
+            雪球历史行情 API 需要登录用户的 u Cookie 值。该值可能会过期，届时需要重新获取。
           </Paragraph>
         </Card>
       )}

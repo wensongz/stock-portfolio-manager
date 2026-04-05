@@ -15,9 +15,9 @@ pub async fn update_quote_provider_config(
     db: State<'_, Database>,
     config: QuoteProviderConfig,
 ) -> Result<bool, String> {
-    // Apply the user-provided Xueqiu cookie immediately so that subsequent
-    // API requests use it without waiting for a restart.
-    quote_service::set_xueqiu_user_cookie(config.xueqiu_cookie.clone());
+    // Apply the user-provided Xueqiu `u` cookie immediately so that
+    // subsequent API requests use it without waiting for a restart.
+    quote_service::set_xueqiu_user_u(config.xueqiu_u.clone());
 
     quote_provider_service::update_quote_provider_config(&db, &config)
 }

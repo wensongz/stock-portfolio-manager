@@ -705,9 +705,10 @@ fn parse_eastmoney_quote(symbol: &str, market: &str, resp: EastMoneyResponse) ->
 /// Whether the Xueqiu client has obtained a session cookie from the homepage.
 static XUEQIU_TOKEN_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// User-provided Xueqiu cookie string (from a logged-in browser session).
-/// When set, this takes priority over the automatic homepage token fetch.
-static XUEQIU_USER_COOKIE: Mutex<Option<String>> = Mutex::new(None);
+/// User-provided Xueqiu `u` cookie value (user ID from a logged-in browser session).
+/// When set, it is appended alongside `xq_a_token` in the Cookie header
+/// to authenticate kline API requests.
+static XUEQIU_USER_U: Mutex<Option<String>> = Mutex::new(None);
 
 /// Auto-obtained `xq_a_token` value extracted from the homepage response.
 ///
@@ -718,25 +719,19 @@ static XUEQIU_USER_COOKIE: Mutex<Option<String>> = Mutex::new(None);
 /// guaranteeing it reaches the API regardless of cookie-jar domain matching.
 static XUEQIU_AUTO_COOKIE: Mutex<Option<String>> = Mutex::new(None);
 
-/// Set (or clear) the user-provided Xueqiu cookie.
-///
-/// After calling this, subsequent Xueqiu API requests will include this cookie
-/// in the `Cookie` header, bypassing the automatic homepage token fetch.
-pub fn set_xueqiu_user_cookie(cookie: Option<String>) {
-    let cookie = cookie
+/// Set (or clear) the user-provided Xueqiu `u` cookie value.
+pub fn set_xueqiu_user_u(u_value: Option<String>) {
+    let u_value = u_value
         .as_deref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let mut guard = XUEQIU_USER_COOKIE.lock().unwrap();
-    *guard = cookie;
-    // Reset the automatic token so the next request picks up the new cookie.
-    XUEQIU_TOKEN_INITIALIZED.store(false, Ordering::SeqCst);
+    *XUEQIU_USER_U.lock().unwrap() = u_value;
 }
 
-/// Return a clone of the current user-provided Xueqiu cookie, if any.
-fn get_xueqiu_user_cookie() -> Option<String> {
-    XUEQIU_USER_COOKIE.lock().unwrap().clone()
+/// Return a clone of the current user-provided Xueqiu `u` cookie value, if any.
+fn get_xueqiu_user_u() -> Option<String> {
+    XUEQIU_USER_U.lock().unwrap().clone()
 }
 
 /// Ensure the Xueqiu HTTP client has a valid session token.
@@ -757,18 +752,7 @@ async fn ensure_xueqiu_token() -> Result<(), String> {
         return Ok(());
     }
 
-    // When the user has provided a cookie from their browser, skip the
-    // homepage visit – the cookie will be attached directly to each request.
-    if get_xueqiu_user_cookie().is_some() {
-        XUEQIU_TOKEN_INITIALIZED.store(true, Ordering::SeqCst);
-        return Ok(());
-    }
-
     let client = http_client::xueqiu_client();
-    // Override the default Accept header for the homepage visit.
-    // The Xueqiu client's default Accept is "application/json, text/plain, */*"
-    // which is suitable for API calls, but the homepage may only issue the
-    // xq_a_token cookie when it sees a normal browser page-load request.
     let resp = client
         .get("https://xueqiu.com")
         .header(
@@ -784,14 +768,9 @@ async fn ensure_xueqiu_token() -> Result<(), String> {
     // Extract `xq_a_token` from Set-Cookie headers so we can attach it
     // explicitly to API requests (see XUEQIU_AUTO_COOKIE doc comment).
     let mut auto_token: Option<String> = None;
-    let mut cookie_names: Vec<String> = Vec::new();
     for header_val in resp.headers().get_all(reqwest::header::SET_COOKIE).iter() {
         if let Ok(s) = header_val.to_str() {
-            if let Some(name) = s.split('=').next() {
-                cookie_names.push(name.to_string());
-            }
             if s.starts_with("xq_a_token=") {
-                // Parse value: everything after "xq_a_token=" up to the first ";"
                 let val_start = "xq_a_token=".len();
                 let val_end = s[val_start..].find(';').map(|i| val_start + i).unwrap_or(s.len());
                 let token_value = &s[val_start..val_end];
@@ -801,7 +780,6 @@ async fn ensure_xueqiu_token() -> Result<(), String> {
             }
         }
     }
-    // Also try resp.cookies() (convenience wrapper over Set-Cookie).
     if auto_token.is_none() {
         for cookie in resp.cookies() {
             if cookie.name() == "xq_a_token" && !cookie.value().is_empty() {
@@ -812,22 +790,7 @@ async fn ensure_xueqiu_token() -> Result<(), String> {
     }
 
     if let Some(ref token) = auto_token {
-        eprintln!(
-            "Xueqiu token init: captured xq_a_token (len={}) from homepage HTTP {}",
-            token.len(),
-            status
-        );
-        *XUEQIU_AUTO_COOKIE.lock().unwrap() = auto_token.clone();
-    } else if cookie_names.is_empty() {
-        eprintln!(
-            "Xueqiu token init: homepage returned HTTP {} but no Set-Cookie headers (xq_a_token not found; cookies may have been set during redirects)",
-            status
-        );
-    } else {
-        eprintln!(
-            "Xueqiu token init: homepage returned HTTP {}, cookies received: {:?} (xq_a_token NOT found among them)",
-            status, cookie_names
-        );
+        *XUEQIU_AUTO_COOKIE.lock().unwrap() = Some(token.clone());
     }
 
     if status.is_success() || status.is_redirection() {
@@ -847,6 +810,23 @@ fn reset_xueqiu_token() {
     *XUEQIU_AUTO_COOKIE.lock().unwrap() = None;
 }
 
+/// Build the cookie header for Xueqiu API requests.
+///
+/// Always includes the auto-obtained `xq_a_token`.  When the user has
+/// configured a `u` cookie value (user ID), it is appended so that the
+/// kline API returns authenticated data.
+fn build_xueqiu_cookie_header() -> Option<String> {
+    let auto_token = XUEQIU_AUTO_COOKIE.lock().unwrap().clone();
+    let u_value = get_xueqiu_user_u();
+
+    match (auto_token, u_value) {
+        (Some(token), Some(u)) => Some(format!("xq_a_token={}; u={}", token, u)),
+        (Some(token), None) => Some(format!("xq_a_token={}", token)),
+        (None, Some(u)) => Some(format!("u={}", u)),
+        (None, None) => None,
+    }
+}
+
 /// Maximum number of retry attempts for transient Xueqiu API failures.
 const XUEQIU_MAX_RETRIES: u32 = 2;
 
@@ -854,71 +834,22 @@ const XUEQIU_MAX_RETRIES: u32 = 2;
 ///
 /// If the initial request returns HTTP 400 (which indicates an expired or
 /// missing session token), the token is refreshed and the request is retried.
-///
-/// When a user-provided cookie is available it is attached as a `Cookie`
-/// header on every request, taking priority over the automatic cookie jar.
 async fn send_xueqiu_request(url: &str, symbol: &str) -> Result<reqwest::Response, String> {
     ensure_xueqiu_token().await?;
 
     let client = http_client::xueqiu_client();
     let mut last_err = String::new();
 
-    // Log which cookie source is active (once per call, not per retry).
-    let is_quote_api = url.contains("/v5/stock/quote.json");
-    if is_quote_api {
-        let cookie_source = if get_xueqiu_user_cookie().is_some() {
-            "user-provided"
-        } else if XUEQIU_AUTO_COOKIE.lock().unwrap().is_some() {
-            "auto-obtained"
-        } else {
-            "NONE"
-        };
-        eprintln!(
-            "--- Xueqiu QUOTE request for {}: cookie source={}, url={}",
-            symbol, cookie_source, url
-        );
-    }
-
     for attempt in 0..=XUEQIU_MAX_RETRIES {
         let mut req = client.get(url);
 
-        // Attach the user-provided cookie if configured.
-        // The user may supply:
-        //   1. A full cookie string with multiple cookies (contains ";")
-        //   2. Just the xq_a_token value
-        //   3. "xq_a_token=<value>"
-        // We pass the full string as-is when it looks like a multi-cookie string.
-        //
-        // When no user cookie is configured, attach the auto-obtained token
-        // explicitly via the Cookie header.  This ensures the cookie reaches
-        // `stock.xueqiu.com` even if the cookie jar restricts it to the
-        // exact `xueqiu.com` host (RFC 6265 domain-matching rules).
-        if let Some(ref cookie) = get_xueqiu_user_cookie() {
-            let header_value = if cookie.contains(';') || cookie.contains("xq_id_token") || cookie.contains("xq_r_token") {
-                cookie.clone()
-            } else if cookie.starts_with("xq_a_token=") {
-                cookie.clone()
-            } else {
-                format!("xq_a_token={}", cookie)
-            };
-            req = req.header(reqwest::header::COOKIE, header_value);
-        } else if let Some(ref auto_token) = *XUEQIU_AUTO_COOKIE.lock().unwrap() {
-            req = req.header(
-                reqwest::header::COOKIE,
-                format!("xq_a_token={}", auto_token),
-            );
+        if let Some(cookie) = build_xueqiu_cookie_header() {
+            req = req.header(reqwest::header::COOKIE, cookie);
         }
 
         let result = req.send().await;
         match result {
             Ok(resp) if resp.status() == reqwest::StatusCode::BAD_REQUEST && attempt < XUEQIU_MAX_RETRIES => {
-                // Log the 400 response for diagnosis before retrying.
-                eprintln!(
-                    "Xueqiu API returned 400 for {} (attempt {}/{}), refreshing token and retrying",
-                    symbol, attempt + 1, XUEQIU_MAX_RETRIES + 1
-                );
-                // Token likely expired – refresh and retry after a short delay
-                // to allow the new session cookie to propagate.
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 reset_xueqiu_token();
                 ensure_xueqiu_token().await?;
@@ -1442,152 +1373,57 @@ pub async fn fetch_stock_history_xueqiu(
         xueqiu_symbol, begin_ts, count
     );
 
-    // The Xueqiu kline API may return HTTP 200 with an empty response
-    // (no `column` field) when the session token is stale or insufficient.
-    // This differs from the HTTP 400 that `send_xueqiu_request` already
-    // retries on.  We therefore wrap the request + initial parsing in a
-    // retry loop that refreshes the token on this specific pattern.
-    const MAX_KLINE_AUTH_RETRIES: u32 = 1;
-    let mut body;
-    let mut columns: Vec<String>;
-    let mut data: XueqiuKlineData;
+    let response = send_xueqiu_request(&url, symbol).await?;
 
-    let mut kline_attempt = 0u32;
-    loop {
-        // --- Verbose kline request debug logging ---
-        // Build the request manually so we can inspect exactly what is sent.
-        let response = {
-            ensure_xueqiu_token().await?;
-            let client = http_client::xueqiu_client();
-            let mut req = client.get(&url);
-
-            // TEMPORARY HARDCODED COOKIES FOR TESTING
-            // Round 2: testing with only xq_a_token + xq_id_token + xq_r_token
-            // (removed xqat and u which appear redundant — xqat == xq_a_token)
-            let hardcoded_cookie = "xq_a_token=6a7dc04b2c6770dc8e3f21e3d334831ca6192560; \
-                xq_id_token=eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJ1aWQiOjkwOTU4OTA2OTcsImlzcyI6InVjIiwiZXhwIjoxNzc2OTI5NTg0LCJjdG0iOjE3NzQzMzc2Mjg3MjEsImNpZCI6ImQ5ZDBuNEFadXAifQ.BNGh2OqeZcWfT3LS7th5alyuU5gVRU4-kipzFx0ex0x_b8DMgiglKGGM-yWrVOyJo-yWsM8QX3tqH59AQbvNb4t7upfrpcypSkB7yeJ8eS5-fr39RLVToYMyT2pRlAkU6NAM_jQms5_XijsOSaLy1RbzrHbHcM7SIDM7M0h9ZI8XjHrIPQ6PN4BluE2IFgllptH8qf4XUzA00Gwm8n2cAdCUW1tkR5eDz1555Z2_5s1WnLYuWBGItYNUNsgPpMw81ROIGIURaCndrv168W2kilKDUIsmdJvVVrnaBNaTajQd5neA8RVvDOOkvbzoQHllbLS8zWk0xTHZZfm5Ltko1Q; \
-                xq_r_token=5f1c93d4453297dd81c951d2b629160b60659c89";
-            req = req.header(reqwest::header::COOKIE, hardcoded_cookie);
-            let cookie_header: Option<String> = Some(hardcoded_cookie.to_string());
-
-            // Build the final request so we can log ALL its headers.
-            let built_req = req.build().map_err(|e| {
-                format!("fetch_stock_history_xueqiu: failed to build request: {}", e)
-            })?;
-
-            // Log complete request details.
-            eprintln!("=== Xueqiu kline DEBUG REQUEST (attempt {}) ===", kline_attempt + 1);
-            eprintln!("  URL: {}", built_req.url());
-            eprintln!("  Method: {}", built_req.method());
-            for (name, value) in built_req.headers().iter() {
-                eprintln!("  Req Header: {}: {}", name, value.to_str().unwrap_or("<non-utf8>"));
-            }
-            if let Some(ref ch) = cookie_header {
-                // Log whether it was user-provided or auto-obtained.
-                let source = if get_xueqiu_user_cookie().is_some() {
-                    "user-provided"
-                } else {
-                    "auto-obtained"
-                };
-                eprintln!("  Cookie source: {}, value length: {}", source, ch.len());
-            } else {
-                eprintln!("  Cookie: NONE (no user cookie and no auto-obtained token)");
-            }
-
-            let resp = client
-                .execute(built_req)
-                .await
-                .map_err(|e| format!("Network error fetching {} from Xueqiu: {}", symbol, e))?;
-
-            // Log complete response details.
-            eprintln!("=== Xueqiu kline DEBUG RESPONSE (attempt {}) ===", kline_attempt + 1);
-            eprintln!("  Status: {}", resp.status());
-            for (name, value) in resp.headers().iter() {
-                eprintln!("  Resp Header: {}: {}", name, value.to_str().unwrap_or("<non-utf8>"));
-            }
-
-            resp
-        };
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body_preview = response
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(XUEQIU_RESPONSE_PREVIEW_LEN)
-                .collect::<String>();
-            return Err(format!(
-                "fetch_stock_history_xueqiu: HTTP {} for {}. Response: {}",
-                status, symbol, body_preview
-            ));
-        }
-
-        body = response
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_preview = response
             .text()
             .await
-            .map_err(|e| format!("fetch_stock_history_xueqiu: read error for {}: {}", symbol, e))?;
+            .unwrap_or_default()
+            .chars()
+            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
+            .collect::<String>();
+        return Err(format!(
+            "fetch_stock_history_xueqiu: HTTP {} for {}. Response: {}",
+            status, symbol, body_preview
+        ));
+    }
 
-        // Log the full response body for debugging.
-        eprintln!(
-            "  Resp Body (len={}): {}",
-            body.len(),
-            if body.len() <= 500 {
-                body.clone()
-            } else {
-                format!("{}…(truncated)", &body[..500])
-            }
-        );
-        eprintln!("=== END Xueqiu kline DEBUG ===");
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("fetch_stock_history_xueqiu: read error for {}: {}", symbol, e))?;
 
-        let resp: XueqiuKlineResponse = serde_json::from_str(&body).map_err(|e| {
-            let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
-            format!(
-                "fetch_stock_history_xueqiu: parse error for {}: {}. Preview: {}",
-                symbol, e, preview
-            )
-        })?;
+    let resp: XueqiuKlineResponse = serde_json::from_str(&body).map_err(|e| {
+        let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
+        format!(
+            "fetch_stock_history_xueqiu: parse error for {}: {}. Preview: {}",
+            symbol, e, preview
+        )
+    })?;
 
-        if let Some(err_code) = resp.error_code {
-            if err_code != 0 {
-                let desc = resp.error_description.unwrap_or_default();
-                return Err(format!(
-                    "fetch_stock_history_xueqiu: API error for {}: code={}, message={}",
-                    symbol, err_code, desc
-                ));
-            }
+    if let Some(err_code) = resp.error_code {
+        if err_code != 0 {
+            let desc = resp.error_description.unwrap_or_default();
+            return Err(format!(
+                "fetch_stock_history_xueqiu: API error for {}: code={}, message={}",
+                symbol, err_code, desc
+            ));
         }
+    }
 
-        data = resp
-            .data
-            .ok_or_else(|| format!("fetch_stock_history_xueqiu: no data for {}", symbol))?;
+    let mut data = resp
+        .data
+        .ok_or_else(|| format!("fetch_stock_history_xueqiu: no data for {}", symbol))?;
 
-        columns = data.column.take().unwrap_or_default();
-        if !columns.is_empty() {
-            // Got valid kline data with column definitions – proceed.
-            break;
-        }
-
-        // Empty/missing `column` indicates an auth-related soft failure
-        // (HTTP 200 but the server withheld data).  Refresh the token
-        // and retry once before giving up.
-        if kline_attempt < MAX_KLINE_AUTH_RETRIES {
-            eprintln!(
-                "fetch_stock_history_xueqiu: empty 'column' for {} (attempt {}/{}), refreshing token and retrying",
-                symbol, kline_attempt + 1, MAX_KLINE_AUTH_RETRIES + 1
-            );
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            reset_xueqiu_token();
-            kline_attempt += 1;
-            continue;
-        }
-
+    let columns = data.column.take().unwrap_or_default();
+    if columns.is_empty() {
         let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
         return Err(format!(
             "fetch_stock_history_xueqiu: empty or missing 'column' field for {}. \
-             The Xueqiu kline API may require a logged-in session. \
-             Try providing your browser cookie in Settings → Quote Provider → Xueqiu Cookie. \
+             The Xueqiu kline API requires a `u` cookie value. \
+             Provide it in Settings → Quote Provider → 雪球用户ID. \
              URL: {} Response preview: {}",
             symbol, url, preview
         ));

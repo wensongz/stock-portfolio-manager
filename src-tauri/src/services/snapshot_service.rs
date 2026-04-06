@@ -281,7 +281,11 @@ pub async fn backfill_snapshots(
     start_date: NaiveDate,
     end_date: NaiveDate,
 ) -> Result<i32, String> {
-    let today = chrono::Utc::now().date_naive();
+    // Use UTC+8 (the furthest-ahead market timezone) to determine "today"
+    // so that CN/HK users don't see today's date clamped to yesterday
+    // before 08:00 local time.
+    let utc_plus_8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    let today = chrono::Utc::now().with_timezone(&utc_plus_8).date_naive();
     // Clamp end_date to today
     let end_date = if end_date > today { today } else { end_date };
 

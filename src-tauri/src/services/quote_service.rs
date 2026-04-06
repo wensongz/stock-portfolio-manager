@@ -29,6 +29,29 @@ pub fn cash_display_name(symbol: &str) -> String {
     format!("现金 ({})", currency)
 }
 
+/// Return the UTC offset for the exchange of the given market.
+/// CN and HK exchanges operate in UTC+8; US exchanges in UTC-5 (EST).
+/// We use a fixed offset (ignoring DST for US) because we only need the
+/// date component — even during US daylight-saving time (UTC-4), the
+/// difference does not shift the date when the timestamp falls within the
+/// trading day.
+fn market_utc_offset(market: &str) -> chrono::FixedOffset {
+    match market {
+        "CN" | "HK" => chrono::FixedOffset::east_opt(8 * 3600).unwrap(),
+        "US" => chrono::FixedOffset::west_opt(5 * 3600).unwrap(),
+        _ => chrono::FixedOffset::east_opt(0).unwrap(),
+    }
+}
+
+/// Convert a Unix timestamp (seconds) to a [`chrono::NaiveDate`] in the
+/// market's local timezone. This avoids the off-by-one-day error that occurs
+/// when timestamps representing a date in CST (UTC+8) are interpreted in UTC.
+pub fn timestamp_to_market_date(ts_secs: i64, market: &str) -> Option<chrono::NaiveDate> {
+    let offset = market_utc_offset(market);
+    chrono::DateTime::from_timestamp(ts_secs, 0)
+        .map(|dt| dt.with_timezone(&offset).date_naive())
+}
+
 /// Build a synthetic [`StockQuote`] for a cash symbol.
 /// Cash always has price = 1.0, zero change, zero volume.
 pub fn make_cash_quote(symbol: &str, market: &str) -> StockQuote {
@@ -1321,8 +1344,8 @@ pub async fn fetch_stock_history_yahoo(
     let mut result: Vec<(chrono::NaiveDate, f64)> = Vec::new();
     for (ts, cl) in timestamps.iter().zip(closes.iter()) {
         if let (Some(ts_i), Some(cl_f)) = (ts.as_i64(), cl.as_f64()) {
-            if let Some(dt) = chrono::DateTime::from_timestamp(ts_i, 0) {
-                result.push((dt.date_naive(), cl_f));
+            if let Some(date) = timestamp_to_market_date(ts_i, market) {
+                result.push((date, cl_f));
             }
         }
     }
@@ -1511,8 +1534,7 @@ pub async fn fetch_stock_history_xueqiu(
         let close = item.get(close_idx).and_then(|v| v.as_f64());
 
         if let (Some(ts_ms), Some(close_price)) = (ts_ms, close) {
-            if let Some(dt) = chrono::DateTime::from_timestamp(ts_ms / 1000, 0) {
-                let date = dt.date_naive();
+            if let Some(date) = timestamp_to_market_date(ts_ms / 1000, market) {
                 if date >= start_date && date <= end_date {
                     result.push((date, close_price));
                 }
@@ -3065,6 +3087,89 @@ mod tests {
             err.contains("empty or missing"),
             "Error should indicate missing column: {}",
             err
+        );
+    }
+
+    // ---- timestamp_to_market_date tests ----
+
+    #[test]
+    fn test_timestamp_to_market_date_cn() {
+        // 2026-03-06 00:00:00 CST (UTC+8) = 2026-03-05 16:00:00 UTC
+        let ts = chrono::NaiveDate::from_ymd_opt(2026, 3, 5)
+            .unwrap()
+            .and_hms_opt(16, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let date = timestamp_to_market_date(ts, "CN").unwrap();
+        assert_eq!(
+            date,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 6).unwrap(),
+            "CN timestamp at midnight CST should map to 2026-03-06"
+        );
+    }
+
+    #[test]
+    fn test_timestamp_to_market_date_hk() {
+        // Same offset as CN (UTC+8)
+        let ts = chrono::NaiveDate::from_ymd_opt(2026, 3, 5)
+            .unwrap()
+            .and_hms_opt(16, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let date = timestamp_to_market_date(ts, "HK").unwrap();
+        assert_eq!(
+            date,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 6).unwrap(),
+            "HK timestamp at midnight CST should map to 2026-03-06"
+        );
+    }
+
+    #[test]
+    fn test_timestamp_to_market_date_us() {
+        // 2026-03-06 00:00:00 EST (UTC-5) = 2026-03-06 05:00:00 UTC
+        let ts = chrono::NaiveDate::from_ymd_opt(2026, 3, 6)
+            .unwrap()
+            .and_hms_opt(5, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let date = timestamp_to_market_date(ts, "US").unwrap();
+        assert_eq!(
+            date,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 6).unwrap(),
+            "US timestamp at midnight EST should map to 2026-03-06"
+        );
+    }
+
+    #[test]
+    fn test_timestamp_to_market_date_utc_would_be_wrong() {
+        // Verify that naively using UTC gives the WRONG date for CN stocks.
+        // 2026-03-06 00:00:00 CST = 2026-03-05 16:00:00 UTC
+        let ts = chrono::NaiveDate::from_ymd_opt(2026, 3, 5)
+            .unwrap()
+            .and_hms_opt(16, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+
+        // Using UTC (old buggy behavior) would give 2026-03-05
+        let utc_date = chrono::DateTime::from_timestamp(ts, 0)
+            .unwrap()
+            .date_naive();
+        assert_eq!(
+            utc_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 5).unwrap(),
+            "UTC interpretation gives 2026-03-05 (wrong for CN market)"
+        );
+
+        // Using market-aware conversion gives correct 2026-03-06
+        let market_date = timestamp_to_market_date(ts, "CN").unwrap();
+        assert_eq!(
+            market_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 6).unwrap(),
+            "Market-aware gives 2026-03-06 (correct)"
         );
     }
 }

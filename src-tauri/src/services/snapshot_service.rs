@@ -138,25 +138,24 @@ pub async fn take_daily_snapshot(
     // cumulative_pnl: total unrealized P&L since positions were opened
     let cumulative_pnl = total_value - total_cost;
 
-    // daily_pnl: change in portfolio value compared to previous day's snapshot
-    let prev_total_value: f64 = {
-        let conn = db.conn.lock().map_err(|e| e.to_string())?;
-        conn.query_row(
-            "SELECT COALESCE(total_value, 0) FROM daily_portfolio_values WHERE date < ?1 ORDER BY date DESC LIMIT 1",
-            rusqlite::params![date_str],
-            |row| row.get(0),
-        )
-        .unwrap_or(0.0)
-    };
-    let daily_pnl = total_value - prev_total_value;
-
     let rates_json = serde_json::to_string(&rates).unwrap_or_default();
 
-    // 6. Persist to DB (synchronous, upsert)
+    // 6. Persist to DB inside a transaction for atomicity and performance.
     {
-        let conn = db.conn.lock().map_err(|e| e.to_string())?;
+        let mut conn = db.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
 
-        conn.execute(
+        // daily_pnl: change in portfolio value compared to previous day's snapshot
+        let prev_total_value: f64 = tx
+            .query_row(
+                "SELECT COALESCE(total_value, 0) FROM daily_portfolio_values WHERE date < ?1 ORDER BY date DESC LIMIT 1",
+                rusqlite::params![date_str],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0);
+        let daily_pnl = total_value - prev_total_value;
+
+        tx.execute(
             "INSERT OR REPLACE INTO daily_portfolio_values
              (date, total_cost, total_value, us_cost, us_value, cn_cost, cn_value, hk_cost, hk_value, exchange_rates, daily_pnl, cumulative_pnl)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -169,14 +168,14 @@ pub async fn take_daily_snapshot(
         .map_err(|e| e.to_string())?;
 
         // Delete existing snapshots for this date, then insert new ones
-        conn.execute(
+        tx.execute(
             "DELETE FROM daily_holding_snapshots WHERE date = ?1",
             rusqlite::params![date_str],
         )
         .map_err(|e| e.to_string())?;
 
         for snap in &snapshots {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO daily_holding_snapshots
                  (date, account_id, symbol, market, category_name, shares, avg_cost, close_price, market_value)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -188,6 +187,8 @@ pub async fn take_daily_snapshot(
             )
             .map_err(|e| e.to_string())?;
         }
+
+        tx.commit().map_err(|e| e.to_string())?;
     }
 
     Ok(())
@@ -491,29 +492,40 @@ pub async fn backfill_snapshots(
     // holidays / non-trading days at the beginning of the analysis period.
     let fetch_start = start_date - chrono::Duration::days(14);
 
-    for holding in &holdings {
+    // Deduplicate symbols – multiple accounts may hold the same stock;
+    // we only need to fetch historical prices once per unique symbol.
+    let unique_symbols: Vec<(String, String)> = {
+        let mut seen = std::collections::HashSet::new();
+        holdings
+            .iter()
+            .filter(|h| seen.insert(h.symbol.clone()))
+            .map(|h| (h.symbol.clone(), h.market.clone()))
+            .collect()
+    };
+
+    for (symbol, market) in &unique_symbols {
         // Cash holdings have a constant price of 1.0 – no history fetch needed.
-        if crate::services::quote_service::is_cash_symbol(&holding.symbol) {
+        if crate::services::quote_service::is_cash_symbol(symbol) {
             // Populate every missing date with price = 1.0 so forward-fill works
             let mut cash_prices =
                 std::collections::HashMap::with_capacity(missing_dates.len());
             for d in &missing_dates {
                 cash_prices.insert(*d, 1.0);
             }
-            history_map.insert(holding.symbol.clone(), cash_prices);
+            history_map.insert(symbol.clone(), cash_prices);
             continue;
         }
 
         // Select the configured provider for the holding's market.
-        let provider = match holding.market.as_str() {
+        let provider = match market.as_str() {
             "US" => config.us_provider.as_str(),
             "HK" => config.hk_provider.as_str(),
             _ => config.cn_provider.as_str(),
         };
 
         match fetch_stock_history(
-            &holding.symbol,
-            &holding.market,
+            symbol,
+            market,
             fetch_start,
             end_date,
             provider,
@@ -523,12 +535,12 @@ pub async fn backfill_snapshots(
             Ok(prices) => {
                 let date_price_map: std::collections::HashMap<NaiveDate, f64> =
                     prices.into_iter().collect();
-                history_map.insert(holding.symbol.clone(), date_price_map);
+                history_map.insert(symbol.clone(), date_price_map);
             }
             Err(e) => {
                 eprintln!(
                     "Warning: failed to fetch history for {} ({}): {}",
-                    holding.symbol, holding.market, e
+                    symbol, market, e
                 );
             }
         }
@@ -557,10 +569,30 @@ pub async fn backfill_snapshots(
     //    running_unwind accumulates the unwind of transactions up to each
     //    date; the adjustment for date D = total_unwind - running_unwind
     //    gives the unwind of all transactions AFTER D.
+    //
+    //    All DB writes are wrapped in a single SQLite transaction for
+    //    atomicity and significantly better write performance (avoids
+    //    per-statement fsync in autocommit mode).
     let mut count = 0i32;
     let mut txn_idx = 0usize;
     let mut running_unwind: std::collections::HashMap<(String, String), f64> =
         std::collections::HashMap::new();
+
+    // Collect all rows to persist, then batch-write inside a transaction.
+    struct DateRow {
+        date_str: String,
+        total_cost: f64,
+        total_value: f64,
+        us_cost: f64,
+        us_value: f64,
+        cn_cost: f64,
+        cn_value: f64,
+        hk_cost: f64,
+        hk_value: f64,
+        cumulative_pnl: f64,
+        snapshots: Vec<DailyHoldingSnapshot>,
+    }
+    let mut date_rows: Vec<DateRow> = Vec::with_capacity(missing_dates.len());
 
     for date in &missing_dates {
         let date_str = date.format("%Y-%m-%d").to_string();
@@ -691,40 +723,58 @@ pub async fn backfill_snapshots(
 
         let cumulative_pnl = total_value - total_cost;
 
-        let prev_total_value: f64 = {
-            let conn = db.conn.lock().map_err(|e| e.to_string())?;
-            conn.query_row(
-                "SELECT COALESCE(total_value, 0) FROM daily_portfolio_values WHERE date < ?1 ORDER BY date DESC LIMIT 1",
-                rusqlite::params![date_str],
-                |row| row.get(0),
-            )
-            .unwrap_or(0.0)
-        };
-        let daily_pnl = total_value - prev_total_value;
+        date_rows.push(DateRow {
+            date_str,
+            total_cost,
+            total_value,
+            us_cost,
+            us_value,
+            cn_cost,
+            cn_value,
+            hk_cost,
+            hk_value,
+            cumulative_pnl,
+            snapshots,
+        });
+    }
 
-        // Persist
-        {
-            let conn = db.conn.lock().map_err(|e| e.to_string())?;
-            conn.execute(
+    // 6. Batch-persist all computed rows inside a single SQLite transaction.
+    //    This avoids per-statement fsync overhead and provides atomicity.
+    {
+        let mut conn = db.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        for row in &date_rows {
+            let prev_total_value: f64 = tx
+                .query_row(
+                    "SELECT COALESCE(total_value, 0) FROM daily_portfolio_values WHERE date < ?1 ORDER BY date DESC LIMIT 1",
+                    rusqlite::params![row.date_str],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0.0);
+            let daily_pnl = row.total_value - prev_total_value;
+
+            tx.execute(
                 "INSERT OR REPLACE INTO daily_portfolio_values
                  (date, total_cost, total_value, us_cost, us_value, cn_cost, cn_value, hk_cost, hk_value, exchange_rates, daily_pnl, cumulative_pnl)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
-                    date_str, total_cost, total_value,
-                    us_cost, us_value, cn_cost, cn_value, hk_cost, hk_value,
-                    rates_json, daily_pnl, cumulative_pnl
+                    row.date_str, row.total_cost, row.total_value,
+                    row.us_cost, row.us_value, row.cn_cost, row.cn_value,
+                    row.hk_cost, row.hk_value,
+                    rates_json, daily_pnl, row.cumulative_pnl
                 ],
             )
             .map_err(|e| e.to_string())?;
 
-            conn.execute(
+            tx.execute(
                 "DELETE FROM daily_holding_snapshots WHERE date = ?1",
-                rusqlite::params![date_str],
+                rusqlite::params![row.date_str],
             )
             .map_err(|e| e.to_string())?;
 
-            for snap in &snapshots {
-                conn.execute(
+            for snap in &row.snapshots {
+                tx.execute(
                     "INSERT INTO daily_holding_snapshots
                      (date, account_id, symbol, market, category_name, shares, avg_cost, close_price, market_value)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -736,9 +786,11 @@ pub async fn backfill_snapshots(
                 )
                 .map_err(|e| e.to_string())?;
             }
+
+            count += 1;
         }
 
-        count += 1;
+        tx.commit().map_err(|e| e.to_string())?;
     }
 
     Ok(count)

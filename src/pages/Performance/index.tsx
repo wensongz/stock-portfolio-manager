@@ -146,7 +146,7 @@ export default function PerformancePage() {
             />
             <Button
               icon={<ReloadOutlined />}
-              onClick={() => usePerformanceStore.getState().fetchAll()}
+              onClick={() => usePerformanceStore.getState().fetchAll(true)}
               loading={loading}
               size="small"
             >

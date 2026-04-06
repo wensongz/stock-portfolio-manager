@@ -92,7 +92,7 @@ interface PerformanceState {
   setBenchmarks: (symbols: string[]) => void;
   setMarket: (market: string | null) => void;
   setAccountId: (accountId: string | null) => void;
-  fetchAll: () => Promise<void>;
+  fetchAll: (forceRefresh?: boolean) => Promise<void>;
   fetchBenchmark: (symbol: string) => Promise<void>;
 }
 
@@ -137,7 +137,7 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
     set({ selectedAccountId: accountId, selectedMarket: null });
   },
 
-  fetchAll: async () => {
+  fetchAll: async (forceRefresh?: boolean) => {
     set({ loading: true, error: null });
     try {
       const state = get();
@@ -161,9 +161,16 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
         filterParams.accountId = state.selectedAccountId;
       }
 
-      // Automatically backfill missing daily snapshots using historical closing prices
+      // Automatically backfill missing daily snapshots using historical closing prices.
+      // When forceRefresh is true (user clicked "刷新"), re-create all snapshots
+      // including transaction-aware adjustments. Otherwise only fill in dates
+      // that have never been computed, so the page loads quickly from cache.
       try {
-        await invoke<number>("backfill_snapshots", { startDate, endDate });
+        await invoke<number>("backfill_snapshots", {
+          startDate,
+          endDate,
+          force: forceRefresh ?? false,
+        });
       } catch (err) {
         console.warn("backfill_snapshots error (non-fatal):", err);
       }

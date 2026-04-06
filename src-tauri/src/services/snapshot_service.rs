@@ -280,6 +280,7 @@ pub async fn backfill_snapshots(
     cache: &ExchangeRateCache,
     start_date: NaiveDate,
     end_date: NaiveDate,
+    force: bool,
 ) -> Result<i32, String> {
     // Use UTC+8 (the furthest-ahead market timezone) to determine "today"
     // so that CN/HK users don't see today's date clamped to yesterday
@@ -454,12 +455,12 @@ pub async fn backfill_snapshots(
     };
 
     let mut missing_dates: Vec<NaiveDate> = Vec::new();
-    // If there are transactions in the period, force re-creation of ALL
-    // snapshots. A transaction on any date D changes the adjusted holdings
-    // for every date before D (they had different shares), so ALL dates in
-    // the range could have stale snapshots from a previous backfill that
-    // didn't account for transactions.
-    let has_transactions = transactions.iter().any(|tx| tx.trade_date <= end_date);
+    // When `force` is true, re-create ALL snapshots if any transactions
+    // exist in the period (a transaction on date D changes the adjusted
+    // holdings for every date around D).  When `force` is false, only
+    // fill in dates that have never been calculated – this lets the UI
+    // load quickly from cached data without re-fetching historical prices.
+    let has_transactions = force && transactions.iter().any(|tx| tx.trade_date <= end_date);
     let mut d = start_date;
     while d <= end_date {
         let wd = d.weekday();

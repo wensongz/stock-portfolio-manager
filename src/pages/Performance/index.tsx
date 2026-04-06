@@ -83,58 +83,58 @@ export default function PerformancePage() {
   return (
     <div>
       {/* Header */}
-      <div className="flex justify-between items-center mb-2">
+      <div className="flex justify-between items-start mb-4">
         <Title level={2} className="!mb-0">
           📊 绩效分析
         </Title>
-        <Space>
-          <Select
-            value={selectedMarket ?? undefined}
-            onChange={handleMarketChange}
-            placeholder="按市场"
-            allowClear
-            style={{ width: 130 }}
-            size="small"
-          >
-            {MARKETS.map((m) => (
-              <Select.Option key={m.value} value={m.value}>
-                {m.label}
-              </Select.Option>
-            ))}
-          </Select>
-          <Select
-            value={selectedAccountId ?? undefined}
-            onChange={handleAccountChange}
-            placeholder="按账户"
-            allowClear
-            style={{ width: 180 }}
-            size="small"
-          >
-            {accounts.map((a) => (
-              <Select.Option key={a.id} value={a.id}>
-                {a.name} ({a.market})
-              </Select.Option>
-            ))}
-          </Select>
-        </Space>
-      </div>
-      <div className="flex justify-end items-center mb-4">
-        <Space wrap>
-          <TimeRangeSelector
-            timeRange={timeRange}
-            customStart={customStart}
-            customEnd={customEnd}
-            onChange={handleTimeRangeChange}
-          />
-          <Button
-            icon={<ReloadOutlined />}
-            onClick={() => usePerformanceStore.getState().fetchAll()}
-            loading={loading}
-            size="small"
-          >
-            刷新
-          </Button>
-        </Space>
+        <div className="flex flex-col items-end gap-1">
+          <Space>
+            <Select
+              value={selectedMarket ?? undefined}
+              onChange={handleMarketChange}
+              placeholder="按市场"
+              allowClear
+              style={{ width: 130 }}
+              size="small"
+            >
+              {MARKETS.map((m) => (
+                <Select.Option key={m.value} value={m.value}>
+                  {m.label}
+                </Select.Option>
+              ))}
+            </Select>
+            <Select
+              value={selectedAccountId ?? undefined}
+              onChange={handleAccountChange}
+              placeholder="按账户"
+              allowClear
+              style={{ width: 180 }}
+              size="small"
+            >
+              {accounts.map((a) => (
+                <Select.Option key={a.id} value={a.id}>
+                  {a.name} ({a.market})
+                </Select.Option>
+              ))}
+            </Select>
+          </Space>
+          <Space wrap>
+            <TimeRangeSelector
+              timeRange={timeRange}
+              customStart={customStart}
+              customEnd={customEnd}
+              onChange={handleTimeRangeChange}
+            />
+            <Button
+              icon={<ReloadOutlined />}
+              onClick={() => usePerformanceStore.getState().fetchAll()}
+              loading={loading}
+              size="small"
+            >
+              刷新
+            </Button>
+          </Space>
+        </div>
       </div>
 
       {/* Summary cards */}

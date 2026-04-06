@@ -83,11 +83,11 @@ export default function PerformancePage() {
   return (
     <div>
       {/* Header */}
-      <div className="flex justify-between items-center mb-4">
+      <div className="flex justify-between items-center mb-2">
         <Title level={2} className="!mb-0">
           📊 绩效分析
         </Title>
-        <Space wrap>
+        <Space>
           <Select
             value={selectedMarket ?? undefined}
             onChange={handleMarketChange}
@@ -116,6 +116,10 @@ export default function PerformancePage() {
               </Select.Option>
             ))}
           </Select>
+        </Space>
+      </div>
+      <div className="flex justify-end items-center mb-4">
+        <Space wrap>
           <TimeRangeSelector
             timeRange={timeRange}
             customStart={customStart}

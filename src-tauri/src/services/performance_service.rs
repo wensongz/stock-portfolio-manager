@@ -16,12 +16,47 @@ use chrono::NaiveDate;
 // Internal DB helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Optional filters for narrowing performance analysis to a specific market
+/// or account.
+#[derive(Debug, Clone, Default)]
+pub struct PerformanceFilter {
+    pub market: Option<String>,
+    pub account_id: Option<String>,
+}
+
+impl PerformanceFilter {
+    pub fn is_active(&self) -> bool {
+        self.market.is_some() || self.account_id.is_some()
+    }
+
+    /// Append optional WHERE clauses for market/account_id and push
+    /// corresponding parameter values. Returns the number of params added.
+    fn append_where_clauses(
+        &self,
+        sql: &mut String,
+        params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    ) {
+        if let Some(ref market) = self.market {
+            sql.push_str(&format!(" AND market = ?{}", params.len() + 1));
+            params.push(Box::new(market.clone()));
+        }
+        if let Some(ref account_id) = self.account_id {
+            sql.push_str(&format!(" AND account_id = ?{}", params.len() + 1));
+            params.push(Box::new(account_id.clone()));
+        }
+    }
+}
+
 /// Fetch daily portfolio values (total_value, daily_pnl) for the date range.
 fn fetch_daily_values(
     db: &Database,
     start: NaiveDate,
     end: NaiveDate,
+    filter: &PerformanceFilter,
 ) -> Result<Vec<(NaiveDate, f64, f64)>, String> {
+    if filter.is_active() {
+        return fetch_filtered_daily_values(db, start, end, filter);
+    }
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let start_str = start.format("%Y-%m-%d").to_string();
     let end_str = end.format("%Y-%m-%d").to_string();
@@ -55,9 +90,75 @@ fn fetch_daily_values(
         .collect()
 }
 
-/// Fetch the portfolio value on its inception (earliest) date.
-fn fetch_inception_value(db: &Database) -> Result<Option<f64>, String> {
+/// Fetch daily values from `daily_holding_snapshots` aggregated by date,
+/// filtered by market and/or account_id. Derives daily_pnl from consecutive
+/// day value differences.
+fn fetch_filtered_daily_values(
+    db: &Database,
+    start: NaiveDate,
+    end: NaiveDate,
+    filter: &PerformanceFilter,
+) -> Result<Vec<(NaiveDate, f64, f64)>, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let start_str = start.format("%Y-%m-%d").to_string();
+    let end_str = end.format("%Y-%m-%d").to_string();
+
+    let mut sql = String::from(
+        "SELECT date, SUM(market_value) as total_value
+         FROM daily_holding_snapshots
+         WHERE date BETWEEN ?1 AND ?2",
+    );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+        Box::new(start_str),
+        Box::new(end_str),
+    ];
+
+    filter.append_where_clauses(&mut sql, &mut params);
+
+    sql.push_str(" GROUP BY date ORDER BY date ASC");
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            let date_str: String = row.get(0)?;
+            let value: f64 = row.get(1)?;
+            Ok((date_str, value))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let mut result = Vec::with_capacity(rows.len());
+    let mut prev_value: Option<f64> = None;
+    for (ds, v) in rows {
+        let date = NaiveDate::parse_from_str(&ds, "%Y-%m-%d")
+            .map_err(|e| format!("bad date '{}': {}", ds, e))?;
+        let dpnl = prev_value.map(|pv| v - pv).unwrap_or(0.0);
+        result.push((date, v, dpnl));
+        prev_value = Some(v);
+    }
+    Ok(result)
+}
+
+/// Fetch the portfolio value on its inception (earliest) date.
+fn fetch_inception_value(db: &Database, filter: &PerformanceFilter) -> Result<Option<f64>, String> {
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    if filter.is_active() {
+        let mut sql = String::from(
+            "SELECT SUM(market_value) FROM daily_holding_snapshots WHERE date = (SELECT MIN(date) FROM daily_holding_snapshots WHERE 1=1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        filter.append_where_clauses(&mut sql, &mut params);
+        sql.push(')');
+        // Apply same filters to outer WHERE
+        filter.append_where_clauses(&mut sql, &mut params);
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let result = conn
+            .query_row(&sql, param_refs.as_slice(), |row| row.get::<_, f64>(0))
+            .ok();
+        return Ok(result);
+    }
     let mut stmt = conn
         .prepare("SELECT total_value FROM daily_portfolio_values ORDER BY date ASC LIMIT 1")
         .map_err(|e| e.to_string())?;
@@ -68,9 +169,24 @@ fn fetch_inception_value(db: &Database) -> Result<Option<f64>, String> {
 /// Fetch the portfolio value on the latest day strictly before `date`.
 /// Used as the baseline for cumulative-return curves so that the first
 /// visible day already shows a non-zero return.
-fn fetch_previous_day_value(db: &Database, date: NaiveDate) -> Result<Option<f64>, String> {
+fn fetch_previous_day_value(db: &Database, date: NaiveDate, filter: &PerformanceFilter) -> Result<Option<f64>, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let date_str = date.format("%Y-%m-%d").to_string();
+    if filter.is_active() {
+        let mut sql = String::from(
+            "SELECT SUM(market_value) FROM daily_holding_snapshots WHERE date = (SELECT MAX(date) FROM daily_holding_snapshots WHERE date < ?1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(date_str.clone())];
+        filter.append_where_clauses(&mut sql, &mut params);
+        sql.push(')');
+        // Apply same filters to outer WHERE
+        filter.append_where_clauses(&mut sql, &mut params);
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let result = conn
+            .query_row(&sql, param_refs.as_slice(), |row| row.get::<_, f64>(0))
+            .ok();
+        return Ok(result);
+    }
     let result = conn
         .query_row(
             "SELECT total_value FROM daily_portfolio_values WHERE date < ?1 ORDER BY date DESC LIMIT 1",
@@ -86,22 +202,34 @@ fn fetch_transaction_dates(
     db: &Database,
     start: NaiveDate,
     end: NaiveDate,
+    filter: &PerformanceFilter,
 ) -> Result<Vec<NaiveDate>, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let start_str = start.format("%Y-%m-%d").to_string();
     let end_str = end.format("%Y-%m-%d").to_string();
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT DISTINCT DATE(traded_at) as d
-             FROM transactions
-             WHERE DATE(traded_at) BETWEEN ?1 AND ?2
-             ORDER BY d ASC",
-        )
-        .map_err(|e| e.to_string())?;
+    let mut sql = String::from(
+        "SELECT DISTINCT DATE(traded_at) as d
+         FROM transactions
+         WHERE DATE(traded_at) BETWEEN ?1 AND ?2",
+    );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+        Box::new(start_str),
+        Box::new(end_str),
+    ];
+
+    if let Some(ref account_id) = filter.account_id {
+        sql.push_str(&format!(" AND account_id = ?{}", params.len() + 1));
+        params.push(Box::new(account_id.clone()));
+    }
+
+    sql.push_str(" ORDER BY d ASC");
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
     let dates = stmt
-        .query_map(rusqlite::params![start_str, end_str], |row| {
+        .query_map(param_refs.as_slice(), |row| {
             let ds: String = row.get(0)?;
             Ok(ds)
         })
@@ -269,9 +397,10 @@ pub fn get_return_series(
     db: &Database,
     start_date: NaiveDate,
     end_date: NaiveDate,
+    filter: &PerformanceFilter,
 ) -> Result<Vec<ReturnDataPoint>, String> {
-    let daily = fetch_daily_values(db, start_date, end_date)?;
-    let base_value = fetch_previous_day_value(db, start_date)?;
+    let daily = fetch_daily_values(db, start_date, end_date, filter)?;
+    let base_value = fetch_previous_day_value(db, start_date, filter)?;
     Ok(build_return_series(&daily, base_value))
 }
 
@@ -279,8 +408,9 @@ pub fn get_performance_summary(
     db: &Database,
     start_date: NaiveDate,
     end_date: NaiveDate,
+    filter: &PerformanceFilter,
 ) -> Result<PerformanceSummary, String> {
-    let daily = fetch_daily_values(db, start_date, end_date)?;
+    let daily = fetch_daily_values(db, start_date, end_date, filter)?;
     if daily.is_empty() {
         return Ok(PerformanceSummary {
             start_date: start_date.format("%Y-%m-%d").to_string(),
@@ -300,13 +430,13 @@ pub fn get_performance_summary(
     let end_value = daily.last().unwrap().1;
 
     // TWR using transaction-date sub-periods
-    let tx_dates = fetch_transaction_dates(db, start_date, end_date)?;
+    let tx_dates = fetch_transaction_dates(db, start_date, end_date, filter)?;
     let twr = compute_twr(&daily, &tx_dates, start_value);
     let days = (end_date - start_date).num_days();
     let annualised = annualise_return(twr, days);
     let total_pnl = end_value - start_value;
 
-    let inception_value = fetch_inception_value(db)?;
+    let inception_value = fetch_inception_value(db, filter)?;
     let return_series = build_return_series(&daily, inception_value);
     let dd_analysis = calculate_max_drawdown(&return_series);
 
@@ -386,8 +516,9 @@ pub fn get_risk_metrics(
     db: &Database,
     start_date: NaiveDate,
     end_date: NaiveDate,
+    filter: &PerformanceFilter,
 ) -> Result<RiskMetrics, String> {
-    let daily = fetch_daily_values(db, start_date, end_date)?;
+    let daily = fetch_daily_values(db, start_date, end_date, filter)?;
     if daily.is_empty() {
         return Ok(RiskMetrics {
             daily_volatility: 0.0,
@@ -399,13 +530,13 @@ pub fn get_risk_metrics(
         });
     }
 
-    let tx_dates = fetch_transaction_dates(db, start_date, end_date)?;
+    let tx_dates = fetch_transaction_dates(db, start_date, end_date, filter)?;
     let start_value = daily[0].1;
     let twr = compute_twr(&daily, &tx_dates, start_value);
     let days = (end_date - start_date).num_days();
     let annualised = annualise_return(twr, days);
 
-    let inception_value = fetch_inception_value(db)?;
+    let inception_value = fetch_inception_value(db, filter)?;
     let return_series = build_return_series(&daily, inception_value);
     let daily_returns: Vec<f64> = return_series.iter().map(|r| r.daily_return).collect();
     let (daily_vol, ann_vol) = calculate_volatility(&daily_returns);
@@ -430,6 +561,7 @@ pub fn get_return_attribution(
     db: &Database,
     start_date: NaiveDate,
     end_date: NaiveDate,
+    filter: &PerformanceFilter,
 ) -> Result<ReturnAttribution, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let start_str = start_date.format("%Y-%m-%d").to_string();
@@ -442,17 +574,22 @@ pub fn get_return_attribution(
         std::collections::HashMap::new();
 
     {
-        let mut stmt = conn
-            .prepare(
-                "SELECT symbol, market, COALESCE(category_name, '未分类'), market_value
-                 FROM daily_holding_snapshots
-                 WHERE date = (
-                     SELECT MAX(date) FROM daily_holding_snapshots WHERE date <= ?1
-                 )",
-            )
-            .map_err(|e| e.to_string())?;
+        // Build start query with filters applied to both subquery and outer query
+        let mut sql = String::from(
+            "SELECT symbol, market, COALESCE(category_name, '未分类'), SUM(market_value)
+             FROM daily_holding_snapshots
+             WHERE date = (
+                 SELECT MAX(date) FROM daily_holding_snapshots WHERE date <= ?1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(start_str.clone())];
+        filter.append_where_clauses(&mut sql, &mut params);
+        sql.push(')');
+        filter.append_where_clauses(&mut sql, &mut params);
+        sql.push_str(" GROUP BY symbol");
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(rusqlite::params![start_str], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -464,29 +601,35 @@ pub fn get_return_attribution(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         for (sym, mkt, cat, val) in rows {
-            start_vals.insert(sym, (mkt, cat, val));
+            let entry = start_vals.entry(sym).or_insert((mkt, cat, 0.0));
+            entry.2 += val;
         }
     }
 
     {
-        let mut stmt = conn
-            .prepare(
-                "SELECT symbol, market_value
-                 FROM daily_holding_snapshots
-                 WHERE date = (
-                     SELECT MAX(date) FROM daily_holding_snapshots WHERE date <= ?1
-                 )",
-            )
-            .map_err(|e| e.to_string())?;
+        // Build end query with filters applied to both subquery and outer query
+        let mut sql = String::from(
+            "SELECT symbol, SUM(market_value)
+             FROM daily_holding_snapshots
+             WHERE date = (
+                 SELECT MAX(date) FROM daily_holding_snapshots WHERE date <= ?1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(end_str.clone())];
+        filter.append_where_clauses(&mut sql, &mut params);
+        sql.push(')');
+        filter.append_where_clauses(&mut sql, &mut params);
+        sql.push_str(" GROUP BY symbol");
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(rusqlite::params![end_str], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         for (sym, val) in rows {
-            end_vals.insert(sym, val);
+            *end_vals.entry(sym).or_insert(0.0) += val;
         }
     }
 
@@ -603,8 +746,9 @@ pub fn get_monthly_returns(
     db: &Database,
     start_date: NaiveDate,
     end_date: NaiveDate,
+    filter: &PerformanceFilter,
 ) -> Result<Vec<MonthlyReturn>, String> {
-    let daily = fetch_daily_values(db, start_date, end_date)?;
+    let daily = fetch_daily_values(db, start_date, end_date, filter)?;
     if daily.is_empty() {
         return Ok(vec![]);
     }
@@ -669,6 +813,7 @@ pub fn get_holding_performance_ranking(
     end_date: NaiveDate,
     sort_by: &str,
     limit: usize,
+    filter: &PerformanceFilter,
 ) -> Result<Vec<HoldingPerformance>, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let start_str = start_date.format("%Y-%m-%d").to_string();
@@ -683,18 +828,21 @@ pub fn get_holding_performance_ranking(
     }
 
     let fetch_snap = |date_param: &str| -> Result<Vec<SnapRow>, String> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT symbol, market, COALESCE(category_name, '未分类'), SUM(market_value)
-                 FROM daily_holding_snapshots
-                 WHERE date = (
-                     SELECT MAX(date) FROM daily_holding_snapshots WHERE date <= ?1
-                 )
-                 GROUP BY symbol",
-            )
-            .map_err(|e| e.to_string())?;
+        let mut sql = String::from(
+            "SELECT symbol, market, COALESCE(category_name, '未分类'), SUM(market_value)
+             FROM daily_holding_snapshots
+             WHERE date = (
+                 SELECT MAX(date) FROM daily_holding_snapshots WHERE date <= ?1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(date_param.to_string())];
+        filter.append_where_clauses(&mut sql, &mut params);
+        sql.push(')');
+        filter.append_where_clauses(&mut sql, &mut params);
+        sql.push_str(" GROUP BY symbol");
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(rusqlite::params![date_param], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 Ok(SnapRow {
                     symbol: row.get(0)?,
                     market: row.get(1)?,

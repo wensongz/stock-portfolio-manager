@@ -72,6 +72,8 @@ interface PerformanceState {
   customStart: string | null;
   customEnd: string | null;
   selectedBenchmarks: string[];
+  selectedMarket: string | null;
+  selectedAccountId: string | null;
 
   summary: PerformanceSummary | null;
   returnSeries: ReturnDataPoint[];
@@ -88,6 +90,8 @@ interface PerformanceState {
 
   setTimeRange: (range: TimeRange, start?: string, end?: string) => void;
   setBenchmarks: (symbols: string[]) => void;
+  setMarket: (market: string | null) => void;
+  setAccountId: (accountId: string | null) => void;
   fetchAll: () => Promise<void>;
   fetchBenchmark: (symbol: string) => Promise<void>;
 }
@@ -97,6 +101,8 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
   customStart: null,
   customEnd: null,
   selectedBenchmarks: [],
+  selectedMarket: null,
+  selectedAccountId: null,
 
   summary: null,
   returnSeries: [],
@@ -123,6 +129,14 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
     set({ selectedBenchmarks: symbols });
   },
 
+  setMarket: (market) => {
+    set({ selectedMarket: market, selectedAccountId: null });
+  },
+
+  setAccountId: (accountId) => {
+    set({ selectedAccountId: accountId, selectedMarket: null });
+  },
+
   fetchAll: async () => {
     set({ loading: true, error: null });
     try {
@@ -139,6 +153,14 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
         endDate = range.end;
       }
 
+      const filterParams: { market?: string; accountId?: string } = {};
+      if (state.selectedMarket) {
+        filterParams.market = state.selectedMarket;
+      }
+      if (state.selectedAccountId) {
+        filterParams.accountId = state.selectedAccountId;
+      }
+
       // Automatically backfill missing daily snapshots using historical closing prices
       try {
         await invoke<number>("backfill_snapshots", { startDate, endDate });
@@ -148,24 +170,26 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
 
       const [summary, returnSeries, drawdown, attribution, monthlyReturns, topGainers, topLosers, riskMetrics] =
         await Promise.allSettled([
-          invoke<PerformanceSummary>("get_performance_summary", { startDate, endDate }),
-          invoke<ReturnDataPoint[]>("get_return_series", { startDate, endDate }),
-          invoke<DrawdownAnalysis>("get_drawdown_analysis", { startDate, endDate }),
-          invoke<ReturnAttribution>("get_return_attribution", { startDate, endDate }),
-          invoke<MonthlyReturn[]>("get_monthly_returns", { startDate, endDate }),
+          invoke<PerformanceSummary>("get_performance_summary", { startDate, endDate, ...filterParams }),
+          invoke<ReturnDataPoint[]>("get_return_series", { startDate, endDate, ...filterParams }),
+          invoke<DrawdownAnalysis>("get_drawdown_analysis", { startDate, endDate, ...filterParams }),
+          invoke<ReturnAttribution>("get_return_attribution", { startDate, endDate, ...filterParams }),
+          invoke<MonthlyReturn[]>("get_monthly_returns", { startDate, endDate, ...filterParams }),
           invoke<HoldingPerformance[]>("get_holding_performance_ranking", {
             startDate,
             endDate,
             sortBy: "return_rate",
             limit: 10,
+            ...filterParams,
           }),
           invoke<HoldingPerformance[]>("get_holding_performance_ranking", {
             startDate,
             endDate,
             sortBy: "pnl",
             limit: 10,
+            ...filterParams,
           }),
-          invoke<RiskMetrics>("get_risk_metrics", { startDate, endDate }),
+          invoke<RiskMetrics>("get_risk_metrics", { startDate, endDate, ...filterParams }),
         ]);
 
       set({

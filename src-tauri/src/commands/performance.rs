@@ -4,6 +4,7 @@ use crate::models::performance::{
     ReturnDataPoint, RiskMetrics,
 };
 use crate::services::performance_service;
+use crate::services::performance_service::PerformanceFilter;
 use tauri::State;
 
 /// How many calendar days before the requested start to fetch so we can find
@@ -14,15 +15,22 @@ fn parse_date(s: &str) -> Result<chrono::NaiveDate, String> {
     crate::models::performance::parse_date(s)
 }
 
+fn build_filter(market: Option<String>, account_id: Option<String>) -> PerformanceFilter {
+    PerformanceFilter { market, account_id }
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_performance_summary(
     db: State<'_, Database>,
     start_date: String,
     end_date: String,
+    market: Option<String>,
+    account_id: Option<String>,
 ) -> Result<PerformanceSummary, String> {
     let start = parse_date(&start_date)?;
     let end = parse_date(&end_date)?;
-    performance_service::get_performance_summary(&db, start, end)
+    let filter = build_filter(market, account_id);
+    performance_service::get_performance_summary(&db, start, end, &filter)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -30,10 +38,13 @@ pub async fn get_return_series(
     db: State<'_, Database>,
     start_date: String,
     end_date: String,
+    market: Option<String>,
+    account_id: Option<String>,
 ) -> Result<Vec<ReturnDataPoint>, String> {
     let start = parse_date(&start_date)?;
     let end = parse_date(&end_date)?;
-    performance_service::get_return_series(&db, start, end)
+    let filter = build_filter(market, account_id);
+    performance_service::get_return_series(&db, start, end, &filter)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -70,10 +81,13 @@ pub async fn get_return_attribution(
     db: State<'_, Database>,
     start_date: String,
     end_date: String,
+    market: Option<String>,
+    account_id: Option<String>,
 ) -> Result<ReturnAttribution, String> {
     let start = parse_date(&start_date)?;
     let end = parse_date(&end_date)?;
-    performance_service::get_return_attribution(&db, start, end)
+    let filter = build_filter(market, account_id);
+    performance_service::get_return_attribution(&db, start, end, &filter)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -81,10 +95,13 @@ pub async fn get_monthly_returns(
     db: State<'_, Database>,
     start_date: String,
     end_date: String,
+    market: Option<String>,
+    account_id: Option<String>,
 ) -> Result<Vec<MonthlyReturn>, String> {
     let start = parse_date(&start_date)?;
     let end = parse_date(&end_date)?;
-    performance_service::get_monthly_returns(&db, start, end)
+    let filter = build_filter(market, account_id);
+    performance_service::get_monthly_returns(&db, start, end, &filter)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -94,15 +111,19 @@ pub async fn get_holding_performance_ranking(
     end_date: String,
     sort_by: String,
     limit: u32,
+    market: Option<String>,
+    account_id: Option<String>,
 ) -> Result<Vec<HoldingPerformance>, String> {
     let start = parse_date(&start_date)?;
     let end = parse_date(&end_date)?;
+    let filter = build_filter(market, account_id);
     performance_service::get_holding_performance_ranking(
         &db,
         start,
         end,
         &sort_by,
         limit as usize,
+        &filter,
     )
 }
 
@@ -111,10 +132,13 @@ pub async fn get_risk_metrics(
     db: State<'_, Database>,
     start_date: String,
     end_date: String,
+    market: Option<String>,
+    account_id: Option<String>,
 ) -> Result<RiskMetrics, String> {
     let start = parse_date(&start_date)?;
     let end = parse_date(&end_date)?;
-    performance_service::get_risk_metrics(&db, start, end)
+    let filter = build_filter(market, account_id);
+    performance_service::get_risk_metrics(&db, start, end, &filter)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -122,9 +146,12 @@ pub async fn get_drawdown_analysis(
     db: State<'_, Database>,
     start_date: String,
     end_date: String,
+    market: Option<String>,
+    account_id: Option<String>,
 ) -> Result<DrawdownAnalysis, String> {
     let start = parse_date(&start_date)?;
     let end = parse_date(&end_date)?;
-    let series = performance_service::get_return_series(&db, start, end)?;
+    let filter = build_filter(market, account_id);
+    let series = performance_service::get_return_series(&db, start, end, &filter)?;
     Ok(performance_service::calculate_max_drawdown(&series))
 }

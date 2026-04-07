@@ -206,7 +206,10 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
       const resolvedSummary = summary.status === "fulfilled" ? { ...summary.value } : null;
       const resolvedSeries = returnSeries.status === "fulfilled" ? returnSeries.value : [];
       if (resolvedSummary && resolvedSeries.length > 0) {
-        resolvedSummary.total_return = resolvedSeries[resolvedSeries.length - 1].cumulative_return;
+        const lastPoint = resolvedSeries[resolvedSeries.length - 1];
+        if (lastPoint?.cumulative_return != null) {
+          resolvedSummary.total_return = lastPoint.cumulative_return;
+        }
       }
 
       set({

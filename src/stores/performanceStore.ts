@@ -199,9 +199,19 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
           invoke<RiskMetrics>("get_risk_metrics", { startDate, endDate, ...filterParams }),
         ]);
 
+      // Derive total_return from the return series so the summary card and
+      // the cumulative-return chart always display the exact same number.
+      // Both previously came from independent backend calls which could
+      // produce slightly different floating-point results.
+      const resolvedSummary = summary.status === "fulfilled" ? { ...summary.value } : null;
+      const resolvedSeries = returnSeries.status === "fulfilled" ? returnSeries.value : [];
+      if (resolvedSummary && resolvedSeries.length > 0) {
+        resolvedSummary.total_return = resolvedSeries[resolvedSeries.length - 1].cumulative_return;
+      }
+
       set({
-        summary: summary.status === "fulfilled" ? summary.value : null,
-        returnSeries: returnSeries.status === "fulfilled" ? returnSeries.value : [],
+        summary: resolvedSummary,
+        returnSeries: resolvedSeries,
         drawdown: drawdown.status === "fulfilled" ? drawdown.value : null,
         attribution: attribution.status === "fulfilled" ? attribution.value : null,
         monthlyReturns: monthlyReturns.status === "fulfilled" ? monthlyReturns.value : [],

@@ -260,6 +260,8 @@ export interface PerformanceSummary {
   max_drawdown: number;
   volatility: number;
   sharpe_ratio: number;
+  /** Daily return series computed from the same DB query as the summary. */
+  return_series: ReturnDataPoint[];
 }
 
 export interface ReturnDataPoint {

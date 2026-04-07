@@ -175,10 +175,9 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
         console.warn("backfill_snapshots error (non-fatal):", err);
       }
 
-      const [summary, returnSeries, drawdown, attribution, monthlyReturns, topGainers, topLosers, riskMetrics] =
+      const [summary, drawdown, attribution, monthlyReturns, topGainers, topLosers, riskMetrics] =
         await Promise.allSettled([
           invoke<PerformanceSummary>("get_performance_summary", { startDate, endDate, ...filterParams }),
-          invoke<ReturnDataPoint[]>("get_return_series", { startDate, endDate, ...filterParams }),
           invoke<DrawdownAnalysis>("get_drawdown_analysis", { startDate, endDate, ...filterParams }),
           invoke<ReturnAttribution>("get_return_attribution", { startDate, endDate, ...filterParams }),
           invoke<MonthlyReturn[]>("get_monthly_returns", { startDate, endDate, ...filterParams }),
@@ -199,18 +198,12 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
           invoke<RiskMetrics>("get_risk_metrics", { startDate, endDate, ...filterParams }),
         ]);
 
-      // Derive total_return from the return series so the summary card and
-      // the cumulative-return chart always display the exact same number.
-      // Both previously came from independent backend calls which could
-      // produce slightly different floating-point results.
-      const resolvedSummary = summary.status === "fulfilled" ? { ...summary.value } : null;
-      const resolvedSeries = returnSeries.status === "fulfilled" ? returnSeries.value : [];
-      if (resolvedSummary && resolvedSeries.length > 0) {
-        const lastPoint = resolvedSeries[resolvedSeries.length - 1];
-        if (lastPoint?.cumulative_return != null) {
-          resolvedSummary.total_return = lastPoint.cumulative_return;
-        }
-      }
+      // Summary now includes return_series computed from the same single DB
+      // query, so both the summary card total_return and the cumulative-return
+      // chart are guaranteed to be consistent — no separate get_return_series
+      // call is needed.
+      const resolvedSummary = summary.status === "fulfilled" ? summary.value : null;
+      const resolvedSeries = resolvedSummary?.return_series ?? [];
 
       set({
         summary: resolvedSummary,

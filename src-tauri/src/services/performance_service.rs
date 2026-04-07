@@ -428,6 +428,7 @@ pub fn get_performance_summary(
             max_drawdown: 0.0,
             volatility: 0.0,
             sharpe_ratio: 0.0,
+            return_series: vec![],
         });
     }
 
@@ -475,6 +476,7 @@ pub fn get_performance_summary(
         max_drawdown: dd_analysis.max_drawdown,
         volatility: ann_vol * 100.0,
         sharpe_ratio: sharpe,
+        return_series,
     })
 }
 

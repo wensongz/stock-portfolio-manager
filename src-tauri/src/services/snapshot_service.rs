@@ -3,7 +3,36 @@ use crate::models::{DailyHoldingSnapshot, DailyPortfolioValue};
 use crate::services::exchange_rate_service::ExchangeRateCache;
 use crate::services::quote_service::{fetch_quotes_batch_cached_with_providers, fetch_stock_history, QuoteCache};
 use crate::services::quote_provider_service;
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, NaiveDate, Timelike};
+
+/// Return the latest date for which all markets are guaranteed to have
+/// closing prices available.
+///
+/// Historical price APIs only return data **after** market close.  The
+/// furthest-ahead market is CN/HK (UTC+8) which closes at 15:00 local time.
+/// We use 16:00 UTC+8 as a safe buffer (allowing for settlement/delayed
+/// data publication).
+///
+/// * If the current time in UTC+8 is **before** 16:00 → yesterday's date
+///   (in UTC+8) is the latest date with guaranteed closing prices.
+/// * If it is 16:00 or later → today's date (in UTC+8) is safe.
+///
+/// For US markets (EST/EDT), the close is 16:00 US Eastern, which is
+/// already past midnight UTC+8 of the **next** day.  So the CN/HK gate
+/// is always the binding constraint: if CN/HK has closed, the US close
+/// for the previous calendar day has long since passed.
+pub fn last_closed_market_date() -> NaiveDate {
+    let utc_plus_8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    let now_cst = chrono::Utc::now().with_timezone(&utc_plus_8);
+    let today_cst = now_cst.date_naive();
+
+    // CN/HK markets close at 15:00 CST; add 1-hour buffer → 16:00.
+    if now_cst.hour() < 16 {
+        today_cst - chrono::Duration::days(1)
+    } else {
+        today_cst
+    }
+}
 
 /// Take a daily portfolio snapshot for the given date.
 /// This is idempotent: running it twice for the same date replaces the existing record.
@@ -194,13 +223,15 @@ pub async fn take_daily_snapshot(
     Ok(())
 }
 
-/// Check if today's snapshot has already been taken; if not, take it.
+/// Check if the latest market-closed day's snapshot has already been taken;
+/// if not, take it.  Uses `last_closed_market_date()` so we never attempt to
+/// snapshot a date whose closing prices are not yet available.
 pub async fn auto_snapshot_check(
     db: &Database,
     cache: &ExchangeRateCache,
     quote_cache: &QuoteCache,
 ) -> Result<(), String> {
-    let today = chrono::Utc::now().date_naive();
+    let today = last_closed_market_date();
     let today_str = today.format("%Y-%m-%d").to_string();
 
     let already_taken: bool = {
@@ -283,13 +314,11 @@ pub async fn backfill_snapshots(
     end_date: NaiveDate,
     force: bool,
 ) -> Result<i32, String> {
-    // Use UTC+8 (the furthest-ahead market timezone) to determine "today"
-    // so that CN/HK users don't see today's date clamped to yesterday
-    // before 08:00 local time.
-    let utc_plus_8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-    let today = chrono::Utc::now().with_timezone(&utc_plus_8).date_naive();
-    // Clamp end_date to today
-    let end_date = if end_date > today { today } else { end_date };
+    // Clamp end_date to the last date for which closing prices are
+    // available.  Before CN/HK market close (≈15:00 UTC+8), today's
+    // prices do not exist yet, so we use yesterday.
+    let latest_closed = last_closed_market_date();
+    let end_date = if end_date > latest_closed { latest_closed } else { end_date };
 
     if start_date > end_date {
         return Ok(0);

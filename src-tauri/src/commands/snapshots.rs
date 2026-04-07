@@ -16,7 +16,11 @@ pub async fn take_snapshot(
     let target_date = match date {
         Some(d) => NaiveDate::parse_from_str(&d, "%Y-%m-%d")
             .map_err(|e| format!("Invalid date format (expected YYYY-MM-DD): {}", e))?,
-        None => chrono::Utc::now().date_naive(),
+        None => {
+            // Use the last market-closed date so we never snapshot a day
+            // whose closing prices are not yet available.
+            crate::services::snapshot_service::last_closed_market_date()
+        }
     };
 
     take_daily_snapshot(&db, &cache, &quote_cache, target_date).await?;

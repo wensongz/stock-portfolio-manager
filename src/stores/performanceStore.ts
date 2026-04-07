@@ -186,14 +186,14 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
             startDate,
             endDate,
             sortBy: "return_rate",
-            limit: 10,
+            limit: 100,
             ...filterParams,
           }),
           invoke<HoldingPerformance[]>("get_holding_performance_ranking", {
             startDate,
             endDate,
-            sortBy: "pnl",
-            limit: 10,
+            sortBy: "return_rate",
+            limit: 100,
             ...filterParams,
           }),
           invoke<RiskMetrics>("get_risk_metrics", { startDate, endDate, ...filterParams }),
@@ -205,10 +205,19 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
         drawdown: drawdown.status === "fulfilled" ? drawdown.value : null,
         attribution: attribution.status === "fulfilled" ? attribution.value : null,
         monthlyReturns: monthlyReturns.status === "fulfilled" ? monthlyReturns.value : [],
-        topGainers: topGainers.status === "fulfilled" ? topGainers.value : [],
+        topGainers:
+          topGainers.status === "fulfilled"
+            ? topGainers.value
+                .filter((h) => h.return_rate >= 0)
+                .sort((a, b) => b.return_rate - a.return_rate)
+                .slice(0, 10)
+            : [],
         topLosers:
           topLosers.status === "fulfilled"
-            ? [...topLosers.value].sort((a, b) => a.pnl - b.pnl).slice(0, 10)
+            ? topLosers.value
+                .filter((h) => h.return_rate < 0)
+                .sort((a, b) => a.return_rate - b.return_rate)
+                .slice(0, 10)
             : [],
         riskMetrics: riskMetrics.status === "fulfilled" ? riskMetrics.value : null,
         loading: false,

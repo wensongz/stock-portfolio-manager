@@ -48,7 +48,7 @@ function PctStat({
   );
 }
 
-export default function PerformanceSummaryCards({ summary, loading, currency = "USD" }: Props) {
+export default function PerformanceSummaryCards({ summary, loading, currency = "CNY" }: Props) {
   const { pnlColorDark } = usePnlColor();
   return (
     <Row gutter={[16, 16]}>

@@ -80,10 +80,10 @@ export default function RankingChart({ gainers, losers, height = 340 }: Props) {
       <Text strong>🏆 个股表现排行</Text>
       <div style={{ display: "flex", gap: 4, marginBottom: 4 }}>
         <Text style={{ flex: 1, textAlign: "center", fontSize: 12, color: profitColor }}>
-          最佳表现 Top 10
+          最佳表现
         </Text>
         <Text style={{ flex: 1, textAlign: "center", fontSize: 12, color: lossColor }}>
-          最差表现 Top 10
+          最差表现
         </Text>
       </div>
       <ReactECharts

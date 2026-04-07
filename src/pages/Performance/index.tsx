@@ -3,6 +3,7 @@ import { Button, Card, Col, Divider, Row, Select, Space, Typography } from "antd
 import { ReloadOutlined } from "@ant-design/icons";
 import { usePerformanceStore } from "../../stores/performanceStore";
 import { useAccountStore } from "../../stores/accountStore";
+import { useExchangeRateStore } from "../../stores/exchangeRateStore";
 import TimeRangeSelector from "./TimeRangeSelector";
 import PerformanceSummaryCards from "./PerformanceSummaryCards";
 import ReturnChart from "./ReturnChart";
@@ -53,18 +54,20 @@ export default function PerformancePage() {
   } = usePerformanceStore();
 
   const { accounts, fetchAccounts } = useAccountStore();
+  const { baseCurrency } = useExchangeRateStore();
 
-  // Derive currency from the selected account or market filter
+  // Derive currency from the selected account or market filter, falling
+  // back to the dashboard's base currency setting (not hardcoded "USD").
   const currency = useMemo(() => {
     if (selectedAccountId) {
       const account = accounts.find((a) => a.id === selectedAccountId);
-      if (account) return MARKET_CURRENCY[account.market] ?? "USD";
+      if (account) return MARKET_CURRENCY[account.market] ?? baseCurrency;
     }
     if (selectedMarket) {
-      return MARKET_CURRENCY[selectedMarket as Market] ?? "USD";
+      return MARKET_CURRENCY[selectedMarket as Market] ?? baseCurrency;
     }
-    return "USD";
-  }, [selectedAccountId, selectedMarket, accounts]);
+    return baseCurrency;
+  }, [selectedAccountId, selectedMarket, accounts, baseCurrency]);
 
   useEffect(() => {
     fetchAccounts();

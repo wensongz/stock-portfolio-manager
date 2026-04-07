@@ -735,6 +735,15 @@ pub fn get_return_attribution(
         std::collections::HashMap::new();
 
     for sym in &all_symbols {
+        // Skip cash symbols ($CASH-CNY, $CASH-USD, $CASH-HKD) from attribution.
+        // Cash holdings don't have entries in the transactions table, so their
+        // PnL = ev − sv reflects the cash flow from buying/selling stocks, NOT
+        // actual investment returns. Including them double-counts the trade
+        // amounts that are already subtracted from individual stock PnLs.
+        if crate::services::quote_service::is_cash_symbol(sym) {
+            continue;
+        }
+
         let (market, cat, sv) = start_vals
             .get(sym)
             .map(|(m, c, v)| (m.clone(), c.clone(), *v))
@@ -1017,6 +1026,7 @@ pub fn get_holding_performance_ranking(
 
     let mut performances: Vec<HoldingPerformance> = end_snaps
         .into_iter()
+        .filter(|e| !crate::services::quote_service::is_cash_symbol(&e.symbol))
         .map(|e| {
             let (market, cat, sv) = start_map
                 .get(&e.symbol)

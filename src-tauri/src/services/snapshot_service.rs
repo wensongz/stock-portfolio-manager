@@ -5,6 +5,12 @@ use crate::services::quote_service::{fetch_quotes_batch_cached_with_providers, f
 use crate::services::quote_provider_service;
 use chrono::{Datelike, NaiveDate, Timelike};
 
+/// Number of calendar days to look back before the first missing date when
+/// fetching historical prices.  This ensures that stocks suspended (停牌)
+/// around the start of the backfill window still have a prior trading-day
+/// close available for forward-fill.
+const SUSPENSION_LOOKBACK_DAYS: i64 = 30;
+
 /// Return the latest date for which all markets are guaranteed to have
 /// closing prices available.
 ///
@@ -530,7 +536,7 @@ pub async fn backfill_snapshots(
         .first()
         .copied()
         .unwrap_or(start_date)
-        - chrono::Duration::days(30);
+        - chrono::Duration::days(SUSPENSION_LOOKBACK_DAYS);
     let fetch_end = missing_dates.last().copied().unwrap_or(end_date);
 
     // Deduplicate symbols – multiple accounts may hold the same stock;

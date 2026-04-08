@@ -625,12 +625,6 @@ pub async fn backfill_snapshots(
     let mut running_unwind: std::collections::HashMap<(String, String), f64> =
         std::collections::HashMap::new();
 
-    // Track (symbol, date) pairs that already warned about missing prices
-    // so we only emit each warning once (a stock held in multiple accounts
-    // would otherwise produce duplicate warnings).
-    let mut warned_missing: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
-
     // Collect all rows to persist, then batch-write inside a transaction.
     struct DateRow {
         date_str: String,
@@ -685,6 +679,29 @@ pub async fn backfill_snapshots(
         let mut snapshots: Vec<DailyHoldingSnapshot> = Vec::new();
         let mut has_any_price = false;
 
+        // Pre-resolve the closing price for each unique symbol on this date.
+        // This avoids redundant forward_fill_price calls when the same stock
+        // is held in multiple accounts, and naturally deduplicates warnings.
+        let mut resolved_prices: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for (symbol, market) in &unique_symbols {
+            let price = history_map
+                .get(symbol)
+                .and_then(|date_map| {
+                    history_sorted
+                        .get(symbol)
+                        .and_then(|sorted| forward_fill_price(date_map, sorted, date))
+                })
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "Warning: no historical price for {} ({}) on {}",
+                        symbol, market, date_str
+                    );
+                    0.0
+                });
+            resolved_prices.insert(symbol.clone(), price);
+        }
+
         for holding in &holdings {
             // Compute adjusted shares for this holding on this date:
             // current shares + (total_unwind - running_unwind) for this key.
@@ -698,26 +715,11 @@ pub async fn backfill_snapshots(
             if adjusted_shares.abs() < 1e-9 {
                 continue;
             }
-            // Look up the closing price for this stock on this date.
-            // If the exact date is missing (market holiday), forward-fill
-            // from the most recent prior trading day's closing price.
-            let close_price = history_map
+            // Look up the pre-resolved closing price for this symbol.
+            let close_price = resolved_prices
                 .get(&holding.symbol)
-                .and_then(|date_map| {
-                    history_sorted
-                        .get(&holding.symbol)
-                        .and_then(|sorted| forward_fill_price(date_map, sorted, date))
-                })
-                .unwrap_or_else(|| {
-                    let warn_key = (holding.symbol.clone(), date_str.clone());
-                    if warned_missing.insert(warn_key) {
-                        eprintln!(
-                            "Warning: no historical price for {} ({}) on {}",
-                            holding.symbol, holding.market, date_str
-                        );
-                    }
-                    0.0
-                });
+                .copied()
+                .unwrap_or(0.0);
 
             if close_price > 0.0 {
                 has_any_price = true;

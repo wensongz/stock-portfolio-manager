@@ -13,6 +13,11 @@ pub struct PerformanceSummary {
     pub max_drawdown: f64,
     pub volatility: f64,
     pub sharpe_ratio: f64,
+    /// The daily return series computed from the same DB query used for
+    /// the summary metrics.  Returned here so the frontend can render
+    /// both the summary card and the cumulative-return chart from a
+    /// single backend call, eliminating redundant DB queries.
+    pub return_series: Vec<ReturnDataPoint>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

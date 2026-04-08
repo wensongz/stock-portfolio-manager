@@ -13,8 +13,10 @@ interface Props {
 
 export default function RankingChart({ gainers, losers, height = 340 }: Props) {
   const { profitColor, lossColor } = usePnlColor();
-  const topGainers = gainers.slice(0, 10);
-  const topLosers = losers.slice(0, 10);
+  // ECharts horizontal bar charts render categories bottom-to-top,
+  // so reverse the arrays to show highest return rate at the top.
+  const topGainers = gainers.slice(0, 10).reverse();
+  const topLosers = losers.slice(0, 10).reverse();
 
   const gainNames = topGainers.map((h) => `${h.symbol} ${h.name}`);
   const lossNames = topLosers.map((h) => `${h.symbol} ${h.name}`);

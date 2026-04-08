@@ -428,21 +428,35 @@ pub fn get_performance_summary(
             max_drawdown: 0.0,
             volatility: 0.0,
             sharpe_ratio: 0.0,
+            return_series: vec![],
         });
     }
 
-    let start_value = daily[0].1;
+    // Use the portfolio value on the day *before* the range as the baseline,
+    // exactly the same as get_return_series() does for the cumulative-return
+    // chart.  Falling back to the first in-range value keeps the maths safe
+    // when there is no prior snapshot.
+    let base_value = fetch_previous_day_value(db, start_date, filter)?;
+    let start_value = base_value.unwrap_or(daily[0].1);
     let end_value = daily.last().unwrap().1;
 
-    // TWR using transaction-date sub-periods
-    let tx_dates = fetch_transaction_dates(db, start_date, end_date, filter)?;
-    let twr = compute_twr(&daily, &tx_dates, start_value);
-    let days = (end_date - start_date).num_days();
-    let annualised = annualise_return(twr, days);
     let total_pnl = end_value - start_value;
 
-    let inception_value = fetch_inception_value(db, filter)?;
-    let return_series = build_return_series(&daily, inception_value);
+    // Build the return series FIRST, then derive total_return from its last
+    // cumulative_return.  This guarantees the summary card value matches the
+    // cumulative-return chart exactly (avoids tiny floating-point divergence
+    // that can arise when two independent computations of the same formula
+    // are compiled into different machine-code sequences).
+    let return_series = build_return_series(&daily, base_value);
+    let total_return_pct = return_series
+        .last()
+        .map(|r| r.cumulative_return)
+        .unwrap_or(0.0);
+    let total_return = total_return_pct / 100.0; // decimal form for annualisation
+
+    let days = (end_date - start_date).num_days();
+    let annualised = annualise_return(total_return, days);
+
     let dd_analysis = calculate_max_drawdown(&return_series);
 
     // daily_return values from build_return_series are already in percentage
@@ -456,12 +470,13 @@ pub fn get_performance_summary(
         end_date: end_date.format("%Y-%m-%d").to_string(),
         start_value,
         end_value,
-        total_return: twr * 100.0,
+        total_return: total_return_pct,
         annualized_return: annualised * 100.0,
         total_pnl,
         max_drawdown: dd_analysis.max_drawdown,
         volatility: ann_vol * 100.0,
         sharpe_ratio: sharpe,
+        return_series,
     })
 }
 
@@ -542,14 +557,18 @@ pub fn get_risk_metrics(
         });
     }
 
-    let tx_dates = fetch_transaction_dates(db, start_date, end_date, filter)?;
-    let start_value = daily[0].1;
-    let twr = compute_twr(&daily, &tx_dates, start_value);
-    let days = (end_date - start_date).num_days();
-    let annualised = annualise_return(twr, days);
+    let base_value = fetch_previous_day_value(db, start_date, filter)?;
 
-    let inception_value = fetch_inception_value(db, filter)?;
-    let return_series = build_return_series(&daily, inception_value);
+    let return_series = build_return_series(&daily, base_value);
+    let total_return_pct = return_series
+        .last()
+        .map(|r| r.cumulative_return)
+        .unwrap_or(0.0);
+    let total_return = total_return_pct / 100.0;
+
+    let days = (end_date - start_date).num_days();
+    let annualised = annualise_return(total_return, days);
+
     // daily_return values from build_return_series are already in percentage
     // form (e.g. 1.5 means 1.5%), so convert to decimal for volatility/Sharpe.
     let daily_returns: Vec<f64> = return_series.iter().map(|r| r.daily_return / 100.0).collect();

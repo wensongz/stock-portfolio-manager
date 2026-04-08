@@ -3,7 +3,42 @@ use crate::models::{DailyHoldingSnapshot, DailyPortfolioValue};
 use crate::services::exchange_rate_service::ExchangeRateCache;
 use crate::services::quote_service::{fetch_quotes_batch_cached_with_providers, fetch_stock_history, QuoteCache};
 use crate::services::quote_provider_service;
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, NaiveDate, Timelike};
+
+/// Number of calendar days to look back before the first missing date when
+/// fetching historical prices.  This ensures that stocks suspended (停牌)
+/// around the start of the backfill window still have a prior trading-day
+/// close available for forward-fill.
+const SUSPENSION_LOOKBACK_DAYS: i64 = 30;
+
+/// Return the latest date for which all markets are guaranteed to have
+/// closing prices available.
+///
+/// Historical price APIs only return data **after** market close.  The
+/// furthest-ahead market is CN/HK (UTC+8) which closes at 15:00 local time.
+/// We use 16:00 UTC+8 as a safe buffer (allowing for settlement/delayed
+/// data publication).
+///
+/// * If the current time in UTC+8 is **before** 16:00 → yesterday's date
+///   (in UTC+8) is the latest date with guaranteed closing prices.
+/// * If it is 16:00 or later → today's date (in UTC+8) is safe.
+///
+/// For US markets (EST/EDT), the close is 16:00 US Eastern, which is
+/// already past midnight UTC+8 of the **next** day.  So the CN/HK gate
+/// is always the binding constraint: if CN/HK has closed, the US close
+/// for the previous calendar day has long since passed.
+pub fn last_closed_market_date() -> NaiveDate {
+    let utc_plus_8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    let now_cst = chrono::Utc::now().with_timezone(&utc_plus_8);
+    let today_cst = now_cst.date_naive();
+
+    // CN/HK markets close at 15:00 CST; add 1-hour buffer → 16:00.
+    if now_cst.hour() < 16 {
+        today_cst - chrono::Duration::days(1)
+    } else {
+        today_cst
+    }
+}
 
 /// Take a daily portfolio snapshot for the given date.
 /// This is idempotent: running it twice for the same date replaces the existing record.
@@ -194,13 +229,15 @@ pub async fn take_daily_snapshot(
     Ok(())
 }
 
-/// Check if today's snapshot has already been taken; if not, take it.
+/// Check if the latest market-closed day's snapshot has already been taken;
+/// if not, take it.  Uses `last_closed_market_date()` so we never attempt to
+/// snapshot a date whose closing prices are not yet available.
 pub async fn auto_snapshot_check(
     db: &Database,
     cache: &ExchangeRateCache,
     quote_cache: &QuoteCache,
 ) -> Result<(), String> {
-    let today = chrono::Utc::now().date_naive();
+    let today = last_closed_market_date();
     let today_str = today.format("%Y-%m-%d").to_string();
 
     let already_taken: bool = {
@@ -283,13 +320,11 @@ pub async fn backfill_snapshots(
     end_date: NaiveDate,
     force: bool,
 ) -> Result<i32, String> {
-    // Use UTC+8 (the furthest-ahead market timezone) to determine "today"
-    // so that CN/HK users don't see today's date clamped to yesterday
-    // before 08:00 local time.
-    let utc_plus_8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-    let today = chrono::Utc::now().with_timezone(&utc_plus_8).date_naive();
-    // Clamp end_date to today
-    let end_date = if end_date > today { today } else { end_date };
+    // Clamp end_date to the last date for which closing prices are
+    // available.  Before CN/HK market close (≈15:00 UTC+8), today's
+    // prices do not exist yet, so we use yesterday.
+    let latest_closed = last_closed_market_date();
+    let end_date = if end_date > latest_closed { latest_closed } else { end_date };
 
     if start_date > end_date {
         return Ok(0);
@@ -491,9 +526,17 @@ pub async fn backfill_snapshots(
     // Narrow the fetch window to cover only the missing dates.  When most
     // snapshots are already cached (e.g. a new day just started), this avoids
     // re-fetching weeks of historical prices that are already in the DB.
-    // No extra look-back is needed here: we only need prices within the
-    // missing date range; forward-fill handles holidays within this window.
-    let fetch_start = missing_dates.first().copied().unwrap_or(start_date);
+    //
+    // We add a 30-calendar-day look-back before the first missing date so
+    // that `forward_fill_price` can find the last trading-day close for
+    // stocks that were suspended (停牌) around the start of the window.
+    // Without this, a stock suspended on the first missing date would have
+    // no earlier price to forward-fill from.
+    let fetch_start = missing_dates
+        .first()
+        .copied()
+        .unwrap_or(start_date)
+        - chrono::Duration::days(SUSPENSION_LOOKBACK_DAYS);
     let fetch_end = missing_dates.last().copied().unwrap_or(end_date);
 
     // Deduplicate symbols – multiple accounts may hold the same stock;
@@ -636,6 +679,29 @@ pub async fn backfill_snapshots(
         let mut snapshots: Vec<DailyHoldingSnapshot> = Vec::new();
         let mut has_any_price = false;
 
+        // Pre-resolve the closing price for each unique symbol on this date.
+        // This avoids redundant forward_fill_price calls when the same stock
+        // is held in multiple accounts, and naturally deduplicates warnings.
+        let mut resolved_prices: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for (symbol, market) in &unique_symbols {
+            let price = history_map
+                .get(symbol)
+                .and_then(|date_map| {
+                    history_sorted
+                        .get(symbol)
+                        .and_then(|sorted| forward_fill_price(date_map, sorted, date))
+                })
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "Warning: no historical price for {} ({}) on {}",
+                        symbol, market, date_str
+                    );
+                    0.0
+                });
+            resolved_prices.insert(symbol.clone(), price);
+        }
+
         for holding in &holdings {
             // Compute adjusted shares for this holding on this date:
             // current shares + (total_unwind - running_unwind) for this key.
@@ -649,23 +715,11 @@ pub async fn backfill_snapshots(
             if adjusted_shares.abs() < 1e-9 {
                 continue;
             }
-            // Look up the closing price for this stock on this date.
-            // If the exact date is missing (market holiday), forward-fill
-            // from the most recent prior trading day's closing price.
-            let close_price = history_map
+            // Look up the pre-resolved closing price for this symbol.
+            let close_price = resolved_prices
                 .get(&holding.symbol)
-                .and_then(|date_map| {
-                    history_sorted
-                        .get(&holding.symbol)
-                        .and_then(|sorted| forward_fill_price(date_map, sorted, date))
-                })
-                .unwrap_or_else(|| {
-                    eprintln!(
-                        "Warning: no historical price for {} ({}) on {}",
-                        holding.symbol, holding.market, date_str
-                    );
-                    0.0
-                });
+                .copied()
+                .unwrap_or(0.0);
 
             if close_price > 0.0 {
                 has_any_price = true;

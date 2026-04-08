@@ -520,9 +520,17 @@ pub async fn backfill_snapshots(
     // Narrow the fetch window to cover only the missing dates.  When most
     // snapshots are already cached (e.g. a new day just started), this avoids
     // re-fetching weeks of historical prices that are already in the DB.
-    // No extra look-back is needed here: we only need prices within the
-    // missing date range; forward-fill handles holidays within this window.
-    let fetch_start = missing_dates.first().copied().unwrap_or(start_date);
+    //
+    // We add a 30-calendar-day look-back before the first missing date so
+    // that `forward_fill_price` can find the last trading-day close for
+    // stocks that were suspended (停牌) around the start of the window.
+    // Without this, a stock suspended on the first missing date would have
+    // no earlier price to forward-fill from.
+    let fetch_start = missing_dates
+        .first()
+        .copied()
+        .unwrap_or(start_date)
+        - chrono::Duration::days(30);
     let fetch_end = missing_dates.last().copied().unwrap_or(end_date);
 
     // Deduplicate symbols – multiple accounts may hold the same stock;
@@ -611,6 +619,12 @@ pub async fn backfill_snapshots(
     let mut running_unwind: std::collections::HashMap<(String, String), f64> =
         std::collections::HashMap::new();
 
+    // Track (symbol, date) pairs that already warned about missing prices
+    // so we only emit each warning once (a stock held in multiple accounts
+    // would otherwise produce duplicate warnings).
+    let mut warned_missing: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+
     // Collect all rows to persist, then batch-write inside a transaction.
     struct DateRow {
         date_str: String,
@@ -689,10 +703,13 @@ pub async fn backfill_snapshots(
                         .and_then(|sorted| forward_fill_price(date_map, sorted, date))
                 })
                 .unwrap_or_else(|| {
-                    eprintln!(
-                        "Warning: no historical price for {} ({}) on {}",
-                        holding.symbol, holding.market, date_str
-                    );
+                    let warn_key = (holding.symbol.clone(), date_str.clone());
+                    if warned_missing.insert(warn_key) {
+                        eprintln!(
+                            "Warning: no historical price for {} ({}) on {}",
+                            holding.symbol, holding.market, date_str
+                        );
+                    }
                     0.0
                 });
 

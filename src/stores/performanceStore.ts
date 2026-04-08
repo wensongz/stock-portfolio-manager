@@ -214,15 +214,15 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
         topGainers:
           topGainers.status === "fulfilled"
             ? topGainers.value
-                .filter((h) => h.return_rate >= 0)
-                .sort((a, b) => b.return_rate - a.return_rate)
+                .filter((h) => h.pnl >= 0)
+                .sort((a, b) => b.pnl - a.pnl)
                 .slice(0, 10)
             : [],
         topLosers:
           topLosers.status === "fulfilled"
             ? topLosers.value
-                .filter((h) => h.return_rate < 0)
-                .sort((a, b) => a.return_rate - b.return_rate)
+                .filter((h) => h.pnl < 0)
+                .sort((a, b) => a.pnl - b.pnl)
                 .slice(0, 10)
             : [],
         riskMetrics: riskMetrics.status === "fulfilled" ? riskMetrics.value : null,

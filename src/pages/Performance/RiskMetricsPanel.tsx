@@ -27,6 +27,7 @@ export default function RiskMetricsPanel({ metrics, loading }: Props) {
               value={metrics?.daily_volatility ?? 0}
               precision={3}
               suffix="%"
+              valueStyle={{ fontSize: 12 }}
             />
           </Card>
         </Col>
@@ -44,6 +45,7 @@ export default function RiskMetricsPanel({ metrics, loading }: Props) {
               value={metrics?.annualized_volatility ?? 0}
               precision={2}
               suffix="%"
+              valueStyle={{ fontSize: 12 }}
             />
           </Card>
         </Col>
@@ -61,6 +63,7 @@ export default function RiskMetricsPanel({ metrics, loading }: Props) {
               value={metrics?.sharpe_ratio ?? 0}
               precision={2}
               valueStyle={{
+                fontSize: 12,
                 color: (metrics?.sharpe_ratio ?? 0) >= 1 ? pnlColorDark(1) : (metrics?.sharpe_ratio ?? 0) >= 0 ? "#d46b08" : pnlColorDark(-1),
               }}
             />
@@ -73,7 +76,7 @@ export default function RiskMetricsPanel({ metrics, loading }: Props) {
               value={Math.abs(metrics?.max_drawdown ?? 0)}
               precision={2}
               suffix="%"
-              valueStyle={{ color: lossColor }}
+              valueStyle={{ fontSize: 12, color: lossColor }}
             />
           </Card>
         </Col>
@@ -91,6 +94,7 @@ export default function RiskMetricsPanel({ metrics, loading }: Props) {
               value={metrics?.calmar_ratio ?? 0}
               precision={2}
               valueStyle={{
+                fontSize: 12,
                 color: (metrics?.calmar_ratio ?? 0) >= 1 ? pnlColorDark(1) : "#d46b08",
               }}
             />
@@ -103,6 +107,7 @@ export default function RiskMetricsPanel({ metrics, loading }: Props) {
               value={metrics?.risk_free_rate ?? 4.5}
               precision={1}
               suffix="%"
+              valueStyle={{ fontSize: 12 }}
             />
           </Card>
         </Col>

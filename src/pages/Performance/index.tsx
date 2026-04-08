@@ -12,7 +12,7 @@ import AttributionChart from "./AttributionChart";
 import MonthlyReturnsTable from "./MonthlyReturnsTable";
 import RankingChart from "./RankingChart";
 import RiskMetricsPanel from "./RiskMetricsPanel";
-import type { Market } from "../../types";
+import type { Currency, Market } from "../../types";
 
 const { Title } = Typography;
 
@@ -42,8 +42,7 @@ export default function PerformancePage() {
     drawdown,
     attribution,
     monthlyReturns,
-    topGainers,
-    topLosers,
+    holdingPerformances,
     riskMetrics,
     loading,
     setTimeRange,
@@ -54,7 +53,7 @@ export default function PerformancePage() {
   } = usePerformanceStore();
 
   const { accounts, fetchAccounts } = useAccountStore();
-  const { baseCurrency } = useExchangeRateStore();
+  const { baseCurrency, convertWithCachedRates, rates, fetchRates } = useExchangeRateStore();
 
   // Derive currency from the selected account or market filter, falling
   // back to the dashboard's base currency setting (not hardcoded "USD").
@@ -69,8 +68,28 @@ export default function PerformancePage() {
     return baseCurrency;
   }, [selectedAccountId, selectedMarket, accounts, baseCurrency]);
 
+  // Convert each holding's PnL to the display currency, then rank.
+  const { topGainers, topLosers } = useMemo(() => {
+    const converted = holdingPerformances.map((h) => {
+      const fromCurrency = (MARKET_CURRENCY[h.market as Market] ?? "USD") as Currency;
+      const convertedPnl = convertWithCachedRates(h.pnl, fromCurrency, currency as Currency);
+      return { ...h, pnl: convertedPnl };
+    });
+    return {
+      topGainers: converted
+        .filter((h) => h.pnl >= 0)
+        .sort((a, b) => b.pnl - a.pnl)
+        .slice(0, 10),
+      topLosers: converted
+        .filter((h) => h.pnl < 0)
+        .sort((a, b) => a.pnl - b.pnl)
+        .slice(0, 10),
+    };
+  }, [holdingPerformances, convertWithCachedRates, currency]);
+
   useEffect(() => {
     fetchAccounts();
+    if (!rates) fetchRates();
     // fetchAll is stable from the Zustand store - use getState() to avoid stale closure
     usePerformanceStore.getState().fetchAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -213,7 +232,7 @@ export default function PerformancePage() {
 
       {/* Ranking */}
       <Card size="small">
-        <RankingChart gainers={topGainers} losers={topLosers} height={360} />
+        <RankingChart gainers={topGainers} losers={topLosers} height={360} currency={currency} />
       </Card>
     </div>
   );

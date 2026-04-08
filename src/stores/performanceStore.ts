@@ -81,8 +81,7 @@ interface PerformanceState {
   drawdown: DrawdownAnalysis | null;
   attribution: ReturnAttribution | null;
   monthlyReturns: MonthlyReturn[];
-  topGainers: HoldingPerformance[];
-  topLosers: HoldingPerformance[];
+  holdingPerformances: HoldingPerformance[];
   riskMetrics: RiskMetrics | null;
 
   loading: boolean;
@@ -110,8 +109,7 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
   drawdown: null,
   attribution: null,
   monthlyReturns: [],
-  topGainers: [],
-  topLosers: [],
+  holdingPerformances: [],
   riskMetrics: null,
 
   loading: false,
@@ -175,19 +173,12 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
         console.warn("backfill_snapshots error (non-fatal):", err);
       }
 
-      const [summary, drawdown, attribution, monthlyReturns, topGainers, topLosers, riskMetrics] =
+      const [summary, drawdown, attribution, monthlyReturns, holdingPerformances, riskMetrics] =
         await Promise.allSettled([
           invoke<PerformanceSummary>("get_performance_summary", { startDate, endDate, ...filterParams }),
           invoke<DrawdownAnalysis>("get_drawdown_analysis", { startDate, endDate, ...filterParams }),
           invoke<ReturnAttribution>("get_return_attribution", { startDate, endDate, ...filterParams }),
           invoke<MonthlyReturn[]>("get_monthly_returns", { startDate, endDate, ...filterParams }),
-          invoke<HoldingPerformance[]>("get_holding_performance_ranking", {
-            startDate,
-            endDate,
-            sortBy: "return_rate",
-            limit: 100,
-            ...filterParams,
-          }),
           invoke<HoldingPerformance[]>("get_holding_performance_ranking", {
             startDate,
             endDate,
@@ -211,20 +202,8 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
         drawdown: drawdown.status === "fulfilled" ? drawdown.value : null,
         attribution: attribution.status === "fulfilled" ? attribution.value : null,
         monthlyReturns: monthlyReturns.status === "fulfilled" ? monthlyReturns.value : [],
-        topGainers:
-          topGainers.status === "fulfilled"
-            ? topGainers.value
-                .filter((h) => h.return_rate >= 0)
-                .sort((a, b) => b.return_rate - a.return_rate)
-                .slice(0, 10)
-            : [],
-        topLosers:
-          topLosers.status === "fulfilled"
-            ? topLosers.value
-                .filter((h) => h.return_rate < 0)
-                .sort((a, b) => a.return_rate - b.return_rate)
-                .slice(0, 10)
-            : [],
+        holdingPerformances:
+          holdingPerformances.status === "fulfilled" ? holdingPerformances.value : [],
         riskMetrics: riskMetrics.status === "fulfilled" ? riskMetrics.value : null,
         loading: false,
       });

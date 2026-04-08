@@ -9,10 +9,14 @@ interface Props {
   gainers: HoldingPerformance[];
   losers: HoldingPerformance[];
   height?: number;
+  currency?: string;
 }
 
-export default function RankingChart({ gainers, losers, height = 340 }: Props) {
+const CURRENCY_SYMBOL: Record<string, string> = { USD: "$", CNY: "¥", HKD: "HK$" };
+
+export default function RankingChart({ gainers, losers, height = 340, currency = "USD" }: Props) {
   const { profitColor, lossColor } = usePnlColor();
+  const cSym = CURRENCY_SYMBOL[currency] ?? "";
   // ECharts horizontal bar charts render categories bottom-to-top,
   // so reverse the arrays to show highest pnl at the top.
   const topGainers = gainers.slice(0, 10).reverse();
@@ -23,9 +27,31 @@ export default function RankingChart({ gainers, losers, height = 340 }: Props) {
 
   const fmtPnl = (v: number) => {
     const abs = Math.abs(v);
-    if (abs >= 1e8) return `${(v / 1e8).toFixed(2)}亿`;
-    if (abs >= 1e4) return `${(v / 1e4).toFixed(2)}万`;
+    if (currency === "CNY") {
+      if (abs >= 1e8) return `${(v / 1e8).toFixed(2)}亿`;
+      if (abs >= 1e4) return `${(v / 1e4).toFixed(2)}万`;
+    } else {
+      if (abs >= 1e6) return `${(v / 1e6).toFixed(2)}M`;
+      if (abs >= 1e3) return `${(v / 1e3).toFixed(2)}K`;
+    }
     return v.toFixed(2);
+  };
+
+  // Format PnL with sign and currency symbol, e.g. "+¥1.25万" or "-$300.00"
+  const fmtSignedPnl = (v: number) => {
+    const sign = v >= 0 ? "+" : "-";
+    const abs = Math.abs(v);
+    let formatted: string;
+    if (currency === "CNY") {
+      if (abs >= 1e8) formatted = `${(abs / 1e8).toFixed(2)}亿`;
+      else if (abs >= 1e4) formatted = `${(abs / 1e4).toFixed(2)}万`;
+      else formatted = abs.toFixed(2);
+    } else {
+      if (abs >= 1e6) formatted = `${(abs / 1e6).toFixed(2)}M`;
+      else if (abs >= 1e3) formatted = `${(abs / 1e3).toFixed(2)}K`;
+      else formatted = abs.toFixed(2);
+    }
+    return `${sign}${cSym}${formatted}`;
   };
 
   const option = {
@@ -37,7 +63,7 @@ export default function RankingChart({ gainers, losers, height = 340 }: Props) {
         const list = p.seriesIndex === 0 ? topGainers : topLosers;
         const h = list[p.dataIndex];
         const rr = h?.return_rate ?? 0;
-        return `${p.name}<br/>盈亏: <b>${p.value >= 0 ? "+" : ""}${fmtPnl(p.value)}</b><br/>收益率: <b>${rr >= 0 ? "+" : ""}${rr.toFixed(2)}%</b>`;
+        return `${p.name}<br/>盈亏: <b>${fmtSignedPnl(p.value)}</b><br/>收益率: <b>${rr >= 0 ? "+" : ""}${rr.toFixed(2)}%</b>`;
       },
     },
     legend: { bottom: 0 },

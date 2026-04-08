@@ -63,7 +63,7 @@ export default function RankingChart({ gainers, losers, height = 340, currency =
         const list = p.seriesIndex === 0 ? topGainers : topLosers;
         const h = list[p.dataIndex];
         const rr = h?.return_rate ?? 0;
-        return `${p.name}<br/>盈亏: <b>${fmtSignedPnl(p.value)}</b><br/>收益率: <b>${rr >= 0 ? "+" : ""}${rr.toFixed(2)}%</b>`;
+        return `${p.name}<br/>盈亏(${currency}): <b>${fmtSignedPnl(p.value)}</b><br/>收益率: <b>${rr >= 0 ? "+" : ""}${rr.toFixed(2)}%</b>`;
       },
     },
     legend: { bottom: 0 },

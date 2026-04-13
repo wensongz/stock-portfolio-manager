@@ -170,7 +170,7 @@ fn build_macos_menu(app: &AppHandle, l: &Labels) -> tauri::Result<Menu<tauri::Wr
         true,
         &[
             &PredefinedMenuItem::minimize(app, Some(l.minimize))?,
-            &PredefinedMenuItem::zoom(app, Some(l.zoom))?,
+            &PredefinedMenuItem::maximize(app, Some(l.zoom))?,
             &PredefinedMenuItem::separator(app)?,
             &PredefinedMenuItem::close_window(app, Some(l.close_window))?,
         ],

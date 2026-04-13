@@ -28,6 +28,7 @@ thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "gzip", "cookies"] }
 csv = "1"
+sys-locale = "0.3"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

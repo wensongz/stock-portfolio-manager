@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod menu;
 mod models;
 mod services;
 
@@ -12,7 +13,13 @@ use tauri::{Emitter, Manager};
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .menu(|app| menu::build_menu(app))
         .setup(|app| {
+            // Register the Window submenu with NSApp so macOS injects
+            // "Bring All to Front", "Move to [Display]", and the window list.
+            #[cfg(target_os = "macos")]
+            menu::register_window_menu_for_nsapp();
+
             let app_dir = app
                 .path()
                 .app_data_dir()

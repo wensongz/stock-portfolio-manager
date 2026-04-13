@@ -28,6 +28,11 @@ thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "gzip", "cookies"] }
 csv = "1"
+sys-locale = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSMenu", "NSMenuItem"], default-features = false }
+objc2-foundation = { version = "0.3.2", features = ["NSString", "NSThread"], default-features = false }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

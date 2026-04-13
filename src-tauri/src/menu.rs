@@ -1,4 +1,6 @@
 use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
+#[cfg(target_os = "macos")]
+use tauri::Manager;
 use tauri::AppHandle;
 
 /// Returns `true` when the system locale starts with "zh" (any Chinese variant).
@@ -115,7 +117,7 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 
 #[cfg(target_os = "macos")]
 fn build_macos_menu(app: &AppHandle, l: &Labels) -> tauri::Result<Menu<tauri::Wry>> {
-    let app_name = "Stock Portfolio Manager";
+    let app_name = &app.package_info().name;
 
     // ── App menu ──────────────────────────────────────────────────────
     let about_text = format!("{} {}", l.about_prefix, app_name);

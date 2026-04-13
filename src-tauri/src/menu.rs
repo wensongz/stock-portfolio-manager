@@ -1,6 +1,4 @@
 use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
-#[cfg(target_os = "macos")]
-use tauri::menu::WINDOW_SUBMENU_ID;
 use tauri::AppHandle;
 
 /// Returns `true` when the system locale starts with "zh" (any Chinese variant).
@@ -163,13 +161,16 @@ fn build_macos_menu(app: &AppHandle, l: &Labels) -> tauri::Result<Menu<tauri::Wr
         &[&PredefinedMenuItem::fullscreen(app, Some(l.fullscreen))?],
     )?;
 
-    // ── Window menu (with multi-screen / display support) ─────────────
-    // Use WINDOW_SUBMENU_ID so Tauri's init_app_menu automatically calls
-    // set_as_windows_menu_for_nsapp(), which lets macOS inject "Bring All
-    // to Front", "Move to [Display]", and the window list.
-    let window_menu = Submenu::with_id_and_items(
+    // ── Window menu ─────────────────────────────────────────────────────
+    // NOTE: We intentionally use `Submenu::with_items` (no WINDOW_SUBMENU_ID)
+    // because Tauri's auto-registration via init_app_menu calls muda's
+    // set_as_windows_menu_for_nsapp(), which passes the WRONG NSMenu to
+    // NSApp.setWindowsMenu (muda bug: create_ns_item_for_submenu creates a
+    // new NSMenu for the menu bar, but set_as_windows_menu_for_nsapp uses the
+    // original one). Instead, we call register_window_menu_for_nsapp() from
+    // setup, which finds the *actual* NSMenu in the menu bar and registers it.
+    let window_menu = Submenu::with_items(
         app,
-        WINDOW_SUBMENU_ID,
         l.window,
         true,
         &[
@@ -230,4 +231,41 @@ fn build_non_macos_menu(app: &AppHandle, l: &Labels) -> tauri::Result<Menu<tauri
     )?;
 
     Menu::with_items(app, &[&file_menu, &edit_menu, &window_menu])
+}
+
+// ---------------------------------------------------------------------------
+// macOS: register the Window submenu with NSApp.setWindowsMenu
+// ---------------------------------------------------------------------------
+//
+// This works around a muda bug where `Submenu::set_as_windows_menu_for_nsapp`
+// calls `NSApp.setWindowsMenu` on the NSMenu created during `new_submenu()`,
+// but `create_ns_item_for_submenu` creates a *different* NSMenu when the
+// submenu is actually attached to the menu bar.  We bypass muda and find the
+// real NSMenu in the menu bar by title.
+//
+// Must be called **after** `init_for_nsapp()` has run (i.e. from `setup`).
+
+#[cfg(target_os = "macos")]
+pub fn register_window_menu_for_nsapp() {
+    use objc2_app_kit::NSApplication;
+    use objc2_foundation::{MainThreadMarker, NSString};
+
+    let l = get_labels();
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(main_menu) = app.mainMenu() else {
+        return;
+    };
+    let title = NSString::from_str(l.window);
+    let window_item = match unsafe { main_menu.itemWithTitle(&title) } {
+        Some(item) => item,
+        None => return,
+    };
+    let submenu = match unsafe { window_item.submenu() } {
+        Some(m) => m,
+        None => return,
+    };
+    unsafe { app.setWindowsMenu(Some(&submenu)) };
 }

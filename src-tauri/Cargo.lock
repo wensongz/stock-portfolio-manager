@@ -3479,6 +3479,8 @@ version = "0.6.0"
 dependencies = [
  "chrono",
  "csv",
+ "objc2-app-kit",
+ "objc2-foundation",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

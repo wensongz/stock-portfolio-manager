@@ -1,6 +1,6 @@
 use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
 #[cfg(target_os = "macos")]
-use tauri::Manager;
+use tauri::menu::WINDOW_SUBMENU_ID;
 use tauri::AppHandle;
 
 /// Returns `true` when the system locale starts with "zh" (any Chinese variant).
@@ -164,8 +164,12 @@ fn build_macos_menu(app: &AppHandle, l: &Labels) -> tauri::Result<Menu<tauri::Wr
     )?;
 
     // ── Window menu (with multi-screen / display support) ─────────────
-    let window_menu = Submenu::with_items(
+    // Use WINDOW_SUBMENU_ID so Tauri's init_app_menu automatically calls
+    // set_as_windows_menu_for_nsapp(), which lets macOS inject "Bring All
+    // to Front", "Move to [Display]", and the window list.
+    let window_menu = Submenu::with_id_and_items(
         app,
+        WINDOW_SUBMENU_ID,
         l.window,
         true,
         &[
@@ -175,10 +179,6 @@ fn build_macos_menu(app: &AppHandle, l: &Labels) -> tauri::Result<Menu<tauri::Wr
             &PredefinedMenuItem::close_window(app, Some(l.close_window))?,
         ],
     )?;
-
-    // Register this submenu as the NSApp windowsMenu so macOS will
-    // auto-add "Bring All to Front", "Move to [Display]", window list, etc.
-    window_menu.set_as_windows_menu_for_nsapp();
 
     Menu::with_items(app, &[&app_menu, &edit_menu, &view_menu, &window_menu])
 }

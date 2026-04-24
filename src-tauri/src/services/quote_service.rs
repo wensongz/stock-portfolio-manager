@@ -1247,6 +1247,7 @@ pub async fn fetch_quotes_batch_with_providers(
     let unique_symbols = deduplicate_symbols(symbols);
 
     let mut quotes = Vec::new();
+    let mut has_xueqiu_cookie_warning = false;
     for (symbol, market) in unique_symbols {
         // Cash symbols don't need an API call – return a synthetic quote.
         if is_cash_symbol(&symbol) {
@@ -1263,12 +1264,14 @@ pub async fn fetch_quotes_batch_with_providers(
             Ok(quote) => quotes.push(quote),
             Err(e) => {
                 if is_xueqiu_cookie_expired_error(&e) {
-                    *LAST_QUOTE_WARNING.lock().unwrap() =
-                        Some(XUEQIU_COOKIE_EXPIRED_HINT.to_string());
+                    has_xueqiu_cookie_warning = true;
                 }
                 eprintln!("Warning: failed to fetch quote for {} ({}): {}", symbol, market, e)
             }
         }
+    }
+    if has_xueqiu_cookie_warning {
+        *LAST_QUOTE_WARNING.lock().unwrap() = Some(XUEQIU_COOKIE_EXPIRED_HINT.to_string());
     }
     Ok(quotes)
 }

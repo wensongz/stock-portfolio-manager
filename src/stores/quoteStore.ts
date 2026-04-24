@@ -8,14 +8,6 @@ const DEFAULT_REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const STORAGE_KEY = "quote_refresh_interval_ms";
 
 const MAX_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
-const XUEQIU_COOKIE_WARNING = "雪球 Cookie 可能已经过期，请到设置页面更新雪球 Cookie。";
-
-function isXueqiuCookieExpiredError(err: string): boolean {
-  return (
-    err.includes("Xueqiu API error") &&
-    (err.includes("400016") || err.includes("重新登录帐号后再试") || err.includes("刷新页面或者重新登录帐号后再试"))
-  );
-}
 
 function loadRefreshInterval(): number {
   try {
@@ -78,13 +70,7 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
         set({ warning });
       }
     } catch (err) {
-      const error = String(err);
-      if (isXueqiuCookieExpiredError(error)) {
-        message.warning(XUEQIU_COOKIE_WARNING);
-        set({ error, warning: XUEQIU_COOKIE_WARNING, loading: false });
-        return;
-      }
-      set({ error, warning: null, loading: false });
+      set({ error: String(err), warning: null, loading: false });
     }
   },
 
@@ -111,13 +97,7 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
         set({ warning });
       }
     } catch (err) {
-      const error = String(err);
-      if (isXueqiuCookieExpiredError(error)) {
-        message.warning(XUEQIU_COOKIE_WARNING);
-        set({ error, warning: XUEQIU_COOKIE_WARNING, loading: false });
-        return;
-      }
-      set({ error, warning: null, loading: false });
+      set({ error: String(err), warning: null, loading: false });
     }
   },
 

@@ -745,6 +745,25 @@ static XUEQIU_USER_U: Mutex<Option<String>> = Mutex::new(None);
 /// explicitly we can attach it via the `Cookie` header on every API request,
 /// guaranteeing it reaches the API regardless of cookie-jar domain matching.
 static XUEQIU_AUTO_COOKIE: Mutex<Option<String>> = Mutex::new(None);
+static LAST_QUOTE_WARNING: Mutex<Option<String>> = Mutex::new(None);
+
+const XUEQIU_COOKIE_EXPIRED_HINT: &str =
+    "雪球 Cookie 可能已经过期，请到设置页面更新雪球 Cookie。";
+
+fn is_xueqiu_cookie_expired_error(err: &str) -> bool {
+    err.contains("Xueqiu API error")
+        && (err.contains("400016")
+            || err.contains("重新登录帐号后再试")
+            || err.contains("刷新页面或者重新登录帐号后再试"))
+}
+
+pub fn clear_quote_warning() {
+    *LAST_QUOTE_WARNING.lock().unwrap() = None;
+}
+
+pub fn take_quote_warning() -> Option<String> {
+    LAST_QUOTE_WARNING.lock().unwrap().take()
+}
 
 /// Set (or clear) the user-provided Xueqiu cookie string.
 pub fn set_xueqiu_user_cookie(cookie: Option<String>) {
@@ -1242,7 +1261,13 @@ pub async fn fetch_quotes_batch_with_providers(
         };
         match result {
             Ok(quote) => quotes.push(quote),
-            Err(e) => eprintln!("Warning: failed to fetch quote for {} ({}): {}", symbol, market, e),
+            Err(e) => {
+                if is_xueqiu_cookie_expired_error(&e) {
+                    *LAST_QUOTE_WARNING.lock().unwrap() =
+                        Some(XUEQIU_COOKIE_EXPIRED_HINT.to_string());
+                }
+                eprintln!("Warning: failed to fetch quote for {} ({}): {}", symbol, market, e)
+            }
         }
     }
     Ok(quotes)

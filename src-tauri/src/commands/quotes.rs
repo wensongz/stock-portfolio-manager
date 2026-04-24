@@ -12,6 +12,7 @@ pub async fn get_real_time_quotes(
     force_refresh: Option<bool>,
 ) -> Result<Vec<StockQuote>, String> {
     let config = quote_provider_service::get_quote_provider_config(&db)?;
+    crate::services::quote_service::clear_quote_warning();
     let quotes = fetch_quotes_batch_cached_with_providers(&quote_cache, symbols, &config.us_provider, &config.hk_provider, &config.cn_provider, force_refresh.unwrap_or(false)).await?;
     // Persist freshly fetched quotes to the database
     if let Err(e) = save_quotes_to_db(&db, &quotes) {
@@ -27,6 +28,7 @@ pub async fn get_holding_quotes(
     refresh_symbols: Option<Vec<(String, String)>>,
 ) -> Result<Vec<HoldingWithQuote>, String> {
     let config = quote_provider_service::get_quote_provider_config(&db)?;
+    crate::services::quote_service::clear_quote_warning();
     // Load holdings from DB (synchronous)
     let holdings = {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
@@ -141,6 +143,11 @@ pub async fn get_holding_quotes(
         .collect();
 
     Ok(result)
+}
+
+#[tauri::command]
+pub fn take_quote_warning() -> Option<String> {
+    crate::services::quote_service::take_quote_warning()
 }
 
 #[tauri::command(rename_all = "camelCase")]

@@ -1,12 +1,21 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { message } from "antd";
 import type { HoldingWithQuote, StockQuote } from "../types";
 
 const DEFAULT_REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const STORAGE_KEY = "quote_refresh_interval_ms";
 
 const MAX_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const XUEQIU_COOKIE_WARNING = "雪球 Cookie 可能已经过期，请到设置页面更新雪球 Cookie。";
+
+function isXueqiuCookieExpiredError(err: string): boolean {
+  return (
+    err.includes("Xueqiu API error") &&
+    (err.includes("400016") || err.includes("重新登录帐号后再试") || err.includes("刷新页面或者重新登录帐号后再试"))
+  );
+}
 
 function loadRefreshInterval(): number {
   try {
@@ -26,6 +35,7 @@ interface QuoteState {
   quotes: Record<string, StockQuote>;
   loading: boolean;
   error: string | null;
+  warning: string | null;
   lastUpdatedAt: string | null;
   refreshIntervalMs: number;
   fetchHoldingQuotes: (refreshSymbols?: [string, string][]) => Promise<void>;
@@ -39,6 +49,7 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
   quotes: {},
   loading: false,
   error: null,
+  warning: null,
   lastUpdatedAt: null,
   refreshIntervalMs: loadRefreshInterval(),
 
@@ -58,10 +69,22 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
         holdingQuotes,
         quotes,
         loading: false,
+        warning: null,
         lastUpdatedAt: new Date().toISOString(),
       });
+      const warning = await invoke<string | null>("take_quote_warning");
+      if (warning) {
+        message.warning(warning);
+        set({ warning });
+      }
     } catch (err) {
-      set({ error: String(err), loading: false });
+      const error = String(err);
+      if (isXueqiuCookieExpiredError(error)) {
+        message.warning(XUEQIU_COOKIE_WARNING);
+        set({ error, warning: XUEQIU_COOKIE_WARNING, loading: false });
+        return;
+      }
+      set({ error, warning: null, loading: false });
     }
   },
 
@@ -79,10 +102,22 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
       set({
         quotes,
         loading: false,
+        warning: null,
         lastUpdatedAt: new Date().toISOString(),
       });
+      const warning = await invoke<string | null>("take_quote_warning");
+      if (warning) {
+        message.warning(warning);
+        set({ warning });
+      }
     } catch (err) {
-      set({ error: String(err), loading: false });
+      const error = String(err);
+      if (isXueqiuCookieExpiredError(error)) {
+        message.warning(XUEQIU_COOKIE_WARNING);
+        set({ error, warning: XUEQIU_COOKIE_WARNING, loading: false });
+        return;
+      }
+      set({ error, warning: null, loading: false });
     }
   },
 

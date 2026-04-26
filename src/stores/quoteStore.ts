@@ -52,7 +52,13 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
   refreshIntervalMs: loadRefreshInterval(),
 
   fetchHoldingQuotes: async (refreshSymbols?: [string, string][]) => {
-    set({ loading: true, error: null });
+    // A "refresh fetch" is one that hits the upstream API: either a full
+    // refresh (no refreshSymbols arg) or a targeted refresh (non-empty list).
+    // A cache-only call passes an empty array and does NOT touch the API.
+    const isRefreshFetch = refreshSymbols === undefined || refreshSymbols.length > 0;
+    // Clear any stale warning at the start of a refresh so the UI doesn't
+    // keep showing the previous error while the new fetch is in-flight.
+    set({ loading: true, error: null, ...(isRefreshFetch ? { quoteWarning: null } : {}) });
     try {
       const holdingQuotes = await invoke<HoldingWithQuote[]>("get_holding_quotes", {
         ...(refreshSymbols !== undefined ? { refreshSymbols } : {}),
@@ -63,9 +69,10 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
           quotes[h.symbol] = h.quote;
         }
       });
-      // Immediately read any Xueqiu warning set by the backend during this
-      // fetch. This is the most reliable path: the warning is checked right
-      // after the invoke that may have triggered it, with no timing ambiguity.
+      // Read any Xueqiu warning produced during this fetch. This is the most
+      // reliable delivery path for user-triggered refreshes: the warning is
+      // checked immediately after the invoke that may have produced it, with
+      // no timing ambiguity and no dependency on startup-only Tauri events.
       const qw = await invoke<string | null>("take_quote_warning").catch(() => null);
       set({
         holdingQuotes,
@@ -73,7 +80,11 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
         loading: false,
         warning: null,
         lastUpdatedAt: new Date().toISOString(),
-        ...(qw ? { quoteWarning: qw } : {}),
+        // For refresh fetches: always update quoteWarning (null = no issue,
+        // which clears a previously-shown warning). For cache-only fetches:
+        // only write if there IS a new warning so we don't accidentally clear
+        // a warning that was already being displayed.
+        ...(isRefreshFetch ? { quoteWarning: qw } : qw ? { quoteWarning: qw } : {}),
       });
     } catch (err) {
       set({ error: String(err), warning: null, loading: false });
@@ -81,7 +92,7 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
   },
 
   fetchQuotes: async (symbols: [string, string][], forceRefresh?: boolean) => {
-    set({ loading: true, error: null });
+    set({ loading: true, error: null, ...(forceRefresh ? { quoteWarning: null } : {}) });
     try {
       const quoteList = await invoke<StockQuote[]>("get_real_time_quotes", {
         symbols,
@@ -91,14 +102,13 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
       quoteList.forEach((q) => {
         quotes[q.symbol] = q;
       });
-      // Same immediate warning check as in fetchHoldingQuotes.
       const qw = await invoke<string | null>("take_quote_warning").catch(() => null);
       set({
         quotes,
         loading: false,
         warning: null,
         lastUpdatedAt: new Date().toISOString(),
-        ...(qw ? { quoteWarning: qw } : {}),
+        ...(forceRefresh ? { quoteWarning: qw } : qw ? { quoteWarning: qw } : {}),
       });
     } catch (err) {
       set({ error: String(err), warning: null, loading: false });

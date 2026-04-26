@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useEffect } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -22,30 +22,23 @@ import ReviewPage from "./pages/Review";
 import SettingsPage from "./pages/Settings";
 
 function App() {
-  // quoteWarning lives in the global quoteStore so that any fetch path
-  // (Dashboard, Holdings, Statistics, manual refresh…) can update it.
+  // quoteWarning in the global store is the single source of truth for the
+  // Xueqiu warning banner. All delivery paths write to it; the JSX below
+  // reads from it. This avoids a split between local pendingWarning state
+  // and the store copy that caused warnings set by fetchHoldingQuotes /
+  // fetchQuotes to never reach the Alert.
+  const quoteWarning = useQuoteStore((s) => s.quoteWarning);
   const setQuoteWarning = useQuoteStore((s) => s.setQuoteWarning);
-
-  // pendingWarning drives the JSX-based Alert banner below.
-  // Async callbacks (Tauri events, setInterval) set this via setPendingWarning.
-  // Rendering the Alert in JSX is the most reliable approach in Tauri's webview
-  // because it avoids antd notification portals, which can silently fail to
-  // mount at startup before the portal root is ready.
-  const [pendingWarning, setPendingWarning] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const unsubs: Array<() => void> = [];
-    const show = (text: string) => {
-      setPendingWarning(text);
-      setQuoteWarning(text);
-    };
 
     // Path 1 (fast): the background startup refresh emits `quote-warning`
     // carrying the warning text directly in the payload via peek (so
     // LAST_QUOTE_WARNING is NOT consumed and remains available below).
     listen<string>("quote-warning", (event) => {
-      if (event.payload) show(event.payload);
+      if (event.payload) setQuoteWarning(event.payload);
     }).then((fn) => {
       if (cancelled) fn();
       else unsubs.push(fn);
@@ -57,7 +50,7 @@ function App() {
     // every page, unlike startAutoRefresh which only runs on the Holdings page.
     listen<unknown>("quotes-refreshed", () => {
       invoke<string | null>("take_quote_warning")
-        .then((w) => { if (w) show(w); })
+        .then((w) => { if (w) setQuoteWarning(w); })
         .catch(() => {});
     }).then((fn) => {
       if (cancelled) fn();
@@ -76,7 +69,7 @@ function App() {
       }
       pollCount++;
       invoke<string | null>("take_quote_warning")
-        .then((w) => { if (w) show(w); })
+        .then((w) => { if (w) setQuoteWarning(w); })
         .catch(() => {});
     }, 2000);
 
@@ -87,17 +80,13 @@ function App() {
     };
   }, [setQuoteWarning]);
 
-  const handleWarningClose = () => {
-    setPendingWarning(null);
-    setQuoteWarning(null);
-  };
-
   return (
     <>
       {/* Xueqiu warning banner — rendered in the React tree (not a portal) so
           it is guaranteed to display in Tauri's webview regardless of startup
-          timing or portal availability. */}
-      {pendingWarning && (
+          timing. Driven by quoteStore.quoteWarning, the single source of truth
+          written by fetchHoldingQuotes, fetchQuotes, and the event/poll paths. */}
+      {quoteWarning && (
         <div style={{
           position: "fixed",
           top: 16,
@@ -111,10 +100,10 @@ function App() {
           <Alert
             type="warning"
             message="行情获取提示"
-            description={pendingWarning}
+            description={quoteWarning}
             showIcon
             closable
-            onClose={handleWarningClose}
+            onClose={() => setQuoteWarning(null)}
           />
         </div>
       )}

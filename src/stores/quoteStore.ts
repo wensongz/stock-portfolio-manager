@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { message } from "antd";
+import { notification } from "antd";
 import type { HoldingWithQuote, StockQuote } from "../types";
 
 const DEFAULT_REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -66,7 +66,13 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
       });
       const warning = await invoke<string | null>("take_quote_warning");
       if (warning) {
-        message.warning(warning);
+        notification.warning({
+          key: "quote-warning",
+          message: "行情获取提示",
+          description: warning,
+          duration: 0,
+          placement: "topRight",
+        });
         set({ warning });
       }
     } catch (err) {
@@ -93,7 +99,13 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
       });
       const warning = await invoke<string | null>("take_quote_warning");
       if (warning) {
-        message.warning(warning);
+        notification.warning({
+          key: "quote-warning",
+          message: "行情获取提示",
+          description: warning,
+          duration: 0,
+          placement: "topRight",
+        });
         set({ warning });
       }
     } catch (err) {

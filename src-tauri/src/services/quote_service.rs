@@ -773,6 +773,12 @@ pub fn take_quote_warning() -> Option<String> {
     LAST_QUOTE_WARNING.lock().unwrap().take()
 }
 
+/// Return the current warning without consuming it, so the value remains
+/// available for the fallback `take_quote_warning` invocation from the frontend.
+pub fn peek_quote_warning() -> Option<String> {
+    LAST_QUOTE_WARNING.lock().unwrap().clone()
+}
+
 /// Set (or clear) the user-provided Xueqiu cookie string.
 pub fn set_xueqiu_user_cookie(cookie: Option<String>) {
     let cookie = cookie

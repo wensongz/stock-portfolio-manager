@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { message } from "antd";
+import { notification } from "antd";
 import MainLayout from "./components/Layout/MainLayout";
 import DashboardPage from "./pages/Dashboard";
 import AccountsPage from "./pages/Accounts";
@@ -20,6 +20,18 @@ import AlertsPage from "./pages/Alerts";
 import ReviewPage from "./pages/Review";
 import SettingsPage from "./pages/Settings";
 
+const QUOTE_WARNING_NOTIFICATION_KEY = "quote-warning";
+
+function showQuoteWarning(warning: string) {
+  notification.warning({
+    key: QUOTE_WARNING_NOTIFICATION_KEY,
+    message: "行情获取提示",
+    description: warning,
+    duration: 0,
+    placement: "topRight",
+  });
+}
+
 function App() {
   useEffect(() => {
     let unlisten: (() => void) | null = null;
@@ -30,7 +42,7 @@ function App() {
       try {
         const warning = await invoke<string | null>("take_quote_warning");
         if (warning) {
-          message.warning(warning);
+          showQuoteWarning(warning);
         }
       } catch {
         // ignore
@@ -52,7 +64,10 @@ function App() {
     listen<string>("quote-warning", (event) => {
       const warning = event.payload;
       if (warning) {
-        message.warning(warning);
+        showQuoteWarning(warning);
+        // Consume the warning so the fallback pullQuoteWarning() on
+        // quotes-refreshed does not show a duplicate notification.
+        invoke("take_quote_warning").catch(() => {});
       }
     }).then((fn) => {
       if (cancelled) {

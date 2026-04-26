@@ -1,9 +1,8 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useState } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { App as AntdApp } from "antd";
-import type { NotificationInstance } from "antd/es/notification/interface";
+import { Alert } from "antd";
 import MainLayout from "./components/Layout/MainLayout";
 import DashboardPage from "./pages/Dashboard";
 import AccountsPage from "./pages/Accounts";
@@ -21,48 +20,33 @@ import AlertsPage from "./pages/Alerts";
 import ReviewPage from "./pages/Review";
 import SettingsPage from "./pages/Settings";
 
-const QUOTE_WARNING_KEY = "quote-warning";
-
-// Polls `take_quote_warning` once and shows a notification if a warning is set.
-// Uses the hook-based notification API passed in via ref to ensure it runs
-// within React's component context (reliable in Tauri's WebKit webview).
-async function pollWarning(notifRef: React.RefObject<NotificationInstance | null>) {
-  try {
-    const warning = await invoke<string | null>("take_quote_warning");
-    if (warning && notifRef.current) {
-      notifRef.current.warning({
-        key: QUOTE_WARNING_KEY,
-        message: "行情获取提示",
-        description: warning,
-        duration: 0,
-        placement: "topRight",
-      });
-    }
-  } catch {
-    // ignore
-  }
-}
-
 function App() {
-  // Use the hook-based notification API from antd's App context.
-  // This is more reliable than the static notification import in Tauri's WebKit
-  // because it is backed by a React portal already mounted in the component tree.
-  const { notification } = AntdApp.useApp();
-  const notifRef = useRef<NotificationInstance | null>(null);
-  notifRef.current = notification;
+  // quoteWarning drives a React-rendered Alert banner.
+  // Using React state (instead of calling notification APIs from async callbacks)
+  // guarantees the warning is visible in Tauri's WebKit webview: the Alert is
+  // part of the normal React component tree and always renders when state is set.
+  const [quoteWarning, setQuoteWarning] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    let unlisten: (() => void) | null = null;
-    let unlistenWarning: (() => void) | null = null;
+    const unsubs: Array<() => void> = [];
 
-    // Poll once immediately (catches any warning set before the event listeners
-    // are registered, e.g. a very fast backend startup).
-    pollWarning(notifRef);
+    // Pull any pending warning from the Rust backend and set React state.
+    const checkWarning = async () => {
+      try {
+        const warning = await invoke<string | null>("take_quote_warning");
+        if (warning) setQuoteWarning(warning);
+      } catch {
+        // ignore
+      }
+    };
 
-    // Poll every 2 s for the first 30 s after startup as a guaranteed fallback.
+    // Immediate check (catches warnings set before listeners are registered).
+    checkWarning();
+
+    // Polling fallback: check every 2 s for the first 30 s after startup.
     // The background refresh task runs ~2 s after launch, so this catches it
-    // even if the Tauri event delivery is delayed or missed.
+    // even if the Tauri event is delivered before the listener is registered.
     let pollCount = 0;
     const MAX_POLLS = 15; // 15 × 2 s = 30 s
     const pollInterval = setInterval(() => {
@@ -71,47 +55,60 @@ function App() {
         return;
       }
       pollCount++;
-      pollWarning(notifRef);
+      checkWarning();
     }, 2000);
 
-    // Primary path: Tauri emits `quote-warning` directly when the background
-    // refresh encounters a Xueqiu error.
+    // Primary path: Tauri emits `quote-warning` when the background refresh
+    // encounters a Xueqiu error. Consume the stored warning so the polling
+    // fallback does not duplicate it.
     listen<string>("quote-warning", (event) => {
-      if (event.payload && notifRef.current) {
-        notifRef.current.warning({
-          key: QUOTE_WARNING_KEY,
-          message: "行情获取提示",
-          description: event.payload,
-          duration: 0,
-          placement: "topRight",
-        });
-        // Consume the stored warning so the polling fallback doesn't duplicate it.
+      if (event.payload) {
+        setQuoteWarning(event.payload);
         invoke("take_quote_warning").catch(() => {});
       }
     }).then((fn) => {
       if (cancelled) fn();
-      else unlistenWarning = fn;
+      else unsubs.push(fn);
     });
 
-    // Secondary path: after the backend signals it has finished refreshing,
-    // pull any remaining (un-consumed) warning.
-    listen("quotes-refreshed", () => {
-      pollWarning(notifRef);
-    }).then((fn) => {
+    // Secondary path: after the backend signals quotes are refreshed, poll
+    // for any remaining (un-consumed) warning.
+    listen("quotes-refreshed", () => checkWarning()).then((fn) => {
       if (cancelled) fn();
-      else unlisten = fn;
+      else unsubs.push(fn);
     });
 
     return () => {
       cancelled = true;
       clearInterval(pollInterval);
-      if (unlisten) unlisten();
-      if (unlistenWarning) unlistenWarning();
+      unsubs.forEach((fn) => fn());
     };
   }, []);
 
   return (
     <MainLayout>
+      {quoteWarning && (
+        <div
+          style={{
+            position: "fixed",
+            top: 24,
+            right: 24,
+            zIndex: 9999,
+            maxWidth: 400,
+            // 224 px = sidebar width (200 px) + border/padding; 48 px = left+right margin
+            width: "calc(100vw - 224px - 48px)",
+          }}
+        >
+          <Alert
+            message="行情获取提示"
+            description={quoteWarning}
+            type="warning"
+            closable
+            showIcon
+            onClose={() => setQuoteWarning(null)}
+          />
+        </div>
+      )}
       <Routes>
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
         <Route path="/dashboard" element={<DashboardPage />} />

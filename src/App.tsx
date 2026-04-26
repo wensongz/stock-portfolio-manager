@@ -57,25 +57,15 @@ function App() {
       else unsubs.push(fn);
     });
 
-    // Path 3 (safety net): poll take_quote_warning every 2 s for up to 10 s.
-    // Catches warnings set by any fetch that ran before events could fire,
-    // e.g. the Dashboard's own initial cache-miss fetch at startup.
-    const MAX_POLLS = 5; // 5 × 2 s = 10 s
-    let pollCount = 0;
-    const pollId = setInterval(() => {
-      if (cancelled || pollCount >= MAX_POLLS) {
-        clearInterval(pollId);
-        return;
-      }
-      pollCount++;
-      invoke<string | null>("take_quote_warning")
-        .then((w) => { if (w) setQuoteWarning(w); })
-        .catch(() => {});
-    }, 2000);
+    // NOTE: A periodic polling fallback was deliberately removed here.
+    // It raced with fetchHoldingQuotes's own take_quote_warning() call:
+    // the poll could consume the warning first, then fetchHoldingQuotes
+    // would receive null and write quoteWarning: null — clearing the alert.
+    // PATH 1 (quote-warning event) and PATH 2 (quotes-refreshed) are
+    // sufficient for startup; manual refreshes use their own direct call.
 
     return () => {
       cancelled = true;
-      clearInterval(pollId);
       unsubs.forEach((fn) => fn());
     };
   }, [setQuoteWarning]);

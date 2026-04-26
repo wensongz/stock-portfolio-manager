@@ -27,10 +27,16 @@ interface QuoteState {
   loading: boolean;
   error: string | null;
   warning: string | null;
+  // quoteWarning holds a Xueqiu error message to be shown in the UI.
+  // It is set immediately after every quote fetch that touches the upstream
+  // API (by calling the take_quote_warning Tauri command) and via the
+  // quote-warning Tauri event emitted by the backend's background refresh task.
+  quoteWarning: string | null;
   lastUpdatedAt: string | null;
   refreshIntervalMs: number;
   fetchHoldingQuotes: (refreshSymbols?: [string, string][]) => Promise<void>;
   fetchQuotes: (symbols: [string, string][], forceRefresh?: boolean) => Promise<void>;
+  setQuoteWarning: (w: string | null) => void;
   setRefreshInterval: (ms: number) => void;
   startAutoRefresh: () => () => void;
 }
@@ -41,6 +47,7 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
   loading: false,
   error: null,
   warning: null,
+  quoteWarning: null,
   lastUpdatedAt: null,
   refreshIntervalMs: loadRefreshInterval(),
 
@@ -56,12 +63,17 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
           quotes[h.symbol] = h.quote;
         }
       });
+      // Immediately read any Xueqiu warning set by the backend during this
+      // fetch. This is the most reliable path: the warning is checked right
+      // after the invoke that may have triggered it, with no timing ambiguity.
+      const qw = await invoke<string | null>("take_quote_warning").catch(() => null);
       set({
         holdingQuotes,
         quotes,
         loading: false,
         warning: null,
         lastUpdatedAt: new Date().toISOString(),
+        ...(qw ? { quoteWarning: qw } : {}),
       });
     } catch (err) {
       set({ error: String(err), warning: null, loading: false });
@@ -79,16 +91,21 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
       quoteList.forEach((q) => {
         quotes[q.symbol] = q;
       });
+      // Same immediate warning check as in fetchHoldingQuotes.
+      const qw = await invoke<string | null>("take_quote_warning").catch(() => null);
       set({
         quotes,
         loading: false,
         warning: null,
         lastUpdatedAt: new Date().toISOString(),
+        ...(qw ? { quoteWarning: qw } : {}),
       });
     } catch (err) {
       set({ error: String(err), warning: null, loading: false });
     }
   },
+
+  setQuoteWarning: (w) => set({ quoteWarning: w }),
 
   setRefreshInterval: (ms: number) => {
     try {

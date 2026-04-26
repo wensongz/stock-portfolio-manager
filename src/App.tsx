@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Alert } from "antd";
+import { useQuoteStore } from "./stores/quoteStore";
 import MainLayout from "./components/Layout/MainLayout";
 import DashboardPage from "./pages/Dashboard";
 import AccountsPage from "./pages/Accounts";
@@ -21,49 +22,23 @@ import ReviewPage from "./pages/Review";
 import SettingsPage from "./pages/Settings";
 
 function App() {
-  // quoteWarning drives a React-rendered Alert banner.
-  // Using React state (instead of calling notification APIs from async callbacks)
-  // guarantees the warning is visible in Tauri's WebKit webview: the Alert is
-  // part of the normal React component tree and always renders when state is set.
-  const [quoteWarning, setQuoteWarning] = useState<string | null>(null);
+  // quoteWarning lives in the global quoteStore so that any fetch path
+  // (Dashboard, Holdings, Statistics, manual refresh…) can update it.
+  const quoteWarning = useQuoteStore((s) => s.quoteWarning);
+  const setQuoteWarning = useQuoteStore((s) => s.setQuoteWarning);
 
   useEffect(() => {
     let cancelled = false;
     const unsubs: Array<() => void> = [];
 
-    // Pull any pending warning from the Rust backend and set React state.
-    const checkWarning = async () => {
-      try {
-        const warning = await invoke<string | null>("take_quote_warning");
-        if (warning) setQuoteWarning(warning);
-      } catch {
-        // ignore
-      }
-    };
-
-    // Immediate check (catches warnings set before listeners are registered).
-    checkWarning();
-
-    // Polling fallback: check every 2 s for the first 30 s after startup.
-    // The background refresh task runs ~2 s after launch, so this catches it
-    // even if the Tauri event is delivered before the listener is registered.
-    let pollCount = 0;
-    const MAX_POLLS = 15; // 15 × 2 s = 30 s
-    const pollInterval = setInterval(() => {
-      if (cancelled || pollCount >= MAX_POLLS) {
-        clearInterval(pollInterval);
-        return;
-      }
-      pollCount++;
-      checkWarning();
-    }, 2000);
-
-    // Primary path: Tauri emits `quote-warning` when the background refresh
-    // encounters a Xueqiu error. Consume the stored warning so the polling
-    // fallback does not duplicate it.
+    // Primary path for the BACKGROUND startup refresh: Tauri emits
+    // `quote-warning` with the warning text directly in the payload.
+    // Writing straight to the store avoids any timing issues.
     listen<string>("quote-warning", (event) => {
       if (event.payload) {
-        setQuoteWarning(event.payload);
+        useQuoteStore.getState().setQuoteWarning(event.payload);
+        // Consume the stored copy so subsequent take_quote_warning calls
+        // (from fetchHoldingQuotes) don't show a stale duplicate.
         invoke("take_quote_warning").catch(() => {});
       }
     }).then((fn) => {
@@ -71,16 +46,8 @@ function App() {
       else unsubs.push(fn);
     });
 
-    // Secondary path: after the backend signals quotes are refreshed, poll
-    // for any remaining (un-consumed) warning.
-    listen("quotes-refreshed", () => checkWarning()).then((fn) => {
-      if (cancelled) fn();
-      else unsubs.push(fn);
-    });
-
     return () => {
       cancelled = true;
-      clearInterval(pollInterval);
       unsubs.forEach((fn) => fn());
     };
   }, []);

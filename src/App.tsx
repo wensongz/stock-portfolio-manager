@@ -1,8 +1,8 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Alert } from "antd";
+import { App as AntdApp } from "antd";
 import { useQuoteStore } from "./stores/quoteStore";
 import MainLayout from "./components/Layout/MainLayout";
 import DashboardPage from "./pages/Dashboard";
@@ -24,42 +24,63 @@ import SettingsPage from "./pages/Settings";
 function App() {
   // quoteWarning lives in the global quoteStore so that any fetch path
   // (Dashboard, Holdings, Statistics, manual refresh…) can update it.
-  const quoteWarning = useQuoteStore((s) => s.quoteWarning);
   const setQuoteWarning = useQuoteStore((s) => s.setQuoteWarning);
+
+  // Use antd's imperative notification API (available because this component
+  // is rendered inside <AntdApp> in main.tsx). Storing in a ref makes it
+  // accessible from async event callbacks without stale-closure issues.
+  const { notification } = AntdApp.useApp();
+  const notifRef = useRef(notification);
+  notifRef.current = notification;
+
+  // Show the warning as an antd notification popup. Using the imperative API
+  // avoids depending on React re-rendering timing, which was the root cause of
+  // the warning not appearing on the Dashboard at startup. The `key` ensures
+  // only one notification is shown at a time even if called from multiple paths.
+  const showQuoteWarning = useRef((text: string) => {
+    setQuoteWarning(text); // keep store in sync for any component that reads it
+    notifRef.current.warning({
+      key: "quote-warning",
+      message: "行情获取提示",
+      description: text,
+      duration: 0,
+      onClose: () => setQuoteWarning(null),
+    });
+  });
 
   useEffect(() => {
     let cancelled = false;
     const unsubs: Array<() => void> = [];
+    const show = showQuoteWarning.current;
 
     // Path 1 (fast): the background startup refresh emits `quote-warning`
     // carrying the warning text directly in the payload via peek (so
     // LAST_QUOTE_WARNING is NOT consumed and remains available below).
     listen<string>("quote-warning", (event) => {
-      if (event.payload) setQuoteWarning(event.payload);
+      if (event.payload) show(event.payload);
     }).then((fn) => {
       if (cancelled) fn();
       else unsubs.push(fn);
     });
 
     // Path 2 (reliable, page-agnostic): the background task emits
-    // `quotes-refreshed` AFTER setting and peeking the warning. By the time
-    // this event fires LAST_QUOTE_WARNING is guaranteed to hold any Xueqiu
-    // error. Calling take_quote_warning here consumes it — this listener is
-    // active on every page, unlike startAutoRefresh which only runs on the
-    // Holdings page. This is the most reliable delivery path.
+    // `quotes-refreshed` AFTER peeking the warning. LAST_QUOTE_WARNING is
+    // still set at this point; consume it here. This listener is active on
+    // every page, unlike startAutoRefresh which only runs on the Holdings page.
     listen<unknown>("quotes-refreshed", () => {
       invoke<string | null>("take_quote_warning")
-        .then((w) => { if (w) setQuoteWarning(w); })
+        .then((w) => { if (w) show(w); })
         .catch(() => {});
     }).then((fn) => {
       if (cancelled) fn();
       else unsubs.push(fn);
     });
 
-    // Path 3 (safety net): poll take_quote_warning every 2 s for up to 30 s.
-    // Catches warnings if both events above were missed due to listener
-    // registration timing on slow machines.
-    const MAX_POLLS = 15; // 15 × 2 s = 30 s
+    // Path 3 (safety net): poll take_quote_warning every 2 s for up to 10 s.
+    // Catches warnings if both events above were missed (e.g. listener
+    // registration timing on slow machines, or the warning was set by the
+    // Dashboard's own initial cache-miss fetch before any event fired).
+    const MAX_POLLS = 5; // 5 × 2 s = 10 s
     let pollCount = 0;
     const pollId = setInterval(() => {
       if (cancelled || pollCount >= MAX_POLLS) {
@@ -68,7 +89,7 @@ function App() {
       }
       pollCount++;
       invoke<string | null>("take_quote_warning")
-        .then((w) => { if (w) setQuoteWarning(w); })
+        .then((w) => { if (w) show(w); })
         .catch(() => {});
     }, 2000);
 
@@ -81,28 +102,6 @@ function App() {
 
   return (
     <MainLayout>
-      {quoteWarning && (
-        <div
-          style={{
-            position: "fixed",
-            top: 24,
-            right: 24,
-            zIndex: 9999,
-            maxWidth: 400,
-            // 224 px = sidebar width (200 px) + border/padding; 48 px = left+right margin
-            width: "calc(100vw - 224px - 48px)",
-          }}
-        >
-          <Alert
-            message="行情获取提示"
-            description={quoteWarning}
-            type="warning"
-            closable
-            showIcon
-            onClose={() => setQuoteWarning(null)}
-          />
-        </div>
-      )}
       <Routes>
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
         <Route path="/dashboard" element={<DashboardPage />} />

@@ -31,24 +31,34 @@ function App() {
     let cancelled = false;
     const unsubs: Array<() => void> = [];
 
-    // Fast path: the background startup refresh emits `quote-warning` with
-    // the warning text directly in the payload.  Set the store immediately
-    // without consuming the Rust-side value so the polling fallback below
-    // can still pick it up if this event arrived before the listener was ready.
+    // Path 1 (fast): the background startup refresh emits `quote-warning`
+    // carrying the warning text directly in the payload via peek (so
+    // LAST_QUOTE_WARNING is NOT consumed and remains available below).
     listen<string>("quote-warning", (event) => {
-      if (event.payload) {
-        setQuoteWarning(event.payload);
-      }
+      if (event.payload) setQuoteWarning(event.payload);
     }).then((fn) => {
       if (cancelled) fn();
       else unsubs.push(fn);
     });
 
-    // Reliable fallback: poll take_quote_warning every 2 s for up to 30 s.
-    // This catches warnings even if the quote-warning event was emitted before
-    // the listener above was fully registered (a common race on slow machines).
-    // The Rust background task uses peek_quote_warning (not take) so the
-    // warning stays available here until one of these polls consumes it.
+    // Path 2 (reliable, page-agnostic): the background task emits
+    // `quotes-refreshed` AFTER setting and peeking the warning. By the time
+    // this event fires LAST_QUOTE_WARNING is guaranteed to hold any Xueqiu
+    // error. Calling take_quote_warning here consumes it — this listener is
+    // active on every page, unlike startAutoRefresh which only runs on the
+    // Holdings page. This is the most reliable delivery path.
+    listen<unknown>("quotes-refreshed", () => {
+      invoke<string | null>("take_quote_warning")
+        .then((w) => { if (w) setQuoteWarning(w); })
+        .catch(() => {});
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unsubs.push(fn);
+    });
+
+    // Path 3 (safety net): poll take_quote_warning every 2 s for up to 30 s.
+    // Catches warnings if both events above were missed due to listener
+    // registration timing on slow machines.
     const MAX_POLLS = 15; // 15 × 2 s = 30 s
     let pollCount = 0;
     const pollId = setInterval(() => {

@@ -749,12 +749,20 @@ static LAST_QUOTE_WARNING: Mutex<Option<String>> = Mutex::new(None);
 
 const XUEQIU_COOKIE_EXPIRED_HINT: &str =
     "雪球 Cookie 可能已经过期，请到设置页面更新雪球 Cookie。";
+const XUEQIU_API_FAILED_HINT: &str =
+    "访问雪球行情服务失败，请检查网络连接或稍后重试。";
 
 fn is_xueqiu_cookie_expired_error(err: &str) -> bool {
     err.contains("Xueqiu API error")
         && (err.contains("400016")
             || err.contains("重新登录帐号后再试")
             || err.contains("刷新页面或者重新登录帐号后再试"))
+}
+
+fn is_xueqiu_request_error(err: &str) -> bool {
+    err.contains("Xueqiu")
+        || err.contains("xueqiu.com")
+        || err.contains("stock.xueqiu.com")
 }
 
 pub fn clear_quote_warning() {
@@ -1248,6 +1256,7 @@ pub async fn fetch_quotes_batch_with_providers(
 
     let mut quotes = Vec::new();
     let mut has_xueqiu_cookie_warning = false;
+    let mut has_xueqiu_api_warning = false;
     for (symbol, market) in unique_symbols {
         // Cash symbols don't need an API call – return a synthetic quote.
         if is_cash_symbol(&symbol) {
@@ -1265,6 +1274,8 @@ pub async fn fetch_quotes_batch_with_providers(
             Err(e) => {
                 if is_xueqiu_cookie_expired_error(&e) {
                     has_xueqiu_cookie_warning = true;
+                } else if is_xueqiu_request_error(&e) {
+                    has_xueqiu_api_warning = true;
                 }
                 eprintln!("Warning: failed to fetch quote for {} ({}): {}", symbol, market, e)
             }
@@ -1272,6 +1283,8 @@ pub async fn fetch_quotes_batch_with_providers(
     }
     if has_xueqiu_cookie_warning {
         *LAST_QUOTE_WARNING.lock().unwrap() = Some(XUEQIU_COOKIE_EXPIRED_HINT.to_string());
+    } else if has_xueqiu_api_warning {
+        *LAST_QUOTE_WARNING.lock().unwrap() = Some(XUEQIU_API_FAILED_HINT.to_string());
     }
     Ok(quotes)
 }

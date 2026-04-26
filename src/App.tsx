@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -27,31 +27,36 @@ function App() {
   const setQuoteWarning = useQuoteStore((s) => s.setQuoteWarning);
 
   // Use antd's imperative notification API (available because this component
-  // is rendered inside <AntdApp> in main.tsx). Storing in a ref makes it
-  // accessible from async event callbacks without stale-closure issues.
+  // is rendered inside <AntdApp> in main.tsx).
   const { notification } = AntdApp.useApp();
-  const notifRef = useRef(notification);
-  notifRef.current = notification;
 
-  // Show the warning as an antd notification popup. Using the imperative API
-  // avoids depending on React re-rendering timing, which was the root cause of
-  // the warning not appearing on the Dashboard at startup. The `key` ensures
-  // only one notification is shown at a time even if called from multiple paths.
-  const showQuoteWarning = useRef((text: string) => {
-    setQuoteWarning(text); // keep store in sync for any component that reads it
-    notifRef.current.warning({
+  // pendingWarning is set by async callbacks (Tauri events, setInterval).
+  // Calling notification.warning() directly from those async contexts can
+  // silently fail in React 18 because the call happens outside the React
+  // commit cycle. By routing through useState + useEffect we guarantee the
+  // notification is triggered from inside the React lifecycle.
+  const [pendingWarning, setPendingWarning] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!pendingWarning) return;
+    setQuoteWarning(pendingWarning); // keep store in sync
+    notification.warning({
       key: "quote-warning",
       message: "行情获取提示",
-      description: text,
+      description: pendingWarning,
       duration: 0,
-      onClose: () => setQuoteWarning(null),
+      onClose: () => {
+        setPendingWarning(null);
+        setQuoteWarning(null);
+      },
     });
-  });
+  }, [pendingWarning, notification, setQuoteWarning]);
 
   useEffect(() => {
     let cancelled = false;
     const unsubs: Array<() => void> = [];
-    const show = showQuoteWarning.current;
+    // Async callbacks only set state; the effect above handles display.
+    const show = (text: string) => setPendingWarning(text);
 
     // Path 1 (fast): the background startup refresh emits `quote-warning`
     // carrying the warning text directly in the payload via peek (so

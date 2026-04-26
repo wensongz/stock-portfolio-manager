@@ -37,7 +37,7 @@ function App() {
     // can still pick it up if this event arrived before the listener was ready.
     listen<string>("quote-warning", (event) => {
       if (event.payload) {
-        useQuoteStore.getState().setQuoteWarning(event.payload);
+        setQuoteWarning(event.payload);
       }
     }).then((fn) => {
       if (cancelled) fn();
@@ -58,7 +58,7 @@ function App() {
       }
       pollCount++;
       invoke<string | null>("take_quote_warning")
-        .then((w) => { if (w) useQuoteStore.getState().setQuoteWarning(w); })
+        .then((w) => { if (w) setQuoteWarning(w); })
         .catch(() => {});
     }, 2000);
 

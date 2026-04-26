@@ -28,7 +28,13 @@ pub async fn get_holding_quotes(
     refresh_symbols: Option<Vec<(String, String)>>,
 ) -> Result<Vec<HoldingWithQuote>, String> {
     let config = quote_provider_service::get_quote_provider_config(&db)?;
-    crate::services::quote_service::clear_quote_warning();
+    let should_refresh_from_api = match refresh_symbols.as_ref() {
+        Some(symbols) => !symbols.is_empty(),
+        None => true,
+    };
+    if should_refresh_from_api {
+        crate::services::quote_service::clear_quote_warning();
+    }
     // Load holdings from DB (synchronous)
     let holdings = {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;

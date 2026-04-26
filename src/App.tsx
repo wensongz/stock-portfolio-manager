@@ -23,6 +23,7 @@ import SettingsPage from "./pages/Settings";
 function App() {
   useEffect(() => {
     let unlisten: (() => void) | null = null;
+    let unlistenWarning: (() => void) | null = null;
     let cancelled = false;
 
     const pullQuoteWarning = async () => {
@@ -48,9 +49,23 @@ function App() {
       }
     });
 
+    listen<string>("quote-warning", (event) => {
+      const warning = event.payload;
+      if (warning) {
+        message.warning(warning);
+      }
+    }).then((fn) => {
+      if (cancelled) {
+        fn();
+      } else {
+        unlistenWarning = fn;
+      }
+    });
+
     return () => {
       cancelled = true;
       if (unlisten) unlisten();
+      if (unlistenWarning) unlistenWarning();
     };
   }, []);
 

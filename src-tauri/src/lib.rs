@@ -116,6 +116,11 @@ pub fn run() {
                     Ok(quotes) => {
                         // Persist the freshly fetched quotes to the database.
                         let _ = services::quote_service::save_quotes_to_db(&db, &quotes);
+                        // Emit warning message directly to frontend to avoid
+                        // race conditions around one-time warning consumption.
+                        if let Some(warning) = services::quote_service::take_quote_warning() {
+                            let _ = handle.emit("quote-warning", warning);
+                        }
                         // Notify the frontend so it can re-render with fresh prices.
                         let _ = handle.emit("quotes-refreshed", ());
                     }

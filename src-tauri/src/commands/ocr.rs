@@ -190,32 +190,40 @@ fn ocr_image(data: &[u8]) -> Result<String, String> {
 /// Parse the plain-text output of Tesseract (from a 同花顺 trade screenshot)
 /// into a list of [`ParsedTradeRow`] values.
 ///
-/// # 同花顺 layout
+/// # 同花顺 OCR layout (observed from tesseract chi_sim output)
 ///
-/// THS displays one trade per "card" or row. After OCR the text may look like:
+/// Tesseract produces output like:
 ///
 /// ```text
 /// 2026-04
-/// 卖出双汇发展          2026-04-09 09:58
-/// 28.41  2000  56820.00  33.98
-/// 买入-招商银行
-/// 04-22 14:26   28.95   2000   57900.00   150.00
+///
+/// 贵州茅台
+///
+/// 卖出 2026-04-09 09:58 1459.48 100 145861.89 86.11
+/// 双汇发展
+///
+/// 卖出 2026-04-09 13:39 28.41 2000 56786.02 33.98
+/// 招商银行
+///
+/// 买人 2026-04-22 14:26 28.95 2000 57865.44 54.57
 /// ```
 ///
-/// Key observations:
-/// - "买入"/"卖出" may appear **anywhere** on a line (not just at the start).
-/// - The stock name consists purely of CJK characters (stop at digits/ASCII).
-/// - THS sometimes shows a signed P&L amount (e.g. -56786.02) — these must be
-///   discarded before numeric field extraction.
-/// - Column order in the data lines is always:  price → shares → total → commission.
+/// Key observations from real tesseract output:
+/// - **Stock name is on its own line**, separate from the direction line.
+/// - **买入 is consistently OCR'd as "买人"** (入→人 misread) — must be handled.
+/// - 卖出 is read correctly.
+/// - The date uses full YYYY-MM-DD format on the direction line.
+/// - The image "金额" (amount) is net of commission; total_amount in the DB
+///   must be price × shares (gross).
 ///
 /// Algorithm:
-/// 1. Extract the year from the first `YYYY-MM` header.
-/// 2. Find every line containing "买入" or "卖出".
-/// 3. For each anchor: extract CJK stock name; collect remaining text on the
-///    same line plus up to 6 subsequent non-anchor lines as context.
-/// 4. Remove negative numbers, percentages, dates, and times; then assign
-///    numeric fields using an ordered positional heuristic.
+/// 1. Extract the year from the first `YYYY-MM` header (or YYYY-MM-DD).
+/// 2. Walk lines looking for an anchor (line containing 买入/买人/卖出).
+/// 3. For each anchor, find the stock name by looking backward up to 3 lines
+///    (the name typically precedes the direction line).
+///    If still not found, try the same anchor line (some formats embed the name).
+/// 4. Collect subsequent non-anchor lines as context for field extraction.
+/// 5. Compute total_amount = price × shares (do not use the OCR'd net amount).
 fn parse_ths_ocr(text: &str) -> Vec<ParsedTradeRow> {
     let year = extract_year(text);
     let lines: Vec<&str> = text.lines().collect();
@@ -225,43 +233,86 @@ fn parse_ths_ocr(text: &str) -> Vec<ParsedTradeRow> {
     while i < lines.len() {
         let line = lines[i].trim();
 
-        if let Some((tx_type, stock_name, anchor_extra)) = detect_trade_anchor(line) {
-            // Collect up to 6 subsequent non-empty, non-anchor lines as context.
-            let mut window: Vec<&str> = Vec::new();
-            let mut j = i + 1;
-            while j < lines.len() && window.len() < 6 {
-                let l = lines[j].trim();
-                if !l.is_empty() {
-                    // Stop if we hit the next trade anchor.
-                    if is_trade_anchor(l) {
-                        break;
-                    }
-                    window.push(l);
-                }
-                j += 1;
-            }
-
-            if let Some(row) =
-                extract_fields_from_context(&tx_type, &stock_name, year, &anchor_extra, &window)
-            {
-                rows.push(row);
-            }
-
-            // j now points at the next anchor (or is past the window limit).
-            // Do NOT skip to j – advance by 1 so the outer loop naturally
-            // reaches j on subsequent iterations (avoids skipping anchors that
-            // were found inside what would have been the window).
+        if !is_trade_anchor(line) {
             i += 1;
-        } else {
-            i += 1;
+            continue;
         }
+
+        let tx_type = anchor_tx_type(line).to_string();
+
+        // ── Find stock name ──────────────────────────────────────────────────
+        // Case A: name embedded on the anchor line (e.g. "卖出双汇发展 ...").
+        let (stock_name, anchor_extra) = if let Some((_, name, extra)) = detect_trade_anchor(line) {
+            (name, extra)
+        } else {
+            // Case B: name is on a preceding line (most common THS OCR format).
+            let extra = strip_trade_keywords(line);
+            let mut found: Option<String> = None;
+            for back in 1..=3usize {
+                if i < back {
+                    break;
+                }
+                let prev = lines[i - back].trim();
+                // Don't look past another anchor.
+                if is_trade_anchor(prev) {
+                    break;
+                }
+                if let Some(name) = extract_longest_cjk_run(prev) {
+                    found = Some(name);
+                    break;
+                }
+            }
+            match found {
+                Some(name) => (name, extra),
+                // No name found anywhere — skip this anchor.
+                None => {
+                    i += 1;
+                    continue;
+                }
+            }
+        };
+
+        // ── Collect forward context ─────────────────────────────────────────
+        let mut window: Vec<&str> = Vec::new();
+        let mut j = i + 1;
+        while j < lines.len() && window.len() < 6 {
+            let l = lines[j].trim();
+            if !l.is_empty() {
+                if is_trade_anchor(l) {
+                    break;
+                }
+                window.push(l);
+            }
+            j += 1;
+        }
+
+        if let Some(row) =
+            extract_fields_from_context(&tx_type, &stock_name, year, &anchor_extra, &window)
+        {
+            rows.push(row);
+        }
+
+        i += 1;
     }
 
-    // Remove exact duplicates (same time + name) that can arise when the same
-    // 买入/卖出 keyword appears on two consecutive OCR lines.
+    // Sort chronologically; remove exact duplicates (same name + time).
     rows.sort_by(|a, b| a.traded_at.cmp(&b.traded_at));
     rows.dedup_by(|a, b| a.traded_at == b.traded_at && a.stock_name == b.stock_name);
     rows
+}
+
+/// Return "BUY" or "SELL" for a confirmed anchor line (caller must verify
+/// `is_trade_anchor` first).
+fn anchor_tx_type(line: &str) -> &'static str {
+    if line.contains("卖出") { "SELL" } else { "BUY" }
+}
+
+/// Remove all trade-direction keywords from `line` and return the remainder.
+/// Used to build `anchor_extra` when no CJK name is on the anchor line.
+fn strip_trade_keywords(line: &str) -> String {
+    line.replace("卖出", " ")
+        .replace("买入", " ")
+        .replace("买人", " ")
 }
 
 /// Return the 4-digit year found in the first `YYYY-MM` header in `text`.
@@ -286,39 +337,34 @@ fn extract_year(text: &str) -> i32 {
 
 /// Returns true when the trimmed line contains a trade keyword and is
 /// therefore an anchor for a new transaction record.
+///
+/// **Important**: tesseract chi_sim consistently misreads "买入" as "买人"
+/// (入 → 人) for common THS fonts, so both spellings are accepted.
 fn is_trade_anchor(line: &str) -> bool {
-    (line.contains("买入") || line.contains("卖出"))
+    (line.contains("买入") || line.contains("买人") || line.contains("卖出"))
         && !line.starts_with("类型")
         && !line.starts_with("交易类型")
         && !line.starts_with("方向")
 }
 
-/// Try to detect a trade anchor in `line`.
+/// Try to detect a trade anchor in `line` where the stock name is **also on
+/// the same line**.
 ///
 /// Returns `(transaction_type, stock_name, anchor_extra)` where:
 /// - `transaction_type` is "BUY" or "SELL".
-/// - `stock_name` is the longest CJK character run found on the line (2–12 chars).
-/// - `anchor_extra` is the remaining text on the anchor line after the keyword
-///   and name are removed (may contain price / date / time digits).
+/// - `stock_name` is the longest CJK character run found on the line.
+/// - `anchor_extra` is the remaining text after the keyword and name are removed.
 ///
-/// Unlike the old `parse_trade_header`, this function detects the keyword
-/// **anywhere** on the line (not only at the start) and extracts **only** the
-/// CJK portion as the stock name, stopping at digits or ASCII characters.
+/// Returns `None` when no CJK stock name is found on the anchor line; callers
+/// should then search preceding lines (see `parse_ths_ocr`).
 fn detect_trade_anchor(line: &str) -> Option<(String, String, String)> {
     if !is_trade_anchor(line) {
         return None;
     }
 
-    let tx_type = if line.contains("卖出") { "SELL" } else { "BUY" };
-
-    // Remove the keyword so we can search for the CJK name cleanly.
-    let without_keyword = line
-        .replace("卖出", " ")
-        .replace("买入", " ");
-
+    let tx_type = anchor_tx_type(line);
+    let without_keyword = strip_trade_keywords(line);
     let stock_name = extract_longest_cjk_run(&without_keyword)?;
-
-    // Build the "extra" text: everything left after removing the keyword and name.
     let anchor_extra = without_keyword.replace(&stock_name as &str, " ");
 
     Some((tx_type.to_string(), stock_name, anchor_extra))
@@ -372,6 +418,9 @@ fn is_cjk(c: char) -> bool {
 ///
 /// `anchor_extra` is the non-name remainder of the anchor line (may contain
 /// date/time or price digits).  `window` is the subsequent non-anchor lines.
+///
+/// **total_amount** is always computed as `price × shares` and is never taken
+/// from the OCR'd figure (which THS shows as the net amount after commission).
 fn extract_fields_from_context(
     tx_type: &str,
     stock_name: &str,
@@ -379,11 +428,14 @@ fn extract_fields_from_context(
     anchor_extra: &str,
     window: &[&str],
 ) -> Option<ParsedTradeRow> {
-    let date_re = regex::Regex::new(r"\b(\d{1,2})-(\d{2})\b").unwrap();
-    let time_re = regex::Regex::new(r"\b(\d{1,2}):(\d{2})(?::\d{2})?\b").unwrap();
-    let neg_re  = regex::Regex::new(r"-\d+(?:[.,]\d+)?").unwrap();
-    let pct_re  = regex::Regex::new(r"\d+(?:\.\d+)?\s*%").unwrap();
-    let num_re  = regex::Regex::new(r"\b(\d+(?:\.\d+)?)\b").unwrap();
+    // Regex patterns compiled once per call (acceptable; `parse_ths_ocr` is
+    // called infrequently and regex is fast to compile).
+    let full_ymd_re = regex::Regex::new(r"\b(\d{4})-(\d{2})-(\d{2})\b").unwrap();
+    let date_re     = regex::Regex::new(r"\b(\d{1,2})-(\d{2})\b").unwrap();
+    let time_re     = regex::Regex::new(r"\b(\d{1,2}):(\d{2})(?::\d{2})?\b").unwrap();
+    let neg_re      = regex::Regex::new(r"-\d+(?:[.,]\d+)?").unwrap();
+    let pct_re      = regex::Regex::new(r"\d+(?:\.\d+)?\s*%").unwrap();
+    let num_re      = regex::Regex::new(r"\b(\d+(?:\.\d+)?)\b").unwrap();
 
     // Combine anchor extra + window into one searchable string.
     let mut parts: Vec<&str> = vec![anchor_extra];
@@ -391,14 +443,22 @@ fn extract_fields_from_context(
     let all_text = parts.join(" ");
 
     // --- Date ---
-    let (month, day) = date_re
-        .captures(&all_text)
-        .map(|c| {
-            (
-                c[1].parse::<u32>().unwrap_or(1),
-                c[2].parse::<u32>().unwrap_or(1),
-            )
-        })?;
+    // Prefer the full YYYY-MM-DD pattern to avoid false matches.
+    // Without this, date_re on "2026-04-09" would first match "20-26"
+    // (position 0) instead of the correct "04-09".
+    let (effective_year, month, day) =
+        if let Some(cap) = full_ymd_re.captures(&all_text) {
+            let y = cap[1].parse::<i32>().unwrap_or(year);
+            let m = cap[2].parse::<u32>().unwrap_or(1);
+            let d = cap[3].parse::<u32>().unwrap_or(1);
+            (y, m, d)
+        } else if let Some(cap) = date_re.captures(&all_text) {
+            let m = cap[1].parse::<u32>().unwrap_or(1);
+            let d = cap[2].parse::<u32>().unwrap_or(1);
+            (year, m, d)
+        } else {
+            return None; // no date found → cannot form a valid trade row
+        };
 
     // --- Time ---
     let (hour, minute) = time_re
@@ -413,14 +473,12 @@ fn extract_fields_from_context(
 
     let traded_at = format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:00",
-        year, month, day, hour, minute
+        effective_year, month, day, hour, minute
     );
 
     // --- Numbers ---
-    // Strip: full dates (YYYY-MM-DD), month-day (MM-DD), times (HH:MM[:SS]),
-    // negative numbers (P&L like -56786.02), and percentages (4.02%).
-    let full_date_re = regex::Regex::new(r"\b\d{4}-\d{2}-\d{2}\b").unwrap();
-    let cleaned = full_date_re.replace_all(&all_text, " ");
+    // Strip full dates, short dates, times, negative numbers (P&L), percentages.
+    let cleaned = full_ymd_re.replace_all(&all_text, " ");
     let cleaned = date_re.replace_all(&cleaned, " ");
     let cleaned = time_re.replace_all(&cleaned, " ");
     let cleaned = neg_re.replace_all(&cleaned, " ");
@@ -432,7 +490,11 @@ fn extract_fields_from_context(
         .filter(|&n| n > 0.0)
         .collect();
 
-    let (price, shares, total_amount, commission) = assign_fields_ordered(&numbers)?;
+    // assign_fields_ordered identifies price/shares/total by the constraint
+    // total ≈ price × shares.  total_amount is then *overridden* with the
+    // exact computed value (price × shares) because THS displays a net figure.
+    let (price, shares, _ocr_total, commission) = assign_fields_ordered(&numbers)?;
+    let total_amount = price * shares;
 
     Some(ParsedTradeRow {
         transaction_type: tx_type.to_string(),
@@ -645,6 +707,15 @@ mod tests {
         assert!(parse_trade_header("普通文本").is_none());
     }
 
+    // --- is_trade_anchor handles 买人 (OCR misread of 买入) ---
+
+    #[test]
+    fn test_is_trade_anchor_mai_ren() {
+        assert!(is_trade_anchor("买人 2026-04-22 14:26 28.95 2000 57865.44 54.57"));
+        // Should be classified BUY, not SELL
+        assert_eq!(anchor_tx_type("买人 28.95 2000"), "BUY");
+    }
+
     // --- detect_trade_anchor ---
 
     /// keyword at end of line (common THS layout)
@@ -666,6 +737,14 @@ mod tests {
         // extra should contain the number but not the name
         assert!(extra.contains("28.41"));
         assert!(!extra.contains("双汇发展"));
+    }
+
+    /// 买人 (tesseract misread) on anchor line — no CJK name on same line
+    #[test]
+    fn test_detect_trade_anchor_mai_ren_no_name() {
+        // Direction line has no stock name; detect_trade_anchor returns None.
+        // parse_ths_ocr should then look backward.
+        assert!(detect_trade_anchor("买人 2026-04-22 14:26 28.95 2000 57865.44 54.57").is_none());
     }
 
     // --- extract_longest_cjk_run ---
@@ -721,6 +800,7 @@ mod tests {
 
     // --- parse_ths_ocr (integration) ---
 
+    /// Inline format: name + keyword on same line.
     #[test]
     fn test_parse_ths_ocr_single_trade() {
         let text = "2026-04\n买入-贵州茅台\n04-03  09:30   1505.00  100  150500.00  5.00\n";
@@ -732,6 +812,7 @@ mod tests {
         assert_eq!(r.traded_at, "2026-04-03T09:30:00");
         assert!((r.price - 1505.0).abs() < 0.01);
         assert!((r.shares - 100.0).abs() < 0.01);
+        // total_amount must be computed (price × shares), not taken from OCR.
         assert!((r.total_amount - 150500.0).abs() < 1.0);
         assert!((r.commission - 5.0).abs() < 0.01);
     }
@@ -743,6 +824,32 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].transaction_type, "SELL");
         assert_eq!(rows[0].stock_name, "招商银行");
+    }
+
+    /// Total_amount is always price × shares, not the OCR'd net amount.
+    #[test]
+    fn test_total_amount_computed_from_price_times_shares() {
+        // THS shows net amount 57865.44 (after commission 54.57).
+        // DB must store gross: 28.95 × 2000 = 57900.
+        let text = "2026-04\n买入-招商银行\n04-22 14:26 28.95 2000 57865.44 54.57\n";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 1);
+        let expected = 28.95 * 2000.0;
+        assert!(
+            (rows[0].total_amount - expected).abs() < 1.0,
+            "total={}, expected={}",
+            rows[0].total_amount,
+            expected
+        );
+    }
+
+    /// Full YYYY-MM-DD date on the anchor line — must not produce month=20 day=26.
+    #[test]
+    fn test_parse_ths_ocr_full_date_format() {
+        let text = "买入-招商银行 2026-04-22 14:26 28.95 2000 57900.00 150.00\n";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 1, "expected 1 row, got {}", rows.len());
+        assert_eq!(rows[0].traded_at, "2026-04-22T14:26:00");
     }
 
     #[test]
@@ -799,5 +906,115 @@ mod tests {
         assert_eq!(rows[0].stock_name, "双汇发展"); // sorted: 04-09 first
         assert!((rows[0].price - 28.41).abs() < 0.01);
         assert!((rows[1].price - 28.95).abs() < 0.01);
+    }
+
+    // ── Real THS OCR format tests ────────────────────────────────────────────
+    // Observed from running `tesseract chi_sim` on a synthetic THS-style image:
+    //   - Stock name appears on its OWN line.
+    //   - Direction is on the NEXT line (no stock name).
+    //   - 买入 is consistently misread as "买人" by tesseract.
+    //   - Full YYYY-MM-DD format is used for dates.
+
+    /// Name-before-direction format (the most common real-world THS OCR output).
+    #[test]
+    fn test_parse_ths_ocr_name_before_direction() {
+        let text = "\
+2026-04
+双汇发展
+卖出 2026-04-09 09:58 28.41 2000 56786.02 33.98
+招商银行
+买人 2026-04-22 14:26 28.95 2000 57865.44 54.57
+";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 2, "expected 2 rows, got {}: {rows:?}", rows.len());
+
+        let sell = rows.iter().find(|r| r.transaction_type == "SELL").unwrap();
+        assert_eq!(sell.stock_name, "双汇发展");
+        assert!((sell.price - 28.41).abs() < 0.01, "sell price={}", sell.price);
+        assert!((sell.shares - 2000.0).abs() < 0.01, "sell shares={}", sell.shares);
+        // total_amount must be price × shares, not the OCR'd net amount.
+        assert!(
+            (sell.total_amount - 28.41 * 2000.0).abs() < 1.0,
+            "sell total={} (expected {})",
+            sell.total_amount,
+            28.41 * 2000.0
+        );
+        assert!((sell.commission - 33.98).abs() < 0.01, "sell comm={}", sell.commission);
+        assert_eq!(sell.traded_at, "2026-04-09T09:58:00");
+
+        let buy = rows.iter().find(|r| r.transaction_type == "BUY").unwrap();
+        assert_eq!(buy.stock_name, "招商银行");
+        assert!((buy.price - 28.95).abs() < 0.01, "buy price={}", buy.price);
+        assert!((buy.shares - 2000.0).abs() < 0.01, "buy shares={}", buy.shares);
+        assert_eq!(buy.traded_at, "2026-04-22T14:26:00");
+    }
+
+    /// 买人 (tesseract misread of 买入) must be detected as BUY.
+    #[test]
+    fn test_parse_ths_ocr_mai_ren_ocr_misread() {
+        let text = "\
+2026-04
+招商银行
+买人 2026-04-22 14:26 28.95 2000 57865.44 54.57
+";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 1, "expected 1 BUY row, got {}", rows.len());
+        assert_eq!(rows[0].transaction_type, "BUY");
+        assert_eq!(rows[0].stock_name, "招商银行");
+        assert!((rows[0].price - 28.95).abs() < 0.01);
+    }
+
+    /// Six records: name-before-direction format with 买人 misreads (real OCR output).
+    /// This is the exact format tesseract chi_sim produces from a THS screenshot.
+    #[test]
+    fn test_parse_ths_ocr_six_records_real_ocr_format() {
+        // This text was produced by running tesseract chi_sim on a synthetic
+        // THS-style image (see ocr_test_image.rs / scripts/gen_ths_img.py).
+        let text = "\
+2026-04
+
+贵州茅台
+
+卖出 2026-04-09 09:58 1459.48 100 145861.89 86.11
+双汇发展
+
+卖出 2026-04-09 13:39 28.41 2000 56786.02 33.98
+招商银行
+
+买人 2026-04-22 14:26 28.95 2000 57865.44 54.57
+平安银行
+
+买人 2026-04-15 10:30 12.50 1000 12487.50 12.50
+工商银行
+
+卖出 2026-04-20 14:00 5.80 2000 11588.00 12.00
+中国石油
+
+买人 2026-04-25 09:45 7.20 3000 21578.40 21.60
+";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(
+            rows.len(),
+            6,
+            "expected 6 rows, got {}: {:?}",
+            rows.len(),
+            rows.iter().map(|r| format!("{}/{}", r.stock_name, r.transaction_type)).collect::<Vec<_>>()
+        );
+
+        // Verify a sample of expected values.
+        let maotai = rows.iter().find(|r| r.stock_name.contains("贵州茅台")).unwrap();
+        assert_eq!(maotai.transaction_type, "SELL");
+        assert!((maotai.price - 1459.48).abs() < 0.01, "maotai price={}", maotai.price);
+        assert!((maotai.shares - 100.0).abs() < 0.01);
+        assert!(
+            (maotai.total_amount - 1459.48 * 100.0).abs() < 1.0,
+            "total={} expected={}",
+            maotai.total_amount, 1459.48 * 100.0
+        );
+
+        let zhaoshang = rows.iter().find(|r| r.stock_name.contains("招商银行")).unwrap();
+        assert_eq!(zhaoshang.transaction_type, "BUY");
+        assert!((zhaoshang.price - 28.95).abs() < 0.01);
+        assert!((zhaoshang.shares - 2000.0).abs() < 0.01);
     }
 }

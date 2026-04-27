@@ -180,6 +180,16 @@ async fn lookup_via_sina(name: &str) -> Result<Option<String>, String> {
 /// this are discarded as separator artefacts or padding-only strips.
 const MIN_CARD_HEIGHT_PX: u32 = 30;
 
+/// Minimum height (in pixels) that a separator band must span before it is
+/// treated as a genuine inter-card boundary.
+///
+/// Compact THS list layouts use 1-3 px thin divider lines, and intra-line
+/// whitespace within a single entry is typically < 8 px.  Requiring ≥ 8 px
+/// prevents the algorithm from falsely splitting a 2-line entry in half.
+/// Card-based layouts with wide white separators (≥ 8 px) still benefit from
+/// slicing.
+const MIN_SEPARATOR_BAND_PX: u32 = 8;
+
 /// Split a THS trade-history screenshot into individual card images by
 /// detecting horizontal separator bands.
 ///
@@ -237,15 +247,24 @@ fn split_image_by_separators(data: &[u8]) -> Vec<Vec<u8>> {
         match (is_sep[y as usize], band_start) {
             (true, None) => band_start = Some(y),
             (false, Some(start)) => {
-                // Emit the midpoint of this band as the cut position.
-                cut_ys.push((start + y) / 2);
+                let band_height = y - start;
+                // Only treat as a genuine inter-card separator when the band
+                // is wide enough.  Thin 1-3 px dividers and normal intra-line
+                // whitespace (< MIN_SEPARATOR_BAND_PX) are ignored so that
+                // compact two-line entries are not split in half.
+                if band_height >= MIN_SEPARATOR_BAND_PX {
+                    cut_ys.push((start + y) / 2);
+                }
                 band_start = None;
             }
             _ => {}
         }
     }
     if let Some(start) = band_start {
-        cut_ys.push((start + height) / 2);
+        let band_height = height - start;
+        if band_height >= MIN_SEPARATOR_BAND_PX {
+            cut_ys.push((start + height) / 2);
+        }
     }
 
     if cut_ys.is_empty() {
@@ -741,7 +760,18 @@ fn assign_fields_ordered(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
     }
 
     // Tier 3: combinatorial (position-independent).
-    pick_fields_combinatorial(numbers)
+    if let Some(r) = pick_fields_combinatorial(numbers) {
+        return Some(r);
+    }
+
+    // Tier 4: no-total fallback.
+    //
+    // BUY entries in the THS "对账单" layout show a *negative* net amount
+    // (e.g., -59525.60) which the cleaner strips.  We are therefore left with
+    // only three positive numbers: [price, shares, commission].  There is no
+    // explicit total to verify against, so we compute total = price × shares
+    // ourselves and verify basic sanity (total ≥ 100).
+    pick_fields_no_total(numbers)
 }
 
 /// Combinatorial search: try all (price, shares, total) index triples
@@ -784,6 +814,55 @@ fn pick_fields_combinatorial(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
                     return Some((price, shares, total, commission));
                 }
             }
+        }
+    }
+    None
+}
+
+/// No-total fallback (Tier 4): used when the net transaction amount is
+/// *negative* in the source text (BUY entries in THS "对账单" layout) and has
+/// been stripped, leaving only [price, shares, commission].
+///
+/// Strategy: walk number pairs (pi, si) in document order.  Accept the first
+/// pair where:
+/// * `price` is a plausible per-share price (0 < price ≤ 10 000),
+/// * `shares` is a near-integer (within ±0.5), and
+/// * `price × shares` ≥ 100 (a sanity lower-bound on trade value).
+///
+/// Commission is the smallest remaining positive number that is less than
+/// 1 % of the computed total.  Returns `None` when no valid pair is found.
+fn pick_fields_no_total(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
+    if numbers.len() < 2 {
+        return None;
+    }
+    for pi in 0..numbers.len() {
+        let price = numbers[pi];
+        if price <= 0.0 || price > 10_000.0 {
+            continue;
+        }
+        for si in 0..numbers.len() {
+            if si == pi {
+                continue;
+            }
+            let shares_raw = numbers[si];
+            if shares_raw < 1.0 || (shares_raw - shares_raw.round()).abs() > 0.5 {
+                continue;
+            }
+            let shares = shares_raw.round();
+            let total = price * shares;
+            if total < 100.0 {
+                continue;
+            }
+            // Commission is any remaining number smaller than 1 % of total.
+            let commission_cap = total * 0.01;
+            let commission = numbers
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| *idx != pi && *idx != si)
+                .map(|(_, &v)| v)
+                .find(|&v| v > 0.0 && v < commission_cap)
+                .unwrap_or(0.0);
+            return Some((price, shares, total, commission));
         }
     }
     None
@@ -1210,7 +1289,7 @@ mod tests {
     fn make_test_image_with_separators(n_cards: u32) -> Vec<u8> {
         use image::{ImageBuffer, Rgb};
         let card_h: u32 = 80;
-        let sep_h: u32 = 5; // 5px of light-gray (uniform)
+        let sep_h: u32 = 10; // 10 px ≥ MIN_SEPARATOR_BAND_PX (8) → emitted as a cut
         let width: u32 = 400;
         // Total height: n cards + (n-1) separators
         let total_h = n_cards * card_h + (n_cards.saturating_sub(1)) * sep_h;
@@ -1264,5 +1343,135 @@ mod tests {
         let slices = split_image_by_separators(&bad);
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0], bad);
+    }
+
+    /// Thin 1-4 px separator bands are ignored — the compact THS list layout
+    /// should NOT be sliced into per-entry fragments (which would separate
+    /// line 1 from line 2 of the same entry).
+    #[test]
+    fn test_split_thin_separators_not_cut() {
+        use image::{ImageBuffer, Rgb};
+        // Build image with 4px thin light-gray separator bands between dark cards.
+        let card_h: u32 = 80;
+        let sep_h: u32 = 4; // below MIN_SEPARATOR_BAND_PX=8 → not treated as cut
+        let n_cards: u32 = 3;
+        let width: u32 = 400;
+        let total_h = n_cards * card_h + (n_cards - 1) * sep_h;
+        let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(width, total_h);
+        let card_color = Rgb([50u8, 50, 50]);
+        let sep_color = Rgb([235u8, 235, 235]);
+        for y in 0..total_h {
+            let stripe = card_h + sep_h;
+            let col = if y % stripe < card_h { card_color } else { sep_color };
+            for x in 0..width { img.put_pixel(x, y, col); }
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .expect("encode");
+        let slices = split_image_by_separators(&buf);
+        // Thin separators (< MIN_SEPARATOR_BAND_PX) should be ignored →
+        // no cuts → falls back to returning the original image as a single slice.
+        assert_eq!(slices.len(), 1, "thin separators must not trigger slicing, got {} slices", slices.len());
+    }
+
+    // ── pick_fields_no_total (Tier 4) ────────────────────────────────────────
+
+    /// BUY entries in THS 对账单 have a negative net amount which gets stripped.
+    /// Only [price, shares, commission] remain.  Tier 4 must handle this.
+    #[test]
+    fn test_pick_fields_no_total_buy_entry() {
+        // 招商银行: price=39.680, shares=1500, commission=5.60
+        let nums = vec![39.680f64, 1500.0, 5.60];
+        let (price, shares, total, comm) = pick_fields_no_total(&nums).unwrap();
+        assert!((price - 39.680).abs() < 0.01, "price={price}");
+        assert!((shares - 1500.0).abs() < 0.01, "shares={shares}");
+        assert!((total - 39.680 * 1500.0).abs() < 1.0, "total={total}");
+        assert!((comm - 5.60).abs() < 0.01, "comm={comm}");
+    }
+
+    #[test]
+    fn test_pick_fields_no_total_with_small_price() {
+        // 双汇发展: price=28.95, shares=2000, commission=34.57
+        let nums = vec![28.95f64, 2000.0, 34.57];
+        let (price, shares, total, comm) = pick_fields_no_total(&nums).unwrap();
+        assert!((price - 28.95).abs() < 0.01);
+        assert!((shares - 2000.0).abs() < 0.01);
+        assert!((total - 57900.0).abs() < 1.0);
+        assert!((comm - 34.57).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_pick_fields_no_total_returns_none_for_single_number() {
+        assert!(pick_fields_no_total(&[100.0]).is_none());
+        assert!(pick_fields_no_total(&[]).is_none());
+    }
+
+    /// End-to-end: THS 对账单 format with BUY entries having negative net amounts.
+    /// This is the actual format from the user's screenshot.
+    #[test]
+    fn test_parse_ths_ocr_duizhangsingle_buy_negative_amount() {
+        // 买入-招商银行  price  -net_amount
+        // MM-DD HH:MM   shares  commission
+        let text = "\
+2026-04
+买入-招商银行    39.680  -59525.60
+04-22 14:26              1500       5.60
+";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 1, "expected 1 BUY row, got {}: {rows:?}", rows.len());
+        let r = &rows[0];
+        assert_eq!(r.transaction_type, "BUY");
+        assert_eq!(r.stock_name, "招商银行");
+        assert!((r.price - 39.680).abs() < 0.01, "price={}", r.price);
+        assert!((r.shares - 1500.0).abs() < 0.01, "shares={}", r.shares);
+        assert!((r.total_amount - 39.680 * 1500.0).abs() < 1.0, "total={}", r.total_amount);
+        assert!((r.commission - 5.60).abs() < 0.01, "comm={}", r.commission);
+    }
+
+    /// End-to-end: full THS 对账单 page with 3 BUYs + 3 SELLs as shown in
+    /// the user's real screenshot.
+    #[test]
+    fn test_parse_ths_ocr_duizhangdan_six_mixed_entries() {
+        let text = "\
+2026-04
+买入-招商银行    39.680  -59525.60
+04-22 14:26              1500       5.60
+卖出-双汇发展   28.950    57865.43
+04-22 14:26              2000      34.57
+买入-招商银行   38.970   -58460.58
+04-13 09:59              1500       5.58
+卖出-双汇发展   28.410    56786.02
+04-13 09:58              2000      33.98
+买入-招商银行   39.280  -145349.09
+04-09 13:59              3700      13.09
+卖出-贵州茅台  1459.480  145861.89
+04-09 13:39              100       86.11
+";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 6, "expected 6 rows, got {}: {rows:?}", rows.len());
+
+        let buys: Vec<_> = rows.iter().filter(|r| r.transaction_type == "BUY").collect();
+        let sells: Vec<_> = rows.iter().filter(|r| r.transaction_type == "SELL").collect();
+        assert_eq!(buys.len(), 3, "expected 3 BUY rows");
+        assert_eq!(sells.len(), 3, "expected 3 SELL rows");
+
+        // Check the 贵州茅台 sell
+        let maotai = sells.iter().find(|r| r.stock_name.contains("贵州茅台")).unwrap();
+        assert!((maotai.price - 1459.480).abs() < 0.01);
+        assert!((maotai.shares - 100.0).abs() < 0.01);
+        assert!((maotai.total_amount - 1459.480 * 100.0).abs() < 1.0);
+
+        // Check a 招商银行 buy — both 1500-share entries should be present
+        // with their actual prices.  After chronological sort the 04-13 entry
+        // (38.970) precedes the 04-22 entry (39.680), so use explicit find.
+        let zhaoshang_buy_0422 = buys.iter()
+            .find(|r| r.stock_name.contains("招商银行") && (r.shares - 1500.0).abs() < 1.0
+                && r.traded_at.contains("04-22"))
+            .expect("04-22 招商银行 1500-share buy not found");
+        assert!((zhaoshang_buy_0422.price - 39.680).abs() < 0.01,
+            "price={}", zhaoshang_buy_0422.price);
+        assert!((zhaoshang_buy_0422.commission - 5.60).abs() < 0.01,
+            "commission={}", zhaoshang_buy_0422.commission);
     }
 }

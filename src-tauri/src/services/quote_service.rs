@@ -1277,6 +1277,7 @@ pub async fn fetch_quotes_batch_with_providers(
         let uses_xueqiu = match market.as_str() {
             "CN" => cn_provider == "xueqiu",
             "HK" => hk_provider == "xueqiu",
+            "US" => us_provider == "xueqiu",
             _ => false,
         };
         if xueqiu_failed && uses_xueqiu {

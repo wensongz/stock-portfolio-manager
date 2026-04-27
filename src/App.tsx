@@ -44,26 +44,13 @@ function App() {
       else unsubs.push(fn);
     });
 
-    // Path 2 (reliable, page-agnostic): the background task emits
-    // `quotes-refreshed` AFTER peeking the warning. LAST_QUOTE_WARNING is
-    // still set at this point; consume it here. This listener is active on
-    // every page, unlike startAutoRefresh which only runs on the Holdings page.
-    listen<unknown>("quotes-refreshed", () => {
-      invoke<string | null>("take_quote_warning")
-        .then((w) => { if (w) setQuoteWarning(w); })
-        .catch(() => {});
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unsubs.push(fn);
-    });
-
-    // Path 3 (polling fallback): the background startup task fires ~2 s after
-    // launch and may take up to 15 s to fail per Xueqiu timeout.  Poll every
-    // 3 s for up to 90 s so we surface the warning regardless of how long
-    // Xueqiu takes to respond and without depending on event delivery timing.
-    // Polling stops as soon as a warning is found or the budget is exhausted.
+    // Path 2 (polling fallback): poll take_quote_warning every 3 s for up to
+    // 30 s.  Xueqiu failures now surface after at most one 15-second timeout,
+    // so a 30-second budget is more than sufficient.  This catches warnings
+    // that arrive before the quote-warning event listener is registered, or
+    // when the event is missed due to webview timing.  Stops on first hit.
     let pollCount = 0;
-    const MAX_POLLS = 30;       // 30 × 3 s = 90 s total
+    const MAX_POLLS = 10;          // 10 × 3 s = 30 s total
     const POLL_INTERVAL_MS = 3000; // 3 seconds between checks
     const intervalId = window.setInterval(async () => {
       if (cancelled) {

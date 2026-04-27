@@ -183,12 +183,19 @@ const MIN_CARD_HEIGHT_PX: u32 = 30;
 /// Minimum height (in pixels) that a separator band must span before it is
 /// treated as a genuine inter-card boundary.
 ///
-/// Compact THS list layouts use 1-3 px thin divider lines, and intra-line
-/// whitespace within a single entry is typically < 8 px.  Requiring ≥ 8 px
-/// prevents the algorithm from falsely splitting a 2-line entry in half.
-/// Card-based layouts with wide white separators (≥ 8 px) still benefit from
-/// slicing.
-const MIN_SEPARATOR_BAND_PX: u32 = 8;
+/// In high-resolution phone screenshots (e.g., 3× Retina, ~1170 px wide)
+/// each UI row is 88–132 px tall, leaving 24–46 px of blank padding above
+/// and below the text.  Those padding rows are also detected as "separator
+/// candidates" (high mean luminance, low range).  We must ignore them.
+///
+/// A genuine between-card separator (e.g., the light-gray group-header
+/// background in the ∧ 2026-04 row) spans at least one full row (~88 px)
+/// of uniform light color, whereas in-row padding is typically < 50 px.
+///
+/// Setting the threshold to 50 px keeps us from splitting a single 2-line
+/// trade entry in half while still allowing detection of obvious card
+/// separators in lower-resolution "card" layouts.
+const MIN_SEPARATOR_BAND_PX: u32 = 50;
 
 /// Split a THS trade-history screenshot into individual card images by
 /// detecting horizontal separator bands.
@@ -1273,27 +1280,37 @@ pub async fn parse_trade_image(image_base64: String) -> Result<Vec<ParsedTradeRo
         .decode(b64.trim())
         .map_err(|e| format!("base64 解码失败: {}", e))?;
 
-    // Split the image into per-card slices (falls back to the whole image when
-    // no separator lines are detected).
-    let slices = split_image_by_separators(&bytes);
+    // ── Primary path: whole-image OCR ────────────────────────────────────────
+    // The THS 对账单 trade list is a continuous scrollable view without
+    // explicit inter-card separators, so OCR-ing the full image gives the
+    // best result.  split_image_by_separators is kept as a fallback for
+    // "card-based" screenshot formats.
+    let text = ocr_image(&bytes)?;
+    let mut all_rows = parse_ths_ocr(&text);
 
-    let mut all_rows: Vec<ParsedTradeRow> = if slices.len() <= 1 {
-        // No separators found — OCR the whole image as before.
-        let text = ocr_image(&bytes)?;
-        parse_ths_ocr(&text)
-    } else {
-        let mut combined: Vec<ParsedTradeRow> = Vec::new();
-        for slice in &slices {
-            if let Ok(text) = ocr_image(slice) {
-                combined.extend(parse_ths_ocr(&text));
+    // ── Fallback: per-slice OCR ───────────────────────────────────────────────
+    // When the whole-image parse finds nothing, try splitting by separator
+    // bands and OCR-ing each slice independently.  This handles layouts
+    // where individual cards are separated by wide uniform-colour bands.
+    if all_rows.is_empty() {
+        let slices = split_image_by_separators(&bytes);
+        if slices.len() > 1 {
+            for slice in &slices {
+                if let Ok(slice_text) = ocr_image(slice) {
+                    all_rows.extend(parse_ths_ocr(&slice_text));
+                }
             }
         }
-        combined
-    };
+    }
 
     // Deduplicate and sort chronologically.
     all_rows.sort_by(|a, b| a.traded_at.cmp(&b.traded_at));
-    all_rows.dedup_by(|a, b| a.traded_at == b.traded_at && a.stock_name == b.stock_name);
+    all_rows.dedup_by(|a, b| {
+        a.traded_at == b.traded_at
+            && a.stock_name == b.stock_name
+            && (a.price - b.price).abs() < 0.001
+            && (a.shares - b.shares).abs() < 0.001
+    });
     Ok(all_rows)
 }
 
@@ -1660,7 +1677,7 @@ mod tests {
     fn make_test_image_with_separators(n_cards: u32) -> Vec<u8> {
         use image::{ImageBuffer, Rgb};
         let card_h: u32 = 80;
-        let sep_h: u32 = 10; // 10 px ≥ MIN_SEPARATOR_BAND_PX (8) → emitted as a cut
+        let sep_h: u32 = 60; // 60 px ≥ MIN_SEPARATOR_BAND_PX (50) → emitted as a cut
         let width: u32 = 400;
         // Total height: n cards + (n-1) separators
         let total_h = n_cards * card_h + (n_cards.saturating_sub(1)) * sep_h;
@@ -1716,15 +1733,19 @@ mod tests {
         assert_eq!(slices[0], bad);
     }
 
-    /// Thin 1-4 px separator bands are ignored — the compact THS list layout
-    /// should NOT be sliced into per-entry fragments (which would separate
-    /// line 1 from line 2 of the same entry).
+    /// Thin separator bands below MIN_SEPARATOR_BAND_PX are ignored — the
+    /// compact THS list layout should NOT be sliced into per-entry fragments
+    /// (which would separate line 1 from line 2 of the same entry).
+    ///
+    /// Also verifies that the common "in-row whitespace" pattern (short blank
+    /// bands above/below text within a row) is ignored when those bands are
+    /// < 50 px tall.
     #[test]
     fn test_split_thin_separators_not_cut() {
         use image::{ImageBuffer, Rgb};
         // Build image with 4px thin light-gray separator bands between dark cards.
         let card_h: u32 = 80;
-        let sep_h: u32 = 4; // below MIN_SEPARATOR_BAND_PX=8 → not treated as cut
+        let sep_h: u32 = 4; // below MIN_SEPARATOR_BAND_PX=50 → not treated as cut
         let n_cards: u32 = 3;
         let width: u32 = 400;
         let total_h = n_cards * card_h + (n_cards - 1) * sep_h;

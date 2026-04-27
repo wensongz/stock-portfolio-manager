@@ -554,6 +554,23 @@ fn parse_ths_ocr(text: &str) -> Vec<ParsedTradeRow> {
     // Sort chronologically; remove exact duplicates (same name + time).
     rows.sort_by(|a, b| a.traded_at.cmp(&b.traded_at));
     rows.dedup_by(|a, b| a.traded_at == b.traded_at && a.stock_name == b.stock_name);
+
+    // ── Dateline fallback ─────────────────────────────────────────────────────
+    // When Tesseract cannot read CJK trade-direction keywords (买入/卖出) — which
+    // happens on small-font phone screenshots — the anchor-based pass above
+    // returns zero rows.  In that case, fall back to detecting the secondary
+    // "★ / 日 MM-DD HH:MM  shares  commission" line and working backward to get
+    // the price and amount from the preceding line.
+    //
+    // Layout (2-line per trade, as seen on iPhone THS app):
+    //   Line N  : [garbled-name]  price  ±amount          ← price row
+    //   Line N+1: (日|★|@) MM-DD HH[.:]MM  shares  comm   ← date row
+    if rows.is_empty() {
+        if let Some(fallback) = parse_ths_ocr_dateline_fallback(text, year, &lines) {
+            return fallback;
+        }
+    }
+
     rows
 }
 
@@ -571,20 +588,214 @@ fn strip_trade_keywords(line: &str) -> String {
         .replace("买人", " ")
 }
 
-/// Return the 4-digit year found in the first `YYYY-MM` header in `text`.
-/// Falls back to the current UTC year if none is found.
-fn extract_year(text: &str) -> i32 {
-    // Match YYYY-MM at the start of a word (possibly with surrounding spaces)
-    let re = regex::Regex::new(r"(?m)^\s*(\d{4})-\d{2}\s*$").unwrap();
-    if let Some(cap) = re.captures(text) {
-        if let Ok(y) = cap[1].parse::<i32>() {
-            return y;
+/// Fallback parser for the 2-line-per-trade THS layout when the primary
+/// anchor-based pass returns zero rows (because Tesseract could not read the
+/// CJK direction keywords "买入"/"卖出" and they appeared garbled or blank).
+///
+/// # Layout observed in 2× phone-screenshot OCR output
+///
+/// ```text
+/// 日2026-04    +270.742.49
+///              39.680    -59525.60    ← price row (name garbled/blank)
+/// 日04-22 14.26    1500    5.60       ← date row  (★ misread as 日)
+///              28.950    57865.43
+/// 日04-22 14.26    2000    3457
+/// ...
+/// ```
+///
+/// The date row is identified by the pattern `(日|@|★)? MM[.:-]DD HH[.:]MM`
+/// (possibly run together as `MMDDHHMI`).  The price row immediately precedes it.
+///
+/// BUY vs SELL is inferred from the sign of the amount on the price row:
+/// negative → BUY (money left account), positive → SELL.
+///
+/// Stock name: look backward from the price row for the first CJK run (≥ 2
+/// chars) not in a group-header line.  If none found, use "未知" ("unknown")
+/// so the row is still returned — the user can correct it in the review table.
+fn parse_ths_ocr_dateline_fallback(
+    _text: &str,
+    year: i32,
+    lines: &[&str],
+) -> Option<Vec<ParsedTradeRow>> {
+    // Regex for a "date row": optional non-digit prefix, then MM-DD or MM.DD,
+    // then optional space, then HH:MM or HH.MM or HHMM.
+    let dateline_re = regex::Regex::new(
+        r"^[^\d]*(\d{1,2})[.\-](\d{2})\s*[.\-:]?(\d{2})[.\-:]?(\d{2})"
+    ).unwrap();
+    // For extracting numbers that follow AFTER the date/time portion.
+    let pos_num_re = regex::Regex::new(r"\b(\d+(?:\.\d+)?)\b").unwrap();
+    let all_num_re = regex::Regex::new(r"-?\d+(?:\.\d+)?").unwrap();
+
+    let mut rows: Vec<ParsedTradeRow> = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let cap = match dateline_re.captures(trimmed) {
+            Some(c) => c,
+            None    => continue,
+        };
+        let month:  u32 = cap[1].parse().unwrap_or(0);
+        let day:    u32 = cap[2].parse().unwrap_or(0);
+        let hour:   u32 = cap[3].parse().unwrap_or(9);
+        let minute: u32 = cap[4].parse().unwrap_or(30);
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            continue;
         }
+        let traded_at = format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:00",
+            year, month, day, hour, minute
+        );
+
+        // ── Extract shares and commission from the date row itself ────────────
+        // Use the END position of the date/time regex match to skip over date
+        // digits and only parse numbers that come AFTER the date portion.
+        // This avoids mis-counting tokens when "HH.MM" is ONE regex match vs
+        // when "HH:MM" splits into two.
+        let date_match_end = cap.get(0).unwrap().end();
+        let after_date = &trimmed[date_match_end..];
+        let pos_after_date: Vec<f64> = pos_num_re
+            .captures_iter(after_date)
+            .filter_map(|c| c[1].parse::<f64>().ok())
+            .filter(|&n| n > 0.0)
+            .collect();
+        // shares is the first near-integer ≥ 1; commission is the next.
+        let shares_f = pos_after_date
+            .iter()
+            .copied()
+            .find(|&n| n >= 1.0 && (n - n.round()).abs() < 0.5);
+        let commission = pos_after_date
+            .iter()
+            .copied()
+            .find(|&n| Some(n) != shares_f)
+            .unwrap_or(0.0);
+
+        // ── Find price row = first non-empty, non-dateline line above ─────────
+        let price_line = (0..i)
+            .rev()
+            .map(|k| lines[k].trim())
+            .find(|l| !l.is_empty() && !dateline_re.is_match(l));
+        let price_line = match price_line {
+            Some(l) => l,
+            None    => continue,
+        };
+        let price_idx = lines[..i]
+            .iter()
+            .rposition(|l| l.trim() == price_line)
+            .unwrap_or(i.saturating_sub(1));
+
+        // All numbers on the price row.
+        let all_nums: Vec<f64> = all_num_re
+            .find_iter(price_line)
+            .filter_map(|m| m.as_str().parse::<f64>().ok())
+            .collect();
+        if all_nums.is_empty() {
+            continue;
+        }
+        let pos_nums: Vec<f64> = pos_num_re
+            .captures_iter(price_line)
+            .filter_map(|c| c[1].parse::<f64>().ok())
+            .collect();
+
+        // BUY/SELL inferred from sign of amount.
+        let amount_opt = all_nums.iter().copied().find(|&n| n < 0.0);
+        let (tx_type, price_opt) = if let Some(_neg) = amount_opt {
+            // negative amount → BUY; price is the smallest positive < 10 000
+            ("BUY", pos_nums.iter().copied().filter(|&n| n > 0.0 && n < 10_000.0).next())
+        } else if pos_nums.len() >= 2 {
+            // All positive: infer from scale.
+            // Find the smallest positive number that could be a per-share price
+            // (< 10 000), then check if any OTHER positive is > price × 1.5
+            // (i.e. it's the total amount, not another price).  If so → SELL.
+            let price_cand = pos_nums.iter().copied()
+                .filter(|&n| n > 0.0 && n < 10_000.0)
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let amount_cand = price_cand.and_then(|p| {
+                pos_nums.iter().copied()
+                    .find(|&n| n > p * 1.5)
+            });
+            if price_cand.is_some() && amount_cand.is_some() {
+                ("SELL", price_cand)
+            } else {
+                ("BUY", pos_nums.first().copied())
+            }
+        } else {
+            ("BUY", pos_nums.first().copied())
+        };
+
+        let price = match price_opt {
+            Some(p) if p > 0.0 => p,
+            _ => continue,
+        };
+        let shares = match shares_f {
+            Some(s) if s >= 1.0 => s.round(),
+            _ => continue,
+        };
+
+        // ── Stock name: search backward for CJK run (≥ 2 Unicode chars) ───────
+        // Check char count (not byte length) so single CJK chars like "日"
+        // (3 bytes but 1 char) are not accepted as stock names.
+        let stock_name = std::iter::once(price_line)
+            .chain((0..price_idx).rev().map(|k| lines[k].trim()))
+            .take(4)
+            .find_map(|l| {
+                // Skip group-header lines containing a year number.
+                if l.contains("2026") || l.contains("2025") || l.contains("2024") {
+                    return None;
+                }
+                extract_longest_cjk_run(l)
+                    .filter(|name| name.chars().count() >= 2)
+            })
+            .unwrap_or_else(|| "未知".to_string());
+
+        let total_amount = price * shares;
+        rows.push(ParsedTradeRow {
+            transaction_type: tx_type.to_string(),
+            stock_name,
+            traded_at,
+            price,
+            shares,
+            total_amount,
+            commission,
+        });
     }
-    // Also search inline
-    let re2 = regex::Regex::new(r"\b(\d{4})-\d{2}\b").unwrap();
-    if let Some(cap) = re2.captures(text) {
-        if let Ok(y) = cap[1].parse::<i32>() {
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    // Sort chronologically; deduplicate.
+    // Use (traded_at, price, shares) as the key so that two trades at the same
+    // timestamp but with different prices/shares are NOT removed (this happens
+    // when stock names are both "未知" due to garbled OCR).
+    rows.sort_by(|a, b| a.traded_at.cmp(&b.traded_at));
+    rows.dedup_by(|a, b| {
+        a.traded_at == b.traded_at
+            && a.stock_name == b.stock_name
+            && (a.price - b.price).abs() < 0.001
+            && (a.shares - b.shares).abs() < 0.001
+    });
+    Some(rows)
+}
+
+/// Return the 4-digit year found in the first `YYYY-MM` or `YYYY.MM` header
+/// in `text`.  Falls back to the current UTC year if none is found.
+///
+/// NOTE: The `\b` word-boundary assertion does not fire between CJK characters
+/// (like "日") and ASCII digits in Rust's regex engine, so we use a raw byte
+/// "not preceded by ASCII digit" guard instead.
+fn extract_year(text: &str) -> i32 {
+    // Match YYYY-MM at the start of a line (possibly preceded by CJK chars).
+    let re = regex::Regex::new(r"(?m)(\d{4})[-.](\d{2})").unwrap();
+    for cap in re.captures_iter(text) {
+        let start = cap.get(1).unwrap().start();
+        // Reject if preceded by a digit (avoids matching inside e.g. "12345-06").
+        if start > 0 && text.as_bytes()[start - 1].is_ascii_digit() {
+            continue;
+        }
+        let y: i32 = match cap[1].parse() { Ok(y) => y, Err(_) => continue };
+        let m: u32 = match cap[2].parse() { Ok(m) => m, Err(_) => continue };
+        // Accept a year only if the month component is plausible (1–12).
+        if y > 2000 && y < 2200 && (1..=12).contains(&m) {
             return y;
         }
     }
@@ -1811,5 +2022,62 @@ V 2026.04           270.742.49 +1.6896
         let maotai = sells.iter().find(|r| r.stock_name.contains("贵州茅台"))
             .expect("贵州茅台 SELL not found");
         assert!((maotai.price - 1459.480).abs() < 0.01, "maotai price={}", maotai.price);
+    }
+
+    /// Test the dateline fallback using the EXACT Tesseract output from the
+    /// user's actual THS phone screenshot (2x upscaled, 460→920px wide).
+    /// At this scale Tesseract reads Chinese correctly EXCEPT the
+    /// "买入-招商银行" / "卖出-双汇发展" trade-direction+name lines, which
+    /// appear blank (Chinese text not rendered in the small synthetic image).
+    /// The dateline fallback must still produce 6 rows by using the
+    /// "日MM-DD HH.MM  shares  commission" secondary lines and working backward
+    /// to the price+amount line.
+    #[test]
+    fn test_parse_dateline_fallback_no_anchors() {
+        // Verbatim OCR output from tesseract on the 2x synthetic image.
+        // The name/direction lines are blank — only numbers survive.
+        let text = "\
+                                                                         E台到                             E台到
+
+日2026-04                                                +270.742.49
+
+                                                                         39.680                       -59525.60
+日04-22 14.26                                   1500              5.60
+                                                                         28.950                       57865.43
+日04-22 14.26                                   2000              34.57
+                                                                         38.970                       -58460.58
+日04-13 09.59                                   1500              5.58
+                                                                         28.410                       56786.02
+日04-13 09.58                                   2000              33.98
+                                               39.280                    -145349.09
+日04-09 13:39                                   3700              13.09
+                                        1459.480           145861.89
+日04-09 13:39                                   100               86.11
+
+日2026-03
+
+日2026-02
+";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 6,
+            "dateline fallback must produce 6 rows, got {}: {rows:?}", rows.len());
+
+        let buys:  Vec<_> = rows.iter().filter(|r| r.transaction_type == "BUY").collect();
+        let sells: Vec<_> = rows.iter().filter(|r| r.transaction_type == "SELL").collect();
+        assert_eq!(buys.len(),  3, "expected 3 BUY rows, got {buys:?}");
+        assert_eq!(sells.len(), 3, "expected 3 SELL rows, got {sells:?}");
+
+        // Spot-check 招商银行 04-22 buy
+        let r0 = buys.iter().find(|r| r.traded_at.contains("04-22"))
+            .expect("04-22 BUY not found");
+        assert!((r0.price  - 39.680).abs() < 0.01, "price={}", r0.price);
+        assert!((r0.shares - 1500.0).abs() < 0.01, "shares={}", r0.shares);
+        assert!(r0.transaction_type == "BUY");
+
+        // Spot-check 贵州茅台 sell
+        let maotai = sells.iter().find(|r| r.price > 1000.0)
+            .expect("贵州茅台 SELL (price>1000) not found");
+        assert!((maotai.price  - 1459.480).abs() < 0.01, "maotai price={}", maotai.price);
+        assert!((maotai.shares - 100.0).abs()    < 0.01, "maotai shares={}", maotai.shares);
     }
 }

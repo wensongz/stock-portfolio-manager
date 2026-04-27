@@ -311,7 +311,7 @@ export default function ImportFromImageModal({
           value={record.stock_name}
           style={{ width: 100 }}
           onChange={(e) =>
-            updateRow(record.key, { stock_name: e.target.value.trimStart() })
+            updateRow(record.key, { stock_name: e.target.value.trim() })
           }
         />
       ),

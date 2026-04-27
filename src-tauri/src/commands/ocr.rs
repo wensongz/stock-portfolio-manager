@@ -745,8 +745,10 @@ fn parse_ths_ocr_dateline_fallback(
             .chain((0..price_idx).rev().map(|k| lines[k].trim()))
             .take(4)
             .find_map(|l| {
-                // Skip group-header lines containing a year number.
-                if l.contains("2026") || l.contains("2025") || l.contains("2024") {
+                // Skip group-header lines containing a year number (e.g. "∧ 2026-04").
+                let has_year = regex::Regex::new(r"\b\d{4}\b").ok()
+                    .map_or(false, |re| re.is_match(l));
+                if has_year {
                     return None;
                 }
                 extract_longest_cjk_run(l)
@@ -801,8 +803,10 @@ fn extract_year(text: &str) -> i32 {
         }
         let y: i32 = match cap[1].parse() { Ok(y) => y, Err(_) => continue };
         let m: u32 = match cap[2].parse() { Ok(m) => m, Err(_) => continue };
-        // Accept a year only if the month component is plausible (1–12).
-        if y > 2000 && y < 2200 && (1..=12).contains(&m) {
+        // Accept a year only if the month component is plausible (1–12) and the
+        // year is within a reasonable range of the current year (±10 years).
+        let current_year = chrono::Utc::now().year();
+        if y >= current_year - 10 && y <= current_year + 2 && (1..=12).contains(&m) {
             return y;
         }
     }

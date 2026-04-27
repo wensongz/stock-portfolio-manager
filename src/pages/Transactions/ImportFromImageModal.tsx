@@ -7,6 +7,7 @@ import {
   Table,
   Space,
   Select,
+  Input,
   InputNumber,
   DatePicker,
   Spin,
@@ -303,7 +304,17 @@ export default function ImportFromImageModal({
       title: "股票名称",
       dataIndex: "stock_name",
       key: "name",
-      width: 100,
+      width: 110,
+      render: (_: unknown, record: EditableRow) => (
+        <Input
+          size="small"
+          value={record.stock_name}
+          style={{ width: 100 }}
+          onChange={(e) =>
+            updateRow(record.key, { stock_name: e.target.value.trimStart() })
+          }
+        />
+      ),
     },
     {
       title: "股票代码",
@@ -584,7 +595,7 @@ export default function ImportFromImageModal({
             rowKey="key"
             size="small"
             pagination={false}
-            scroll={{ x: 850 }}
+            scroll={{ x: 870, y: 380 }}
           />
         </div>
       )}

@@ -35,6 +35,8 @@ struct XueqiuSearchResponse {
 #[derive(Debug, Deserialize)]
 struct XueqiuSearchData {
     items: Option<Vec<XueqiuSearchItem>>,
+    /// Some Xueqiu API versions return "list" instead of "items".
+    list: Option<Vec<XueqiuSearchItem>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,17 +54,23 @@ struct XueqiuSearchItem {
 /// found, and `Err(…)` for network / API failures.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn lookup_cn_stock_code(name: String) -> Result<Option<String>, String> {
+    // Try Xueqiu first (uses the shared authenticated session).
+    if let Ok(Some(code)) = lookup_via_xueqiu(&name).await {
+        return Ok(Some(code));
+    }
+    // Fall back to Sina Suggest, which needs no cookies.
+    match lookup_via_sina(&name).await {
+        Ok(r) => Ok(r),
+        Err(e) => Err(format!("股票代码查询失败: {e}")),
+    }
+}
+
+/// Xueqiu `stock/search.json` lookup.
+async fn lookup_via_xueqiu(name: &str) -> Result<Option<String>, String> {
     use std::time::Duration;
 
-    // Ensure Xueqiu session is initialised (reuse the existing helper via a
-    // minimal ad-hoc approach: just call the homepage once if needed).
-    // We deliberately avoid importing private quote_service internals and
-    // instead build the request directly on the shared xueqiu_client.
     let client = http_client::xueqiu_client();
 
-    // A minimal session warm-up: if the client has no cookie yet, visit the
-    // homepage so Xueqiu sets xq_a_token.  We use a static AtomicBool to
-    // perform this only once per process.
     static INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !INIT.load(std::sync::atomic::Ordering::SeqCst) {
         let _ = client
@@ -79,7 +87,7 @@ pub async fn lookup_cn_stock_code(name: String) -> Result<Option<String>, String
 
     let url = format!(
         "https://xueqiu.com/stock/search.json?q={}&type=1&count=5",
-        urlencoding::encode(&name)
+        urlencoding::encode(name)
     );
 
     let resp = client
@@ -100,20 +108,15 @@ pub async fn lookup_cn_stock_code(name: String) -> Result<Option<String>, String
 
     let items = body
         .data
-        .and_then(|d| d.items)
+        .and_then(|d| d.items.or(d.list))
         .unwrap_or_default();
 
-    // Find first CN A-share result: symbol starts with "SH" or "SZ" and has
-    // exactly 8 chars (prefix 2 + code 6).
     for item in &items {
         let sym = match &item.symbol {
             Some(s) if !s.is_empty() => s.as_str(),
             _ => continue,
         };
-        // stock_type field may say "stock" for A-shares; the symbol prefix is
-        // the most reliable indicator.
         let is_cn = sym.starts_with("SH") || sym.starts_with("SZ");
-        let _ = &item.stock_type; // kept for potential future filtering
         if is_cn && sym.len() == 8 {
             return Ok(Some(sym[2..].to_string()));
         }
@@ -122,11 +125,169 @@ pub async fn lookup_cn_stock_code(name: String) -> Result<Option<String>, String
     Ok(None)
 }
 
+/// Sina Suggest API lookup — does not require any cookie or token.
+///
+/// Endpoint: `https://suggest3.sinajs.cn/suggest/type=11,12&key={name}`
+///
+/// Response: `var suggestvalue="SH600519,11,贵州茅台,...;SZ000858,...;"`
+///
+/// Each semicolon-delimited item has comma-separated fields:
+/// `symbol_with_prefix,type,name,...`
+async fn lookup_via_sina(name: &str) -> Result<Option<String>, String> {
+    let url = format!(
+        "https://suggest3.sinajs.cn/suggest/type=11,12&key={}",
+        urlencoding::encode(name)
+    );
+
+    let client = reqwest::Client::new();
+    let text = client
+        .get(&url)
+        .header(reqwest::header::REFERER, "https://finance.sina.com.cn")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("{e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    // Extract the value string: var suggestvalue="...";
+    let re = regex::Regex::new(r#"suggestvalue="([^"]*)""#).unwrap();
+    let Some(cap) = re.captures(&text) else {
+        return Ok(None);
+    };
+    let value = &cap[1];
+
+    for item in value.split(';') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let sym = item.splitn(2, ',').next().unwrap_or("");
+        if (sym.starts_with("SH") || sym.starts_with("SZ")) && sym.len() == 8 {
+            return Ok(Some(sym[2..].to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
 // ---------------------------------------------------------------------------
-// OCR parsing
+// Image slicing — split THS screenshot into individual trade-card images
 // ---------------------------------------------------------------------------
 
-/// Run Tesseract on raw image bytes and return the recognised text.
+/// Minimum pixel height for a valid trade-card slice.  Slices shorter than
+/// this are discarded as separator artefacts or padding-only strips.
+const MIN_CARD_HEIGHT_PX: u32 = 30;
+
+/// Split a THS trade-history screenshot into individual card images by
+/// detecting horizontal separator bands.
+///
+/// THS renders each trade as a "card" in a list.  Between consecutive cards
+/// there is a band of uniform light-coloured pixels (white/light-gray
+/// background + optional thin divider line, typically ≥ 3 px tall).
+///
+/// Algorithm:
+/// 1. Convert the image to grayscale (Luma8).
+/// 2. For every pixel row compute the mean luminance and the pixel-value range.
+/// 3. Mark rows where mean > 220 **and** range < 30 as separator candidates.
+/// 4. Merge consecutive candidate rows into "separator bands".
+/// 5. Cut the image at the midpoint of each band.
+/// 6. Return the resulting sub-images as PNG byte vectors.
+///
+/// Returns `vec![data.to_vec()]` (the original image unchanged) when fewer
+/// than two separator bands are found, so the caller can fall back to
+/// whole-image OCR.
+fn split_image_by_separators(data: &[u8]) -> Vec<Vec<u8>> {
+    use image::GenericImageView as _;
+
+    let img = match image::load_from_memory(data) {
+        Ok(i) => i,
+        Err(_) => return vec![data.to_vec()],
+    };
+
+    let (width, height) = img.dimensions();
+    if width == 0 || height < MIN_CARD_HEIGHT_PX * 2 {
+        return vec![data.to_vec()];
+    }
+
+    let gray = img.to_luma8();
+
+    // ── 1. Label each row as a separator candidate ────────────────────────────
+    let mut is_sep: Vec<bool> = vec![false; height as usize];
+    for y in 0..height {
+        let mut min_lum: u32 = 255;
+        let mut max_lum: u32 = 0;
+        let mut sum: u32 = 0;
+        for x in 0..width {
+            let lum = gray.get_pixel(x, y)[0] as u32;
+            if lum < min_lum { min_lum = lum; }
+            if lum > max_lum { max_lum = lum; }
+            sum += lum;
+        }
+        let mean = sum / width;
+        let range = max_lum - min_lum;
+        is_sep[y as usize] = mean > 220 && range < 30;
+    }
+
+    // ── 2. Find separator bands (consecutive sep rows) ────────────────────────
+    let mut cut_ys: Vec<u32> = Vec::new();
+    let mut band_start: Option<u32> = None;
+    for y in 0..height {
+        match (is_sep[y as usize], band_start) {
+            (true, None) => band_start = Some(y),
+            (false, Some(start)) => {
+                // Emit the midpoint of this band as the cut position.
+                cut_ys.push((start + y) / 2);
+                band_start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = band_start {
+        cut_ys.push((start + height) / 2);
+    }
+
+    if cut_ys.is_empty() {
+        return vec![data.to_vec()];
+    }
+
+    // ── 3. Build slice boundaries ─────────────────────────────────────────────
+    let mut bounds: Vec<u32> = vec![0];
+    bounds.extend_from_slice(&cut_ys);
+    bounds.push(height);
+    bounds.dedup();
+
+    let mut slices: Vec<Vec<u8>> = Vec::new();
+    for pair in bounds.windows(2) {
+        let (y0, y1) = (pair[0], pair[1]);
+        if y1 <= y0 || y1 - y0 < MIN_CARD_HEIGHT_PX {
+            continue; // Skip slivers too thin to contain a trade card.
+        }
+        let sub = img.crop_imm(0, y0, width, y1 - y0);
+        let mut buf: Vec<u8> = Vec::new();
+        if sub
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Png,
+            )
+            .is_ok()
+        {
+            slices.push(buf);
+        }
+    }
+
+    if slices.is_empty() {
+        vec![data.to_vec()]
+    } else {
+        slices
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OCR helper
+// ---------------------------------------------------------------------------
+
 ///
 /// `data` is the raw PNG/JPEG file content.  Tesseract is invoked via
 /// `std::process::Command` so no native library linking is required.
@@ -638,8 +799,12 @@ fn pick_fields(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
 // Tauri command
 // ---------------------------------------------------------------------------
 
-/// Decode a base64-encoded image, run Tesseract OCR on it, and return the
-/// parsed trade rows.
+/// Decode a base64-encoded image, pre-slice it by separator bands, run
+/// Tesseract OCR on each slice, and return the merged parsed trade rows.
+///
+/// Slicing each trade card into its own image dramatically improves OCR
+/// accuracy because Tesseract no longer has to deal with cross-card layout
+/// ambiguity.
 ///
 /// The caller should pass `image_base64` as a pure base64 string (no
 /// `data:image/...;base64,` prefix, though the prefix is stripped if present).
@@ -658,9 +823,28 @@ pub async fn parse_trade_image(image_base64: String) -> Result<Vec<ParsedTradeRo
         .decode(b64.trim())
         .map_err(|e| format!("base64 解码失败: {}", e))?;
 
-    let text = ocr_image(&bytes)?;
-    let rows = parse_ths_ocr(&text);
-    Ok(rows)
+    // Split the image into per-card slices (falls back to the whole image when
+    // no separator lines are detected).
+    let slices = split_image_by_separators(&bytes);
+
+    let mut all_rows: Vec<ParsedTradeRow> = if slices.len() <= 1 {
+        // No separators found — OCR the whole image as before.
+        let text = ocr_image(&bytes)?;
+        parse_ths_ocr(&text)
+    } else {
+        let mut combined: Vec<ParsedTradeRow> = Vec::new();
+        for slice in &slices {
+            if let Ok(text) = ocr_image(slice) {
+                combined.extend(parse_ths_ocr(&text));
+            }
+        }
+        combined
+    };
+
+    // Deduplicate and sort chronologically.
+    all_rows.sort_by(|a, b| a.traded_at.cmp(&b.traded_at));
+    all_rows.dedup_by(|a, b| a.traded_at == b.traded_at && a.stock_name == b.stock_name);
+    Ok(all_rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,5 +1200,69 @@ mod tests {
         assert_eq!(zhaoshang.transaction_type, "BUY");
         assert!((zhaoshang.price - 28.95).abs() < 0.01);
         assert!((zhaoshang.shares - 2000.0).abs() < 0.01);
+    }
+
+    // ── split_image_by_separators ────────────────────────────────────────────
+
+    /// Build a synthetic PNG with N cards separated by uniform light-gray bands.
+    /// Returns the raw PNG bytes.
+    #[cfg(test)]
+    fn make_test_image_with_separators(n_cards: u32) -> Vec<u8> {
+        use image::{ImageBuffer, Rgb};
+        let card_h: u32 = 80;
+        let sep_h: u32 = 5; // 5px of light-gray (uniform)
+        let width: u32 = 400;
+        // Total height: n cards + (n-1) separators
+        let total_h = n_cards * card_h + (n_cards.saturating_sub(1)) * sep_h;
+        let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(width, total_h);
+
+        let card_color = Rgb([50u8, 50, 50]); // dark content
+        let sep_color = Rgb([235u8, 235, 235]); // light separator
+
+        for y in 0..total_h {
+            // Determine which "stripe" this row belongs to.
+            let stripe_h = card_h + sep_h;
+            let local_y = y % stripe_h;
+            let color = if local_y < card_h { card_color } else { sep_color };
+            for x in 0..width {
+                img.put_pixel(x, y, color);
+            }
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .expect("encode test image");
+        buf
+    }
+
+    #[test]
+    fn test_split_one_card_returns_whole_image() {
+        // Single card: no separator bands → function returns original bytes.
+        let bytes = make_test_image_with_separators(1);
+        let slices = split_image_by_separators(&bytes);
+        assert_eq!(slices.len(), 1, "expected 1 slice for single card");
+    }
+
+    #[test]
+    fn test_split_two_cards_produces_two_slices() {
+        let bytes = make_test_image_with_separators(2);
+        let slices = split_image_by_separators(&bytes);
+        assert_eq!(slices.len(), 2, "expected 2 slices for 2-card image, got {}", slices.len());
+    }
+
+    #[test]
+    fn test_split_six_cards_produces_six_slices() {
+        let bytes = make_test_image_with_separators(6);
+        let slices = split_image_by_separators(&bytes);
+        assert_eq!(slices.len(), 6, "expected 6 slices for 6-card image, got {}", slices.len());
+    }
+
+    #[test]
+    fn test_split_invalid_bytes_returns_original() {
+        let bad = b"not an image".to_vec();
+        let slices = split_image_by_separators(&bad);
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0], bad);
     }
 }

@@ -57,22 +57,34 @@ function App() {
       else unsubs.push(fn);
     });
 
-    // Path 3 (one-shot fallback): the background startup task runs ~2 s
-    // after launch.  This check fires at 4 s — after the task has had time
-    // to complete — and picks up any unconsumed warning in case the Tauri
-    // events above were missed (e.g. due to webview listener-registration
-    // timing).  It runs only once so it does not create a repeating poll
-    // that could race with user-triggered refreshes.
-    const timerId = window.setTimeout(async () => {
-      if (!cancelled) {
-        const w = await invoke<string | null>("take_quote_warning").catch(() => null);
-        if (w) setQuoteWarning(w);
+    // Path 3 (polling fallback): the background startup task fires ~2 s after
+    // launch and may take up to 15 s to fail per Xueqiu timeout.  Poll every
+    // 3 s for up to 90 s so we surface the warning regardless of how long
+    // Xueqiu takes to respond and without depending on event delivery timing.
+    // Polling stops as soon as a warning is found or the budget is exhausted.
+    let pollCount = 0;
+    const MAX_POLLS = 30;       // 30 × 3 s = 90 s total
+    const POLL_INTERVAL_MS = 3000; // 3 seconds between checks
+    const intervalId = window.setInterval(async () => {
+      if (cancelled) {
+        window.clearInterval(intervalId);
+        return;
       }
-    }, 4000);
+      pollCount += 1;
+      if (pollCount > MAX_POLLS) {
+        window.clearInterval(intervalId);
+        return;
+      }
+      const w = await invoke<string | null>("take_quote_warning").catch(() => null);
+      if (w) {
+        setQuoteWarning(w);
+        window.clearInterval(intervalId);
+      }
+    }, POLL_INTERVAL_MS);
 
     return () => {
       cancelled = true;
-      window.clearTimeout(timerId);
+      window.clearInterval(intervalId);
       unsubs.forEach((fn) => fn());
     };
   }, [setQuoteWarning]);

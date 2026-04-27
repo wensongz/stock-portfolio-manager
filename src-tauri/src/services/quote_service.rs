@@ -1263,10 +1263,25 @@ pub async fn fetch_quotes_batch_with_providers(
     let mut quotes = Vec::new();
     let mut has_xueqiu_cookie_warning = false;
     let mut has_xueqiu_api_warning = false;
+    // Once we know Xueqiu is unreachable, skip remaining Xueqiu symbols so
+    // we don't wait for N × 15-second timeouts (one per symbol).  Non-Xueqiu
+    // symbols (e.g. US via Yahoo) are still fetched normally.
+    let mut xueqiu_failed = false;
     for (symbol, market) in unique_symbols {
         // Cash symbols don't need an API call – return a synthetic quote.
         if is_cash_symbol(&symbol) {
             quotes.push(make_cash_quote(&symbol, &market));
+            continue;
+        }
+        // Determine whether this symbol would use the Xueqiu API.
+        let uses_xueqiu = match market.as_str() {
+            "CN" => cn_provider == "xueqiu",
+            "HK" => hk_provider == "xueqiu",
+            _ => false,
+        };
+        if xueqiu_failed && uses_xueqiu {
+            // Skip: Xueqiu is already known to be unreachable for this batch.
+            eprintln!("Skipping {} ({}) – Xueqiu already failed for this batch", symbol, market);
             continue;
         }
         let result = match market.as_str() {
@@ -1278,12 +1293,19 @@ pub async fn fetch_quotes_batch_with_providers(
         match result {
             Ok(quote) => quotes.push(quote),
             Err(e) => {
-                if is_xueqiu_cookie_expired_error(&e) {
+                eprintln!("Warning: failed to fetch quote for {} ({}): {}", symbol, market, e);
+                let is_cookie_err = is_xueqiu_cookie_expired_error(&e);
+                let is_api_err = is_xueqiu_request_error(&e);
+                if is_cookie_err {
                     has_xueqiu_cookie_warning = true;
-                } else if is_xueqiu_request_error(&e) {
+                } else if is_api_err {
                     has_xueqiu_api_warning = true;
                 }
-                eprintln!("Warning: failed to fetch quote for {} ({}): {}", symbol, market, e)
+                // Mark Xueqiu as failed for either error kind so we can skip
+                // remaining Xueqiu symbols without waiting for more timeouts.
+                if is_cookie_err || is_api_err {
+                    xueqiu_failed = true;
+                }
             }
         }
     }

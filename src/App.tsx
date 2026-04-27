@@ -57,15 +57,22 @@ function App() {
       else unsubs.push(fn);
     });
 
-    // NOTE: A periodic polling fallback was deliberately removed here.
-    // It raced with fetchHoldingQuotes's own take_quote_warning() call:
-    // the poll could consume the warning first, then fetchHoldingQuotes
-    // would receive null and write quoteWarning: null — clearing the alert.
-    // PATH 1 (quote-warning event) and PATH 2 (quotes-refreshed) are
-    // sufficient for startup; manual refreshes use their own direct call.
+    // Path 3 (one-shot fallback): the background startup task runs ~2 s
+    // after launch.  This check fires at 4 s — after the task has had time
+    // to complete — and picks up any unconsumed warning in case the Tauri
+    // events above were missed (e.g. due to webview listener-registration
+    // timing).  It runs only once so it does not create a repeating poll
+    // that could race with user-triggered refreshes.
+    const timerId = window.setTimeout(async () => {
+      if (!cancelled) {
+        const w = await invoke<string | null>("take_quote_warning").catch(() => null);
+        if (w) setQuoteWarning(w);
+      }
+    }, 4000);
 
     return () => {
       cancelled = true;
+      window.clearTimeout(timerId);
       unsubs.forEach((fn) => fn());
     };
   }, [setQuoteWarning]);

@@ -304,6 +304,77 @@ fn split_image_by_separators(data: &[u8]) -> Vec<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// Image pre-processing
+// ---------------------------------------------------------------------------
+
+/// Pre-process raw image bytes to improve Tesseract OCR accuracy on mobile
+/// phone screenshots:
+///
+/// 1. **Upscale**: if the image is narrower than `MIN_OCR_WIDTH` pixels,
+///    scale it up so that CJK characters are large enough for chi_sim
+///    (Tesseract accuracy degrades sharply when characters are < 20 px tall;
+///    a typical 375 px-wide phone screenshot has ~13 px text).
+///
+/// 2. **Grayscale + binarize**: convert to luma and threshold at
+///    `OCR_THRESHOLD`.  Any pixel with luminance < threshold becomes black
+///    (text) and anything ≥ threshold becomes white (background).
+///    This collapses coloured trade text (red negative amounts, blue dates)
+///    into plain black, removes JPEG compression noise, and gives Tesseract
+///    a clean high-contrast input.
+///
+/// 3. Re-encode as PNG (lossless) before handing off to Tesseract.
+///
+/// Falls back to the original bytes on any image-decoding error.
+fn preprocess_for_ocr(data: &[u8]) -> Vec<u8> {
+    use image::GenericImageView as _;
+    let img = match image::load_from_memory(data) {
+        Ok(i) => i,
+        Err(_) => return data.to_vec(),
+    };
+
+    // ── 1. Upscale if too small ───────────────────────────────────────────────
+    const MIN_OCR_WIDTH: u32 = 1000;
+    let (w, h) = img.dimensions();
+    let img = if w < MIN_OCR_WIDTH {
+        // Ceiling: scale up so result width ≥ MIN_OCR_WIDTH.
+        let scale = (MIN_OCR_WIDTH + w - 1) / w;
+        img.resize(w * scale, h * scale, image::imageops::FilterType::CatmullRom)
+    } else {
+        img
+    };
+
+    // ── 2. Grayscale ──────────────────────────────────────────────────────────
+    let gray = img.to_luma8();
+
+    // ── 3. Binarize ───────────────────────────────────────────────────────────
+    // Threshold 180 keeps all coloured text (red amounts ≈ luma 118, blue
+    // dates ≈ luma 76) as black while turning white/light-grey background
+    // pure white.
+    const OCR_THRESHOLD: u8 = 180;
+    let binary = image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_fn(
+        gray.width(),
+        gray.height(),
+        |x, y| {
+            let l = gray.get_pixel(x, y)[0];
+            image::Luma([if l < OCR_THRESHOLD { 0u8 } else { 255u8 }])
+        },
+    );
+
+    let mut buf: Vec<u8> = Vec::new();
+    if image::DynamicImage::ImageLuma8(binary)
+        .write_to(
+            &mut std::io::Cursor::new(&mut buf),
+            image::ImageFormat::Png,
+        )
+        .is_ok()
+    {
+        buf
+    } else {
+        data.to_vec()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OCR helper
 // ---------------------------------------------------------------------------
 
@@ -311,12 +382,17 @@ fn split_image_by_separators(data: &[u8]) -> Vec<Vec<u8>> {
 /// `data` is the raw PNG/JPEG file content.  Tesseract is invoked via
 /// `std::process::Command` so no native library linking is required.
 fn ocr_image(data: &[u8]) -> Result<String, String> {
+    // Pre-process: upscale small images and binarize to improve chi_sim accuracy
+    // on mobile phone screenshots.  On any processing failure, fall back to the
+    // original bytes so OCR can still be attempted.
+    let processed = preprocess_for_ocr(data);
+
     // Write image bytes to a temp file.
     let mut tmp = tempfile::Builder::new()
         .suffix(".png")
         .tempfile()
         .map_err(|e| format!("创建临时文件失败: {}", e))?;
-    tmp.write_all(data)
+    tmp.write_all(&processed)
         .map_err(|e| format!("写临时文件失败: {}", e))?;
     tmp.flush()
         .map_err(|e| format!("刷新临时文件失败: {}", e))?;
@@ -611,30 +687,94 @@ fn extract_fields_from_context(
     // Regex patterns compiled once per call (acceptable; `parse_ths_ocr` is
     // called infrequently and regex is fast to compile).
     let full_ymd_re = regex::Regex::new(r"\b(\d{4})-(\d{2})-(\d{2})\b").unwrap();
-    let date_re     = regex::Regex::new(r"\b(\d{1,2})-(\d{2})\b").unwrap();
-    let time_re     = regex::Regex::new(r"\b(\d{1,2}):(\d{2})(?::\d{2})?\b").unwrap();
-    let neg_re      = regex::Regex::new(r"-\d+(?:[.,]\d+)?").unwrap();
-    let pct_re      = regex::Regex::new(r"\d+(?:\.\d+)?\s*%").unwrap();
-    let num_re      = regex::Regex::new(r"\b(\d+(?:\.\d+)?)\b").unwrap();
+    // Accept both hyphen and period as the date separator.  Tesseract on small
+    // phone screenshots often reads "04-22" as "04.22".
+    //
+    // NOTE: no leading \b.  The Rust regex crate treats Unicode characters
+    // (including CJK, e.g. "全") as \w, so there is NO word boundary between
+    // "全" and a following ASCII digit.  Instead we apply a manual "not preceded
+    // by an ASCII digit" guard inside the filter_map / closure below.
+    let date_re = regex::Regex::new(r"(\d{1,2})[.-](\d{2})").unwrap();
+    // Same but also optionally consumes a run-together HHMM that immediately
+    // follows the date (e.g. "04.221426" ← merged "04-22 14:26").
+    // The captured HHMM is discarded; we want to strip the spurious digits so
+    // they don't pollute number extraction.
+    let date_clean_re = regex::Regex::new(
+        r"(\d{1,2})[.-](\d{2})(?:\s*([01]\d|2[0-3])([0-5]\d)\b)?",
+    )
+    .unwrap();
+    let time_re = regex::Regex::new(r"\b(\d{1,2}):(\d{2})(?::\d{2})?\b").unwrap();
+    let neg_re  = regex::Regex::new(r"-\d+(?:[.,]\d+)?").unwrap();
+    let pct_re  = regex::Regex::new(r"\d+(?:\.\d+)?\s*%").unwrap();
+    let num_re  = regex::Regex::new(r"\b(\d+(?:\.\d+)?)\b").unwrap();
 
     // Combine anchor extra + window into one searchable string.
     let mut parts: Vec<&str> = vec![anchor_extra];
     parts.extend_from_slice(window);
     let all_text = parts.join(" ");
 
-    // --- Date ---
-    // Prefer the full YYYY-MM-DD pattern to avoid false matches.
-    // Without this, date_re on "2026-04-09" would first match "20-26"
-    // (position 0) instead of the correct "04-09".
+    // Helper: check that the byte immediately before position `pos` in `s` is
+    // NOT an ASCII digit.  This is the manual lookbehind that replaces the
+    // leading \b (which doesn't fire between CJK and ASCII digits in Rust regex).
+    let not_preceded_by_digit = |s: &str, pos: usize| -> bool {
+        pos == 0 || !s.as_bytes()[pos - 1].is_ascii_digit()
+    };
+
+    // --- Date (3-tier cascade) ---
+    //
+    // Tier A – full YYYY-MM-DD (e.g. section-header lines).
+    // Tier B – MM-DD or MM.DD with a separator character.
+    //          No leading \b: Rust regex treats CJK chars (like "全") as \w,
+    //          so \b would not fire between "全" and the following digit.
+    //          A manual "not preceded by ASCII digit" guard replaces it.
+    // Tier C – 8-digit MMDDHHMI blob (e.g. "04091353") produced when OCR
+    //          merges date *and* time with all separators lost.
     let (effective_year, month, day) =
         if let Some(cap) = full_ymd_re.captures(&all_text) {
             let y = cap[1].parse::<i32>().unwrap_or(year);
             let m = cap[2].parse::<u32>().unwrap_or(1);
             let d = cap[3].parse::<u32>().unwrap_or(1);
             (y, m, d)
-        } else if let Some(cap) = date_re.captures(&all_text) {
-            let m = cap[1].parse::<u32>().unwrap_or(1);
-            let d = cap[2].parse::<u32>().unwrap_or(1);
+        } else if let Some((m, d)) = date_re
+            .captures_iter(&all_text)
+            .filter_map(|cap| {
+                let start = cap.get(0)?.start();
+                if !not_preceded_by_digit(&all_text, start) {
+                    return None;
+                }
+                let m = cap[1].parse::<u32>().ok()?;
+                let d = cap[2].parse::<u32>().ok()?;
+                if (1..=12).contains(&m) && (1..=31).contains(&d) {
+                    Some((m, d))
+                } else {
+                    None
+                }
+            })
+            .next()
+        {
+            (year, m, d)
+        } else if let Some((m, d)) = {
+            // Tier C: isolated 8-digit blob – first 4 digits are MMDD.
+            // Bind eight_re to a local so its lifetime doesn't escape the block.
+            let eight_re = regex::Regex::new(r"\d{8}").unwrap();
+            let result = eight_re.find_iter(&all_text).find_map(|m_match| {
+                let start = m_match.start();
+                let end   = m_match.end();
+                if !not_preceded_by_digit(&all_text, start) { return None; }
+                if end < all_text.len() && all_text.as_bytes()[end].is_ascii_digit() {
+                    return None;
+                }
+                let s = m_match.as_str();
+                let month: u32 = s[0..2].parse().ok()?;
+                let day:   u32 = s[2..4].parse().ok()?;
+                if (1..=12).contains(&month) && (1..=31).contains(&day) {
+                    Some((month, day))
+                } else {
+                    None
+                }
+            });
+            result
+        } {
             (year, m, d)
         } else {
             return None; // no date found → cannot form a valid trade row
@@ -657,9 +797,28 @@ fn extract_fields_from_context(
     );
 
     // --- Numbers ---
-    // Strip full dates, short dates, times, negative numbers (P&L), percentages.
-    let cleaned = full_ymd_re.replace_all(&all_text, " ");
-    let cleaned = date_re.replace_all(&cleaned, " ");
+    // Strip full dates, short dates (+ merged HHMM), times, negatives, pcts.
+    // The date_clean_re closure applies the same manual "not preceded by digit"
+    // guard and month/day range check used in the date-capture step above.
+    let cleaned = full_ymd_re.replace_all(&all_text, " ").into_owned();
+    let cleaned = {
+        let src: &str = &cleaned;
+        date_clean_re.replace_all(src, |cap: &regex::Captures<'_>| {
+            let start = cap.get(0).unwrap().start();
+            // Skip if preceded by an ASCII digit (avoids removing part of a
+            // price like "39.68" when the full number is "39.680").
+            if !not_preceded_by_digit(src, start) {
+                return cap[0].to_string();
+            }
+            let m = cap[1].parse::<u32>().unwrap_or(99);
+            let d = cap[2].parse::<u32>().unwrap_or(99);
+            if (1..=12).contains(&m) && (1..=31).contains(&d) {
+                " ".to_string()
+            } else {
+                cap[0].to_string() // not a valid date → keep
+            }
+        })
+    };
     let cleaned = time_re.replace_all(&cleaned, " ");
     let cleaned = neg_re.replace_all(&cleaned, " ");
     let cleaned = pct_re.replace_all(&cleaned, " ");
@@ -1521,5 +1680,135 @@ V 2026-02                 +74,518.99 +0.47%
         assert!((zhaoshang.price  - 39.680).abs() < 0.01, "zhaoshang price={}", zhaoshang.price);
         assert!((zhaoshang.shares - 1500.0).abs() < 0.01, "zhaoshang shares={}", zhaoshang.shares);
         assert!((zhaoshang.commission - 5.60).abs() < 0.01, "zhaoshang commission={}", zhaoshang.commission);
+    }
+
+    #[test]
+    fn debug_date_re_in_rust() {
+        // Verify that the manual "not preceded by digit" guard (used in place of
+        // the now-removed leading \b) correctly handles CJK prefixes like "全".
+        // The Rust regex crate treats Unicode CJK characters as \w, so \b would
+        // NOT fire between "全" and a following ASCII digit; we check the raw byte
+        // instead.
+        let samples: &[(&str, bool)] = &[
+            ("全04.221425   1500   5.60", true),  // "04.22" m=4 d=22 ← CJK prefix
+            ("全04-22 14:26  1500  5.60", true),  // "04-22" m=4 d=22 ← CJK prefix
+            ("全04-1309:59  1500   5.58", true),  // "04-13" m=4 d=13 ← CJK prefix
+            ("39.680 full text", false),           // "39.68" m=39 → invalid
+        ];
+        let date_re = regex::Regex::new(r"(\d{1,2})[.-](\d{2})").unwrap();
+        for (s, should_find) in samples {
+            let bytes = s.as_bytes();
+            let found = date_re.captures_iter(s).any(|cap| {
+                let start = cap.get(0).unwrap().start();
+                let preceded_by_digit = start > 0 && bytes[start - 1].is_ascii_digit();
+                if preceded_by_digit { return false; }
+                let m: u32 = cap[1].parse().unwrap_or(99);
+                let d: u32 = cap[2].parse().unwrap_or(99);
+                (1..=12).contains(&m) && (1..=31).contains(&d)
+            });
+            assert_eq!(found, *should_find,
+                "date_re on '{}': found={found} want={should_find}", s);
+        }
+    }
+
+    /// Test with the verbatim OCR text produced by Tesseract on the 2× upscaled
+    /// phone-scale synthetic image (375→750 px wide, 13px→26px font).
+    /// This is what a real iPhone 对账单 screenshot produces after preprocessing.
+    #[test]
+    fn test_parse_2x_phone_scale_tesseract_output() {
+        // Verbatim output from: tesseract ths_phone_2x.png out -l chi_sim --psm 6
+        // (generated by make_ths_phone_image.py then upscaled 2× with Lanczos3)
+        let text = "\
+本月操作                              价格/数量           金手/税费
+
+V 2026-04                          +270,742.49 +1.689%6
+
+买入-招商银行                                39.680               -59525.60
+全04-22 14:26                                   1500                    5.60
+
+卖出-双汇发展           28.950     57865.43
+全04-22 14:26                                   2000                    34.57
+
+买入-招商银行                                38.970               -58460.58
+全04-1309:59                   1500           5.58
+
+卖出-双汇发展           28.410     56786.02
+全04-1309:58                   2000           33.98.
+
+买入-招商银行                                39.280               -145349.09
+全04-0913:59                                   3700                     13.09
+
+卖出-责州茅台           1459.480    145861.89
+全04-0913:39                   100            86.11
+";
+        let rows = parse_ths_ocr(text);
+        // Expect 6 rows; 卖出-责州茅台 is a known OCR misread of 贵州茅台 — still
+        // parsed as SELL.
+        assert_eq!(rows.len(), 6,
+            "expected 6 rows from 2× phone OCR output, got {}: {rows:?}", rows.len());
+
+        let buys:  Vec<_> = rows.iter().filter(|r| r.transaction_type == "BUY").collect();
+        let sells: Vec<_> = rows.iter().filter(|r| r.transaction_type == "SELL").collect();
+        assert_eq!(buys.len(),  3, "expected 3 BUY, got {buys:?}");
+        assert_eq!(sells.len(), 3, "expected 3 SELL, got {sells:?}");
+
+        // 04-22 buy: 招商银行, price=39.680, shares=1500, comm=5.60
+        let r = buys.iter().find(|r| r.traded_at.contains("04-22"))
+            .expect("04-22 BUY not found");
+        assert!((r.price  - 39.680).abs() < 0.01, "price={}", r.price);
+        assert!((r.shares - 1500.0).abs() < 0.01, "shares={}", r.shares);
+        assert!((r.commission - 5.60).abs() < 0.01, "comm={}", r.commission);
+    }
+
+    /// Test with the OCR text produced by Tesseract on the original small
+    /// phone-scale image (375 px wide, 13 px font) WITHOUT preprocessing.
+    /// This exercises the period-separator and merged-date-time code paths.
+    #[test]
+    fn test_parse_period_separator_ocr() {
+        // At original (unscaled) size Tesseract reads "04-22 14:26" as the
+        // merged string "04.221426" or similar.  The parser must still extract
+        // all six trade rows without preprocessing help.
+        let text = "\
+本月操作               失格履昌     全关税费
+
+V 2026.04           270.742.49 +1.6896
+
+买入-招商银行                            39.680             -59525.60
+全04.221425                             1500                 5.60
+
+卖出-双汇发展           28.950     57865.43
+全04.221426                            2000                 34.57
+
+买入-招商银行           38.970     -58460.58
+全04.130953           1500      5.58
+
+卖出-双汇发展                            28.410             56786.02
+全04.1309.58                            2000                 33.98
+
+买入-招商银行                            39.280             -145349.09
+全04091353           3700      13.09
+
+卖出-贵州茅台                             1459.480         145861.89
+全04091339                             100                  86.11
+";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 6,
+            "expected 6 rows from period-separator OCR, got {}: {rows:?}", rows.len());
+
+        let buys:  Vec<_> = rows.iter().filter(|r| r.transaction_type == "BUY").collect();
+        let sells: Vec<_> = rows.iter().filter(|r| r.transaction_type == "SELL").collect();
+        assert_eq!(buys.len(),  3, "expected 3 BUY, got {buys:?}");
+        assert_eq!(sells.len(), 3, "expected 3 SELL, got {sells:?}");
+
+        // Price must be extracted correctly from anchor line; shares from
+        // the date row (may be approximate due to OCR garbling).
+        let r0 = buys.iter().find(|r| r.stock_name.contains("招商银行") && r.traded_at.contains("04-22"))
+            .expect("招商银行 04-22 BUY not found");
+        assert!((r0.price - 39.680).abs() < 0.01, "price={}", r0.price);
+        assert!(r0.shares > 0.0, "shares must be positive, got {}", r0.shares);
+
+        let maotai = sells.iter().find(|r| r.stock_name.contains("贵州茅台"))
+            .expect("贵州茅台 SELL not found");
+        assert!((maotai.price - 1459.480).abs() < 0.01, "maotai price={}", maotai.price);
     }
 }

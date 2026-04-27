@@ -116,6 +116,14 @@ pub fn run() {
                     Ok(quotes) => {
                         // Persist the freshly fetched quotes to the database.
                         let _ = services::quote_service::save_quotes_to_db(&db, &quotes);
+                        // Peek at any warning (without consuming it) so we can
+                        // include it in the quote-warning event.  The warning stays
+                        // in LAST_QUOTE_WARNING so the frontend's take_quote_warning
+                        // command can still read it as a fallback if the event is
+                        // missed, e.g. due to listener registration timing.
+                        if let Some(warning) = services::quote_service::peek_quote_warning() {
+                            let _ = handle.emit("quote-warning", warning);
+                        }
                         // Notify the frontend so it can re-render with fresh prices.
                         let _ = handle.emit("quotes-refreshed", ());
                     }
@@ -147,6 +155,7 @@ pub fn run() {
             commands::quotes::get_us_quote,
             commands::quotes::get_hk_quote,
             commands::quotes::get_cn_quote,
+            commands::quotes::take_quote_warning,
             commands::exchange_rates::get_exchange_rates,
             commands::exchange_rates::convert_amount,
             commands::snapshots::take_snapshot,

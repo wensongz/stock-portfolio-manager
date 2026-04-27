@@ -1,4 +1,5 @@
 import { useCallback, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { Typography, Select, Divider, Card, Row, Col, Statistic, Spin, Alert, Button, Tooltip } from "antd";
 import { ReloadOutlined, SyncOutlined } from "@ant-design/icons";
 import { useDashboardStore } from "../../stores/dashboardStore";
@@ -17,13 +18,25 @@ export default function DashboardPage() {
     useDashboardStore();
   const { rates, loading: ratesLoading, error: ratesError, baseCurrency, fetchRates, setBaseCurrency } =
     useExchangeRateStore();
-  const { loading: quotesLoading, lastUpdatedAt, fetchHoldingQuotes } = useQuoteStore();
+  const { loading: quotesLoading, lastUpdatedAt, fetchHoldingQuotes, setQuoteWarning } = useQuoteStore();
 
   useEffect(() => {
-    fetchRates();
-    fetchSummary(baseCurrency);
-    fetchHoldingDetails();
-  }, [fetchRates, fetchSummary, fetchHoldingDetails, baseCurrency]);
+    // Run all initial data loads in parallel, then check whether any of
+    // them triggered a Xueqiu error.  This is the most reliable delivery
+    // path for the Dashboard because it does not depend on Tauri event
+    // timing: the check runs immediately after the Rust commands that may
+    // have set LAST_QUOTE_WARNING return.
+    const init = async () => {
+      await Promise.allSettled([
+        fetchRates(),
+        fetchSummary(baseCurrency),
+        fetchHoldingDetails(),
+      ]);
+      const w = await invoke<string | null>("take_quote_warning").catch(() => null);
+      if (w) setQuoteWarning(w);
+    };
+    init();
+  }, [fetchRates, fetchSummary, fetchHoldingDetails, baseCurrency, setQuoteWarning]);
 
   const handleCurrencyChange = (currency: Currency) => {
     setBaseCurrency(currency);

@@ -745,6 +745,39 @@ static XUEQIU_USER_U: Mutex<Option<String>> = Mutex::new(None);
 /// explicitly we can attach it via the `Cookie` header on every API request,
 /// guaranteeing it reaches the API regardless of cookie-jar domain matching.
 static XUEQIU_AUTO_COOKIE: Mutex<Option<String>> = Mutex::new(None);
+static LAST_QUOTE_WARNING: Mutex<Option<String>> = Mutex::new(None);
+
+const XUEQIU_COOKIE_EXPIRED_HINT: &str =
+    "雪球 Cookie 可能已经过期，请到设置页面更新雪球 Cookie。";
+const XUEQIU_API_FAILED_HINT: &str =
+    "访问雪球行情服务失败，请检查网络连接或稍后重试。";
+
+fn is_xueqiu_cookie_expired_error(err: &str) -> bool {
+    err.contains("Xueqiu API error")
+        && (err.contains("400016")
+            || err.contains("重新登录帐号后再试")
+            || err.contains("刷新页面或者重新登录帐号后再试"))
+}
+
+fn is_xueqiu_request_error(err: &str) -> bool {
+    err.contains("Xueqiu")
+        || err.contains("xueqiu.com")
+        || err.contains("stock.xueqiu.com")
+}
+
+pub fn clear_quote_warning() {
+    *LAST_QUOTE_WARNING.lock().unwrap() = None;
+}
+
+pub fn take_quote_warning() -> Option<String> {
+    LAST_QUOTE_WARNING.lock().unwrap().take()
+}
+
+/// Return the current warning without consuming it, so the value remains
+/// available for the fallback `take_quote_warning` invocation from the frontend.
+pub fn peek_quote_warning() -> Option<String> {
+    LAST_QUOTE_WARNING.lock().unwrap().clone()
+}
 
 /// Set (or clear) the user-provided Xueqiu cookie string.
 pub fn set_xueqiu_user_cookie(cookie: Option<String>) {
@@ -1228,10 +1261,28 @@ pub async fn fetch_quotes_batch_with_providers(
     let unique_symbols = deduplicate_symbols(symbols);
 
     let mut quotes = Vec::new();
+    let mut has_xueqiu_cookie_warning = false;
+    let mut has_xueqiu_api_warning = false;
+    // Once we know Xueqiu is unreachable, skip remaining Xueqiu symbols so
+    // we don't wait for N × 15-second timeouts (one per symbol).  Non-Xueqiu
+    // symbols (e.g. US via Yahoo) are still fetched normally.
+    let mut xueqiu_failed = false;
     for (symbol, market) in unique_symbols {
         // Cash symbols don't need an API call – return a synthetic quote.
         if is_cash_symbol(&symbol) {
             quotes.push(make_cash_quote(&symbol, &market));
+            continue;
+        }
+        // Determine whether this symbol would use the Xueqiu API.
+        let uses_xueqiu = match market.as_str() {
+            "CN" => cn_provider == "xueqiu",
+            "HK" => hk_provider == "xueqiu",
+            "US" => us_provider == "xueqiu",
+            _ => false,
+        };
+        if xueqiu_failed && uses_xueqiu {
+            // Skip: Xueqiu is already known to be unreachable for this batch.
+            eprintln!("Skipping {} ({}) – Xueqiu already failed for this batch", symbol, market);
             continue;
         }
         let result = match market.as_str() {
@@ -1242,8 +1293,27 @@ pub async fn fetch_quotes_batch_with_providers(
         };
         match result {
             Ok(quote) => quotes.push(quote),
-            Err(e) => eprintln!("Warning: failed to fetch quote for {} ({}): {}", symbol, market, e),
+            Err(e) => {
+                eprintln!("Warning: failed to fetch quote for {} ({}): {}", symbol, market, e);
+                let is_cookie_err = is_xueqiu_cookie_expired_error(&e);
+                let is_api_err = is_xueqiu_request_error(&e);
+                if is_cookie_err {
+                    has_xueqiu_cookie_warning = true;
+                } else if is_api_err {
+                    has_xueqiu_api_warning = true;
+                }
+                // Mark Xueqiu as failed for either error kind so we can skip
+                // remaining Xueqiu symbols without waiting for more timeouts.
+                if is_cookie_err || is_api_err {
+                    xueqiu_failed = true;
+                }
+            }
         }
+    }
+    if has_xueqiu_cookie_warning {
+        *LAST_QUOTE_WARNING.lock().unwrap() = Some(XUEQIU_COOKIE_EXPIRED_HINT.to_string());
+    } else if has_xueqiu_api_warning {
+        *LAST_QUOTE_WARNING.lock().unwrap() = Some(XUEQIU_API_FAILED_HINT.to_string());
     }
     Ok(quotes)
 }

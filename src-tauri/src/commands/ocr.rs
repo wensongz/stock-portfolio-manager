@@ -192,69 +192,75 @@ fn ocr_image(data: &[u8]) -> Result<String, String> {
 ///
 /// # 同花顺 layout
 ///
-/// The app groups transactions by month. Each month starts with a header like
-/// `2026-04` followed by individual trade entries. Every trade entry spans
-/// multiple OCR lines in roughly the following structure:
+/// THS displays one trade per "card" or row. After OCR the text may look like:
 ///
 /// ```text
-/// 买入-贵州茅台
-/// 04-03  09:30   1505.00  100  150500.00  5.00
+/// 2026-04
+/// 卖出双汇发展          2026-04-09 09:58
+/// 28.41  2000  56820.00  33.98
+/// 买入-招商银行
+/// 04-22 14:26   28.95   2000   57900.00   150.00
 /// ```
 ///
-/// or split across lines when columns wrap:
+/// Key observations:
+/// - "买入"/"卖出" may appear **anywhere** on a line (not just at the start).
+/// - The stock name consists purely of CJK characters (stop at digits/ASCII).
+/// - THS sometimes shows a signed P&L amount (e.g. -56786.02) — these must be
+///   discarded before numeric field extraction.
+/// - Column order in the data lines is always:  price → shares → total → commission.
 ///
-/// ```text
-/// 买入-贵州茅台
-/// 04-03  09:30
-/// 1505.00  100  150500.00  5.00
-/// ```
-///
-/// We therefore:
-/// 1. Extract the current year from the first `YYYY-MM` month header found.
-/// 2. Walk lines top-to-bottom looking for lines that start with `买入` or `卖出`.
-/// 3. Collect subsequent lines until we have assembled: date+time, price,
-///    shares, total_amount, commission.
+/// Algorithm:
+/// 1. Extract the year from the first `YYYY-MM` header.
+/// 2. Find every line containing "买入" or "卖出".
+/// 3. For each anchor: extract CJK stock name; collect remaining text on the
+///    same line plus up to 6 subsequent non-anchor lines as context.
+/// 4. Remove negative numbers, percentages, dates, and times; then assign
+///    numeric fields using an ordered positional heuristic.
 fn parse_ths_ocr(text: &str) -> Vec<ParsedTradeRow> {
-    // Step 1 – find year from month header (e.g. "2026-04")
     let year = extract_year(text);
-
-    let lines: Vec<&str> = text.lines().map(|l| l.trim()).collect();
+    let lines: Vec<&str> = text.lines().collect();
     let mut rows: Vec<ParsedTradeRow> = Vec::new();
     let mut i = 0;
 
     while i < lines.len() {
-        let line = lines[i];
+        let line = lines[i].trim();
 
-        // Look for a trade header line: starts with 买入 or 卖出 followed by
-        // optional separator (dash, en-dash, em-dash, space, colon) and name.
-        if let Some((tx_type, stock_name)) = parse_trade_header(line) {
-            // Collect up to 4 subsequent non-empty lines to find the fields.
+        if let Some((tx_type, stock_name, anchor_extra)) = detect_trade_anchor(line) {
+            // Collect up to 6 subsequent non-empty, non-anchor lines as context.
             let mut window: Vec<&str> = Vec::new();
             let mut j = i + 1;
-            while j < lines.len() && window.len() < 5 {
+            while j < lines.len() && window.len() < 6 {
                 let l = lines[j].trim();
                 if !l.is_empty() {
+                    // Stop if we hit the next trade anchor.
+                    if is_trade_anchor(l) {
+                        break;
+                    }
                     window.push(l);
                 }
                 j += 1;
             }
 
-            // Try to extract date+time and numeric fields from the window.
             if let Some(row) =
-                extract_trade_fields(&tx_type, &stock_name, year, &window)
+                extract_fields_from_context(&tx_type, &stock_name, year, &anchor_extra, &window)
             {
                 rows.push(row);
             }
 
-            // Advance past the consumed lines.
-            i = j;
+            // j now points at the next anchor (or is past the window limit).
+            // Do NOT skip to j – advance by 1 so the outer loop naturally
+            // reaches j on subsequent iterations (avoids skipping anchors that
+            // were found inside what would have been the window).
+            i += 1;
         } else {
             i += 1;
         }
     }
 
-    // Sort chronologically so that create_transaction is called oldest-first.
+    // Remove exact duplicates (same time + name) that can arise when the same
+    // 买入/卖出 keyword appears on two consecutive OCR lines.
     rows.sort_by(|a, b| a.traded_at.cmp(&b.traded_at));
+    rows.dedup_by(|a, b| a.traded_at == b.traded_at && a.stock_name == b.stock_name);
     rows
 }
 
@@ -278,50 +284,113 @@ fn extract_year(text: &str) -> i32 {
     chrono::Utc::now().format("%Y").to_string().parse().unwrap_or(2025)
 }
 
-/// Detect a 买入 / 卖出 header line and return `(transaction_type, stock_name)`.
+/// Returns true when the trimmed line contains a trade keyword and is
+/// therefore an anchor for a new transaction record.
+fn is_trade_anchor(line: &str) -> bool {
+    (line.contains("买入") || line.contains("卖出"))
+        && !line.starts_with("类型")
+        && !line.starts_with("交易类型")
+        && !line.starts_with("方向")
+}
+
+/// Try to detect a trade anchor in `line`.
 ///
-/// Accepted separators between verb and name: `-` `–` `—` ` ` `:` `：`.
-fn parse_trade_header(line: &str) -> Option<(String, String)> {
-    // The line may be "买入-贵州茅台" or "卖出 贵州茅台" etc.
-    let (tx_type, rest) = if line.starts_with("买入") {
-        ("BUY", &line["买入".len()..])
-    } else if line.starts_with("卖出") {
-        ("SELL", &line["卖出".len()..])
-    } else {
-        return None;
-    };
-
-    // Strip leading separator characters.
-    let name = rest
-        .trim_start_matches(['-', '–', '—', ' ', ':', '：', '\u{2013}', '\u{2014}'])
-        .trim();
-
-    if name.is_empty() {
+/// Returns `(transaction_type, stock_name, anchor_extra)` where:
+/// - `transaction_type` is "BUY" or "SELL".
+/// - `stock_name` is the longest CJK character run found on the line (2–12 chars).
+/// - `anchor_extra` is the remaining text on the anchor line after the keyword
+///   and name are removed (may contain price / date / time digits).
+///
+/// Unlike the old `parse_trade_header`, this function detects the keyword
+/// **anywhere** on the line (not only at the start) and extracts **only** the
+/// CJK portion as the stock name, stopping at digits or ASCII characters.
+fn detect_trade_anchor(line: &str) -> Option<(String, String, String)> {
+    if !is_trade_anchor(line) {
         return None;
     }
 
-    Some((tx_type.to_string(), name.to_string()))
+    let tx_type = if line.contains("卖出") { "SELL" } else { "BUY" };
+
+    // Remove the keyword so we can search for the CJK name cleanly.
+    let without_keyword = line
+        .replace("卖出", " ")
+        .replace("买入", " ");
+
+    let stock_name = extract_longest_cjk_run(&without_keyword)?;
+
+    // Build the "extra" text: everything left after removing the keyword and name.
+    let anchor_extra = without_keyword.replace(&stock_name as &str, " ");
+
+    Some((tx_type.to_string(), stock_name, anchor_extra))
 }
 
-/// Extract numeric fields and date/time from lines following a trade header.
+/// Kept for backward compatibility with existing unit tests.
 ///
-/// Searches for a line containing both `MM-DD` and `HH:MM` patterns, then
-/// collects the first four positive decimal numbers found in the remaining
-/// text as price, shares, total_amount, commission.
-fn extract_trade_fields(
+/// Wraps [`detect_trade_anchor`] to return the old `(tx_type, name)` pair.
+fn parse_trade_header(line: &str) -> Option<(String, String)> {
+    detect_trade_anchor(line).map(|(tx, name, _)| (tx, name))
+}
+
+/// Extract the longest run of CJK characters from `s` that is between 2 and
+/// 12 characters long (typical A-share stock names are 2–5 chars).
+fn extract_longest_cjk_run(s: &str) -> Option<String> {
+    let mut best = String::new();
+    let mut current = String::new();
+    for c in s.chars() {
+        if is_cjk(c) {
+            current.push(c);
+        } else {
+            if current.len() > best.len() {
+                best = std::mem::take(&mut current);
+            } else {
+                current.clear();
+            }
+        }
+    }
+    if current.len() > best.len() {
+        best = current;
+    }
+    if best.len() >= 2 && best.len() <= 12 {
+        Some(best)
+    } else {
+        None
+    }
+}
+
+/// Return true if `c` is a CJK Unified Ideograph (covers the vast majority of
+/// Chinese characters used in A-share stock names).
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{4e00}'..='\u{9fff}'   // CJK Unified Ideographs
+        | '\u{3400}'..='\u{4dbf}' // Extension A
+        | '\u{f900}'..='\u{faff}' // CJK Compatibility Ideographs
+    )
+}
+
+/// Extract date, time, and numeric trade fields from the context lines for a
+/// single transaction.
+///
+/// `anchor_extra` is the non-name remainder of the anchor line (may contain
+/// date/time or price digits).  `window` is the subsequent non-anchor lines.
+fn extract_fields_from_context(
     tx_type: &str,
     stock_name: &str,
     year: i32,
+    anchor_extra: &str,
     window: &[&str],
 ) -> Option<ParsedTradeRow> {
-    // Regex patterns
     let date_re = regex::Regex::new(r"\b(\d{1,2})-(\d{2})\b").unwrap();
-    let time_re = regex::Regex::new(r"\b(\d{1,2}):(\d{2})\b").unwrap();
-    let num_re = regex::Regex::new(r"\b(\d+(?:\.\d+)?)\b").unwrap();
+    let time_re = regex::Regex::new(r"\b(\d{1,2}):(\d{2})(?::\d{2})?\b").unwrap();
+    let neg_re  = regex::Regex::new(r"-\d+(?:[.,]\d+)?").unwrap();
+    let pct_re  = regex::Regex::new(r"\d+(?:\.\d+)?\s*%").unwrap();
+    let num_re  = regex::Regex::new(r"\b(\d+(?:\.\d+)?)\b").unwrap();
 
-    let all_text = window.join(" ");
+    // Combine anchor extra + window into one searchable string.
+    let mut parts: Vec<&str> = vec![anchor_extra];
+    parts.extend_from_slice(window);
+    let all_text = parts.join(" ");
 
-    // Locate date and time.
+    // --- Date ---
     let (month, day) = date_re
         .captures(&all_text)
         .map(|c| {
@@ -331,6 +400,7 @@ fn extract_trade_fields(
             )
         })?;
 
+    // --- Time ---
     let (hour, minute) = time_re
         .captures(&all_text)
         .map(|c| {
@@ -346,11 +416,15 @@ fn extract_trade_fields(
         year, month, day, hour, minute
     );
 
-    // Collect all decimal numbers from the window, excluding date/time parts.
-    // We remove the date (MM-DD) and time (HH:MM) tokens first to avoid
-    // picking up month/day/hour/minute as numbers.
-    let cleaned = date_re.replace_all(&all_text, " ");
+    // --- Numbers ---
+    // Strip: full dates (YYYY-MM-DD), month-day (MM-DD), times (HH:MM[:SS]),
+    // negative numbers (P&L like -56786.02), and percentages (4.02%).
+    let full_date_re = regex::Regex::new(r"\b\d{4}-\d{2}-\d{2}\b").unwrap();
+    let cleaned = full_date_re.replace_all(&all_text, " ");
+    let cleaned = date_re.replace_all(&cleaned, " ");
     let cleaned = time_re.replace_all(&cleaned, " ");
+    let cleaned = neg_re.replace_all(&cleaned, " ");
+    let cleaned = pct_re.replace_all(&cleaned, " ");
 
     let numbers: Vec<f64> = num_re
         .captures_iter(&cleaned)
@@ -358,14 +432,7 @@ fn extract_trade_fields(
         .filter(|&n| n > 0.0)
         .collect();
 
-    // We need at least 4 numbers: price, shares, total_amount, commission.
-    // In some layouts there may be extra numbers (e.g. sequence numbers).
-    // The most reliable heuristic: the first large-ish number is price,
-    // then shares (integer), then total_amount (price × shares ≈), then
-    // commission (smallest, last).
-    //
-    // Find price, shares, total_amount, commission by trying combinations.
-    let (price, shares, total_amount, commission) = pick_fields(&numbers)?;
+    let (price, shares, total_amount, commission) = assign_fields_ordered(&numbers)?;
 
     Some(ParsedTradeRow {
         transaction_type: tx_type.to_string(),
@@ -383,19 +450,86 @@ fn extract_trade_fields(
 /// rounding that occurs when the brokerage records price and total separately.
 const TOTAL_MATCH_TOLERANCE: f64 = 0.02;
 
-/// Pick price/shares/total/commission from a list of numbers extracted from
-/// the OCR text.
+/// Assign (price, shares, total_amount, commission) from an ordered list of
+/// positive numbers, using a three-tier strategy:
 ///
-/// Strategy: iterate over candidate tuples (price, shares, total, commission)
-/// and return the first one where `|price * shares - total| / total < TOTAL_MATCH_TOLERANCE`.
-/// Falls back to returning the first four numbers if no consistent tuple is found.
-fn pick_fields(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
-    if numbers.len() < 4 {
+/// **Tier 1 – ordered search with total verification**: walk numbers in
+/// document order.  For each candidate price (0 < p ≤ 10 000) find the first
+/// subsequent near-integer shares (≥ 100, within ±0.5) such that a later
+/// number matches `price × shares` within [`TOTAL_MATCH_TOLERANCE`].
+/// Commission is the number immediately following total.
+///
+/// Requiring shares ≥ 100 exploits the CN market minimum lot size and rules
+/// out spurious matches like "4 × 28 ≈ 112".
+///
+/// **Tier 2 – ordered search, shares ≥ 1**: same as tier 1 but allows odd
+/// lots (< 100 shares) that arise when selling a partial position.
+///
+/// **Tier 3 – combinatorial fallback**: try all (i, j, k) index triples
+/// regardless of order.
+fn assign_fields_ordered(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
+    if numbers.is_empty() {
         return None;
     }
 
-    // Try every combination of 4 numbers where total ≈ price × shares.
-    let n = numbers.len().min(8); // limit search space
+    // Shared inner logic: ordered search with a minimum share count.
+    let ordered_search = |min_shares: f64| -> Option<(f64, f64, f64, f64)> {
+        for pi in 0..numbers.len() {
+            let price = numbers[pi];
+            if price <= 0.0 || price > 10_000.0 {
+                continue;
+            }
+            for si in (pi + 1)..numbers.len() {
+                let shares_raw = numbers[si];
+                if shares_raw < min_shares
+                    || (shares_raw - shares_raw.round()).abs() > 0.5
+                {
+                    continue;
+                }
+                let shares = shares_raw.round();
+                let expected = price * shares;
+                if expected <= 0.0 {
+                    continue;
+                }
+                for ti in (si + 1)..numbers.len() {
+                    let total = numbers[ti];
+                    if total <= 0.0 {
+                        continue;
+                    }
+                    let rel_err = (expected - total).abs() / total;
+                    if rel_err < TOTAL_MATCH_TOLERANCE {
+                        let commission = numbers.get(ti + 1).copied().unwrap_or(0.0);
+                        return Some((price, shares, total, commission));
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    // Tier 1: CN lot size ≥ 100.
+    if let Some(r) = ordered_search(100.0) {
+        return Some(r);
+    }
+
+    // Tier 2: allow odd lots (≥ 1 share).
+    if let Some(r) = ordered_search(1.0) {
+        return Some(r);
+    }
+
+    // Tier 3: combinatorial (position-independent).
+    pick_fields_combinatorial(numbers)
+}
+
+/// Combinatorial search: try all (price, shares, total) index triples
+/// regardless of their document order.  Commission is any remaining number.
+///
+/// This is kept as a last-resort fallback for unusual layouts.
+fn pick_fields_combinatorial(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
+    if numbers.len() < 4 {
+        return None;
+    }
+    let n = numbers.len().min(8);
     for i in 0..n {
         for j in 0..n {
             if j == i {
@@ -417,7 +551,6 @@ fn pick_fields(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
                 }
                 let rel_err = (expected_total - total).abs() / total;
                 if rel_err < TOTAL_MATCH_TOLERANCE {
-                    // good match – find commission as any remaining number
                     let commission = numbers
                         .iter()
                         .enumerate()
@@ -430,9 +563,13 @@ fn pick_fields(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
             }
         }
     }
+    None
+}
 
-    // Fallback: return first four numbers as-is.
-    Some((numbers[0], numbers[1], numbers[2], numbers[3]))
+/// Kept for backward compatibility with unit tests that call `pick_fields` directly.
+#[cfg(test)]
+fn pick_fields(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
+    assign_fields_ordered(numbers)
 }
 
 // ---------------------------------------------------------------------------
@@ -472,6 +609,8 @@ pub async fn parse_trade_image(image_base64: String) -> Result<Vec<ParsedTradeRo
 mod tests {
     use super::*;
 
+    // --- extract_year ---
+
     #[test]
     fn test_extract_year_from_header() {
         assert_eq!(extract_year("2026-04"), 2026);
@@ -483,6 +622,8 @@ mod tests {
         let y = extract_year("no year here");
         assert!(y >= 2024); // current year
     }
+
+    // --- parse_trade_header (backward-compat wrapper) ---
 
     #[test]
     fn test_parse_trade_header_buy() {
@@ -504,9 +645,48 @@ mod tests {
         assert!(parse_trade_header("普通文本").is_none());
     }
 
+    // --- detect_trade_anchor ---
+
+    /// keyword at end of line (common THS layout)
+    #[test]
+    fn test_detect_trade_anchor_keyword_at_end() {
+        let (tx, name, extra) = detect_trade_anchor("双汇发展 卖出").unwrap();
+        assert_eq!(tx, "SELL");
+        assert_eq!(name, "双汇发展");
+        // extra must NOT contain the CJK name
+        assert!(!extra.contains("双汇发展"));
+    }
+
+    /// keyword in the middle, with numbers on same line
+    #[test]
+    fn test_detect_trade_anchor_with_numbers() {
+        let (tx, name, extra) = detect_trade_anchor("卖出-双汇发展  28.41  -56786.02").unwrap();
+        assert_eq!(tx, "SELL");
+        assert_eq!(name, "双汇发展");
+        // extra should contain the number but not the name
+        assert!(extra.contains("28.41"));
+        assert!(!extra.contains("双汇发展"));
+    }
+
+    // --- extract_longest_cjk_run ---
+
+    #[test]
+    fn test_extract_longest_cjk_run() {
+        assert_eq!(
+            extract_longest_cjk_run("  双汇发展  28.41"),
+            Some("双汇发展".to_string())
+        );
+        assert_eq!(
+            extract_longest_cjk_run("28.41  2000"),
+            None // no CJK
+        );
+    }
+
+    // --- assign_fields_ordered (replaces old pick_fields) ---
+
     #[test]
     fn test_pick_fields_basic() {
-        // price=1505.00, shares=100, total=150500.00, commission=5.00
+        // price=1505.00, shares=100 (≥100 ✓), total=150500.00, commission=5.00
         let nums = vec![1505.0f64, 100.0, 150500.0, 5.0];
         let (price, shares, total, comm) = pick_fields(&nums).unwrap();
         assert!((price - 1505.0).abs() < 0.01);
@@ -514,6 +694,32 @@ mod tests {
         assert!((total - 150500.0).abs() < 1.0);
         assert!((comm - 5.0).abs() < 0.01);
     }
+
+    #[test]
+    fn test_assign_fields_real_case() {
+        // 双汇发展: price=28.41, shares=2000, total=56820, commission=33.98
+        // Negative -56786.02 has already been removed before this call.
+        let nums = vec![28.41f64, 2000.0, 56820.0, 33.98];
+        let (price, shares, total, comm) = assign_fields_ordered(&nums).unwrap();
+        assert!((price - 28.41).abs() < 0.01, "price={price}");
+        assert!((shares - 2000.0).abs() < 0.01, "shares={shares}");
+        assert!((total - 56820.0).abs() < 1.0, "total={total}");
+        assert!((comm - 33.98).abs() < 0.01, "comm={comm}");
+    }
+
+    /// Extra rogue numbers before the real price (e.g. a sequence number).
+    #[test]
+    fn test_assign_fields_with_rogue_prefix() {
+        // "1" is a rogue sequence number; "28.41 2000 56820 33.98" are the real fields.
+        let nums = vec![1.0f64, 28.41, 2000.0, 56820.0, 33.98];
+        let (price, shares, total, comm) = assign_fields_ordered(&nums).unwrap();
+        assert!((price - 28.41).abs() < 0.01, "price={price}");
+        assert!((shares - 2000.0).abs() < 0.01, "shares={shares}");
+        assert!((total - 56820.0).abs() < 1.0, "total={total}");
+        assert!((comm - 33.98).abs() < 0.01, "comm={comm}");
+    }
+
+    // --- parse_ths_ocr (integration) ---
 
     #[test]
     fn test_parse_ths_ocr_single_trade() {
@@ -552,5 +758,46 @@ mod tests {
         assert_eq!(rows.len(), 2);
         // Should be sorted by traded_at: 04-03 before 04-10
         assert!(rows[0].traded_at < rows[1].traded_at);
+    }
+
+    /// Real-world style: keyword NOT at start of line, negative P&L present.
+    #[test]
+    fn test_parse_ths_ocr_keyword_not_at_line_start() {
+        let text = "\
+2026-04
+双汇发展 卖出  28.41  -56786.02
+04-09  09:58   2000  56820.00  33.98
+招商银行 买入  28.95  57865.44
+04-22  14:26   2000  57900.00  150.00
+";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 2, "expected 2 rows, got {}: {rows:?}", rows.len());
+
+        let sell = rows.iter().find(|r| r.transaction_type == "SELL").unwrap();
+        assert_eq!(sell.stock_name, "双汇发展");
+        assert!((sell.price - 28.41).abs() < 0.01, "sell price={}", sell.price);
+        assert!((sell.shares - 2000.0).abs() < 0.01, "sell shares={}", sell.shares);
+        assert!((sell.total_amount - 56820.0).abs() < 1.0, "sell total={}", sell.total_amount);
+        assert!((sell.commission - 33.98).abs() < 0.01, "sell comm={}", sell.commission);
+
+        let buy = rows.iter().find(|r| r.transaction_type == "BUY").unwrap();
+        assert_eq!(buy.stock_name, "招商银行");
+        assert!((buy.price - 28.95).abs() < 0.01, "buy price={}", buy.price);
+        assert!((buy.shares - 2000.0).abs() < 0.01, "buy shares={}", buy.shares);
+    }
+
+    /// All six fields on one OCR line (fully inline THS format).
+    #[test]
+    fn test_parse_ths_ocr_inline_format() {
+        let text = "\
+2026-04
+卖出双汇发展 04-09 09:58 28.41 2000 56820.00 33.98
+买入招商银行 04-22 14:26 28.95 2000 57900.00 150.00
+";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].stock_name, "双汇发展"); // sorted: 04-09 first
+        assert!((rows[0].price - 28.41).abs() < 0.01);
+        assert!((rows[1].price - 28.95).abs() < 0.01);
     }
 }

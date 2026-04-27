@@ -1474,4 +1474,52 @@ mod tests {
         assert!((zhaoshang_buy_0422.commission - 5.60).abs() < 0.01,
             "commission={}", zhaoshang_buy_0422.commission);
     }
+
+    /// End-to-end test using the EXACT Tesseract OCR text produced from our
+    /// synthetic THS 对账单 image (verified by running tesseract chi_sim on the
+    /// image and capturing stdout).  This is the closest we can get to a real
+    /// integration test without a real device.
+    #[test]
+    fn test_parse_actual_tesseract_output() {
+        // This is the verbatim output from: tesseract ths_synthetic.png out -l chi_sim --psm 6
+        let text = "\
+本月操作                                                 价格/数量             金额/税费 四
+V 2026-04                   +270,742.49 +1.68%
+买入-招商银行                                           39.680            -59525.60
+@@ 04-22 14:26                                               1500                5.60
+卖出-双汇发展                                           28.950            57865.43
+@@ 04-22 14:26                                               2000                34.57
+买入-招商银行                                           38.970            -58460.58
+@@ 04-13 09:59                            1500          5.58
+卖出-双汇发展                                           28.410            56786.02
+@@ 04-13 09:58                                                  2000                  33.98
+买入-招商银行                                           39.280            -145349.09
+@@ 04-09 13:59                                               3700                 13.09
+卖出-贵州茅台                                            1459.480        145861.89
+@@ 04-09 13:39                                               100                  86.11
+V 2026-03                -151,661.89 -1.00%
+V 2026-02                 +74,518.99 +0.47%
+";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 6, "expected 6 rows from real tesseract output, got {}: {rows:?}", rows.len());
+
+        let buys:  Vec<_> = rows.iter().filter(|r| r.transaction_type == "BUY").collect();
+        let sells: Vec<_> = rows.iter().filter(|r| r.transaction_type == "SELL").collect();
+        assert_eq!(buys.len(),  3, "expected 3 BUY rows, got {buys:?}");
+        assert_eq!(sells.len(), 3, "expected 3 SELL rows, got {sells:?}");
+
+        // Spot-check the 贵州茅台 sell
+        let maotai = sells.iter().find(|r| r.stock_name.contains("贵州茅台"))
+            .expect("贵州茅台 SELL not found");
+        assert!((maotai.price  - 1459.480).abs() < 0.01, "maotai price={}", maotai.price);
+        assert!((maotai.shares - 100.0).abs()    < 0.01, "maotai shares={}", maotai.shares);
+
+        // Spot-check the 04-22 招商银行 buy
+        let zhaoshang = buys.iter()
+            .find(|r| r.stock_name.contains("招商银行") && r.traded_at.contains("04-22"))
+            .expect("招商银行 BUY 04-22 not found");
+        assert!((zhaoshang.price  - 39.680).abs() < 0.01, "zhaoshang price={}", zhaoshang.price);
+        assert!((zhaoshang.shares - 1500.0).abs() < 0.01, "zhaoshang shares={}", zhaoshang.shares);
+        assert!((zhaoshang.commission - 5.60).abs() < 0.01, "zhaoshang commission={}", zhaoshang.commission);
+    }
 }

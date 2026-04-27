@@ -181,10 +181,11 @@ export default function ImportFromImageModal({
 
   const handleLookupAll = useCallback(async () => {
     const targets = rows.filter((r) => r.selected && !r.symbol);
-    for (const r of targets) {
-      await handleLookup(r.key, r.stock_name);
-    }
-  }, [rows, handleLookup]);
+    // Mark all targets as "looking up" immediately so UI updates before awaiting
+    targets.forEach((r) => updateRow(r.key, { lookingUp: true }));
+    // Execute all lookups concurrently
+    await Promise.all(targets.map((r) => handleLookup(r.key, r.stock_name)));
+  }, [rows, handleLookup, updateRow]);
 
   // ---- Step 2 helpers -------------------------------------------------------
 

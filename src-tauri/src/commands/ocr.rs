@@ -378,11 +378,16 @@ fn extract_trade_fields(
     })
 }
 
+/// Maximum relative error between `price × shares` and the reported
+/// `total_amount` that we accept as a consistent match.  2 % accounts for
+/// rounding that occurs when the brokerage records price and total separately.
+const TOTAL_MATCH_TOLERANCE: f64 = 0.02;
+
 /// Pick price/shares/total/commission from a list of numbers extracted from
 /// the OCR text.
 ///
 /// Strategy: iterate over candidate tuples (price, shares, total, commission)
-/// and return the first one where `|price * shares - total| / total < 1%`.
+/// and return the first one where `|price * shares - total| / total < TOTAL_MATCH_TOLERANCE`.
 /// Falls back to returning the first four numbers if no consistent tuple is found.
 fn pick_fields(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
     if numbers.len() < 4 {
@@ -411,7 +416,7 @@ fn pick_fields(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
                     continue;
                 }
                 let rel_err = (expected_total - total).abs() / total;
-                if rel_err < 0.02 {
+                if rel_err < TOTAL_MATCH_TOLERANCE {
                     // good match – find commission as any remaining number
                     let commission = numbers
                         .iter()

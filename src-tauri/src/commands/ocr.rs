@@ -588,7 +588,8 @@ fn extract_year(text: &str) -> i32 {
             return y;
         }
     }
-    chrono::Utc::now().format("%Y").to_string().parse().unwrap_or(2025)
+    use chrono::Datelike as _;
+    chrono::Utc::now().year()
 }
 
 /// Returns true when the trimmed line contains a trade keyword and is

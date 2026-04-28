@@ -1,4 +1,4 @@
-use crate::services::http_client;
+use crate::services::quote_service;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 
@@ -52,34 +52,17 @@ pub async fn lookup_cn_stock_code(name: String) -> Result<Option<String>, String
 }
 
 /// Xueqiu `query/v1/search/stock.json` lookup.
+///
+/// Uses the shared Xueqiu session (including `xq_a_token` cookie management)
+/// from the quote service so that the search API is called with valid
+/// authentication and returns real results.
 async fn lookup_via_xueqiu(name: &str) -> Result<Option<String>, String> {
-    use std::time::Duration;
-
-    let client = http_client::xueqiu_client();
-
-    static INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !INIT.load(std::sync::atomic::Ordering::SeqCst) {
-        let _ = client
-            .get("https://xueqiu.com")
-            .header(
-                reqwest::header::ACCEPT,
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await;
-        INIT.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
     let url = format!(
         "https://xueqiu.com/query/v1/search/stock.json?code={}",
         urlencoding::encode(name)
     );
 
-    let resp = client
-        .get(&url)
-        .timeout(Duration::from_secs(10))
-        .send()
+    let resp = quote_service::xueqiu_fetch(&url)
         .await
         .map_err(|e| format!("查询雪球失败: {}", e))?;
 

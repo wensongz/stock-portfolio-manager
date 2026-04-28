@@ -975,6 +975,15 @@ async fn send_xueqiu_request(url: &str, symbol: &str) -> Result<reqwest::Respons
     Err(last_err)
 }
 
+/// Send an authenticated GET request to any Xueqiu endpoint.
+///
+/// This is a public thin wrapper around [`send_xueqiu_request`] for use by
+/// other modules (e.g. OCR stock-code lookup) that need Xueqiu API access
+/// but are outside the quote service module.
+pub async fn xueqiu_fetch(url: &str) -> Result<reqwest::Response, String> {
+    send_xueqiu_request(url, "lookup").await
+}
+
 /// Maximum number of characters to include in error messages as a response
 /// body preview for debugging failed Xueqiu API responses.
 const XUEQIU_RESPONSE_PREVIEW_LEN: usize = 200;

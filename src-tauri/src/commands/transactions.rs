@@ -206,7 +206,7 @@ pub fn get_transactions(
 
     let transactions = match (account_id, symbol) {
         (Some(aid), Some(sym)) => {
-            let query = format!("{} WHERE account_id = ?1 AND symbol = ?2 ORDER BY traded_at DESC", base_query);
+            let query = format!("{} WHERE account_id = ?1 AND UPPER(symbol) = UPPER(?2) ORDER BY traded_at DESC", base_query);
             let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
             let result = stmt.query_map(rusqlite::params![aid, sym], map_transaction)
                 .map_err(|e| e.to_string())?
@@ -224,7 +224,7 @@ pub fn get_transactions(
             result
         }
         (None, Some(sym)) => {
-            let query = format!("{} WHERE symbol = ?1 ORDER BY traded_at DESC", base_query);
+            let query = format!("{} WHERE UPPER(symbol) = UPPER(?1) ORDER BY traded_at DESC", base_query);
             let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
             let result = stmt.query_map(rusqlite::params![sym], map_transaction)
                 .map_err(|e| e.to_string())?

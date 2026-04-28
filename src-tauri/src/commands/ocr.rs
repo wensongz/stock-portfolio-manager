@@ -65,7 +65,7 @@ pub async fn lookup_cn_stock_code(name: String) -> Result<Option<String>, String
     }
 }
 
-/// Xueqiu `stock/search.json` lookup.
+/// Xueqiu `query/v1/search/stock.json` lookup.
 async fn lookup_via_xueqiu(name: &str) -> Result<Option<String>, String> {
     use std::time::Duration;
 
@@ -86,7 +86,7 @@ async fn lookup_via_xueqiu(name: &str) -> Result<Option<String>, String> {
     }
 
     let url = format!(
-        "https://xueqiu.com/stock/search.json?q={}&type=1&count=5",
+        "https://xueqiu.com/query/v1/search/stock.json?code={}",
         urlencoding::encode(name)
     );
 
@@ -1122,7 +1122,14 @@ fn assign_fields_ordered(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
                     }
                     let rel_err = (expected - total).abs() / total;
                     if rel_err < TOTAL_MATCH_TOLERANCE {
-                        let commission = numbers.get(ti + 1).copied().unwrap_or(0.0);
+                        let commission_raw = numbers.get(ti + 1).copied().unwrap_or(0.0);
+                        // Sanity-check: commission should be below a realistic ceiling.
+                        // Chinese stock fees (commission ≤ 0.3% + stamp duty 0.1%) are
+                        // at most ~0.4 % of trade value for large trades, but for small
+                        // trades the minimum flat fee (5 CNY) can exceed 0.5 %, so we
+                        // also allow up to a 50-yuan absolute floor.
+                        let commission_cap = 50.0_f64.max(total * 0.005);
+                        let commission = if commission_raw > commission_cap { 0.0 } else { commission_raw };
                         return Some((price, shares, total, commission));
                     }
                 }
@@ -1186,13 +1193,15 @@ fn pick_fields_combinatorial(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
                 }
                 let rel_err = (expected_total - total).abs() / total;
                 if rel_err < TOTAL_MATCH_TOLERANCE {
-                    let commission = numbers
+                    let commission_raw = numbers
                         .iter()
                         .enumerate()
                         .filter(|(idx, _)| *idx != i && *idx != j && *idx != k)
                         .map(|(_, &v)| v)
                         .find(|&v| v >= 0.0)
                         .unwrap_or(0.0);
+                    let commission_cap = 50.0_f64.max(total * 0.005);
+                    let commission = if commission_raw > commission_cap { 0.0 } else { commission_raw };
                     return Some((price, shares, total, commission));
                 }
             }
@@ -1439,6 +1448,31 @@ mod tests {
         assert!((shares - 2000.0).abs() < 0.01, "shares={shares}");
         assert!((total - 56820.0).abs() < 1.0, "total={total}");
         assert!((comm - 33.98).abs() < 0.01, "comm={comm}");
+    }
+
+    /// OCR misread: "34.57" read as "354.57" (extra leading digit from adjacent column).
+    /// 354.57 / 57865 ≈ 0.61% which exceeds the max(50, total×0.5%) cap → should be 0.0.
+    #[test]
+    fn test_assign_fields_commission_ocr_misread_capped() {
+        // Correct numbers: price=28.95, net_amount=57865.43, shares=2000, commission=34.57
+        // OCR misread: 34.57 → 354.57
+        let nums = vec![28.95_f64, 57865.43, 2000.0, 354.57];
+        let result = assign_fields_ordered(&nums);
+        assert!(result.is_some(), "should still find price/shares/total");
+        let (price, shares, _total, comm) = result.unwrap();
+        assert!((price - 28.95).abs() < 0.01, "price={price}");
+        assert!((shares - 2000.0).abs() < 0.01, "shares={shares}");
+        assert!((comm - 0.0).abs() < 0.01,
+            "commission 354.57 should be capped to 0.0 (OCR misread), got {comm}");
+    }
+
+    /// Correct commission that is close to (but under) the cap is preserved.
+    #[test]
+    fn test_assign_fields_commission_correct_below_cap() {
+        // Real: price=28.95, net=57865.43, shares=2000, commission=34.57 (0.06% of total)
+        let nums = vec![28.95_f64, 57865.43, 2000.0, 34.57];
+        let (_price, _shares, _total, comm) = assign_fields_ordered(&nums).unwrap();
+        assert!((comm - 34.57).abs() < 0.01, "correct commission should be preserved, got {comm}");
     }
 
     /// Extra rogue numbers before the real price (e.g. a sequence number).

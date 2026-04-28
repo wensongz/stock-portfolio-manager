@@ -24,7 +24,7 @@ import { useAccountStore } from "../../stores/accountStore";
 import { useCategoryStore } from "../../stores/categoryStore";
 import { useQuoteStore } from "../../stores/quoteStore";
 import { usePnlColor } from "../../hooks/usePnlColor";
-import type { Holding, HoldingWithQuote, Market, Currency, StockQuote } from "../../types";
+import type { Holding, HoldingWithQuote, Market, Currency, StockQuote, Transaction, TransactionType } from "../../types";
 import dayjs from "dayjs";
 
 const { Title, Text } = Typography;
@@ -83,6 +83,10 @@ export default function HoldingsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [cashModalOpen, setCashModalOpen] = useState(false);
   const [editingHolding, setEditingHolding] = useState<Holding | null>(null);
+  const [detailModalOpen, setDetailModalOpen] = useState(false);
+  const [detailHolding, setDetailHolding] = useState<HoldingWithQuote | null>(null);
+  const [detailTransactions, setDetailTransactions] = useState<Transaction[]>([]);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [showRealtime, setShowRealtime] = useState(true);
   const [form] = Form.useForm();
   const [cashForm] = Form.useForm();
@@ -285,6 +289,24 @@ export default function HoldingsPage() {
     }
   };
 
+  const handleShowDetail = useCallback(async (holding: HoldingWithQuote) => {
+    setDetailHolding(holding);
+    setDetailModalOpen(true);
+    setDetailLoading(true);
+    try {
+      const txns = await invoke<Transaction[]>("get_transactions", {
+        accountId: holding.account_id,
+        symbol: holding.symbol,
+      });
+      setDetailTransactions(txns);
+    } catch (err) {
+      message.error(`获取交易记录失败: ${err}`);
+      setDetailTransactions([]);
+    } finally {
+      setDetailLoading(false);
+    }
+  }, []);
+
   const accountMap = Object.fromEntries(accounts.map((a) => [a.id, a.name]));
   const categoryMap = Object.fromEntries(categories.map((c) => [c.id, c]));
 
@@ -429,6 +451,9 @@ export default function HoldingsPage() {
     key: "action",
     render: (_: unknown, record: HoldingWithQuote) => (
       <Space>
+        <Button type="link" size="small" onClick={() => handleShowDetail(record)}>
+          明细
+        </Button>
         <Button type="link" size="small" onClick={() => handleEdit(record)}>
           编辑
         </Button>
@@ -693,6 +718,75 @@ export default function HoldingsPage() {
             <InputNumber min={0} precision={2} style={{ width: "100%" }} placeholder="如：10000" />
           </Form.Item>
         </Form>
+      </Modal>
+
+      {/* Transaction Detail Modal */}
+      <Modal
+        title={detailHolding ? `交易明细 — ${detailHolding.name} (${detailHolding.symbol})` : "交易明细"}
+        open={detailModalOpen}
+        onCancel={() => {
+          setDetailModalOpen(false);
+          setDetailHolding(null);
+          setDetailTransactions([]);
+        }}
+        footer={null}
+        width={800}
+      >
+        <Table
+          dataSource={detailTransactions}
+          rowKey="id"
+          loading={detailLoading}
+          pagination={false}
+          scroll={{ y: 400 }}
+          columns={[
+            {
+              title: "日期",
+              dataIndex: "traded_at",
+              key: "traded_at",
+              render: (date: string) => dayjs(date).format("YYYY-MM-DD HH:mm"),
+            },
+            {
+              title: "类型",
+              dataIndex: "transaction_type",
+              key: "transaction_type",
+              render: (type: TransactionType) => (
+                <Tag color={type === "BUY" ? "green" : "red"}>
+                  {type === "BUY" ? "买入" : "卖出"}
+                </Tag>
+              ),
+            },
+            {
+              title: "股数",
+              dataIndex: "shares",
+              key: "shares",
+              render: (v: number) => v.toLocaleString(),
+            },
+            {
+              title: "价格",
+              dataIndex: "price",
+              key: "price",
+              render: (v: number, record: Transaction) => `${record.currency} ${v.toFixed(2)}`,
+            },
+            {
+              title: "总金额",
+              dataIndex: "total_amount",
+              key: "total_amount",
+              render: (v: number, record: Transaction) => `${record.currency} ${v.toFixed(2)}`,
+            },
+            {
+              title: "手续费",
+              dataIndex: "commission",
+              key: "commission",
+              render: (v: number, record: Transaction) => `${record.currency} ${v.toFixed(2)}`,
+            },
+            {
+              title: "备注",
+              dataIndex: "notes",
+              key: "notes",
+              render: (v: string | null) => v || "—",
+            },
+          ]}
+        />
       </Modal>
     </div>
   );

@@ -210,6 +210,9 @@ pub fn run() {
             // Quote Provider Config
             commands::quote_provider::get_quote_provider_config,
             commands::quote_provider::update_quote_provider_config,
+            // OCR: import trades from 同花顺 screenshots
+            commands::ocr::parse_trade_image,
+            commands::ocr::lookup_cn_stock_code,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

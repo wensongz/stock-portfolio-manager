@@ -15,12 +15,13 @@ import {
   DatePicker,
   AutoComplete,
 } from "antd";
-import { PlusOutlined, EditOutlined, FilterOutlined } from "@ant-design/icons";
+import { PlusOutlined, EditOutlined, FilterOutlined, CameraOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { invoke } from "@tauri-apps/api/core";
 import { useTransactionStore } from "../../stores/transactionStore";
 import { useAccountStore } from "../../stores/accountStore";
 import type { Transaction, Market, Currency, TransactionType, Holding, StockQuote } from "../../types";
+import ImportFromImageModal from "./ImportFromImageModal";
 
 const { Title, Text } = Typography;
 
@@ -61,6 +62,7 @@ export default function TransactionsPage() {
   const [accountHoldings, setAccountHoldings] = useState<Holding[]>([]);
   const [symbolSearching, setSymbolSearching] = useState(false);
   const [filterAccountId, setFilterAccountId] = useState<string | undefined>(undefined);
+  const [importModalOpen, setImportModalOpen] = useState(false);
 
   useEffect(() => {
     fetchTransactions();
@@ -317,22 +319,32 @@ export default function TransactionsPage() {
         <Title level={2} className="!mb-0">
           交易记录
         </Title>
-        <Button
-          type="primary"
-          icon={<PlusOutlined />}
-          onClick={() => {
-            setEditingTransaction(null);
-            form.resetFields();
-            setAccountHoldings([]);
-            if (filterAccountId) {
-              form.setFieldsValue({ accountId: filterAccountId });
-              handleAccountChange(filterAccountId);
-            }
-            setModalOpen(true);
-          }}
-        >
-          录入交易
-        </Button>
+        <Space>
+          {filterAccountId && (
+            <Button
+              icon={<CameraOutlined />}
+              onClick={() => setImportModalOpen(true)}
+            >
+              从截图导入
+            </Button>
+          )}
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={() => {
+              setEditingTransaction(null);
+              form.resetFields();
+              setAccountHoldings([]);
+              if (filterAccountId) {
+                form.setFieldsValue({ accountId: filterAccountId });
+                handleAccountChange(filterAccountId);
+              }
+              setModalOpen(true);
+            }}
+          >
+            录入交易
+          </Button>
+        </Space>
       </div>
 
       <div className="mb-4">
@@ -457,6 +469,22 @@ export default function TransactionsPage() {
           </Form.Item>
         </Form>
       </Modal>
+
+      {/* Import from screenshot modal – only available when an account is selected */}
+      {filterAccountId && (() => {
+        const account = accounts.find((a) => a.id === filterAccountId);
+        return account ? (
+          <ImportFromImageModal
+            open={importModalOpen}
+            account={account}
+            onClose={() => setImportModalOpen(false)}
+            onImported={() => {
+              setImportModalOpen(false);
+              fetchTransactions();
+            }}
+          />
+        ) : null;
+      })()}
     </div>
   );
 }

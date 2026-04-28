@@ -6,6 +6,7 @@ pub mod dashboard;
 pub mod exchange_rates;
 pub mod holdings;
 pub mod import_export;
+pub mod ocr;
 pub mod performance;
 pub mod quarterly;
 pub mod quote_provider;

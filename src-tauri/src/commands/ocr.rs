@@ -39,9 +39,9 @@ struct XueqiuSearchItem {
     code: Option<String>,
 }
 
-/// Query Xueqiu to resolve a Chinese stock name to its 6-digit A-share code.
+/// Query Xueqiu to resolve a Chinese stock name to its A-share code.
 ///
-/// Returns `Ok(Some("600036"))` on success, `Ok(None)` when no CN result is
+/// Returns `Ok(Some("SH600036"))` on success, `Ok(None)` when no CN result is
 /// found, and `Err(…)` for network / API failures.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn lookup_cn_stock_code(name: String) -> Result<Option<String>, String> {
@@ -84,7 +84,7 @@ async fn lookup_via_xueqiu(name: &str) -> Result<Option<String>, String> {
         };
         let is_cn = code.starts_with("SH") || code.starts_with("SZ");
         if is_cn && code.len() == 8 {
-            return Ok(Some(code[2..].to_string()));
+            return Ok(Some(code.to_string()));
         }
     }
 

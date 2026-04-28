@@ -182,11 +182,35 @@ export default function ImportFromImageModal({
 
   const handleLookupAll = useCallback(async () => {
     const targets = rows.filter((r) => r.selected && !r.symbol);
+    if (targets.length === 0) return;
+
     // Mark all targets as "looking up" immediately so UI updates before awaiting
     targets.forEach((r) => updateRow(r.key, { lookingUp: true }));
-    // Execute all lookups concurrently
-    await Promise.all(targets.map((r) => handleLookup(r.key, r.stock_name)));
-  }, [rows, handleLookup, updateRow]);
+
+    // Deduplicate: query each distinct stock name only once, then propagate the
+    // result to all rows that share that name.
+    const uniqueNames = [...new Set(targets.map((r) => r.stock_name))];
+    const codeByName = new Map<string, string | null>();
+    await Promise.all(
+      uniqueNames.map(async (name) => {
+        try {
+          const code = await invoke<string | null>("lookup_cn_stock_code", { name });
+          codeByName.set(name, code);
+        } catch {
+          codeByName.set(name, null);
+        }
+      })
+    );
+
+    // Apply results to all affected rows
+    targets.forEach((r) => {
+      const code = codeByName.get(r.stock_name) ?? null;
+      updateRow(r.key, { lookingUp: false, symbol: code ?? "" });
+      if (!code) {
+        message.warning(`未找到「${r.stock_name}」的股票代码，请手动填写`);
+      }
+    });
+  }, [rows, updateRow]);
 
   // ---- Step 2 helpers -------------------------------------------------------
 

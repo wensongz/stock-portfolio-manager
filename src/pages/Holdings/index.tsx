@@ -369,6 +369,11 @@ export default function HoldingsPage() {
       title: "投资类别",
       dataIndex: "category_id",
       key: "category_id",
+      sorter: (a: HoldingWithQuote, b: HoldingWithQuote) => {
+        const nameA = (a.category_id && categoryMap[a.category_id]?.name) || "";
+        const nameB = (b.category_id && categoryMap[b.category_id]?.name) || "";
+        return nameA.localeCompare(nameB);
+      },
       render: (id: string | null) => {
         if (!id) return "—";
         const cat = categoryMap[id];

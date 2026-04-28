@@ -348,6 +348,7 @@ export default function HoldingsPage() {
       title: "股票代码",
       dataIndex: "symbol",
       key: "symbol",
+      sorter: (a: HoldingWithQuote, b: HoldingWithQuote) => a.symbol.localeCompare(b.symbol),
       render: (symbol: string, record: HoldingWithQuote) => (
         <Space>
           <Tag color={isCashSymbol(symbol) ? "gold" : marketColors[record.market as Market]}>
@@ -440,6 +441,8 @@ export default function HoldingsPage() {
     {
       title: "盈亏",
       key: "unrealized_pnl",
+      sorter: (a: HoldingWithQuote, b: HoldingWithQuote) =>
+        (a.unrealized_pnl ?? 0) - (b.unrealized_pnl ?? 0),
       render: (_: unknown, record: HoldingWithQuote) => (
         <PnlText value={record.unrealized_pnl ?? null} percent={record.unrealized_pnl_percent ?? null} />
       ),

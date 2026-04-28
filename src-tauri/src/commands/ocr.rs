@@ -26,26 +26,17 @@ pub struct ParsedTradeRow {
 // Xueqiu stock-name → A-share code lookup
 // ---------------------------------------------------------------------------
 
-/// Response structure returned by Xueqiu stock search API.
+/// Response structure returned by Xueqiu `query/v1/search/stock.json`.
+/// Example: `{"stocks": [{"code": "SH600036", "name": "招商银行", ...}]}`
 #[derive(Debug, Deserialize)]
 struct XueqiuSearchResponse {
-    data: Option<XueqiuSearchData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct XueqiuSearchData {
-    items: Option<Vec<XueqiuSearchItem>>,
-    /// Some Xueqiu API versions return "list" instead of "items".
-    list: Option<Vec<XueqiuSearchItem>>,
+    stocks: Option<Vec<XueqiuSearchItem>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct XueqiuSearchItem {
     /// e.g. "SH600036", "SZ000001"
-    symbol: Option<String>,
-    /// e.g. "CN"
-    #[serde(rename = "type")]
-    stock_type: Option<String>,
+    code: Option<String>,
 }
 
 /// Query Xueqiu to resolve a Chinese stock name to its 6-digit A-share code.
@@ -54,12 +45,7 @@ struct XueqiuSearchItem {
 /// found, and `Err(…)` for network / API failures.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn lookup_cn_stock_code(name: String) -> Result<Option<String>, String> {
-    // Try Xueqiu first (uses the shared authenticated session).
-    if let Ok(Some(code)) = lookup_via_xueqiu(&name).await {
-        return Ok(Some(code));
-    }
-    // Fall back to Sina Suggest, which needs no cookies.
-    match lookup_via_sina(&name).await {
+    match lookup_via_xueqiu(&name).await {
         Ok(r) => Ok(r),
         Err(e) => Err(format!("股票代码查询失败: {e}")),
     }
@@ -106,66 +92,16 @@ async fn lookup_via_xueqiu(name: &str) -> Result<Option<String>, String> {
         .await
         .map_err(|e| format!("解析雪球响应失败: {}", e))?;
 
-    let items = body
-        .data
-        .and_then(|d| d.items.or(d.list))
-        .unwrap_or_default();
+    let items = body.stocks.unwrap_or_default();
 
     for item in &items {
-        let sym = match &item.symbol {
+        let code = match &item.code {
             Some(s) if !s.is_empty() => s.as_str(),
             _ => continue,
         };
-        let is_cn = sym.starts_with("SH") || sym.starts_with("SZ");
-        if is_cn && sym.len() == 8 {
-            return Ok(Some(sym[2..].to_string()));
-        }
-    }
-
-    Ok(None)
-}
-
-/// Sina Suggest API lookup — does not require any cookie or token.
-///
-/// Endpoint: `https://suggest3.sinajs.cn/suggest/type=11,12&key={name}`
-///
-/// Response: `var suggestvalue="SH600519,11,贵州茅台,...;SZ000858,...;"`
-///
-/// Each semicolon-delimited item has comma-separated fields:
-/// `symbol_with_prefix,type,name,...`
-async fn lookup_via_sina(name: &str) -> Result<Option<String>, String> {
-    let url = format!(
-        "https://suggest3.sinajs.cn/suggest/type=11,12&key={}",
-        urlencoding::encode(name)
-    );
-
-    let client = reqwest::Client::new();
-    let text = client
-        .get(&url)
-        .header(reqwest::header::REFERER, "https://finance.sina.com.cn")
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("{e}"))?
-        .text()
-        .await
-        .map_err(|e| format!("{e}"))?;
-
-    // Extract the value string: var suggestvalue="...";
-    let re = regex::Regex::new(r#"suggestvalue="([^"]*)""#).unwrap();
-    let Some(cap) = re.captures(&text) else {
-        return Ok(None);
-    };
-    let value = &cap[1];
-
-    for item in value.split(';') {
-        let item = item.trim();
-        if item.is_empty() {
-            continue;
-        }
-        let sym = item.splitn(2, ',').next().unwrap_or("");
-        if (sym.starts_with("SH") || sym.starts_with("SZ")) && sym.len() == 8 {
-            return Ok(Some(sym[2..].to_string()));
+        let is_cn = code.starts_with("SH") || code.starts_with("SZ");
+        if is_cn && code.len() == 8 {
+            return Ok(Some(code[2..].to_string()));
         }
     }
 
@@ -1123,13 +1059,26 @@ fn assign_fields_ordered(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
                     let rel_err = (expected - total).abs() / total;
                     if rel_err < TOTAL_MATCH_TOLERANCE {
                         let commission_raw = numbers.get(ti + 1).copied().unwrap_or(0.0);
-                        // Sanity-check: commission should be below a realistic ceiling.
-                        // Chinese stock fees (commission ≤ 0.3% + stamp duty 0.1%) are
-                        // at most ~0.4 % of trade value for large trades, but for small
-                        // trades the minimum flat fee (5 CNY) can exceed 0.5 %, so we
-                        // also allow up to a 50-yuan absolute floor.
+                        // Sanity-check: A-share trading costs are at most ~0.4% of trade
+                        // value for large trades, plus a 5-CNY minimum flat fee.  Use a
+                        // 0.5% ceiling with a 50-yuan absolute floor to catch OCR misreads
+                        // where a spurious digit is prepended (e.g., "354.57" for "34.57").
                         let commission_cap = 50.0_f64.max(total * 0.005);
-                        let commission = if commission_raw > commission_cap { 0.0 } else { commission_raw };
+                        let commission = if commission_raw > commission_cap {
+                            // Try to recover the true commission from the net transaction
+                            // amount: THS shows a net figure for sell trades, so
+                            //   commission = price×shares − net_amount (= expected − total).
+                            let implied = expected - total;
+                            if implied > 0.0 && implied < commission_cap {
+                                implied
+                            } else {
+                                // Cannot recover automatically; surface the raw value so
+                                // the user can spot and correct it.
+                                commission_raw
+                            }
+                        } else {
+                            commission_raw
+                        };
                         return Some((price, shares, total, commission));
                     }
                 }
@@ -1201,7 +1150,16 @@ fn pick_fields_combinatorial(numbers: &[f64]) -> Option<(f64, f64, f64, f64)> {
                         .find(|&v| v >= 0.0)
                         .unwrap_or(0.0);
                     let commission_cap = 50.0_f64.max(total * 0.005);
-                    let commission = if commission_raw > commission_cap { 0.0 } else { commission_raw };
+                    let commission = if commission_raw > commission_cap {
+                        let implied = expected_total - total;
+                        if implied > 0.0 && implied < commission_cap {
+                            implied
+                        } else {
+                            commission_raw
+                        }
+                    } else {
+                        commission_raw
+                    };
                     return Some((price, shares, total, commission));
                 }
             }
@@ -1451,19 +1409,36 @@ mod tests {
     }
 
     /// OCR misread: "34.57" read as "354.57" (extra leading digit from adjacent column).
-    /// 354.57 / 57865 ≈ 0.61% which exceeds the max(50, total×0.5%) cap → should be 0.0.
+    /// The THS net amount (57865.43) is in the numbers array, so we recover:
+    ///   implied = price×shares − net = 28.95×2000 − 57865.43 = 34.57.
     #[test]
-    fn test_assign_fields_commission_ocr_misread_capped() {
-        // Correct numbers: price=28.95, net_amount=57865.43, shares=2000, commission=34.57
-        // OCR misread: 34.57 → 354.57
+    fn test_assign_fields_commission_ocr_misread_recovered() {
+        // numbers: [price=28.95, net_amount=57865.43, shares=2000, commission_misread=354.57]
         let nums = vec![28.95_f64, 57865.43, 2000.0, 354.57];
         let result = assign_fields_ordered(&nums);
         assert!(result.is_some(), "should still find price/shares/total");
         let (price, shares, _total, comm) = result.unwrap();
         assert!((price - 28.95).abs() < 0.01, "price={price}");
         assert!((shares - 2000.0).abs() < 0.01, "shares={shares}");
-        assert!((comm - 0.0).abs() < 0.01,
-            "commission 354.57 should be capped to 0.0 (OCR misread), got {comm}");
+        assert!(
+            (comm - 34.57).abs() < 0.01,
+            "commission should be recovered as 34.57 via implied=price×shares−net, got {comm}"
+        );
+    }
+
+    /// When the OCR net amount equals price×shares (no deduction visible), the
+    /// raw misread commission is surfaced unchanged so the user can correct it.
+    #[test]
+    fn test_assign_fields_commission_ocr_misread_no_net_returns_raw() {
+        // Gross total matches exactly → implied = 0 → not usable → raw returned.
+        let nums = vec![28.95_f64, 2000.0, 57900.0, 354.57];
+        let result = assign_fields_ordered(&nums);
+        assert!(result.is_some(), "should still find price/shares/total");
+        let (_price, _shares, _total, comm) = result.unwrap();
+        assert!(
+            (comm - 354.57).abs() < 0.01,
+            "raw misread should be surfaced when implied=0, got {comm}"
+        );
     }
 
     /// Correct commission that is close to (but under) the cap is preserved.

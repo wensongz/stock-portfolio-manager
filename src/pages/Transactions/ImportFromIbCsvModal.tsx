@@ -230,7 +230,9 @@ function parseIbDateTime(raw: string): string {
 
   // Last resort: let dayjs try
   const fallback = dayjs(cleaned);
-  return fallback.isValid() ? fallback.format("YYYY-MM-DDTHH:mm:ss") : new Date().toISOString();
+  if (fallback.isValid()) return fallback.format("YYYY-MM-DDTHH:mm:ss");
+  // Return empty string to signal an unparseable date; callers can surface this to the user
+  return "";
 }
 
 /**
@@ -445,7 +447,7 @@ export default function ImportFromIbCsvModal({
           value={record.symbol}
           style={{ width: 100 }}
           onChange={(e) =>
-            updateRow(record.key, { symbol: e.target.value.trim().toUpperCase() })
+            updateRow(record.key, { symbol: market === "HK" ? e.target.value.trim() : e.target.value.trim().toUpperCase() })
           }
         />
       ),
@@ -576,7 +578,7 @@ export default function ImportFromIbCsvModal({
     }
     if (step === 1) {
       return [
-        <Button key="back" onClick={() => { setStep(0); setFileList([]); }}>
+        <Button key="back" onClick={() => { setStep(0); setFileList([]); setRows([]); setParseError(""); }}>
           返回
         </Button>,
         <Button

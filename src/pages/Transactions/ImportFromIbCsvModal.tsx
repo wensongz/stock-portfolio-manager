@@ -63,67 +63,111 @@ interface ImportFromIbCsvModalProps {
 // CSV parsing helpers
 // ---------------------------------------------------------------------------
 
+/** IB account IDs look like U1234567 or DU1234567 (paper). Non-account values like "Stocks", "USD" fail this. */
+function isValidAcctId(acctId: string): boolean {
+  return /^[A-Z]{1,3}\d+$/.test(acctId.trim());
+}
+
+function parseNum(s: string | undefined): number {
+  return parseFloat((s ?? "").replace(/,/g, ""));
+}
+
 /**
- * Parse IB Activity Statement CSV.
+ * Parse IB Activity Statement or Flex Query CSV.
  *
- * IB CSV has two structural variants depending on export format:
- *   - "Trades" section rows:  Section,Header,Symbol,Date/Time,Quantity,Price,Proceeds,Comm/Fee,...
- *   - Trade rows start with:  Trades,Data,...
+ * Handles the following column name variants (IB export can differ by format/region):
+ *   Date column   : "Trade Date/Time"  OR  "Date/Time"
+ *   Price column  : "Price"  OR  "T. Price"
+ *   Commission    : "Comm" + "Fee" (separate)  OR  "Comm/Fee" (combined)  OR  "Comm in USD"
+ *   Direction     : "Type" column (BUY/SELL)  OR  sign of Quantity
+ *   Filter        : "Acct ID" (skip non-account-number values like "Stocks", "USD")
  *
- * We look for rows where:
- *   col[0] === "Trades" && col[1] === "Data"
- * and use the header row (col[1] === "Header") to find column indices.
+ * Two structural layouts:
+ *   A) Section/Header/Data layout – rows prefixed with "Trades,Header,..." and "Trades,Data,..."
+ *   B) Flat layout – standalone header row containing "Symbol"
  */
 function parseIbCsv(text: string, market: Market): EditableRow[] {
   const lines = text.split(/\r?\n/);
 
-  // Find the Trades header row to get column indices
-  let headerIdx = -1;
-  let headerCols: string[] = [];
+  // --- Try layout A: look for "Trades,Header,..." row ---
   for (let i = 0; i < lines.length; i++) {
     const cols = splitCsvLine(lines[i]);
-    if (cols[0] === "Trades" && cols[1] === "Header") {
-      headerIdx = i;
-      headerCols = cols.map((c) => c.trim());
-      break;
+    if (cols[0].trim() === "Trades" && cols[1].trim() === "Header") {
+      const rows = parseStructured(lines, i, market);
+      if (rows.length > 0) return rows;
     }
   }
 
-  if (headerIdx === -1) return [];
-
-  const col = (name: string) => headerCols.indexOf(name);
-
-  const iSymbol = col("Symbol");
-  const iDateTime = col("Date/Time");
-  const iQuantity = col("Quantity");
-  const iPrice = col("T. Price");
-  const iProceeds = col("Proceeds");
-  const iCommFee = col("Comm/Fee");
-
-  if ([iSymbol, iDateTime, iQuantity, iPrice, iProceeds, iCommFee].some((i) => i === -1)) {
-    // Fallback: try alternate header names used in some IB export variants
-    return parseIbCsvAlt(lines, market);
+  // --- Fallback layout B: find any header row containing "Symbol" ---
+  for (let i = 0; i < lines.length; i++) {
+    const cols = splitCsvLine(lines[i]).map((c) => c.trim());
+    if (cols.includes("Symbol")) {
+      const rows = parseFlat(lines, i, market);
+      if (rows.length > 0) return rows;
+    }
   }
 
+  return [];
+}
+
+/** Layout A parser: rows are prefixed "Trades,Data,..." */
+function parseStructured(lines: string[], headerLineIdx: number, market: Market): EditableRow[] {
+  const headerCols = splitCsvLine(lines[headerLineIdx]).map((c) => c.trim());
+  const col = (name: string) => headerCols.indexOf(name);
+
+  const iSymbol   = col("Symbol");
+  const iDateTime = col("Trade Date/Time") !== -1 ? col("Trade Date/Time") : col("Date/Time");
+  const iQuantity = col("Quantity");
+  const iPrice    = col("Price") !== -1 ? col("Price") : col("T. Price");
+  const iProceeds = col("Proceeds");
+  const iType     = col("Type");
+  const iAcctId   = col("Acct ID");
+  // Commission: separate Comm+Fee, or combined Comm/Fee, or Comm in USD
+  const iComm     = col("Comm");
+  const iFee      = col("Fee");
+  const iCommFee  = col("Comm/Fee") !== -1 ? col("Comm/Fee") : col("Comm in USD");
+
+  if (iSymbol === -1 || iDateTime === -1 || iQuantity === -1 || iPrice === -1) return [];
+
   const rows: EditableRow[] = [];
-  for (let i = headerIdx + 1; i < lines.length; i++) {
+  for (let i = headerLineIdx + 1; i < lines.length; i++) {
     const cols = splitCsvLine(lines[i]);
-    if (cols[0] !== "Trades" || cols[1] !== "Data") continue;
+    if (cols[0].trim() !== "Trades" || cols[1].trim() !== "Data") continue;
 
     const symbol = (cols[iSymbol] ?? "").trim();
     if (!symbol || symbol.startsWith("Total")) continue;
 
-    const quantity = parseFloat((cols[iQuantity] ?? "").replace(/,/g, ""));
-    const price = parseFloat((cols[iPrice] ?? "").replace(/,/g, ""));
-    const proceeds = parseFloat((cols[iProceeds] ?? "").replace(/,/g, ""));
-    const commFee = parseFloat((cols[iCommFee] ?? "").replace(/,/g, ""));
+    // Skip grouping rows where Acct ID is not a real account number
+    if (iAcctId !== -1 && !isValidAcctId(cols[iAcctId] ?? "")) continue;
+
+    const quantity = parseNum(cols[iQuantity]);
+    const price    = parseNum(cols[iPrice]);
 
     if (isNaN(quantity) || isNaN(price)) continue;
 
-    const transaction_type = quantity >= 0 ? "BUY" : "SELL";
-    const shares = Math.abs(quantity);
+    // Direction: from Type column if present, otherwise from Quantity sign
+    let transaction_type: string;
+    if (iType !== -1) {
+      const t = (cols[iType] ?? "").trim().toUpperCase();
+      transaction_type = t === "SELL" ? "SELL" : "BUY";
+    } else {
+      transaction_type = quantity >= 0 ? "BUY" : "SELL";
+    }
+
+    const shares       = Math.abs(quantity);
+    const proceeds     = parseNum(cols[iProceeds]);
     const total_amount = Math.abs(isNaN(proceeds) ? price * shares : proceeds);
-    const commission = Math.abs(isNaN(commFee) ? 0 : commFee);
+
+    // Commission: prefer separate Comm+Fee; fall back to combined column
+    let commission = 0;
+    if (iComm !== -1 || iFee !== -1) {
+      const comm = iComm !== -1 ? parseNum(cols[iComm]) : 0;
+      const fee  = iFee  !== -1 ? parseNum(cols[iFee])  : 0;
+      commission = Math.abs(isNaN(comm) ? 0 : comm) + Math.abs(isNaN(fee) ? 0 : fee);
+    } else if (iCommFee !== -1) {
+      const cf = parseNum(cols[iCommFee]);
+      commission = Math.abs(isNaN(cf) ? 0 : cf);
+    }
 
     const traded_at = parseIbDateTime(cols[iDateTime] ?? "");
 
@@ -144,56 +188,61 @@ function parseIbCsv(text: string, market: Market): EditableRow[] {
   return rows;
 }
 
-/**
- * Alternative parser for IB CSV exports that use a flat "Trades" section
- * without the Section/Header/Data pattern (e.g. some older exports or
- * the "default" layout).  Falls back to scanning for a header row that
- * contains "Symbol" and "Date/Time".
- */
-function parseIbCsvAlt(lines: string[], market: Market): EditableRow[] {
-  let headerCols: string[] = [];
-  let headerIdx = -1;
-
-  for (let i = 0; i < lines.length; i++) {
-    const cols = splitCsvLine(lines[i]);
-    if (cols.some((c) => c.trim() === "Symbol") && cols.some((c) => c.trim() === "Date/Time")) {
-      headerCols = cols.map((c) => c.trim());
-      headerIdx = i;
-      break;
-    }
-  }
-
-  if (headerIdx === -1) return [];
-
+/** Layout B parser: standalone header row (no Section/Data prefix). */
+function parseFlat(lines: string[], headerLineIdx: number, market: Market): EditableRow[] {
+  const headerCols = splitCsvLine(lines[headerLineIdx]).map((c) => c.trim());
   const col = (name: string) => headerCols.indexOf(name);
-  const iSymbol = col("Symbol");
-  const iDateTime = col("Date/Time");
-  const iQuantity = col("Quantity");
-  const iPrice = col("T. Price") !== -1 ? col("T. Price") : col("Price");
-  const iProceeds = col("Proceeds");
-  const iCommFee = col("Comm/Fee") !== -1 ? col("Comm/Fee") : col("Comm in USD");
 
-  if ([iSymbol, iDateTime, iQuantity, iPrice].some((i) => i === -1)) return [];
+  const iSymbol   = col("Symbol");
+  const iDateTime = col("Trade Date/Time") !== -1 ? col("Trade Date/Time") : col("Date/Time");
+  const iQuantity = col("Quantity");
+  const iPrice    = col("Price") !== -1 ? col("Price") : col("T. Price");
+  const iProceeds = col("Proceeds");
+  const iType     = col("Type");
+  const iAcctId   = col("Acct ID");
+  const iComm     = col("Comm");
+  const iFee      = col("Fee");
+  const iCommFee  = col("Comm/Fee") !== -1 ? col("Comm/Fee") : col("Comm in USD");
+
+  if (iSymbol === -1 || iDateTime === -1 || iQuantity === -1 || iPrice === -1) return [];
 
   const rows: EditableRow[] = [];
-  for (let i = headerIdx + 1; i < lines.length; i++) {
+  for (let i = headerLineIdx + 1; i < lines.length; i++) {
     const cols = splitCsvLine(lines[i]);
+    if (cols.length < 3) continue;
+
     const symbol = (cols[iSymbol] ?? "").trim();
     if (!symbol || symbol.startsWith("Total") || symbol === "Symbol") continue;
-    // Skip section label rows (e.g. "Stocks", "USD")
-    if (cols.length <= 3) continue;
 
-    const quantity = parseFloat((cols[iQuantity] ?? "").replace(/,/g, ""));
-    const price = parseFloat((cols[iPrice] ?? "").replace(/,/g, ""));
-    const proceeds = iProceeds !== -1 ? parseFloat((cols[iProceeds] ?? "").replace(/,/g, "")) : NaN;
-    const commFee = iCommFee !== -1 ? parseFloat((cols[iCommFee] ?? "").replace(/,/g, "")) : 0;
+    // Skip grouping rows where Acct ID is not a real account number
+    if (iAcctId !== -1 && !isValidAcctId(cols[iAcctId] ?? "")) continue;
+
+    const quantity = parseNum(cols[iQuantity]);
+    const price    = parseNum(cols[iPrice]);
 
     if (isNaN(quantity) || isNaN(price)) continue;
 
-    const transaction_type = quantity >= 0 ? "BUY" : "SELL";
-    const shares = Math.abs(quantity);
+    let transaction_type: string;
+    if (iType !== -1) {
+      const t = (cols[iType] ?? "").trim().toUpperCase();
+      transaction_type = t === "SELL" ? "SELL" : "BUY";
+    } else {
+      transaction_type = quantity >= 0 ? "BUY" : "SELL";
+    }
+
+    const shares       = Math.abs(quantity);
+    const proceeds     = parseNum(cols[iProceeds]);
     const total_amount = Math.abs(isNaN(proceeds) ? price * shares : proceeds);
-    const commission = Math.abs(isNaN(commFee) ? 0 : commFee);
+
+    let commission = 0;
+    if (iComm !== -1 || iFee !== -1) {
+      const comm = iComm !== -1 ? parseNum(cols[iComm]) : 0;
+      const fee  = iFee  !== -1 ? parseNum(cols[iFee])  : 0;
+      commission = Math.abs(isNaN(comm) ? 0 : comm) + Math.abs(isNaN(fee) ? 0 : fee);
+    } else if (iCommFee !== -1) {
+      const cf = parseNum(cols[iCommFee]);
+      commission = Math.abs(isNaN(cf) ? 0 : cf);
+    }
 
     const traded_at = parseIbDateTime(cols[iDateTime] ?? "");
 

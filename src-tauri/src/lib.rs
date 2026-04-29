@@ -213,6 +213,7 @@ pub fn run() {
             // OCR: import trades from 同花顺 screenshots
             commands::ocr::parse_trade_image,
             commands::ocr::lookup_cn_stock_code,
+            commands::ocr::lookup_stock_name_by_symbol,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -35,8 +35,10 @@ struct XueqiuSearchResponse {
 
 #[derive(Debug, Deserialize)]
 struct XueqiuSearchItem {
-    /// e.g. "SH600036", "SZ000001"
+    /// e.g. "SH600036", "SZ000001", "NYSE:CHA"
     code: Option<String>,
+    /// Display name, e.g. "招商银行", "中国电信"
+    name: Option<String>,
 }
 
 /// Query Xueqiu to resolve a Chinese stock name to its A-share code.
@@ -85,6 +87,70 @@ async fn lookup_via_xueqiu(name: &str) -> Result<Option<String>, String> {
         let is_cn = code.starts_with("SH") || code.starts_with("SZ");
         if is_cn && code.len() == 8 {
             return Ok(Some(code.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Ticker-symbol → stock-name lookup (US / HK / CN, for CSV import)
+// ---------------------------------------------------------------------------
+
+/// Query Xueqiu to resolve a ticker symbol (e.g. "AAPL", "00700") to its
+/// display name (e.g. "苹果", "腾讯控股").
+///
+/// Prefers the result whose code suffix exactly matches the requested symbol
+/// (e.g. "NYSE:AAPL" → suffix "AAPL").  If no exact suffix match is found,
+/// returns the first result's name as a best-effort fallback.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn lookup_stock_name_by_symbol(symbol: String) -> Result<Option<String>, String> {
+    let url = format!(
+        "https://xueqiu.com/query/v1/search/stock.json?code={}",
+        urlencoding::encode(&symbol)
+    );
+
+    let resp = quote_service::xueqiu_fetch(&url)
+        .await
+        .map_err(|e| format!("查询雪球失败: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let body: XueqiuSearchResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("解析雪球响应失败: {}", e))?;
+
+    let items = body.stocks.unwrap_or_default();
+
+    // First pass: prefer an item whose code suffix exactly matches the symbol
+    for item in &items {
+        let code = match &item.code {
+            Some(s) if !s.is_empty() => s.as_str(),
+            _ => continue,
+        };
+        let suffix = if code.contains(':') {
+            code.split(':').last().unwrap_or(code)
+        } else {
+            code
+        };
+        if suffix.eq_ignore_ascii_case(&symbol) {
+            if let Some(name) = &item.name {
+                if !name.is_empty() {
+                    return Ok(Some(name.clone()));
+                }
+            }
+        }
+    }
+
+    // Second pass: return the first result with any name
+    for item in &items {
+        if let Some(name) = &item.name {
+            if !name.is_empty() {
+                return Ok(Some(name.clone()));
+            }
         }
     }
 

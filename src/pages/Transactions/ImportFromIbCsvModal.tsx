@@ -13,6 +13,7 @@ import {
   Typography,
   message,
   Tag,
+  Spin,
 } from "antd";
 import { InboxOutlined, CheckCircleOutlined, CloseCircleOutlined } from "@ant-design/icons";
 import type { UploadFile } from "antd/es/upload";
@@ -38,6 +39,7 @@ interface EditableRow {
   shares: number;
   total_amount: number;
   commission: number;
+  lookingUp?: boolean;
   importOk?: boolean;
   importError?: string;
 }
@@ -348,6 +350,77 @@ export default function ImportFromIbCsvModal({
 
   // ---- Step 0 helpers -------------------------------------------------------
 
+  // ---- Step 1 helpers -------------------------------------------------------
+
+  const updateRow = useCallback(
+    (key: string, patch: Partial<EditableRow>) => {
+      setRows((prev) =>
+        prev.map((r) => (r.key === key ? { ...r, ...patch } : r))
+      );
+    },
+    []
+  );
+
+  /**
+   * After parsing the CSV, try to resolve a human-readable stock name for each
+   * unique symbol.
+   *
+   * Resolution order:
+   *   1. Look up in the user's existing holdings (any account) – fastest, no
+   *      network call needed.
+   *   2. Query Xueqiu `lookup_stock_name_by_symbol` for any symbol not found in
+   *      step 1.
+   *
+   * All rows are marked `lookingUp: true` before the async work begins and
+   * `lookingUp: false` once it completes, letting the table show a spinner.
+   */
+  const resolveStockNames = useCallback(async (parsedRows: EditableRow[]) => {
+    // 1. Build symbol→name map from existing holdings (all accounts)
+    const holdingNameMap = new Map<string, string>();
+    try {
+      const holdings = await invoke<{ symbol: string; name: string }[]>(
+        "get_holdings",
+        { accountId: null }
+      );
+      for (const h of holdings) {
+        holdingNameMap.set(h.symbol.toUpperCase(), h.name);
+      }
+    } catch {
+      // ignore — will fall back to Xueqiu for all symbols
+    }
+
+    // 2. Collect unique symbols that still need a name from Xueqiu
+    const uniqueSymbols = [...new Set(parsedRows.map((r) => r.symbol.toUpperCase()))];
+    const symbolNameMap = new Map<string, string>();
+
+    for (const sym of uniqueSymbols) {
+      const name = holdingNameMap.get(sym);
+      if (name) symbolNameMap.set(sym, name);
+    }
+
+    const needLookup = uniqueSymbols.filter((s) => !symbolNameMap.has(s));
+    await Promise.all(
+      needLookup.map(async (sym) => {
+        try {
+          const name = await invoke<string | null>("lookup_stock_name_by_symbol", {
+            symbol: sym,
+          });
+          if (name) symbolNameMap.set(sym, name);
+        } catch {
+          // ignore individual lookup failures; user can edit manually
+        }
+      })
+    );
+
+    // 3. Apply resolved names; clear lookingUp flag
+    setRows((prev) =>
+      prev.map((r) => {
+        const resolved = symbolNameMap.get(r.symbol.toUpperCase());
+        return { ...r, stock_name: resolved ?? r.stock_name, lookingUp: false };
+      })
+    );
+  }, []);
+
   const handleBeforeUpload = useCallback(
     (file: File) => {
       setParseError("");
@@ -362,8 +435,12 @@ export default function ImportFromIbCsvModal({
             );
             return;
           }
-          setRows(parsed);
+          // Mark all rows as looking up their names before async resolution begins
+          const withLoading = parsed.map((r) => ({ ...r, lookingUp: true }));
+          setRows(withLoading);
           setStep(1);
+          // Fire-and-forget: resolve names from holdings then Xueqiu
+          resolveStockNames(withLoading);
         } catch (err) {
           setParseError(`CSV 解析失败: ${String(err)}`);
         }
@@ -372,18 +449,7 @@ export default function ImportFromIbCsvModal({
       setFileList([file as unknown as UploadFile]);
       return false; // prevent antd default upload
     },
-    [market]
-  );
-
-  // ---- Step 1 helpers -------------------------------------------------------
-
-  const updateRow = useCallback(
-    (key: string, patch: Partial<EditableRow>) => {
-      setRows((prev) =>
-        prev.map((r) => (r.key === key ? { ...r, ...patch } : r))
-      );
-    },
-    []
+    [market, resolveStockNames]
   );
 
   // ---- Step 2 helpers -------------------------------------------------------
@@ -506,14 +572,16 @@ export default function ImportFromIbCsvModal({
       key: "stock_name",
       width: 120,
       render: (_: unknown, record: EditableRow) => (
-        <Input
-          size="small"
-          value={record.stock_name}
-          style={{ width: 110 }}
-          onChange={(e) =>
-            updateRow(record.key, { stock_name: e.target.value })
-          }
-        />
+        <Spin spinning={!!record.lookingUp} size="small">
+          <Input
+            size="small"
+            value={record.stock_name}
+            style={{ width: 110 }}
+            onChange={(e) =>
+              updateRow(record.key, { stock_name: e.target.value })
+            }
+          />
+        </Spin>
       ),
     },
     {

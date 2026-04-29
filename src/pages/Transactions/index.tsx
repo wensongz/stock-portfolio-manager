@@ -15,13 +15,14 @@ import {
   DatePicker,
   AutoComplete,
 } from "antd";
-import { PlusOutlined, EditOutlined, FilterOutlined, CameraOutlined } from "@ant-design/icons";
+import { PlusOutlined, EditOutlined, FilterOutlined, CameraOutlined, FileTextOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { invoke } from "@tauri-apps/api/core";
 import { useTransactionStore } from "../../stores/transactionStore";
 import { useAccountStore } from "../../stores/accountStore";
 import type { Transaction, Market, Currency, TransactionType, Holding, StockQuote } from "../../types";
 import ImportFromImageModal from "./ImportFromImageModal";
+import ImportFromIbCsvModal from "./ImportFromIbCsvModal";
 
 const { Title, Text } = Typography;
 
@@ -63,6 +64,7 @@ export default function TransactionsPage() {
   const [symbolSearching, setSymbolSearching] = useState(false);
   const [filterAccountId, setFilterAccountId] = useState<string | undefined>(undefined);
   const [importModalOpen, setImportModalOpen] = useState(false);
+  const [csvImportModalOpen, setCsvImportModalOpen] = useState(false);
 
   useEffect(() => {
     fetchTransactions();
@@ -320,14 +322,28 @@ export default function TransactionsPage() {
           交易记录
         </Title>
         <Space>
-          {filterAccountId && (
-            <Button
-              icon={<CameraOutlined />}
-              onClick={() => setImportModalOpen(true)}
-            >
-              从截图导入
-            </Button>
-          )}
+          {filterAccountId && (() => {
+            const acct = accounts.find((a) => a.id === filterAccountId);
+            if (!acct) return null;
+            if (acct.market === "CN") {
+              return (
+                <Button
+                  icon={<CameraOutlined />}
+                  onClick={() => setImportModalOpen(true)}
+                >
+                  从截图导入
+                </Button>
+              );
+            }
+            return (
+              <Button
+                icon={<FileTextOutlined />}
+                onClick={() => setCsvImportModalOpen(true)}
+              >
+                从CSV导入
+              </Button>
+            );
+          })()}
           <Button
             type="primary"
             icon={<PlusOutlined />}
@@ -470,16 +486,32 @@ export default function TransactionsPage() {
         </Form>
       </Modal>
 
-      {/* Import from screenshot modal – only available when an account is selected */}
+      {/* Import from screenshot modal – only for CN accounts */}
       {filterAccountId && (() => {
         const account = accounts.find((a) => a.id === filterAccountId);
-        return account ? (
+        return account && account.market === "CN" ? (
           <ImportFromImageModal
             open={importModalOpen}
             account={account}
             onClose={() => setImportModalOpen(false)}
             onImported={() => {
               setImportModalOpen(false);
+              fetchTransactions();
+            }}
+          />
+        ) : null;
+      })()}
+
+      {/* Import from CSV modal – only for US/HK accounts */}
+      {filterAccountId && (() => {
+        const account = accounts.find((a) => a.id === filterAccountId);
+        return account && (account.market === "US" || account.market === "HK") ? (
+          <ImportFromIbCsvModal
+            open={csvImportModalOpen}
+            account={account}
+            onClose={() => setCsvImportModalOpen(false)}
+            onImported={() => {
+              setCsvImportModalOpen(false);
               fetchTransactions();
             }}
           />

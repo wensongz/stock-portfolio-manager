@@ -758,8 +758,8 @@ export default function HoldingsPage() {
               dataIndex: "transaction_type",
               key: "transaction_type",
               render: (type: TransactionType) => (
-                <Tag color={type === "BUY" ? "green" : "red"}>
-                  {type === "BUY" ? "买入" : "卖出"}
+                <Tag color={type === "BUY" ? "green" : type === "OPEN" ? "blue" : "red"}>
+                  {type === "BUY" ? "买入" : type === "OPEN" ? "建仓" : "卖出"}
                 </Tag>
               ),
             },

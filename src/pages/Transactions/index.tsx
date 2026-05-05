@@ -264,8 +264,8 @@ export default function TransactionsPage() {
       dataIndex: "transaction_type",
       key: "transaction_type",
       render: (type: TransactionType) => (
-        <Tag color={type === "BUY" ? "green" : "red"}>
-          {type === "BUY" ? "买入" : "卖出"}
+        <Tag color={type === "BUY" ? "green" : type === "OPEN" ? "blue" : "red"}>
+          {type === "BUY" ? "买入" : type === "OPEN" ? "建仓" : "卖出"}
         </Tag>
       ),
     },
@@ -297,6 +297,7 @@ export default function TransactionsPage() {
             size="small"
             icon={<EditOutlined />}
             onClick={() => handleEdit(record)}
+            disabled={record.transaction_type === "OPEN"}
           >
             编辑
           </Button>
@@ -305,8 +306,9 @@ export default function TransactionsPage() {
             onConfirm={() => handleDelete(record.id)}
             okText="确认"
             cancelText="取消"
+            disabled={record.transaction_type === "OPEN"}
           >
-            <Button type="link" size="small" danger>
+            <Button type="link" size="small" danger disabled={record.transaction_type === "OPEN"}>
               删除
             </Button>
           </Popconfirm>

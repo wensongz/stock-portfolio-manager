@@ -288,14 +288,18 @@ function parseIbDateTime(raw: string): string {
 
 /**
  * Format symbol for the given market.
- * HK stocks on IB are numeric (e.g. "700" for Tencent); keep as-is.
+ * HK stocks on IB are numeric (e.g. "700" for Tencent); strip leading zeros
+ * and append ".HK" to match the format used in holdings (e.g. "700.HK").
  * US stocks are already tickers like "AAPL".
  */
 function formatSymbol(symbol: string, market: Market): string {
   if (market === "HK") {
-    // Pad HK symbols to 5 digits
     const digits = symbol.replace(/\D/g, "");
-    if (digits) return digits.padStart(5, "0");
+    if (digits) {
+      // Strip leading zeros by parsing as integer, then append .HK suffix
+      // to match the format stored in holdings (e.g. "1.HK", "700.HK")
+      return `${parseInt(digits, 10)}.HK`;
+    }
   }
   return symbol.toUpperCase();
 }

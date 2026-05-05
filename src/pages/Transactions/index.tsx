@@ -306,7 +306,6 @@ export default function TransactionsPage() {
             onConfirm={() => handleDelete(record.id)}
             okText="确认"
             cancelText="取消"
-            disabled={record.transaction_type === "OPEN"}
           >
             <Button type="link" size="small" danger disabled={record.transaction_type === "OPEN"}>
               删除

@@ -1,4 +1,5 @@
 import { Card, Table, Tag, Typography } from "antd";
+import { SwapOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
 import type { StockTransactionGroup, Transaction } from "../../types";
 
@@ -153,7 +154,8 @@ export default function QuarterlyTransactionsSection({ groups, loading }: Props)
       size="small"
       title={
         <span>
-          🔄 季度交易{" "}
+          <SwapOutlined className="mr-1" />
+          季度交易{" "}
           <Tag color="blue">{groups.length} 只</Tag>
         </span>
       }

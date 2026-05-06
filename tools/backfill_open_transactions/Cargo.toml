@@ -1,0 +1,14 @@
+[package]
+name = "backfill_open_transactions"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone utility to backfill OPEN position records in the stock-portfolio-manager database"
+
+[[bin]]
+name = "backfill_open_transactions"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"

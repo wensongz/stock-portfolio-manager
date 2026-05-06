@@ -1,0 +1,1 @@
+/home/runner/work/stock-portfolio-manager/stock-portfolio-manager/tools/backfill_open_transactions/target/debug/backfill_open_transactions: /home/runner/work/stock-portfolio-manager/stock-portfolio-manager/tools/backfill_open_transactions/src/main.rs

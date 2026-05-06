@@ -214,7 +214,7 @@ fn main() {
             let total_in = holding.shares + sum_sell_shares; // = s0 + Σbuy_shares
             let p0 = (total_in * holding.avg_cost - sum_buy_cost) / s0;
 
-            if !p0.is_finite() || p0 <= 0.0 {
+            if !p0.is_finite() {
                 println!(
                     "[错误] {}: 反推的建仓价格无效（price₀ = {:.4}），跳过。\
                      \n       请检查持仓 avg_cost = {:.4} 及历史交易是否正确。",
@@ -418,6 +418,39 @@ mod tests {
         let (s0, p0) = calculate_initial_position(120.0, avg, 50.0, 600.0, 30.0);
         assert!((s0 - 100.0).abs() < 1e-4, "s0 = {}", s0);
         assert!((p0 - 10.0).abs() < 1e-3, "p0 = {}", p0);
+    }
+
+    #[test]
+    fn test_formula_negative_avg_cost() {
+        // Simulates a holding where avg_cost is negative (e.g. received dividends /
+        // credits that exceed the purchase cost, making the recorded cost basis negative).
+        // The tool must NOT reject such a price₀ — it should produce a valid finite number.
+        //
+        // Scenario: initial position 100 shares at a cost that, after a subsequent BUY
+        // at a positive price, leaves avg_cost_final = -104.9649.
+        //   avg_cost_final = (s0 * p0 + buy_shares * buy_price) / (s0 + buy_shares)
+        //   ⟹  p0 = (avg_cost_final * (s0 + buy_shares) - buy_shares * buy_price) / s0
+        // We pick concrete numbers that reproduce the reported case.
+        let shares_final = 200.0_f64;
+        let avg_cost_final = -104.9649_f64;
+        let buy_shares = 100.0_f64;
+        let buy_price = 50.0_f64;
+        let sell_shares = 0.0_f64;
+
+        let (s0, p0) = calculate_initial_position(
+            shares_final, avg_cost_final, buy_shares, buy_price * buy_shares, sell_shares,
+        );
+        // s0 = 200 + 0 - 100 = 100
+        assert!((s0 - 100.0).abs() < 1e-6, "s0 = {}", s0);
+        // p0 should be finite (negative is fine)
+        assert!(p0.is_finite(), "p0 must be finite, got {}", p0);
+        // Verify round-trip: reconstructed avg matches
+        let reconstructed_avg = (s0 * p0 + buy_shares * buy_price) / (s0 + buy_shares);
+        assert!(
+            (reconstructed_avg - avg_cost_final).abs() < 1e-4,
+            "round-trip avg mismatch: {} vs {}",
+            reconstructed_avg, avg_cost_final
+        );
     }
 
     #[test]

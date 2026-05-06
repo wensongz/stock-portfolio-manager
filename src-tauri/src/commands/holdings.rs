@@ -17,12 +17,43 @@ pub fn create_holding(
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO holdings (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        rusqlite::params![id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, now, now],
-    )
-    .map_err(|e| e.to_string())?;
+
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+
+    let result = (|| -> Result<(), String> {
+        conn.execute(
+            "INSERT INTO holdings (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, now, now],
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Insert an initial OPEN transaction to record the position entry
+        let txn_id = uuid::Uuid::new_v4().to_string();
+        let total_amount = shares * avg_cost;
+        conn.execute(
+            "INSERT INTO transactions (id, holding_id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, notes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'OPEN', ?7, ?8, ?9, 0.0, ?10, ?11, NULL, ?12)",
+            rusqlite::params![
+                txn_id, id, account_id, symbol, name, market,
+                shares, avg_cost, total_amount, currency, now, now
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    }
+
     Ok(Holding {
         id,
         account_id,

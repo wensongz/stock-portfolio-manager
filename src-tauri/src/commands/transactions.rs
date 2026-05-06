@@ -6,11 +6,13 @@ use tauri::State;
 /// Compute the cash delta for a transaction.
 /// BUY  → cash decreases by total_amount + commission (money leaves the account).
 /// SELL → cash increases by total_amount - commission (money enters the account).
-/// Panics if `transaction_type` is not `"BUY"` or `"SELL"`.
+/// OPEN → no cash impact (initial position entry, not a real trade).
+/// Panics if `transaction_type` is not `"BUY"`, `"SELL"`, or `"OPEN"`.
 pub(crate) fn cash_delta(transaction_type: &str, total_amount: f64, commission: f64) -> f64 {
     match transaction_type {
         "BUY" => -(total_amount + commission),
         "SELL" => total_amount - commission,
+        "OPEN" => 0.0,
         other => panic!("Unexpected transaction_type for cash_delta: {}", other),
     }
 }
@@ -294,6 +296,10 @@ pub fn update_transaction(
         )
         .map_err(|e| format!("Transaction not found: {}", e))?;
 
+    if old_txn.transaction_type == "OPEN" {
+        return Err("Cannot edit the initial position-opening record".to_string());
+    }
+
     conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
 
     let result = (|| -> Result<Option<String>, String> {
@@ -437,6 +443,10 @@ pub fn delete_transaction(db: State<Database>, id: String) -> Result<(), String>
             map_transaction,
         )
         .map_err(|e| format!("Transaction not found: {}", e))?;
+
+    if txn.transaction_type == "OPEN" {
+        return Err("Cannot delete the initial position-opening record".to_string());
+    }
 
     conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
 

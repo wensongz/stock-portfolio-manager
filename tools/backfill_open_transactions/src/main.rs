@@ -45,6 +45,7 @@ struct TxnRow {
     shares: f64,
     price: f64,
     traded_at: String,
+    notes: Option<String>,
 }
 
 fn main() {
@@ -124,7 +125,7 @@ fn main() {
         // Fetch all transactions for this (account_id, symbol), ordered by time.
         let mut txn_stmt = conn
             .prepare(
-                "SELECT transaction_type, shares, price, traded_at
+                "SELECT transaction_type, shares, price, traded_at, notes
                  FROM transactions
                  WHERE account_id = ?1 AND UPPER(symbol) = UPPER(?2)
                  ORDER BY traded_at ASC",
@@ -138,15 +139,19 @@ fn main() {
                     shares: row.get(1)?,
                     price: row.get(2)?,
                     traded_at: row.get(3)?,
+                    notes: row.get(4)?,
                 })
             })
             .expect("transactions 查询失败")
             .collect::<Result<Vec<_>, _>>()
             .expect("无法收集 transactions 结果");
 
-        // Skip if an OPEN record already exists (idempotent).
-        if txns.iter().any(|t| t.transaction_type == "OPEN") {
-            println!("[跳过] {}: 已存在 OPEN 建仓记录", label);
+        // Skip if a backfill BUY record already exists (idempotent).
+        if txns.iter().any(|t| {
+            t.transaction_type == "BUY"
+                && t.notes.as_deref() == Some("backfill:initial")
+        }) {
+            println!("[跳过] {}: 已存在建仓买入记录（backfill:initial）", label);
             skipped_count += 1;
             continue;
         }
@@ -258,7 +263,7 @@ fn main() {
              (id, holding_id, account_id, symbol, name, market, \
               transaction_type, shares, price, total_amount, commission, \
               currency, traded_at, notes, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'OPEN', ?7, ?8, ?9, 0.0, ?10, ?11, NULL, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'BUY', ?7, ?8, ?9, 0.0, ?10, ?11, 'backfill:initial', ?12)",
             params![
                 txn_id,
                 holding.id,       // holding_id
@@ -278,7 +283,7 @@ fn main() {
                 created_count += 1;
             }
             Err(e) => {
-                println!("[错误] {}: 写入 OPEN 记录失败: {}", label, e);
+                println!("[错误] {}: 写入建仓买入记录失败: {}", label, e);
                 error_count += 1;
             }
         }
@@ -346,7 +351,7 @@ mod tests {
                 symbol TEXT NOT NULL,
                 name TEXT NOT NULL,
                 market TEXT NOT NULL,
-                transaction_type TEXT NOT NULL,
+                transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL')),
                 shares REAL NOT NULL,
                 price REAL NOT NULL,
                 total_amount REAL NOT NULL,
@@ -383,7 +388,7 @@ mod tests {
 
     fn count_open(conn: &Connection, symbol: &str) -> i64 {
         conn.query_row(
-            "SELECT COUNT(*) FROM transactions WHERE UPPER(symbol)=UPPER(?1) AND transaction_type='OPEN'",
+            "SELECT COUNT(*) FROM transactions WHERE UPPER(symbol)=UPPER(?1) AND transaction_type='BUY' AND notes='backfill:initial'",
             params![symbol],
             |r| r.get(0),
         ).unwrap()
@@ -489,18 +494,18 @@ mod tests {
 
         assert!(txns.is_empty());
 
-        // Case A: insert OPEN from holding data.
+        // Case A: insert BUY (backfill:initial) from holding data.
         let txn_id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         let created_at_val: String = conn.query_row("SELECT created_at FROM holdings WHERE id=?1", params![hid], |r| r.get(0)).unwrap();
         conn.execute(
-            "INSERT INTO transactions VALUES (?1,?2,'acc1','SH600036','招商银行','CN','OPEN',1000.0,35.5,35500.0,0.0,'CNY',?3,NULL,?4)",
+            "INSERT INTO transactions VALUES (?1,?2,'acc1','SH600036','招商银行','CN','BUY',1000.0,35.5,35500.0,0.0,'CNY',?3,'backfill:initial',?4)",
             params![txn_id, hid, created_at_val, now],
         ).unwrap();
 
         assert_eq!(count_open(&conn, "SH600036"), 1);
         let (open_shares, open_price): (f64, f64) = conn.query_row(
-            "SELECT shares, price FROM transactions WHERE transaction_type='OPEN' AND symbol='SH600036'",
+            "SELECT shares, price FROM transactions WHERE transaction_type='BUY' AND notes='backfill:initial' AND symbol='SH600036'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).unwrap();
@@ -550,10 +555,16 @@ mod tests {
     fn test_existing_open_idempotent() {
         let conn = setup_db();
         let hid = insert_holding(&conn, "HK.00700", "腾讯控股", 200.0, 300.0);
-        insert_txn(&conn, &hid, "HK.00700", "OPEN", 200.0, 300.0, "2023-01-01T00:00:00+00:00");
+        // Simulate a previously-backfilled BUY record (notes='backfill:initial').
+        let txn_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO transactions VALUES (?1,?2,'acc1','HK.00700','腾讯控股','HK','BUY',200.0,300.0,60000.0,0.0,'HKD','2023-01-01T00:00:00+00:00','backfill:initial',?3)",
+            params![txn_id, hid, now],
+        ).unwrap();
 
-        // Should already have 1 OPEN.
+        // Should already have 1 backfill record.
         assert_eq!(count_open(&conn, "HK.00700"), 1);
-        // The main() loop would see has_open=true and skip, so still 1.
+        // The main() loop would see the backfill:initial note and skip, so still 1.
     }
 }

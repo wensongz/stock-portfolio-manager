@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect } from "react";
 import { Button, Space, Typography, message } from "antd";
-import MDEditor from "@uiw/react-md-editor";
+import MDEditor, { commands } from "@uiw/react-md-editor";
+import type { ICommand } from "@uiw/react-md-editor";
 import { useQuarterlyStore } from "../../stores/quarterlyStore";
 
 const { Text } = Typography;
@@ -41,13 +42,69 @@ ${MARKET_SECTION}`;
 
 const INDENT = "  "; // 2 spaces
 
+const indentCommand: ICommand = {
+  name: "indent",
+  keyCommand: "indent",
+  buttonProps: { "aria-label": "增加缩进", title: "增加缩进" },
+  icon: (
+    <svg width="12" height="12" viewBox="0 0 24 24">
+      <path
+        fill="currentColor"
+        d="M3 21h18v-2H3v2zm8-4h10v-2H11v2zm-8-4h18v-2H3v2zm8-4h10V7H11v2zM3 3v2h18V3H3zm8 8l5-5-5-5v10z"
+      />
+    </svg>
+  ),
+  execute: (state, api) => {
+    const { text, selection } = state;
+    const lineStart = text.lastIndexOf("\n", selection.start - 1) + 1;
+    const region = text.slice(lineStart, selection.end);
+    const newRegion = region.replace(/^/gm, INDENT);
+    const firstLineDelta = newRegion.split("\n")[0].length - region.split("\n")[0].length;
+    const totalDelta = newRegion.length - region.length;
+    api.setSelectionRange({ start: lineStart, end: selection.end });
+    api.replaceSelection(newRegion);
+    api.setSelectionRange({
+      start: Math.max(lineStart, selection.start + firstLineDelta),
+      end: selection.end + totalDelta,
+    });
+  },
+};
+
+const unindentCommand: ICommand = {
+  name: "unindent",
+  keyCommand: "unindent",
+  buttonProps: { "aria-label": "减少缩进", title: "减少缩进" },
+  icon: (
+    <svg width="12" height="12" viewBox="0 0 24 24">
+      <path
+        fill="currentColor"
+        d="M11 17h10v-2H11v2zm-8-5l5 5V7l-5 5zm0 9h18v-2H3v2zM3 3v2h18V3H3zm8 4h10V5H11v2zm0 4h10v-2H11v2z"
+      />
+    </svg>
+  ),
+  execute: (state, api) => {
+    const { text, selection } = state;
+    const lineStart = text.lastIndexOf("\n", selection.start - 1) + 1;
+    const region = text.slice(lineStart, selection.end);
+    const newRegion = region.replace(/^  /gm, "");
+    const firstLineDelta = newRegion.split("\n")[0].length - region.split("\n")[0].length;
+    const totalDelta = newRegion.length - region.length;
+    api.setSelectionRange({ start: lineStart, end: selection.end });
+    api.replaceSelection(newRegion);
+    api.setSelectionRange({
+      start: Math.max(lineStart, selection.start + firstLineDelta),
+      end: selection.end + totalDelta,
+    });
+  },
+};
+
+const TOOLBAR_COMMANDS = [...commands.getCommands(), commands.divider, indentCommand, unindentCommand];
+
 export default function QuarterlyNotesEditor({ snapshotId, initialNotes }: Props) {
   const { updateQuarterlyNotes } = useQuarterlyStore();
   const [notes, setNotes] = useState(initialNotes);
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
-  const editorContainerRef = useRef<HTMLDivElement>(null);
-  const pendingSelection = useRef<{ start: number; end: number } | null>(null);
 
   useEffect(() => {
     if (!editing) {
@@ -72,44 +129,6 @@ export default function QuarterlyNotesEditor({ snapshotId, initialNotes }: Props
     setEditing(false);
   };
 
-  const handleIndent = useCallback((increase: boolean) => {
-    const textarea = editorContainerRef.current?.querySelector("textarea");
-    if (!textarea) return;
-
-    const { value, selectionStart, selectionEnd } = textarea;
-    const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
-    const before = value.slice(0, lineStart);
-    const region = value.slice(lineStart, selectionEnd);
-    const after = value.slice(selectionEnd);
-
-    const newRegion = increase
-      ? region.replace(/^/gm, INDENT)
-      : region.replace(/^  /gm, "");
-
-    const firstLineDelta =
-      newRegion.split("\n")[0].length - region.split("\n")[0].length;
-    const totalDelta = newRegion.length - region.length;
-    const newSelStart = Math.max(lineStart, selectionStart + firstLineDelta);
-    const newSelEnd = selectionEnd + totalDelta;
-
-    pendingSelection.current = { start: newSelStart, end: newSelEnd };
-    setNotes(before + newRegion + after);
-  }, []);
-
-  useEffect(() => {
-    if (pendingSelection.current) {
-      const sel = pendingSelection.current;
-      pendingSelection.current = null;
-      requestAnimationFrame(() => {
-        const textarea = editorContainerRef.current?.querySelector("textarea");
-        if (textarea) {
-          textarea.setSelectionRange(sel.start, sel.end);
-          textarea.focus();
-        }
-      });
-    }
-  }, [notes]);
-
   if (!editing) {
     return (
       <div>
@@ -131,29 +150,18 @@ export default function QuarterlyNotesEditor({ snapshotId, initialNotes }: Props
 
   return (
     <div>
-      <Space className="mb-2" wrap>
-        {!notes && (
-          <Button size="small" onClick={() => setNotes(NOTE_TEMPLATE)}>
-            使用模板
-          </Button>
-        )}
-        <Button
-          size="small"
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={() => handleIndent(true)}
-        >
-          增加缩进
+      {!notes && (
+        <Button size="small" className="mb-2" onClick={() => setNotes(NOTE_TEMPLATE)}>
+          使用模板
         </Button>
-        <Button
-          size="small"
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={() => handleIndent(false)}
-        >
-          减少缩进
-        </Button>
-      </Space>
-      <div data-color-mode="light" ref={editorContainerRef}>
-        <MDEditor value={notes} onChange={(v) => setNotes(v ?? "")} height={350} />
+      )}
+      <div data-color-mode="light">
+        <MDEditor
+          value={notes}
+          onChange={(v) => setNotes(v ?? "")}
+          height={350}
+          commands={TOOLBAR_COMMANDS}
+        />
       </div>
       <Space className="mt-3">
         <Button onClick={handleCancel}>取消</Button>

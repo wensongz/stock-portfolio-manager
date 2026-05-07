@@ -194,8 +194,13 @@ export default function SnapshotDetail() {
             })}
           </Row>
           {/* Shared legend — built from all holdings so every category appears */}
-          <div className="flex flex-wrap justify-center gap-x-4 gap-y-1 mt-2">
-            {categorySlices(holdings).map(({ name, color }) => (
+          <div className="flex flex-wrap justify-start gap-x-4 gap-y-1 mt-2">
+            {[...categorySlices(holdings)].sort((a, b) => {
+              const ORDER = ["现金类", "分红股", "成长股", "套利"];
+              const ai = ORDER.indexOf(a.name);
+              const bi = ORDER.indexOf(b.name);
+              return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+            }).map(({ name, color }) => (
               <span key={name} className="flex items-center gap-1 text-sm">
                 <span
                   style={{ display: "inline-block", width: 12, height: 12, borderRadius: 2, background: color ?? "#999", flexShrink: 0 }}

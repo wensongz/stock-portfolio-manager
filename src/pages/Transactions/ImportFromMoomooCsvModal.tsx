@@ -151,7 +151,7 @@ function detectMarket(marketStr: string, fallback: Market): Market {
  *   成交价格   – executed price
  *   成交金额   – executed amount
  *   成交时间   – execution datetime
- *   合计手续费 – total commission
+ *   合计费用   – total commission (older exports may use 合计手续费)
  */
 function parseMoomooCsv(text: string, defaultMarket: Market): EditableRow[] {
   // Strip UTF-8 BOM if present
@@ -180,7 +180,8 @@ function parseMoomooCsv(text: string, defaultMarket: Market): EditableRow[] {
   const iPrice = col("成交价格");
   const iAmount = col("成交金额");
   const iTime = col("成交时间");
-  const iCommission = col("合计手续费");
+  // "合计费用" is the total-fee column; fall back to "合计手续费" for older exports
+  const iCommission = col("合计费用") !== -1 ? col("合计费用") : col("合计手续费");
 
   if (iCode === -1 || iShares === -1 || iPrice === -1) return [];
 
@@ -234,7 +235,12 @@ function parseMoomooCsv(text: string, defaultMarket: Market): EditableRow[] {
     const direction = (iDir !== -1 ? cols[iDir] ?? "" : "").trim();
     const code = (iCode !== -1 ? cols[iCode] ?? "" : "").trim();
 
-    if (!code) continue;
+    const isMainRow = direction === "买入" || direction === "卖出";
+    // Sub-execution rows have an empty direction; they belong to the previous order
+    // and may also have an empty code column in the moomoo export.
+    const isSubRow = direction === "" && currentGroup !== null;
+
+    if (!isMainRow && !isSubRow) continue;
 
     const shares = parseNum(cols[iShares]);
     const price = parseNum(cols[iPrice]);
@@ -252,7 +258,8 @@ function parseMoomooCsv(text: string, defaultMarket: Market): EditableRow[] {
       commission: isNaN(commRaw) ? 0 : Math.abs(commRaw),
     };
 
-    if (direction === "买入" || direction === "卖出") {
+    if (isMainRow) {
+      if (!code) continue; // main rows must have a stock code
       finalizeGroup();
       const marketStr = iMarket !== -1 ? (cols[iMarket] ?? "").trim() : "";
       const market = marketStr ? detectMarket(marketStr, defaultMarket) : defaultMarket;
@@ -264,9 +271,9 @@ function parseMoomooCsv(text: string, defaultMarket: Market): EditableRow[] {
         market,
         subRows: [subRow],
       };
-    } else if (direction === "" && currentGroup) {
+    } else {
       // Sub-execution of the current order
-      currentGroup.subRows.push(subRow);
+      currentGroup!.subRows.push(subRow);
     }
   }
 

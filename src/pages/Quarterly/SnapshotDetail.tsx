@@ -10,6 +10,8 @@ import {
   Statistic,
   Typography,
 } from "antd";
+import PieChart from "../../components/charts/PieChart";
+import type { PieSlice } from "../../types";
 import { ArrowLeftOutlined, EditOutlined, ReloadOutlined } from "@ant-design/icons";
 import { useNavigate, useParams } from "react-router-dom";
 import { useQuarterlyStore } from "../../stores/quarterlyStore";
@@ -40,6 +42,21 @@ export default function SnapshotDetail() {
   } = useQuarterlyStore();
 
   const { pnlColorDark } = usePnlColor();
+
+  /** Build category distribution pie data for a subset of holdings */
+  function categorySlices(hdgs: { market: string; category_name: string; category_color: string; market_value: number }[], market?: string): PieSlice[] {
+    const subset = market ? hdgs.filter((h) => h.market === market) : hdgs;
+    const map = new Map<string, { value: number; color: string }>();
+    subset.forEach((h) => {
+      const key = h.category_name || "未分类";
+      const color = h.category_color || "#999";
+      const prev = map.get(key);
+      map.set(key, { value: (prev?.value ?? 0) + h.market_value, color });
+    });
+    return [...map.entries()].map(([name, { value, color }]) => ({ name, value, color }));
+  }
+
+  const holdings = detail?.holdings ?? [];
 
   const { fetchAccounts } = useAccountStore();
 
@@ -156,6 +173,28 @@ export default function SnapshotDetail() {
           </Descriptions.Item>
         </Descriptions>
       </Card>
+
+      {/* Category distribution */}
+      {holdings.length > 0 && (
+        <Card size="small" className="mb-4" title="类别分布">
+          <Row gutter={[8, 8]}>
+            {[
+              { label: "整体", market: undefined, currency: "USD" },
+              { label: "🇨🇳 A股", market: "CN", currency: "CNY" },
+              { label: "🇭🇰 港股", market: "HK", currency: "HKD" },
+              { label: "🇺🇸 美股", market: "US", currency: "USD" },
+            ].map(({ label, market, currency }) => {
+              const slices = categorySlices(holdings, market);
+              if (slices.length === 0) return null;
+              return (
+                <Col key={label} xs={24} sm={12} lg={6}>
+                  <PieChart data={slices} title={label} height={220} currencyCode={currency} />
+                </Col>
+              );
+            })}
+          </Row>
+        </Card>
+      )}
 
       <Divider />
 

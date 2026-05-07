@@ -1,6 +1,6 @@
 use crate::db::Database;
 use crate::models::{HoldingWithQuote, StockQuote};
-use crate::services::quote_service::{fetch_cn_quote_with_provider, fetch_hk_quote_with_provider, fetch_us_quote_with_provider, fetch_quotes_batch_cached_with_providers, save_quotes_to_db, QuoteCache};
+use crate::services::quote_service::{fetch_cn_quote_with_provider, fetch_hk_quote_with_provider, fetch_us_quote_with_provider, fetch_quotes_batch_cached_with_providers, save_quotes_to_db, QuoteCache, CASH_SYMBOL_PREFIX};
 use crate::services::quote_provider_service;
 use tauri::State;
 
@@ -35,8 +35,9 @@ pub async fn get_holding_quotes(
     if should_refresh_from_api {
         crate::services::quote_service::clear_quote_warning();
     }
-    // Load holdings from DB (synchronous)
-    let holdings = {
+    // Load holdings from DB (synchronous) and pre-compute realized PnL for cleared positions.
+    // realized_pnl_map: holding_id -> (realized_pnl, total_buy_cost)
+    let (holdings, realized_pnl_map) = {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
@@ -61,10 +62,40 @@ pub async fn get_holding_quotes(
             })
         })
         .map_err(|e| e.to_string())?;
-        let result = rows
+        let holdings = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        result
+
+        // For cleared (shares == 0) non-cash holdings, compute realized PnL from transactions:
+        //   realized_pnl = SUM(SELL total_amount - commission) - SUM(BUY total_amount + commission)
+        //   total_buy_cost = SUM(BUY total_amount + commission)  [used for % calculation]
+        // OPEN transactions are excluded (no cash impact).
+        let mut realized_pnl_map: std::collections::HashMap<String, (f64, f64)> =
+            std::collections::HashMap::new();
+        for h in &holdings {
+            if h.shares == 0.0 && !h.symbol.starts_with(CASH_SYMBOL_PREFIX) {
+                let pnl_data: (f64, f64) = conn
+                    .query_row(
+                        "SELECT
+                            COALESCE(SUM(CASE
+                                WHEN transaction_type = 'SELL' THEN total_amount - commission
+                                WHEN transaction_type = 'BUY'  THEN -(total_amount + commission)
+                                ELSE 0
+                            END), 0.0),
+                            COALESCE(SUM(CASE
+                                WHEN transaction_type = 'BUY' THEN total_amount + commission
+                                ELSE 0
+                            END), 0.0)
+                         FROM transactions WHERE holding_id = ?1",
+                        rusqlite::params![h.id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap_or((0.0, 0.0));
+                realized_pnl_map.insert(h.id.clone(), pnl_data);
+            }
+        }
+
+        (holdings, realized_pnl_map)
     };
 
     // Fetch quotes for all holdings.
@@ -117,16 +148,30 @@ pub async fn get_holding_quotes(
         .into_iter()
         .map(|h| {
             let quote = quote_map.get(&h.symbol).cloned();
-            let market_value = quote.as_ref().map(|q| q.current_price * h.shares);
-            let total_cost = Some(h.avg_cost * h.shares);
-            let unrealized_pnl = market_value.zip(total_cost).map(|(mv, tc)| mv - tc);
-            let unrealized_pnl_percent = unrealized_pnl.zip(total_cost).and_then(|(pnl, tc)| {
-                if tc != 0.0 {
-                    Some(pnl / tc * 100.0)
+            let is_cleared = h.shares == 0.0 && !h.symbol.starts_with(CASH_SYMBOL_PREFIX);
+            let (market_value, total_cost, unrealized_pnl, unrealized_pnl_percent) = if is_cleared {
+                // Cleared position: report realized PnL from transaction history.
+                let (realized_pnl, total_buy_cost) =
+                    realized_pnl_map.get(&h.id).copied().unwrap_or((0.0, 0.0));
+                let pnl_pct = if total_buy_cost != 0.0 {
+                    Some(realized_pnl / total_buy_cost * 100.0)
                 } else {
                     None
-                }
-            });
+                };
+                (Some(0.0), Some(total_buy_cost), Some(realized_pnl), pnl_pct)
+            } else {
+                let market_value = quote.as_ref().map(|q| q.current_price * h.shares);
+                let total_cost = Some(h.avg_cost * h.shares);
+                let unrealized_pnl = market_value.zip(total_cost).map(|(mv, tc)| mv - tc);
+                let unrealized_pnl_percent = unrealized_pnl.zip(total_cost).and_then(|(pnl, tc)| {
+                    if tc != 0.0 {
+                        Some(pnl / tc * 100.0)
+                    } else {
+                        None
+                    }
+                });
+                (market_value, total_cost, unrealized_pnl, unrealized_pnl_percent)
+            };
             HoldingWithQuote {
                 id: h.id,
                 account_id: h.account_id,

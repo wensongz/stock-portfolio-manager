@@ -88,6 +88,7 @@ export default function HoldingsPage() {
   const [detailTransactions, setDetailTransactions] = useState<Transaction[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
   const [showRealtime, setShowRealtime] = useState(true);
+  const [showCleared, setShowCleared] = useState(false);
   const [form] = Form.useForm();
   const [cashForm] = Form.useForm();
   const [fetchingName, setFetchingName] = useState(false);
@@ -325,7 +326,13 @@ export default function HoldingsPage() {
   const displayData = allDisplayData.filter((h) => {
     if (filterAccountId && h.account_id !== filterAccountId) return false;
     if (filterMarket && h.market !== filterMarket) return false;
-    return true;
+    if (showCleared) {
+      // Show only cleared (fully-sold) non-cash positions
+      return !isCashSymbol(h.symbol) && h.shares === 0;
+    } else {
+      // Show active positions (shares > 0); cash is always active
+      return isCashSymbol(h.symbol) || h.shares > 0;
+    }
   });
   displayDataRef.current = displayData;
 
@@ -448,9 +455,17 @@ export default function HoldingsPage() {
       key: "unrealized_pnl",
       sorter: (a: HoldingWithQuote, b: HoldingWithQuote) =>
         (a.unrealized_pnl ?? 0) - (b.unrealized_pnl ?? 0),
-      render: (_: unknown, record: HoldingWithQuote) => (
-        <PnlText value={record.unrealized_pnl ?? null} percent={record.unrealized_pnl_percent ?? null} />
-      ),
+      render: (_: unknown, record: HoldingWithQuote) => {
+        const isCleared = !isCashSymbol(record.symbol) && record.shares === 0;
+        return (
+          <span>
+            <PnlText value={record.unrealized_pnl ?? null} percent={record.unrealized_pnl_percent ?? null} />
+            {isCleared && (
+              <Tag color="default" style={{ marginLeft: 4, fontSize: 11 }}>已实现</Tag>
+            )}
+          </span>
+        );
+      },
     },
   ];
 
@@ -591,6 +606,29 @@ export default function HoldingsPage() {
         pagination={{ pageSize: 20 }}
         scroll={{ x: showRealtime ? 1200 : undefined }}
       />
+
+      {/* Cleared positions peek button */}
+      {(() => {
+        const clearedCount = allDisplayData.filter(
+          (h) => !isCashSymbol(h.symbol) && h.shares === 0 &&
+            (!filterAccountId || h.account_id === filterAccountId) &&
+            (!filterMarket || h.market === filterMarket)
+        ).length;
+        if (clearedCount === 0) return null;
+        return (
+          <div className="mt-2">
+            <Button
+              size="small"
+              type={showCleared ? "primary" : "default"}
+              onMouseDown={() => setShowCleared(true)}
+              onMouseUp={() => setShowCleared(false)}
+              onMouseLeave={() => setShowCleared(false)}
+            >
+              查看已清仓股票（{clearedCount}）
+            </Button>
+          </div>
+        );
+      })()}
 
       <Modal
         title={editingHolding ? "编辑持仓" : "新增持仓"}

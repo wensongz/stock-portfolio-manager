@@ -567,23 +567,75 @@ fn ocr_image_tsv(data: &[u8]) -> Result<Vec<TsvWord>, String> {
 /// Return true when `text` represents a bare numeric value (integer or
 /// decimal) that could be a price, share count, amount, or commission.
 ///
-/// Returns false for date strings ("04-23"), times ("11:13"), and any
+/// Returns false for date strings ("04-23"), times ("11:13"), zero, and any
 /// string containing non-numeric characters other than a leading minus sign
 /// or a single decimal point.
+///
+/// Zero is explicitly rejected because a price, share count, or commission
+/// of zero is never valid in a trade record.
 fn is_numeric_tsv_word(text: &str) -> bool {
     let s = text.replace(',', ""); // strip thousands separators first
     if s.contains(':') {
-        return false; // time token
+        return false; // time token (e.g. "11:13")
     }
     let abs = s.trim_start_matches('-');
+    if abs.is_empty() {
+        return false;
+    }
     // Must have only digits and at most one decimal point.
     let parts: Vec<&str> = abs.split('.').collect();
     if parts.len() > 2 {
         return false;
     }
-    parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        && s.parse::<f64>().map_or(false, |n| n.abs() > 0.0)
+    if !parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+        return false;
+    }
+    // Reject zero (a valid trade field is always > 0).
+    !abs.chars().all(|c| c == '0' || c == '.')
 }
+
+// ---------------------------------------------------------------------------
+// Column-layout constants for detect_col_boundaries / parse_ths_from_tsv
+// ---------------------------------------------------------------------------
+
+/// Minimum fraction of the image width (as percent) that column 1 must occupy.
+///
+/// Empirically, the operation / stock-name column in THS and CITIC 对账单
+/// screenshots always occupies at least the left 25 % of the image, ensuring
+/// `c1c2` is never placed so far left that numeric words spill into column 1.
+const MIN_COL1_WIDTH_PCT: u32 = 25;
+
+/// Minimum horizontal gap (px) required between two numbers on the same line
+/// for them to be treated as belonging to different columns.
+///
+/// Values closer than this are assumed to be adjacent digits of the same
+/// number (e.g. an extra OCR space inside "10 950" for "10.950").
+const MIN_COL_GAP_PX: u32 = 50;
+
+/// Fallback column-2 start position as a percentage of image width.
+///
+/// When neither header words nor numeric pairs allow the boundary to be
+/// computed, col 2 is assumed to start 55 % into the image — consistent with
+/// the typical CITIC 对账单 layout where "价格/数量" is roughly centred in
+/// the right half of the screen.
+const COL2_FALLBACK_PCT: u32 = 55;
+
+/// Fallback column-3 start position as a percentage of image width.
+///
+/// Column 3 ("金额/税费") is assumed to start at 77 % of the image width.
+const COL3_FALLBACK_PCT: u32 = 77;
+
+/// Fraction of the median line height used as the vertical grouping tolerance
+/// when clustering TSV words onto the same logical line.
+///
+/// CJK glyphs and Latin digits on the same line often differ in their `top`
+/// coordinate by up to ~60 % of the line height due to ascender / descender
+/// differences.  A tolerance of 3/5 (60 %) of the median height covers this
+/// variation while avoiding merging adjacent lines.
+const LINE_TOL_NUMERATOR: u32 = 3;
+const LINE_TOL_DENOMINATOR: u32 = 5;
+/// Absolute minimum line grouping tolerance (px) regardless of median height.
+const LINE_TOL_MIN_PX: u32 = 10;
 
 /// Determine the x-coordinate boundaries between the three logical columns in
 /// a THS / CITIC 对账单 screenshot from the word bounding boxes produced by
@@ -615,7 +667,7 @@ fn detect_col_boundaries(words: &[TsvWord]) -> (u32, u32) {
     if let (Some(p), Some(a)) = (price_hdr_cx, amt_hdr_cx) {
         let c2c3 = (p + a) / 2;
         let half_gap = a.saturating_sub(p) / 2;
-        let c1c2 = p.saturating_sub(half_gap).max(img_right / 4);
+        let c1c2 = p.saturating_sub(half_gap).max(img_right * MIN_COL1_WIDTH_PCT / 100);
         return (c1c2, c2c3);
     }
 
@@ -642,8 +694,9 @@ fn detect_col_boundaries(words: &[TsvWord]) -> (u32, u32) {
         .filter(|(_, xs)| xs.len() == 2)
         .filter_map(|(_, mut xs)| {
             xs.sort_unstable();
-            // Require at least 50 px separation to exclude adjacent-digit groups.
-            if xs[1] > xs[0] + 50 {
+            // Require at least MIN_COL_GAP_PX separation to exclude adjacent-digit
+            // groups (e.g. an OCR space inside "10 950" for "10.950").
+            if xs[1] > xs[0] + MIN_COL_GAP_PX {
                 Some((xs[0], xs[1]))
             } else {
                 None
@@ -660,12 +713,12 @@ fn detect_col_boundaries(words: &[TsvWord]) -> (u32, u32) {
         let c3_cx = col3_xs[col3_xs.len() / 2];
         let c2c3 = (c2_cx + c3_cx) / 2;
         let half_gap = c3_cx.saturating_sub(c2_cx) / 2;
-        let c1c2 = c2_cx.saturating_sub(half_gap).max(img_right / 4);
+        let c1c2 = c2_cx.saturating_sub(half_gap).max(img_right * MIN_COL1_WIDTH_PCT / 100);
         return (c1c2, c2c3);
     }
 
     // ── Strategy 3: geometric fallback ───────────────────────────────────────
-    (img_right * 55 / 100, img_right * 77 / 100)
+    (img_right * COL2_FALLBACK_PCT / 100, img_right * COL3_FALLBACK_PCT / 100)
 }
 
 /// Parse a THS / CITIC 对账单 screenshot using word-level position information
@@ -710,9 +763,10 @@ fn parse_ths_from_tsv(words: &[TsvWord], year: i32) -> Vec<ParsedTradeRow> {
         hs.sort_unstable();
         if hs.is_empty() { 30 } else { hs[hs.len() / 2] }
     };
-    // Two words on the same logical line may differ in `top` by up to ~60 % of
-    // the line height due to baseline variations between CJK and Latin glyphs.
-    let line_tol = (median_h * 3 / 5).max(10);
+    // Two words on the same logical line may differ in `top` by up to
+    // LINE_TOL_NUMERATOR/LINE_TOL_DENOMINATOR (~60 %) of the line height due
+    // to baseline variations between CJK and Latin glyphs.
+    let line_tol = (median_h * LINE_TOL_NUMERATOR / LINE_TOL_DENOMINATOR).max(LINE_TOL_MIN_PX);
 
     // ── 2. Group words into lines; sort by x within each line ─────────────────
     // Each entry: (representative_top, words sorted by left).

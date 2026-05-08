@@ -959,7 +959,7 @@ fn try_structural_extract(
     //   "04.221426"         → merged date+time (no separators at all)
     //   "04-1309:59"        → merged date with colon-separated time
     let dateline_re = regex::Regex::new(
-        r"\d{1,2}[.\-]\d{2}\s*[.\-:]?\d{2}[.\-:]?\d{2}",
+        r"\d{1,2}[.-]\d{2}\s*[.:\-]?\d{2}[.:\-]?\d{2}",
     )
     .unwrap();
     let after_date_start = if let Some(m) = dateline_re.find(date_line) {
@@ -2329,9 +2329,9 @@ V 2026.04           270.742.49 +1.6896
         assert!((maotai.shares - 100.0).abs()    < 0.01, "maotai shares={}", maotai.shares);
     }
 
-    // ── Structural extraction (CITIC 对账单 misread recovery) ─────────────────
+    // ── Structural extraction (THS / CITIC 对账单 misread recovery) ─────────────
     //
-    // The CITIC Securities 对账单 via THS has the same two-line layout:
+    // Both THS (同花顺) and CITIC (中信证券) 对账单 share the same two-line layout:
     //   证券卖出-{name}   price   net_amount   ← anchor line
     //   卖 MM-DD HH:MM   shares  commission    ← date line
     //

@@ -766,7 +766,7 @@ fn parse_ths_from_tsv(words: &[TsvWord], year: i32) -> Vec<ParsedTradeRow> {
         if hs.is_empty() { 30 } else { hs[hs.len() / 2] }
     };
     // Two words on the same logical line may differ in `top` by up to
-    // LINE_TOL_NUMERATOR/LINE_TOL_DENOMINATOR (~60 %) of the line height due
+    // LINE_TOL_NUMERATOR/LINE_TOL_DENOMINATOR (~80 %) of the line height due
     // to baseline variations between CJK and Latin glyphs.
     let line_tol = (median_h * LINE_TOL_NUMERATOR / LINE_TOL_DENOMINATOR).max(LINE_TOL_MIN_PX);
 
@@ -854,6 +854,20 @@ fn parse_ths_from_tsv(words: &[TsvWord], year: i32) -> Vec<ParsedTradeRow> {
     let n = summaries.len();
     let mut i = 0;
 
+    // Helper: return true when `compact` (a space-free col-1 string) contains a
+    // CJK stock name of at least 2 characters after stripping trade keywords and
+    // single-character direction glyphs.  Used both for anchor detection and for
+    // the date-line "not an anchor" guard.
+    let compact_has_cjk_name = |compact: &str| -> bool {
+        let s2 = strip_trade_keywords(compact)
+            .replace("证券", "")
+            .replace("卖", "")
+            .replace("买", "");
+        extract_longest_cjk_run(&s2)
+            .filter(|n| n.chars().count() >= 2)
+            .is_some()
+    };
+
     while i < n {
         let s = &summaries[i];
         // Use the compact (space-free) version for direction and name detection.
@@ -869,15 +883,7 @@ fn parse_ths_from_tsv(words: &[TsvWord], year: i32) -> Vec<ParsedTradeRow> {
         // misidentifying the date line "卖04-2309:30" as an anchor.
         let col1c = &s.col1_compact;
 
-        let has_cjk_name = {
-            let s2 = strip_trade_keywords(col1c)
-                .replace("证券", "")
-                .replace("卖", "")
-                .replace("买", "");
-            extract_longest_cjk_run(&s2)
-                .filter(|n| n.chars().count() >= 2)
-                .is_some()
-        };
+        let has_cjk_name = compact_has_cjk_name(col1c);
 
         let is_buy  = col1c.contains("买入") || col1c.contains("买人")
                    || (col1c.contains("买") && has_cjk_name);
@@ -930,19 +936,10 @@ fn parse_ths_from_tsv(words: &[TsvWord], year: i32) -> Vec<ParsedTradeRow> {
                     (1..=12).contains(&m) && (1..=31).contains(&d)
                 });
             // A line is NOT a date line if it looks like an anchor.
-            let cjk_name_j = {
-                let s2 = strip_trade_keywords(c1c)
-                    .replace("证券", "")
-                    .replace("卖", "")
-                    .replace("买", "");
-                extract_longest_cjk_run(&s2)
-                    .filter(|n| n.chars().count() >= 2)
-                    .is_some()
-            };
             let is_anchor_j = c1c.contains("买入")
                 || c1c.contains("买人")
                 || c1c.contains("卖出")
-                || ((c1c.contains("买") || c1c.contains("卖")) && cjk_name_j);
+                || ((c1c.contains("买") || c1c.contains("卖")) && compact_has_cjk_name(c1c));
             has_date && !is_anchor_j
         });
 
@@ -1463,7 +1460,8 @@ fn is_cjk(c: char) -> bool {
 /// between a CJK character and a following ASCII digit.  This function
 /// replaces the leading `\b` in date patterns everywhere it is needed.
 fn not_preceded_by_digit(s: &str, pos: usize) -> bool {
-    pos == 0 || !s.as_bytes()[pos - 1].is_ascii_digit()
+    if pos == 0 { return true; }
+    !s.as_bytes()[pos - 1].is_ascii_digit()
 }
 
 /// Attempt to extract `(price, shares, commission)` by exploiting the fixed

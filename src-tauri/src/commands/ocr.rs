@@ -650,23 +650,41 @@ const LINE_TOL_MIN_PX: u32 = 10;
 ///
 /// Detection order:
 /// 1. Look for "价格" / "金额" column-header words (most reliable).
+///    On phone-scale screenshots Tesseract often splits "金额/税费" into individual
+///    characters ("/", "税", "费"); we accept any of these as the col-3 anchor.
 /// 2. Cluster all pair-numeric lines: lines that have exactly 2 numeric
 ///    tokens use the gap midpoint between them as the col-2/col-3 boundary.
+///    When the price header (col-2 center) was found in step 1, we substitute
+///    it for the median left-column x so the boundary is pinned to the actual
+///    header position rather than the numeric median.
 /// 3. Geometric fallback: 55 % / 77 % of the image width.
 fn detect_col_boundaries(words: &[TsvWord]) -> (u32, u32) {
     let img_right: u32 = words.iter().map(|w| w.left + w.width).max().unwrap_or(1000);
 
     // ── Strategy 1: column-header words ──────────────────────────────────────
+    // "价格/数量" is the price+shares combined column header.
+    // Accept either "价格" or "数量" as the col-2 anchor.
     let price_hdr_cx = words
         .iter()
         .find(|w| w.text.contains("价格") || w.text.contains("数量"))
         .map(|w| w.cx());
+
+    // "金额/税费" is the amount+commission combined column header.
+    // On phone screenshots Tesseract splits this into "/" + "税" + "费", so we
+    // accept any of those individual characters as a col-3 anchor as well.
     let amt_hdr_cx = words
         .iter()
-        .find(|w| w.text.contains("金额") || w.text.contains("税费"))
+        .find(|w| {
+            w.text.contains("金额")
+                || w.text.contains("税费")
+                || w.text.contains("税")
+                || w.text.contains("费")
+        })
         .map(|w| w.cx());
 
     if let (Some(p), Some(a)) = (price_hdr_cx, amt_hdr_cx) {
+        // Both headers found: use their exact positions as column centres.
+        // The col-2/col-3 boundary is the midpoint (nearest-centre assignment).
         let c2c3 = (p + a) / 2;
         let half_gap = a.saturating_sub(p) / 2;
         let c1c2 = p.saturating_sub(half_gap).max(img_right * MIN_COL1_WIDTH_PCT / 100);
@@ -711,8 +729,13 @@ fn detect_col_boundaries(words: &[TsvWord]) -> (u32, u32) {
         let mut col3_xs: Vec<u32> = pairs.iter().map(|(_, b)| *b).collect();
         col2_xs.sort_unstable();
         col3_xs.sort_unstable();
-        let c2_cx = col2_xs[col2_xs.len() / 2];
         let c3_cx = col3_xs[col3_xs.len() / 2];
+
+        // When the "价格/数量" header was found (Strategy 1 partial match), use
+        // its exact x-position as the col-2 centre instead of the numeric median.
+        // This anchors the boundary precisely to the visible column header.
+        let c2_cx = price_hdr_cx.unwrap_or_else(|| col2_xs[col2_xs.len() / 2]);
+
         let c2c3 = (c2_cx + c3_cx) / 2;
         let half_gap = c3_cx.saturating_sub(c2_cx) / 2;
         let c1c2 = c2_cx.saturating_sub(half_gap).max(img_right * MIN_COL1_WIDTH_PCT / 100);
@@ -998,7 +1021,12 @@ fn parse_ths_from_tsv(words: &[TsvWord], year: i32) -> Vec<ParsedTradeRow> {
             });
         }
 
-        i += 1;
+        // Advance past the consumed date line so the next iteration starts at
+        // dl_idx + 1.  Without this, the iteration would re-examine every line
+        // between the anchor and the date line, and an incidental "date-like"
+        // pattern on those lines could match as the date line for the next
+        // anchor, causing fields to be read from the wrong row.
+        i = dl_idx + 1;
     }
 
     rows.sort_by(|a, b| a.traded_at.cmp(&b.traded_at));

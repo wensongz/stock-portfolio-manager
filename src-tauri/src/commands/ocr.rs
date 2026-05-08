@@ -877,6 +877,149 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// Manual lookbehind guard: returns `true` when the byte immediately before
+/// position `pos` in `s` is NOT an ASCII digit (or `pos == 0`).
+///
+/// The Rust regex crate treats CJK characters as `\w`, so `\b` does not fire
+/// between a CJK character and a following ASCII digit.  This function
+/// replaces the leading `\b` in date patterns everywhere it is needed.
+fn not_preceded_by_digit(s: &str, pos: usize) -> bool {
+    pos == 0 || !s.as_bytes()[pos - 1].is_ascii_digit()
+}
+
+/// Attempt to extract `(price, shares, commission)` by exploiting the fixed
+/// two-line THS 对账单 trade-entry layout:
+///
+/// ```text
+/// Anchor line: "[operation+name]  [price]  [±net_amount]"
+/// Date line:   "[direction+date+time]  [shares]  [commission]"
+/// ```
+///
+/// **Why this is needed**: when Tesseract severely misreads the `net_amount`
+/// column on the anchor line (e.g. `"114530.62"` → `"1145351"`), the generic
+/// number-soup approach (`assign_fields_ordered`) cannot find a consistent
+/// `(price, shares, total)` triple.  Its Tier-4 fallback then mistakenly
+/// assigns the large misread value as `shares` and the true shares count as
+/// `commission`.
+///
+/// By reading `shares` and `commission` exclusively from the date line we
+/// sidestep the misread entirely; the garbled net_amount on the anchor line is
+/// ignored.
+///
+/// Returns `None` (and lets the caller fall through to the generic approach)
+/// when:
+/// * `window` is empty (inline / name-before-direction format — no separate
+///   date line),
+/// * no window line matches the extracted `month`/`day`, OR
+/// * `anchor_extra` contains no positive number below 10 000 (no price found).
+fn try_structural_extract(
+    anchor_extra: &str,
+    window: &[&str],
+    month: u32,
+    day: u32,
+    date_re: &regex::Regex,
+    full_ymd_re: &regex::Regex,
+    neg_re: &regex::Regex,
+    pct_re: &regex::Regex,
+    num_re: &regex::Regex,
+) -> Option<(f64, f64, f64)> {
+    // Only apply when there is a dedicated date line in the window.  The
+    // inline / name-before-direction formats embed every number in either
+    // anchor_extra or a single window line; structural extraction would
+    // misidentify the price as the shares in those cases.
+    if window.is_empty() {
+        return None;
+    }
+
+    // ── 1. Find the window line that carries the expected date ────────────────
+    let date_line: &&str = window.iter().find(|&&l| {
+        if full_ymd_re.is_match(l) {
+            return full_ymd_re.captures_iter(l).any(|cap| {
+                cap[2].parse::<u32>().unwrap_or(99) == month
+                    && cap[3].parse::<u32>().unwrap_or(99) == day
+            });
+        }
+        date_re.captures_iter(l).any(|cap| {
+            let start = cap.get(0).unwrap().start();
+            not_preceded_by_digit(l, start)
+                && cap[1].parse::<u32>().unwrap_or(99) == month
+                && cap[2].parse::<u32>().unwrap_or(99) == day
+        })
+    })?;
+
+    // ── 2. Extract shares and commission from AFTER the date/time portion ────
+    // Use the end position of the date+time regex match rather than stripping
+    // dates and times from the whole line.  This avoids a subtle false-positive
+    // where decimal commission values that happen to look like valid dates (e.g.
+    // "7.06" → month=7, day=6) would be stripped by date_clean_re.
+    //
+    // The pattern handles the formats observed in THS OCR output:
+    //   "04-22 14:26"       → separator: space + colon
+    //   "04.22 14.26"       → separators: period + period
+    //   "04.221426"         → merged date+time (no separators at all)
+    //   "04-1309:59"        → merged date with colon-separated time
+    let dateline_re = regex::Regex::new(
+        r"\d{1,2}[.\-]\d{2}\s*[.\-:]?\d{2}[.\-:]?\d{2}",
+    )
+    .unwrap();
+    let after_date_start = if let Some(m) = dateline_re.find(date_line) {
+        m.end()
+    } else {
+        // Fallback: skip past the first short-date match.
+        let m = date_re.find(date_line)?;
+        m.end()
+    };
+    let after_date_str = &date_line[after_date_start..];
+
+    let date_nums: Vec<f64> = num_re
+        .captures_iter(after_date_str)
+        .filter_map(|c| c[1].parse::<f64>().ok())
+        .filter(|&n| n > 0.0)
+        .collect();
+
+    if date_nums.is_empty() {
+        return None;
+    }
+
+    // Shares = first near-integer (within ±0.5) ≥ 1 appearing on the date line.
+    let shares_f = date_nums
+        .iter()
+        .copied()
+        .find(|&n| n >= 1.0 && (n - n.round()).abs() <= 0.5)?;
+    let shares = shares_f.round();
+
+    // ── 3. Extract price from anchor_extra ────────────────────────────────────
+    // The net_amount is either negative (BUY → stripped by neg_re) or a large
+    // positive > 10 000 (SELL → excluded by the < 10 000 filter).  In either
+    // case only the per-share price survives.
+    let anchor_cleaned = neg_re.replace_all(anchor_extra, " ").into_owned();
+    let anchor_cleaned = pct_re.replace_all(&anchor_cleaned, " ");
+    let price = num_re
+        .captures_iter(&anchor_cleaned)
+        .filter_map(|c| c[1].parse::<f64>().ok())
+        .filter(|&n| n > 0.0 && n < 10_000.0)
+        .reduce(f64::min)?;   // None when anchor_extra has no price → fall through
+
+    // ── 4. Sanity checks ──────────────────────────────────────────────────────
+    let total = price * shares;
+    if total < 100.0 {
+        return None; // implausibly small trade
+    }
+
+    // Commission = first number (≠ shares_f) on the date line that is within
+    // a plausible range for A-share brokerage fees (min 5 CNY, max ~0.5 % of
+    // trade value).  Numbers outside this range (e.g. the shares count itself
+    // if it somehow appears twice, or a misread total) are skipped.
+    let commission_cap = 50.0_f64.max(total * 0.005);
+    let commission = date_nums
+        .iter()
+        .copied()
+        .find(|&n| (n - shares_f).abs() > 0.001 && n <= commission_cap)
+        .unwrap_or(0.0);
+
+    Some((price, shares, commission))
+}
+
 /// Extract date, time, and numeric trade fields from the context lines for a
 /// single transaction.
 ///
@@ -920,13 +1063,6 @@ fn extract_fields_from_context(
     let mut parts: Vec<&str> = vec![anchor_extra];
     parts.extend_from_slice(window);
     let all_text = parts.join(" ");
-
-    // Helper: check that the byte immediately before position `pos` in `s` is
-    // NOT an ASCII digit.  This is the manual lookbehind that replaces the
-    // leading \b (which doesn't fire between CJK and ASCII digits in Rust regex).
-    let not_preceded_by_digit = |s: &str, pos: usize| -> bool {
-        pos == 0 || !s.as_bytes()[pos - 1].is_ascii_digit()
-    };
 
     // --- Date (3-tier cascade) ---
     //
@@ -1003,6 +1139,35 @@ fn extract_fields_from_context(
         "{:04}-{:02}-{:02}T{:02}:{:02}:00",
         effective_year, month, day, hour, minute
     );
+
+    // --- Structural fast path ------------------------------------------------
+    // Exploit the fixed THS 对账单 layout: price lives on the anchor line and
+    // shares / commission live on the date line.  When the OCR severely
+    // misreads the net_amount column on the anchor line (e.g. "114530.62" →
+    // "1145351"), the number-soup approach below cannot find a consistent
+    // (price, shares, total) triple and its Tier-4 fallback assigns the wrong
+    // values.  The structural path ignores the net_amount entirely.
+    if let Some((s_price, s_shares, s_commission)) = try_structural_extract(
+        anchor_extra,
+        window,
+        month,
+        day,
+        &date_re,
+        &full_ymd_re,
+        &neg_re,
+        &pct_re,
+        &num_re,
+    ) {
+        return Some(ParsedTradeRow {
+            transaction_type: tx_type.to_string(),
+            stock_name: stock_name.to_string(),
+            traded_at,
+            price: s_price,
+            shares: s_shares,
+            total_amount: s_price * s_shares,
+            commission: s_commission,
+        });
+    }
 
     // --- Numbers ---
     // Strip full dates, short dates (+ merged HHMM), times, negatives, pcts.
@@ -2162,5 +2327,111 @@ V 2026.04           270.742.49 +1.6896
             .expect("贵州茅台 SELL (price>1000) not found");
         assert!((maotai.price  - 1459.480).abs() < 0.01, "maotai price={}", maotai.price);
         assert!((maotai.shares - 100.0).abs()    < 0.01, "maotai shares={}", maotai.shares);
+    }
+
+    // ── Structural extraction (CITIC 对账单 misread recovery) ─────────────────
+    //
+    // The CITIC Securities 对账单 via THS has the same two-line layout:
+    //   证券卖出-{name}   price   net_amount   ← anchor line
+    //   卖 MM-DD HH:MM   shares  commission    ← date line
+    //
+    // Tesseract sometimes severely misreads the net_amount column (e.g.
+    // "114530.62" → "1145351"), causing Tiers 1-3 to find no valid
+    // (price × shares ≈ total) triple.  Tier 4 then picks the large misread
+    // value as shares and the true shares count as commission.  The structural
+    // fast path fixes this by reading shares/commission from the date line only.
+
+    /// SELL with misread net_amount on anchor line: large number should be
+    /// ignored; shares and commission come from the date line.
+    #[test]
+    fn test_structural_extract_sell_misread_net_amount_large_shares() {
+        // "114530.62" OCR-misread as "1145351" on anchor line.
+        // Date line is correctly OCR'd: shares=10000, commission=69.38.
+        let text = "\
+2026-04
+证券卖出-平安银行    11.460    1145351
+卖 04-29 10:36       10000      69.38
+";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 1, "expected 1 row, got {}: {rows:?}", rows.len());
+        let r = &rows[0];
+        assert_eq!(r.transaction_type, "SELL");
+        assert_eq!(r.stock_name, "平安银行");
+        assert!((r.price  - 11.460).abs() < 0.01, "price={}", r.price);
+        assert!((r.shares - 10000.0).abs() < 0.01, "shares={}", r.shares);
+        assert!((r.commission - 69.38).abs() < 0.01, "commission={}", r.commission);
+        assert!((r.total_amount - 11.460 * 10000.0).abs() < 1.0, "total={}", r.total_amount);
+    }
+
+    /// SELL of a higher-priced stock: "58413.03" OCR-misread as "584135".
+    #[test]
+    fn test_structural_extract_sell_misread_net_amount_medium_price() {
+        // "58413.03" OCR-misread as "584135" on anchor line.
+        // Date line correct: shares=1000, commission=35.97.
+        let text = "\
+2026-04
+证券卖出-中国平安    58.449    584135
+卖 04-29 10:49       1000      35.97
+";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 1, "expected 1 row, got {}: {rows:?}", rows.len());
+        let r = &rows[0];
+        assert_eq!(r.transaction_type, "SELL");
+        assert_eq!(r.stock_name, "中国平安");
+        assert!((r.price  - 58.449).abs() < 0.01, "price={}", r.price);
+        assert!((r.shares - 1000.0).abs() < 0.01, "shares={}", r.shares);
+        assert!((r.commission - 35.97).abs() < 0.01, "commission={}", r.commission);
+        assert!((r.total_amount - 58.449 * 1000.0).abs() < 1.0, "total={}", r.total_amount);
+    }
+
+    /// BUY with misread on anchor line: negative net_amount misread to a large
+    /// positive; structural path should still extract price from anchor and
+    /// shares/commission from the date line.
+    #[test]
+    fn test_structural_extract_buy_misread_net_amount() {
+        // Normal BUY anchor has a negative net_amount; even if it is OCR-misread
+        // to a large positive, the < 10 000 filter on the anchor line keeps only
+        // the price, and shares/commission come from the date line.
+        let text = "\
+2026-04
+证券买入-招商银行    38.270    9876543
+买 04-30 14:34       1600       7.06
+";
+        let rows = parse_ths_ocr(text);
+        assert_eq!(rows.len(), 1, "expected 1 row, got {}: {rows:?}", rows.len());
+        let r = &rows[0];
+        assert_eq!(r.transaction_type, "BUY");
+        assert_eq!(r.stock_name, "招商银行");
+        assert!((r.price  - 38.270).abs() < 0.01, "price={}", r.price);
+        assert!((r.shares - 1600.0).abs() < 0.01, "shares={}", r.shares);
+        assert!((r.commission - 7.06).abs() < 0.01, "commission={}", r.commission);
+    }
+
+    /// Full CITIC-style page with multiple SELL entries whose net amounts are
+    /// OCR-misread; verifies that all rows are correctly extracted.
+    #[test]
+    fn test_structural_extract_citic_style_mixed_page() {
+        let text = "\
+2026-04
+证券卖出-招商银行    38.270    612391
+卖 04-30 14:34       1600       7.06
+证券卖出-中国平安    59.380    593434
+卖 04-30 14:34       1000      36.54
+证券买入-招商银行    38.520    578673
+买 04-29 10:50       1500       6.67
+";
+        let rows = parse_ths_ocr(text);
+        // All three rows must be extracted.
+        assert_eq!(rows.len(), 3, "expected 3 rows, got {}: {rows:?}", rows.len());
+
+        let buys:  Vec<_> = rows.iter().filter(|r| r.transaction_type == "BUY").collect();
+        let sells: Vec<_> = rows.iter().filter(|r| r.transaction_type == "SELL").collect();
+        assert_eq!(buys.len(), 1, "expected 1 BUY row");
+        assert_eq!(sells.len(), 2, "expected 2 SELL rows");
+
+        let ping_an = sells.iter().find(|r| r.stock_name.contains("中国平安")).unwrap();
+        assert!((ping_an.price  - 59.380).abs() < 0.01, "price={}", ping_an.price);
+        assert!((ping_an.shares - 1000.0).abs() < 0.01, "shares={}", ping_an.shares);
+        assert!((ping_an.commission - 36.54).abs() < 0.01, "commission={}", ping_an.commission);
     }
 }

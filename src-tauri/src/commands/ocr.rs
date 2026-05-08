@@ -23,6 +23,44 @@ pub struct ParsedTradeRow {
 }
 
 // ---------------------------------------------------------------------------
+// TSV word type (Tesseract bounding-box output)
+// ---------------------------------------------------------------------------
+
+/// One recognised word from Tesseract's TSV output, together with its
+/// axis-aligned bounding box in the image coordinate system.
+///
+/// Tesseract emits level-5 (word) rows with this schema:
+/// ```text
+/// level  page_num  block_num  par_num  line_num  word_num
+///   left    top   width  height  conf  text
+/// ```
+/// We only keep the fields used by the column-aware parser.
+#[derive(Debug, Clone)]
+struct TsvWord {
+    /// Horizontal offset of the word's left edge from the image left (px).
+    left: u32,
+    /// Vertical offset of the word's top edge from the image top (px).
+    top: u32,
+    /// Width of the bounding box (px).
+    width: u32,
+    /// Height of the bounding box (px).
+    height: u32,
+    /// Tesseract confidence score (0–100).
+    #[allow(dead_code)]
+    conf: u8,
+    /// Recognised text string.
+    text: String,
+}
+
+impl TsvWord {
+    /// Horizontal centre of the word's bounding box (px).
+    #[inline]
+    fn cx(&self) -> u32 {
+        self.left + self.width / 2
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Xueqiu stock-name → A-share code lookup
 // ---------------------------------------------------------------------------
 
@@ -433,6 +471,443 @@ fn ocr_image(data: &[u8]) -> Result<String, String> {
     let out_file = format!("{}.txt", out_base);
     std::fs::read_to_string(&out_file)
         .map_err(|e| format!("读取 OCR 结果失败: {}", e))
+}
+
+/// Run Tesseract on `data` in TSV output mode and return word-level records.
+///
+/// TSV output gives each recognised word its pixel bounding box, which
+/// [`parse_ths_from_tsv`] uses to assign numbers to the correct table column
+/// (price/shares vs net-amount/commission) purely by x-position — no value
+/// heuristics needed.
+///
+/// Returns `Ok(Vec::new())` (not an error) when Tesseract finds nothing or
+/// TSV output cannot be read, so callers fall back gracefully to the
+/// text-based parser.
+fn ocr_image_tsv(data: &[u8]) -> Result<Vec<TsvWord>, String> {
+    let processed = preprocess_for_ocr(data);
+
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".png")
+        .tempfile()
+        .map_err(|e| format!("创建临时文件失败: {}", e))?;
+    tmp.write_all(&processed)
+        .map_err(|e| format!("写临时文件失败: {}", e))?;
+    tmp.flush()
+        .map_err(|e| format!("刷新临时文件失败: {}", e))?;
+    let input_path = tmp.path().to_owned();
+
+    // Tesseract appends ".tsv" to the output base path.
+    let out_tmp = tempfile::Builder::new()
+        .suffix(".tsv")
+        .tempfile()
+        .map_err(|e| format!("创建输出临时文件失败: {}", e))?;
+    let out_base = out_tmp
+        .path()
+        .to_str()
+        .ok_or("输出路径无效")?
+        .trim_end_matches(".tsv")
+        .to_string();
+    drop(out_tmp);
+
+    let output = std::process::Command::new("tesseract")
+        .arg(&input_path)
+        .arg(&out_base)
+        .arg("-l")
+        .arg("chi_sim")
+        .arg("--psm")
+        .arg("6")
+        .arg("tsv")
+        .output()
+        .map_err(|e| format!("启动 tesseract 失败: {}", e))?;
+
+    if !output.status.success() {
+        // Silently fall back; the caller will try the text-based path instead.
+        return Ok(Vec::new());
+    }
+
+    let tsv_file = format!("{}.tsv", out_base);
+    let content = match std::fs::read_to_string(&tsv_file) {
+        Ok(s) => s,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut words = Vec::new();
+    for line in content.lines().skip(1) {
+        // TSV columns: level page_num block_num par_num line_num word_num
+        //              left top width height conf text
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 12 {
+            continue;
+        }
+        // Only word-level (level=5) rows carry actual text.
+        if f[0] != "5" {
+            continue;
+        }
+        // Skip spacing/separator rows where confidence is -1.
+        let conf: i32 = f[10].parse().unwrap_or(-1);
+        if conf < 0 {
+            continue;
+        }
+        let text = f[11].trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        words.push(TsvWord {
+            left:   f[6].parse().unwrap_or(0),
+            top:    f[7].parse().unwrap_or(0),
+            width:  f[8].parse().unwrap_or(0),
+            height: f[9].parse().unwrap_or(0),
+            conf:   conf.clamp(0, 100) as u8,
+            text,
+        });
+    }
+    Ok(words)
+}
+
+/// Return true when `text` represents a bare numeric value (integer or
+/// decimal) that could be a price, share count, amount, or commission.
+///
+/// Returns false for date strings ("04-23"), times ("11:13"), and any
+/// string containing non-numeric characters other than a leading minus sign
+/// or a single decimal point.
+fn is_numeric_tsv_word(text: &str) -> bool {
+    let s = text.replace(',', ""); // strip thousands separators first
+    if s.contains(':') {
+        return false; // time token
+    }
+    let abs = s.trim_start_matches('-');
+    // Must have only digits and at most one decimal point.
+    let parts: Vec<&str> = abs.split('.').collect();
+    if parts.len() > 2 {
+        return false;
+    }
+    parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        && s.parse::<f64>().map_or(false, |n| n.abs() > 0.0)
+}
+
+/// Determine the x-coordinate boundaries between the three logical columns in
+/// a THS / CITIC 对账单 screenshot from the word bounding boxes produced by
+/// Tesseract TSV output.
+///
+/// Returns `(c1c2, c2c3)` where:
+/// - `cx < c1c2`          → column 1 (operation keyword, stock name, date/time)
+/// - `c1c2 ≤ cx < c2c3`  → column 2 (price on anchor line; shares on date line)
+/// - `cx ≥ c2c3`          → column 3 (net amount on anchor line; commission on date line)
+///
+/// Detection order:
+/// 1. Look for "价格" / "金额" column-header words (most reliable).
+/// 2. Cluster all pair-numeric lines: lines that have exactly 2 numeric
+///    tokens use the gap midpoint between them as the col-2/col-3 boundary.
+/// 3. Geometric fallback: 55 % / 77 % of the image width.
+fn detect_col_boundaries(words: &[TsvWord]) -> (u32, u32) {
+    let img_right: u32 = words.iter().map(|w| w.left + w.width).max().unwrap_or(1000);
+
+    // ── Strategy 1: column-header words ──────────────────────────────────────
+    let price_hdr_cx = words
+        .iter()
+        .find(|w| w.text.contains("价格") || w.text.contains("数量"))
+        .map(|w| w.cx());
+    let amt_hdr_cx = words
+        .iter()
+        .find(|w| w.text.contains("金额") || w.text.contains("税费"))
+        .map(|w| w.cx());
+
+    if let (Some(p), Some(a)) = (price_hdr_cx, amt_hdr_cx) {
+        let c2c3 = (p + a) / 2;
+        let half_gap = a.saturating_sub(p) / 2;
+        let c1c2 = p.saturating_sub(half_gap).max(img_right / 4);
+        return (c1c2, c2c3);
+    }
+
+    // ── Strategy 2: gap between numeric pairs on the same line ────────────────
+    // Group all numeric word x-centres by line (words within 30 px vertically).
+    let mut line_buckets: Vec<(u32, Vec<u32>)> = Vec::new(); // (top, Vec<cx>)
+    for w in words {
+        if !is_numeric_tsv_word(&w.text) {
+            continue;
+        }
+        let cx = w.cx();
+        if let Some(bucket) = line_buckets
+            .iter_mut()
+            .find(|(top, _)| w.top.abs_diff(*top) <= 30)
+        {
+            bucket.1.push(cx);
+        } else {
+            line_buckets.push((w.top, vec![cx]));
+        }
+    }
+
+    let pairs: Vec<(u32, u32)> = line_buckets
+        .into_iter()
+        .filter(|(_, xs)| xs.len() == 2)
+        .filter_map(|(_, mut xs)| {
+            xs.sort_unstable();
+            // Require at least 50 px separation to exclude adjacent-digit groups.
+            if xs[1] > xs[0] + 50 {
+                Some((xs[0], xs[1]))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !pairs.is_empty() {
+        let mut col2_xs: Vec<u32> = pairs.iter().map(|(a, _)| *a).collect();
+        let mut col3_xs: Vec<u32> = pairs.iter().map(|(_, b)| *b).collect();
+        col2_xs.sort_unstable();
+        col3_xs.sort_unstable();
+        let c2_cx = col2_xs[col2_xs.len() / 2];
+        let c3_cx = col3_xs[col3_xs.len() / 2];
+        let c2c3 = (c2_cx + c3_cx) / 2;
+        let half_gap = c3_cx.saturating_sub(c2_cx) / 2;
+        let c1c2 = c2_cx.saturating_sub(half_gap).max(img_right / 4);
+        return (c1c2, c2c3);
+    }
+
+    // ── Strategy 3: geometric fallback ───────────────────────────────────────
+    (img_right * 55 / 100, img_right * 77 / 100)
+}
+
+/// Parse a THS / CITIC 对账单 screenshot using word-level position information
+/// from Tesseract TSV output.
+///
+/// # Why this outperforms the text-based parser
+///
+/// The text-based parser uses value-range heuristics (e.g. "price < 10 000")
+/// to decide which number is the price and which is the net amount.  When
+/// Tesseract misreads the net amount (e.g. "114530.62" → "1145351"), those
+/// heuristics fail and the large misread value ends up assigned as shares.
+///
+/// This function avoids that problem entirely by using the **x-coordinate** of
+/// each word to assign it to the correct column:
+///
+/// ```text
+/// ┌──────────────────────┬──────────────┬──────────────┐
+/// │   col 1              │   col 2      │   col 3      │
+/// │  (operation/name)    │  价格/数量   │  金额/税费   │
+/// ├──────────────────────┼──────────────┼──────────────┤
+/// │ 证券卖出-平安银行    │ 10.950       │ 109433.71    │ ← anchor line
+/// │ 卖 04-23 11:13       │ 10000        │ 66.29        │ ← date line
+/// └──────────────────────┴──────────────┴──────────────┘
+/// ```
+///
+/// Extracted fields:
+/// - **Price**      = first col-2 number on the anchor line.
+/// - **Shares**     = first col-2 number on the date line.
+/// - **Commission** = first col-3 number on the date line.
+/// - **Net amount** (col-3 of anchor line) is **ignored** entirely.
+///
+/// This means even a badly misread net amount (e.g. "1145351") has zero effect
+/// on the output because it sits in the ignored column.
+fn parse_ths_from_tsv(words: &[TsvWord], year: i32) -> Vec<ParsedTradeRow> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+
+    // ── 1. Median line height → grouping tolerance ────────────────────────────
+    let median_h: u32 = {
+        let mut hs: Vec<u32> = words.iter().map(|w| w.height).filter(|&h| h > 5).collect();
+        hs.sort_unstable();
+        if hs.is_empty() { 30 } else { hs[hs.len() / 2] }
+    };
+    // Two words on the same logical line may differ in `top` by up to ~60 % of
+    // the line height due to baseline variations between CJK and Latin glyphs.
+    let line_tol = (median_h * 3 / 5).max(10);
+
+    // ── 2. Group words into lines; sort by x within each line ─────────────────
+    // Each entry: (representative_top, words sorted by left).
+    let mut raw_lines: Vec<(u32, Vec<&TsvWord>)> = Vec::new();
+    for word in words {
+        if let Some(entry) = raw_lines
+            .iter_mut()
+            .find(|(t, _)| word.top.abs_diff(*t) <= line_tol)
+        {
+            entry.1.push(word);
+        } else {
+            raw_lines.push((word.top, vec![word]));
+        }
+    }
+    for (_, group) in &mut raw_lines {
+        group.sort_by_key(|w| w.left);
+    }
+    raw_lines.sort_by_key(|(top, _)| *top);
+
+    // ── 3. Detect column boundaries ───────────────────────────────────────────
+    let (c1c2, c2c3) = detect_col_boundaries(words);
+
+    // ── 4. Build per-line column summaries ────────────────────────────────────
+    struct LineSummary {
+        col1_text: String,   // joined text of all col-1 words
+        col2_nums: Vec<f64>, // positive numbers in col 2 (left to right)
+        col3_nums: Vec<f64>, // positive numbers in col 3 (left to right)
+    }
+
+    let summaries: Vec<LineSummary> = raw_lines
+        .iter()
+        .map(|(_, group)| {
+            let mut col1_parts: Vec<&str> = Vec::new();
+            let mut col2_nums: Vec<f64> = Vec::new();
+            let mut col3_nums: Vec<f64> = Vec::new();
+
+            for word in group {
+                let cx = word.cx();
+                // Parse as a positive number (strip leading minus if present).
+                let num_val: Option<f64> = word
+                    .text
+                    .replace(',', "")
+                    .trim_start_matches('-')
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|&n| n > 0.0);
+
+                if cx < c1c2 {
+                    col1_parts.push(&word.text);
+                } else if cx < c2c3 {
+                    if let Some(n) = num_val {
+                        col2_nums.push(n);
+                    }
+                } else if let Some(n) = num_val {
+                    col3_nums.push(n);
+                }
+            }
+
+            LineSummary {
+                col1_text: col1_parts.join(" "),
+                col2_nums,
+                col3_nums,
+            }
+        })
+        .collect();
+
+    // ── 5. Extract trade entries ───────────────────────────────────────────────
+    let date_re     = regex::Regex::new(r"(\d{1,2})[.\-](\d{2})").unwrap();
+    let full_ymd_re = regex::Regex::new(r"\b(\d{4})-(\d{2})-(\d{2})\b").unwrap();
+    let time_re     = regex::Regex::new(r"(\d{1,2})[.:](\d{2})").unwrap();
+
+    let mut rows: Vec<ParsedTradeRow> = Vec::new();
+    let n = summaries.len();
+    let mut i = 0;
+
+    while i < n {
+        let s = &summaries[i];
+        let col1 = &s.col1_text;
+
+        let is_buy  = col1.contains("买入") || col1.contains("买人");
+        let is_sell = col1.contains("卖出");
+        if !is_buy && !is_sell {
+            i += 1;
+            continue;
+        }
+
+        let tx_type = if is_sell { "SELL" } else { "BUY" };
+
+        // Stock name: strip trade keywords then take the longest CJK run.
+        // "证券" alone is the securities prefix, not a stock name.
+        let col1_stripped = strip_trade_keywords(col1).replace("证券", " ");
+        let stock_name = extract_longest_cjk_run(&col1_stripped)
+            .filter(|name| name.chars().count() >= 2)
+            .or_else(|| {
+                // Look up to 3 preceding lines for the stock name.
+                (1..=3usize).filter_map(|back| {
+                    let idx = i.checked_sub(back)?;
+                    let prev = &summaries[idx].col1_text;
+                    // Don't step past another anchor.
+                    if prev.contains("买入")
+                        || prev.contains("买人")
+                        || prev.contains("卖出")
+                    {
+                        return None;
+                    }
+                    extract_longest_cjk_run(prev)
+                        .filter(|n| n.chars().count() >= 2 && n != "证券")
+                }).next()
+            })
+            .unwrap_or_else(|| "未知".to_string());
+
+        // Price: first col-2 number on the anchor line.
+        let price = s.col2_nums.first().copied().unwrap_or(0.0);
+
+        // Find the next date line within the following 5 lines.
+        let date_line_idx = (i + 1..n.min(i + 6)).find(|&j| {
+            let c1 = &summaries[j].col1_text;
+            let has_date = full_ymd_re.is_match(c1)
+                || date_re.captures_iter(c1).any(|cap| {
+                    let m: u32 = cap[1].parse().unwrap_or(0);
+                    let d: u32 = cap[2].parse().unwrap_or(0);
+                    (1..=12).contains(&m) && (1..=31).contains(&d)
+                });
+            has_date
+                && !c1.contains("买入")
+                && !c1.contains("买人")
+                && !c1.contains("卖出")
+        });
+
+        let Some(dl_idx) = date_line_idx else {
+            // No date line found nearby — skip this anchor.
+            i += 1;
+            continue;
+        };
+
+        let dl  = &summaries[dl_idx];
+        let c1  = &dl.col1_text;
+
+        // Date.
+        let (month, day) = if let Some(cap) = full_ymd_re.captures(c1) {
+            (cap[2].parse().unwrap_or(1u32), cap[3].parse().unwrap_or(1u32))
+        } else {
+            date_re
+                .captures_iter(c1)
+                .filter_map(|cap| {
+                    let m: u32 = cap[1].parse().ok()?;
+                    let d: u32 = cap[2].parse().ok()?;
+                    ((1..=12).contains(&m) && (1..=31).contains(&d)).then_some((m, d))
+                })
+                .next()
+                .unwrap_or((1, 1))
+        };
+
+        // Time.
+        let (hour, minute) = time_re
+            .captures(c1)
+            .and_then(|cap| {
+                let h: u32 = cap[1].parse().ok()?;
+                let m: u32 = cap[2].parse().ok()?;
+                ((0..=23).contains(&h) && (0..=59).contains(&m)).then_some((h, m))
+            })
+            .unwrap_or((9, 30));
+
+        // Shares: first col-2 number on the date line.
+        let shares = dl.col2_nums.first().copied().unwrap_or(0.0);
+
+        // Commission: first col-3 number on the date line.
+        let commission = dl.col3_nums.first().copied().unwrap_or(0.0);
+
+        if price > 0.0 && shares > 0.0 {
+            rows.push(ParsedTradeRow {
+                transaction_type: tx_type.to_string(),
+                stock_name,
+                traded_at: format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:00",
+                    year, month, day, hour, minute
+                ),
+                price,
+                shares,
+                total_amount: price * shares,
+                commission,
+            });
+        }
+
+        i += 1;
+    }
+
+    rows.sort_by(|a, b| a.traded_at.cmp(&b.traded_at));
+    rows.dedup_by(|a, b| {
+        a.traded_at == b.traded_at
+            && a.stock_name == b.stock_name
+            && (a.price  - b.price).abs()  < 0.001
+            && (a.shares - b.shares).abs() < 0.001
+    });
+    rows
 }
 
 /// Parse the plain-text output of Tesseract (from a 同花顺 trade screenshot)
@@ -1465,18 +1940,43 @@ pub async fn parse_trade_image(image_base64: String) -> Result<Vec<ParsedTradeRo
         .decode(b64.trim())
         .map_err(|e| format!("base64 解码失败: {}", e))?;
 
-    // ── Primary path: whole-image OCR ────────────────────────────────────────
-    // The THS 对账单 trade list is a continuous scrollable view without
-    // explicit inter-card separators, so OCR-ing the full image gives the
-    // best result.  split_image_by_separators is kept as a fallback for
-    // "card-based" screenshot formats.
+    // ── Primary path: column-aware TSV OCR ───────────────────────────────────
+    // Tesseract TSV output provides per-word bounding boxes so we can assign
+    // each number to its correct table column (price/shares vs net-amount/
+    // commission) purely by x-position.  This eliminates the most common class
+    // of misassignment errors (e.g. confusing the net amount for shares when
+    // the net amount is OCR-misread as a large integer without a decimal point).
+    if let Ok(tsv_words) = ocr_image_tsv(&bytes) {
+        if !tsv_words.is_empty() {
+            let tsv_text: String = tsv_words
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let year = extract_year(&tsv_text);
+            let tsv_rows = parse_ths_from_tsv(&tsv_words, year);
+            if !tsv_rows.is_empty() {
+                let mut all_rows = tsv_rows;
+                all_rows.sort_by(|a, b| a.traded_at.cmp(&b.traded_at));
+                all_rows.dedup_by(|a, b| {
+                    a.traded_at == b.traded_at
+                        && a.stock_name == b.stock_name
+                        && (a.price  - b.price).abs()  < 0.001
+                        && (a.shares - b.shares).abs() < 0.001
+                });
+                return Ok(all_rows);
+            }
+        }
+    }
+
+    // ── Fallback: text-based whole-image OCR ─────────────────────────────────
+    // When the TSV path finds nothing (e.g. Tesseract could not recognise the
+    // direction keywords in a tiny-font screenshot), fall back to the original
+    // text-based parser.
     let text = ocr_image(&bytes)?;
     let mut all_rows = parse_ths_ocr(&text);
 
     // ── Fallback: per-slice OCR ───────────────────────────────────────────────
-    // When the whole-image parse finds nothing, try splitting by separator
-    // bands and OCR-ing each slice independently.  This handles layouts
-    // where individual cards are separated by wide uniform-colour bands.
     if all_rows.is_empty() {
         let slices = split_image_by_separators(&bytes);
         if slices.len() > 1 {
@@ -2433,5 +2933,186 @@ V 2026.04           270.742.49 +1.6896
         assert!((ping_an.price  - 59.380).abs() < 0.01, "price={}", ping_an.price);
         assert!((ping_an.shares - 1000.0).abs() < 0.01, "shares={}", ping_an.shares);
         assert!((ping_an.commission - 36.54).abs() < 0.01, "commission={}", ping_an.commission);
+    }
+
+    // ── is_numeric_tsv_word ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_numeric_tsv_word_accept() {
+        // Plain prices, shares, amounts.
+        assert!(is_numeric_tsv_word("10.950"),   "price 10.950");
+        assert!(is_numeric_tsv_word("109433.71"), "amount 109433.71");
+        assert!(is_numeric_tsv_word("10000"),    "shares 10000");
+        assert!(is_numeric_tsv_word("66.29"),    "commission 66.29");
+        assert!(is_numeric_tsv_word("-61239.06"),"negative amount");
+    }
+
+    #[test]
+    fn test_is_numeric_tsv_word_reject() {
+        // Date and time tokens must NOT be treated as numbers.
+        assert!(!is_numeric_tsv_word("04-23"),   "date 04-23");
+        assert!(!is_numeric_tsv_word("11:13"),   "time 11:13");
+        assert!(!is_numeric_tsv_word("证券卖出"), "CJK text");
+        assert!(!is_numeric_tsv_word(""),        "empty string");
+        assert!(!is_numeric_tsv_word("0"),       "zero rejected");
+    }
+
+    // ── detect_col_boundaries ───────────────────────────────────────────────
+
+    /// Build a minimal set of TsvWords that mirrors the CITIC 对账单 layout:
+    ///   anchor line: "证券卖出-平安银行" @ x=20   "10.950" @ x=550   "109433.71" @ x=800
+    ///   date   line: "卖"               @ x=20   "10000"  @ x=550   "66.29"     @ x=800
+    fn make_citic_words() -> Vec<TsvWord> {
+        let mut words = Vec::new();
+        // Helper closure.
+        let w = |left: u32, top: u32, width: u32, text: &str| TsvWord {
+            left, top, width, height: 30, conf: 90, text: text.to_string(),
+        };
+        // Anchor line (top=100).
+        words.push(w(20,  100, 200, "证券卖出-平安银行"));
+        words.push(w(550, 100, 80,  "10.950"));
+        words.push(w(780, 100, 120, "109433.71"));
+        // Date line (top=140).
+        words.push(w(20,  140, 30,  "卖"));
+        words.push(w(60,  140, 80,  "04-23"));
+        words.push(w(150, 140, 80,  "11:13"));
+        words.push(w(550, 140, 80,  "10000"));
+        words.push(w(780, 140, 60,  "66.29"));
+        words
+    }
+
+    #[test]
+    fn test_detect_col_boundaries_from_numeric_pairs() {
+        let words = make_citic_words();
+        let (c1c2, c2c3) = detect_col_boundaries(&words);
+        // "10.950" / "10000" are at cx≈590; "109433.71" / "66.29" are at cx≈840.
+        // col-2/3 boundary should fall between those two clusters.
+        assert!(c1c2 < 550, "c1c2={c1c2} should be left of price column (cx≈590)");
+        assert!(c2c3 > 590, "c2c3={c2c3} should be right of price column");
+        assert!(c2c3 < 780, "c2c3={c2c3} should be left of amount column (cx≈840)");
+    }
+
+    #[test]
+    fn test_detect_col_boundaries_with_header_words() {
+        // If header words "价格" and "金额" are present, strategy 1 fires.
+        let mut words = make_citic_words();
+        words.push(TsvWord { left: 510, top: 50, width: 80,  height: 30, conf: 90, text: "价格/数量".to_string() });
+        words.push(TsvWord { left: 760, top: 50, width: 80,  height: 30, conf: 90, text: "金额/税费".to_string() });
+        let (c1c2, c2c3) = detect_col_boundaries(&words);
+        // c2c3 = midpoint between "价格/数量" cx≈550 and "金额/税费" cx≈800 = ~675.
+        assert!(c2c3 > 550 && c2c3 < 800, "c2c3={c2c3} should be between the two header words");
+        assert!(c1c2 < c2c3, "c1c2={c1c2} must be < c2c3={c2c3}");
+    }
+
+    // ── parse_ths_from_tsv ───────────────────────────────────────────────────
+
+    /// Helper: build TsvWord for a word at a given position.
+    fn tsv_word(left: u32, top: u32, width: u32, text: &str) -> TsvWord {
+        TsvWord { left, top, width, height: 30, conf: 90, text: text.to_string() }
+    }
+
+    /// SELL with misread net amount on anchor line: the large misread value
+    /// must be ignored; shares and commission must come from the date line.
+    #[test]
+    fn test_parse_ths_from_tsv_sell_misread_net_amount() {
+        // Simulates: "证券卖出-平安银行  10.950  1094354"  ← 109433.71 misread
+        //            "卖 04-23 11:13    10000   66.29"
+        let words = vec![
+            // Anchor line (top=100): name@col1, price@col2, misread_amount@col3
+            tsv_word(20,  100, 220, "证券卖出-平安银行"),
+            tsv_word(550, 100, 80,  "10.950"),
+            tsv_word(790, 100, 90,  "1094354"),   // ← OCR misread of 109433.71
+            // Date line (top=140): date/time@col1, shares@col2, commission@col3
+            tsv_word(20,  140, 30,  "卖"),
+            tsv_word(60,  140, 80,  "04-23"),
+            tsv_word(150, 140, 60,  "11:13"),
+            tsv_word(550, 140, 80,  "10000"),
+            tsv_word(790, 140, 60,  "66.29"),
+        ];
+        let rows = parse_ths_from_tsv(&words, 2026);
+        assert_eq!(rows.len(), 1, "expected 1 SELL row, got {}: {rows:?}", rows.len());
+        let r = &rows[0];
+        assert_eq!(r.transaction_type, "SELL");
+        assert_eq!(r.stock_name, "平安银行");
+        assert!((r.price  - 10.950).abs() < 0.01,  "price={}", r.price);
+        assert!((r.shares - 10000.0).abs() < 0.01,  "shares={}", r.shares);
+        assert!((r.commission - 66.29).abs() < 0.01, "commission={}", r.commission);
+        assert!((r.total_amount - 10.950 * 10000.0).abs() < 1.0, "total={}", r.total_amount);
+    }
+
+    /// BUY with correct anchor line: price and shares in separate columns.
+    #[test]
+    fn test_parse_ths_from_tsv_buy_correct() {
+        // 招商银行 BUY: price=38.270, shares=1600, commission=7.06
+        let words = vec![
+            tsv_word(20,  100, 200, "证券买入-招商银行"),
+            tsv_word(550, 100, 80,  "38.270"),
+            tsv_word(790, 100, 100, "-61239.06"),  // negative net amount
+            tsv_word(20,  140, 30,  "买"),
+            tsv_word(60,  140, 80,  "04-30"),
+            tsv_word(150, 140, 60,  "14:34"),
+            tsv_word(550, 140, 70,  "1600"),
+            tsv_word(790, 140, 50,  "7.06"),
+        ];
+        let rows = parse_ths_from_tsv(&words, 2026);
+        assert_eq!(rows.len(), 1, "expected 1 BUY row, got {}: {rows:?}", rows.len());
+        let r = &rows[0];
+        assert_eq!(r.transaction_type, "BUY");
+        assert_eq!(r.stock_name, "招商银行");
+        assert!((r.price  - 38.270).abs() < 0.01, "price={}", r.price);
+        assert!((r.shares - 1600.0).abs() < 0.01,  "shares={}", r.shares);
+        assert!((r.commission - 7.06).abs() < 0.01, "commission={}", r.commission);
+    }
+
+    /// Multiple rows on a page: 2 SELL + 1 BUY.
+    #[test]
+    fn test_parse_ths_from_tsv_multiple_rows() {
+        let words = vec![
+            // Row 1: SELL 招商银行 38.270, 1600, 7.06
+            tsv_word(20,  100, 200, "证券卖出-招商银行"),
+            tsv_word(550, 100, 80,  "38.270"),
+            tsv_word(790, 100, 90,  "612391"),   // misread
+            tsv_word(20,  140, 30,  "卖"),
+            tsv_word(60,  140, 80,  "04-30"),
+            tsv_word(150, 140, 60,  "14:34"),
+            tsv_word(550, 140, 70,  "1600"),
+            tsv_word(790, 140, 50,  "7.06"),
+            // Row 2: SELL 中国平安 59.380, 1000, 36.54
+            tsv_word(20,  200, 200, "证券卖出-中国平安"),
+            tsv_word(550, 200, 80,  "59.380"),
+            tsv_word(790, 200, 90,  "593434"),   // misread
+            tsv_word(20,  240, 30,  "卖"),
+            tsv_word(60,  240, 80,  "04-30"),
+            tsv_word(150, 240, 60,  "14:34"),
+            tsv_word(550, 240, 70,  "1000"),
+            tsv_word(790, 240, 50,  "36.54"),
+            // Row 3: BUY 招商银行 38.520, 1500, 6.67
+            tsv_word(20,  300, 200, "证券买入-招商银行"),
+            tsv_word(550, 300, 80,  "38.520"),
+            tsv_word(790, 300, 100, "-57783.33"),
+            tsv_word(20,  340, 30,  "买"),
+            tsv_word(60,  340, 80,  "04-29"),
+            tsv_word(150, 340, 60,  "10:50"),
+            tsv_word(550, 340, 70,  "1500"),
+            tsv_word(790, 340, 50,  "6.67"),
+        ];
+        let rows = parse_ths_from_tsv(&words, 2026);
+        assert_eq!(rows.len(), 3, "expected 3 rows, got {}: {rows:?}", rows.len());
+
+        let buys:  Vec<_> = rows.iter().filter(|r| r.transaction_type == "BUY").collect();
+        let sells: Vec<_> = rows.iter().filter(|r| r.transaction_type == "SELL").collect();
+        assert_eq!(buys.len(), 1, "expected 1 BUY");
+        assert_eq!(sells.len(), 2, "expected 2 SELLs");
+
+        let ping_an = sells.iter().find(|r| r.stock_name.contains("中国平安")).unwrap();
+        assert!((ping_an.price  - 59.380).abs() < 0.01, "ping_an price={}", ping_an.price);
+        assert!((ping_an.shares - 1000.0).abs() < 0.01,  "ping_an shares={}", ping_an.shares);
+        assert!((ping_an.commission - 36.54).abs() < 0.01, "ping_an comm={}", ping_an.commission);
+
+        let buy = buys[0];
+        assert_eq!(buy.stock_name, "招商银行");
+        assert!((buy.price  - 38.520).abs() < 0.01, "buy price={}", buy.price);
+        assert!((buy.shares - 1500.0).abs() < 0.01,  "buy shares={}", buy.shares);
+        assert!((buy.commission - 6.67).abs() < 0.01, "buy comm={}", buy.commission);
     }
 }

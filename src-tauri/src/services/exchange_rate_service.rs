@@ -166,13 +166,14 @@ pub async fn get_cached_rates(
                 return Ok(stale);
             }
             // Offline fallback 2: DB-persisted cache.
+            // We return the persisted rates without populating the in-memory cache
+            // so that the next request still attempts a live fetch.
             match load_exchange_rates_from_db(db) {
                 Ok(Some(persisted)) => {
                     eprintln!(
                         "Warning: could not fetch fresh exchange rates ({}), using DB-persisted cache ({})",
                         e, persisted.updated_at
                     );
-                    cache.set(persisted.clone());
                     Ok(persisted)
                 }
                 _ => Err(e),

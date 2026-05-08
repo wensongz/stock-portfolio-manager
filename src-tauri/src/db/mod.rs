@@ -279,7 +279,7 @@ impl Database {
 
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS cached_exchange_rates (
-                id INTEGER PRIMARY KEY DEFAULT 1,
+                id INTEGER PRIMARY KEY CHECK (id = 1),
                 usd_cny REAL NOT NULL,
                 usd_hkd REAL NOT NULL,
                 cny_hkd REAL NOT NULL,

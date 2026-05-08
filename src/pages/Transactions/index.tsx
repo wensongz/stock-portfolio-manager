@@ -24,6 +24,7 @@ import type { Transaction, Market, Currency, TransactionType, Holding, StockQuot
 import ImportFromImageModal from "./ImportFromImageModal";
 import ImportFromIbCsvModal from "./ImportFromIbCsvModal";
 import ImportFromMoomooCsvModal from "./ImportFromMoomooCsvModal";
+import ImportFromThsCsvModal from "./ImportFromThsCsvModal";
 
 const { Title, Text } = Typography;
 
@@ -65,6 +66,7 @@ export default function TransactionsPage() {
   const [symbolSearching, setSymbolSearching] = useState(false);
   const [filterAccountId, setFilterAccountId] = useState<string | undefined>(undefined);
   const [importModalOpen, setImportModalOpen] = useState(false);
+  const [excelImportModalOpen, setExcelImportModalOpen] = useState(false);
   const [csvImportModalOpen, setCsvImportModalOpen] = useState(false);
   const [moomooCsvImportModalOpen, setMoomooCsvImportModalOpen] = useState(false);
 
@@ -330,12 +332,20 @@ export default function TransactionsPage() {
             if (!acct) return null;
             if (acct.market === "CN") {
               return (
-                <Button
-                  icon={<CameraOutlined />}
-                  onClick={() => setImportModalOpen(true)}
-                >
-                  从截图导入
-                </Button>
+                <>
+                  <Button
+                    icon={<FileTextOutlined />}
+                    onClick={() => setExcelImportModalOpen(true)}
+                  >
+                    从CSV导入
+                  </Button>
+                  <Button
+                    icon={<CameraOutlined />}
+                    onClick={() => setImportModalOpen(true)}
+                  >
+                    从截图导入
+                  </Button>
+                </>
               );
             }
             if (acct.name.toLowerCase().includes("moomoo")) {
@@ -509,6 +519,22 @@ export default function TransactionsPage() {
             onClose={() => setImportModalOpen(false)}
             onImported={() => {
               setImportModalOpen(false);
+              fetchTransactions();
+            }}
+          />
+        ) : null;
+      })()}
+
+      {/* Import from THS CSV modal – only for CN accounts */}
+      {filterAccountId && (() => {
+        const account = accounts.find((a) => a.id === filterAccountId);
+        return account && account.market === "CN" ? (
+          <ImportFromThsCsvModal
+            open={excelImportModalOpen}
+            account={account}
+            onClose={() => setExcelImportModalOpen(false)}
+            onImported={() => {
+              setExcelImportModalOpen(false);
               fetchTransactions();
             }}
           />

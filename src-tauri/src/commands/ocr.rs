@@ -629,10 +629,12 @@ const COL3_FALLBACK_PCT: u32 = 77;
 /// when clustering TSV words onto the same logical line.
 ///
 /// CJK glyphs and Latin digits on the same line often differ in their `top`
-/// coordinate by up to ~60 % of the line height due to ascender / descender
-/// differences.  A tolerance of 3/5 (60 %) of the median height covers this
-/// variation while avoiding merging adjacent lines.
-const LINE_TOL_NUMERATOR: u32 = 3;
+/// coordinate due to ascender / descender differences.  Tesseract frequently
+/// places the "出" in "卖出" up to 80 % of the line height below the
+/// baseline of "卖", so we need at least 4/5 (~80 %) to keep the compound
+/// on a single logical line while still preventing adjacent rows from merging
+/// (inter-row gaps in the THS layout are at least 2× the line height).
+const LINE_TOL_NUMERATOR: u32 = 4;
 const LINE_TOL_DENOMINATOR: u32 = 5;
 /// Absolute minimum line grouping tolerance (px) regardless of median height.
 const LINE_TOL_MIN_PX: u32 = 10;
@@ -791,9 +793,18 @@ fn parse_ths_from_tsv(words: &[TsvWord], year: i32) -> Vec<ParsedTradeRow> {
 
     // ── 4. Build per-line column summaries ────────────────────────────────────
     struct LineSummary {
-        col1_text: String,   // joined text of all col-1 words
-        col2_nums: Vec<f64>, // positive numbers in col 2 (left to right)
-        col3_nums: Vec<f64>, // positive numbers in col 3 (left to right)
+        /// Col-1 words joined with a single space (used for date/time regex matching).
+        col1_text: String,
+        /// Col-1 words concatenated WITHOUT spaces (used for direction-keyword and
+        /// stock-name matching).  Tesseract frequently splits a single CJK compound
+        /// like "卖出" into two word tokens "卖" + "出", so searching for "卖出" in
+        /// the space-joined version fails.  Removing spaces reconstructs the
+        /// original compound.
+        col1_compact: String,
+        /// Positive numbers in col 2 (left to right).
+        col2_nums: Vec<f64>,
+        /// Positive numbers in col 3 (left to right).
+        col3_nums: Vec<f64>,
     }
 
     let summaries: Vec<LineSummary> = raw_lines
@@ -826,7 +837,8 @@ fn parse_ths_from_tsv(words: &[TsvWord], year: i32) -> Vec<ParsedTradeRow> {
             }
 
             LineSummary {
-                col1_text: col1_parts.join(" "),
+                col1_text:    col1_parts.join(" "),
+                col1_compact: col1_parts.concat(),
                 col2_nums,
                 col3_nums,
             }
@@ -844,10 +856,33 @@ fn parse_ths_from_tsv(words: &[TsvWord], year: i32) -> Vec<ParsedTradeRow> {
 
     while i < n {
         let s = &summaries[i];
-        let col1 = &s.col1_text;
+        // Use the compact (space-free) version for direction and name detection.
+        // Tesseract splits "卖出" into ["卖", "出"] and "买入" into ["买", "入"],
+        // so the space-joined col1_text would never match contains("卖出").
+        // Concatenating without spaces reconstructs the original compound.
+        //
+        // Additional fallback: when the "出"/"入" token falls outside the line-
+        // grouping tolerance (large CJK baseline variation observed in practice),
+        // "卖出" → "卖" alone in col1_compact.  We accept "卖"/"买" alone as a
+        // direction indicator ONLY when the compact string also contains a CJK
+        // stock name (≥ 2 chars after stripping trade keywords), to avoid
+        // misidentifying the date line "卖04-2309:30" as an anchor.
+        let col1c = &s.col1_compact;
 
-        let is_buy  = col1.contains("买入") || col1.contains("买人");
-        let is_sell = col1.contains("卖出");
+        let has_cjk_name = {
+            let s2 = strip_trade_keywords(col1c)
+                .replace("证券", "")
+                .replace("卖", "")
+                .replace("买", "");
+            extract_longest_cjk_run(&s2)
+                .filter(|n| n.chars().count() >= 2)
+                .is_some()
+        };
+
+        let is_buy  = col1c.contains("买入") || col1c.contains("买人")
+                   || (col1c.contains("买") && has_cjk_name);
+        let is_sell = col1c.contains("卖出")
+                   || (col1c.contains("卖") && has_cjk_name);
         if !is_buy && !is_sell {
             i += 1;
             continue;
@@ -855,16 +890,17 @@ fn parse_ths_from_tsv(words: &[TsvWord], year: i32) -> Vec<ParsedTradeRow> {
 
         let tx_type = if is_sell { "SELL" } else { "BUY" };
 
-        // Stock name: strip trade keywords then take the longest CJK run.
-        // "证券" alone is the securities prefix, not a stock name.
-        let col1_stripped = strip_trade_keywords(col1).replace("证券", " ");
-        let stock_name = extract_longest_cjk_run(&col1_stripped)
+        // Stock name: strip trade keywords from the COMPACT string so adjacent
+        // characters like "卖出" are found correctly, then take the longest CJK run.
+        // "证券" is the securities-firm prefix, not a stock name.
+        let col1c_stripped = strip_trade_keywords(col1c).replace("证券", "");
+        let stock_name = extract_longest_cjk_run(&col1c_stripped)
             .filter(|name| name.chars().count() >= 2)
             .or_else(|| {
                 // Look up to 3 preceding lines for the stock name.
                 (1..=3usize).filter_map(|back| {
                     let idx = i.checked_sub(back)?;
-                    let prev = &summaries[idx].col1_text;
+                    let prev = &summaries[idx].col1_compact;
                     // Don't step past another anchor.
                     if prev.contains("买入")
                         || prev.contains("买人")
@@ -882,18 +918,32 @@ fn parse_ths_from_tsv(words: &[TsvWord], year: i32) -> Vec<ParsedTradeRow> {
         let price = s.col2_nums.first().copied().unwrap_or(0.0);
 
         // Find the next date line within the following 5 lines.
+        // Use col1_text (space-joined) for date regex matching; use col1_compact
+        // for the "not an anchor" guard so split keywords are caught correctly.
         let date_line_idx = (i + 1..n.min(i + 6)).find(|&j| {
-            let c1 = &summaries[j].col1_text;
-            let has_date = full_ymd_re.is_match(c1)
-                || date_re.captures_iter(c1).any(|cap| {
+            let c1t = &summaries[j].col1_text;
+            let c1c = &summaries[j].col1_compact;
+            let has_date = full_ymd_re.is_match(c1t)
+                || date_re.captures_iter(c1t).any(|cap| {
                     let m: u32 = cap[1].parse().unwrap_or(0);
                     let d: u32 = cap[2].parse().unwrap_or(0);
                     (1..=12).contains(&m) && (1..=31).contains(&d)
                 });
-            has_date
-                && !c1.contains("买入")
-                && !c1.contains("买人")
-                && !c1.contains("卖出")
+            // A line is NOT a date line if it looks like an anchor.
+            let cjk_name_j = {
+                let s2 = strip_trade_keywords(c1c)
+                    .replace("证券", "")
+                    .replace("卖", "")
+                    .replace("买", "");
+                extract_longest_cjk_run(&s2)
+                    .filter(|n| n.chars().count() >= 2)
+                    .is_some()
+            };
+            let is_anchor_j = c1c.contains("买入")
+                || c1c.contains("买人")
+                || c1c.contains("卖出")
+                || ((c1c.contains("买") || c1c.contains("卖")) && cjk_name_j);
+            has_date && !is_anchor_j
         });
 
         let Some(dl_idx) = date_line_idx else {
@@ -3067,21 +3117,31 @@ V 2026.04           270.742.49 +1.6896
 
     /// SELL with misread net amount on anchor line: the large misread value
     /// must be ignored; shares and commission must come from the date line.
+    ///
+    /// This test uses SPLIT WORD TOKENS (matching actual Tesseract TSV output):
+    /// Tesseract splits "卖出" → ["卖", "出"] and "平安银行" → ["-平安", "银行"].
+    /// The old code tested only single-token input and missed this split.
     #[test]
     fn test_parse_ths_from_tsv_sell_misread_net_amount() {
-        // Simulates: "证券卖出-平安银行  10.950  1094354"  ← 109433.71 misread
-        //            "卖 04-23 11:13    10000   66.29"
+        // Simulates actual Tesseract TSV for:
+        //   "证券卖出-平安银行  10.950  1094354"  ← 109433.71 misread
+        //   "卖 04-23 11:13    10000   66.29"
         let words = vec![
-            // Anchor line (top=100): name@col1, price@col2, misread_amount@col3
-            tsv_word(20,  100, 220, "证券卖出-平安银行"),
-            tsv_word(550, 100, 80,  "10.950"),
-            tsv_word(790, 100, 90,  "1094354"),   // ← OCR misread of 109433.71
-            // Date line (top=140): date/time@col1, shares@col2, commission@col3
-            tsv_word(20,  140, 30,  "卖"),
-            tsv_word(60,  140, 80,  "04-23"),
-            tsv_word(150, 140, 60,  "11:13"),
-            tsv_word(550, 140, 80,  "10000"),
-            tsv_word(790, 140, 60,  "66.29"),
+            // Anchor line (top=100): split CJK tokens in col-1
+            tsv_word(11,  100, 43,  "证"),
+            tsv_word(68,  100, 14,  "券"),
+            tsv_word(97,  100, 13,  "卖"),
+            tsv_word(109, 96,  16,  "出"),
+            tsv_word(124, 100, 76,  "-平安"),
+            tsv_word(200, 100, 43,  "银行"),
+            tsv_word(550, 103, 80,  "10.950"),
+            tsv_word(790, 103, 90,  "1094354"),   // ← OCR misread of 109433.71
+            // Date line (top=134): single CJK direction char + date/time + numbers
+            tsv_word(12,  134, 19,  "卖"),
+            tsv_word(38,  137, 54,  "04-23"),
+            tsv_word(99,  137, 53,  "11:13"),
+            tsv_word(550, 137, 58,  "10000"),
+            tsv_word(790, 137, 53,  "66.29"),
         ];
         let rows = parse_ths_from_tsv(&words, 2026);
         assert_eq!(rows.len(), 1, "expected 1 SELL row, got {}: {rows:?}", rows.len());
@@ -3094,9 +3154,38 @@ V 2026.04           270.742.49 +1.6896
         assert!((r.total_amount - 10.950 * 10000.0).abs() < 1.0, "total={}", r.total_amount);
     }
 
-    /// BUY with correct anchor line: price and shares in separate columns.
+    /// BUY with split word tokens: Tesseract splits "买入" → ["买", "入"].
     #[test]
-    fn test_parse_ths_from_tsv_buy_correct() {
+    fn test_parse_ths_from_tsv_buy_split_tokens() {
+        // 招商银行 BUY: price=38.270, shares=1600, commission=7.06
+        let words = vec![
+            tsv_word(11,  100, 43,  "证"),
+            tsv_word(68,  100, 21,  "券"),
+            tsv_word(95,  100, 17,  "买"),
+            tsv_word(112, 93,  14,  "入"),    // "入" slightly higher (Tesseract baseline variation)
+            tsv_word(125, 97,  74,  "-招商"),
+            tsv_word(200, 100, 43,  "银行"),
+            tsv_word(550, 103, 80,  "38.270"),
+            tsv_word(790, 103, 100, "-61239.06"),  // negative net amount → ignored
+            tsv_word(12,  134, 18,  "买"),
+            tsv_word(38,  137, 54,  "04-30"),
+            tsv_word(99,  137, 52,  "14:34"),
+            tsv_word(550, 137, 47,  "1600"),
+            tsv_word(790, 137, 50,  "7.06"),
+        ];
+        let rows = parse_ths_from_tsv(&words, 2026);
+        assert_eq!(rows.len(), 1, "expected 1 BUY row, got {}: {rows:?}", rows.len());
+        let r = &rows[0];
+        assert_eq!(r.transaction_type, "BUY");
+        assert_eq!(r.stock_name, "招商银行");
+        assert!((r.price  - 38.270).abs() < 0.01, "price={}", r.price);
+        assert!((r.shares - 1600.0).abs() < 0.01,  "shares={}", r.shares);
+        assert!((r.commission - 7.06).abs() < 0.01, "commission={}", r.commission);
+    }
+
+    /// BUY with correct anchor line (old-style single token): backwards compatibility.
+    #[test]
+    fn test_parse_ths_from_tsv_buy_single_token() {
         // 招商银行 BUY: price=38.270, shares=1600, commission=7.06
         let words = vec![
             tsv_word(20,  100, 200, "证券买入-招商银行"),
@@ -3118,7 +3207,204 @@ V 2026.04           270.742.49 +1.6896
         assert!((r.commission - 7.06).abs() < 0.01, "commission={}", r.commission);
     }
 
-    /// Multiple rows on a page: 2 SELL + 1 BUY.
+    /// Multiple rows with ACTUAL Tesseract-style split tokens.
+    /// Word positions derived from running Tesseract 5 chi_sim on a synthetic CITIC
+    /// 对账单 image (column layout: col2≈cx730, col3≈cx1021).
+    #[test]
+    fn test_parse_ths_from_tsv_multiple_rows_split_tokens() {
+        // Mirrors the user's actual CITIC 对账单 with 9 rows:
+        //   平安银行 SELL 10.9500 / 10000 / 66.29
+        //   招商银行 BUY  38.2700 / 2900  / 13.24
+        //   招商银行 BUY  38.3600 / 2900  / 13.35
+        //   平安银行 SELL 11.5100 / 10000 / 69.68
+        //   招商银行 BUY  38.3800 / 2900  / 13.17
+        //   平安银行 SELL 11.4000 / 10000 / 69.02
+        //   平安银行 SELL 11.4600 / 10000 / 69.38
+        //   招商银行 BUY  38.3100 / 2900  / 12.91
+        //   中国平安 SELL 58.4490 / 1000  / 35.97
+
+        let w = |left: u32, top: u32, width: u32, h: u32, text: &str| TsvWord {
+            left, top, width, height: h, conf: 90, text: text.to_string(),
+        };
+
+        // Header row (top≈38) – col-2 header "价格" provides boundary hint
+        let header = vec![
+            w(11,  38, 39, 21, "本"),   w(55, 38, 6, 20, "月"),
+            w(61,  38, 36, 20, "操作"),
+            w(731, 38, 42, 20, "价格"),  w(777, 38, 49, 22, "/数量"),
+            w(1021,38, 94, 22, "金额"),  w(1068,34, 15, 36, "/"),
+            w(1082,34, 23, 36, "税"),    w(1104,34, 15, 36, "费"),
+        ];
+
+        // Row 1 – 平安银行 SELL 10.9500 / 10000 / 66.29  (net=109435.40)
+        let row1a = vec![
+            w(11, 131, 43, 26, "证"), w(68, 131, 14, 26, "券"),
+            w(97, 131, 13, 26, "卖"), w(109,127, 16, 41, "出"),
+            w(124,131, 76, 26, "-平安"),w(200,131,43, 26, "银行"),
+            w(732,134, 98, 21, "10.9500"),
+            w(1022,134,129, 21, "109435.40"),
+        ];
+        let row1b = vec![
+            w(12, 165, 19, 21, "卖"),
+            w(38, 168, 54, 16, "04-23"), w(99, 168, 53, 16, "09:30"),
+            w(732,168, 58, 16, "10000"),  w(1021,168, 53, 16, "66.29"),
+        ];
+
+        // Row 2 – 招商银行 BUY 38.2700 / 2900 / 13.24 (net=-111183.24)
+        let row2a = vec![
+            w(11, 209, 44, 26, "证"), w(68, 211, 21, 24, "券"),
+            w(95, 211, 17, 24, "买"), w(112,204, 14, 42, "入"),
+            w(125,208, 74, 27, "-招商"),w(200,209,43, 26, "银行"),
+            w(731,212, 99, 21, "38.2700"),
+            w(1021,212,140, 21, "-111183.24"),
+        ];
+        let row2b = vec![
+            w(12, 245, 18, 19, "买"),
+            w(38, 246, 54, 16, "04-23"), w(100,246, 52, 16, "11:15"),
+            w(731,246, 47, 16, "2900"),   w(1022,246,53, 16, "13.24"),
+        ];
+
+        // Row 3 – 招商银行 BUY 38.3600 / 2900 / 13.35
+        let row3a = vec![
+            w(11, 287, 44, 26, "证"), w(68, 289, 21, 24, "券"),
+            w(95, 289, 17, 24, "买"), w(112,282, 14, 42, "入"),
+            w(125,286, 74, 27, "-招商"),w(200,287,43, 26, "银行"),
+            w(731,290, 99, 21, "38.3600"),
+            w(1021,290,140, 21, "-111244.00"),
+        ];
+        let row3b = vec![
+            w(12, 323, 18, 19, "买"),
+            w(38, 324, 54, 16, "04-27"), w(99, 324, 53, 16, "09:34"),
+            w(731,324, 47, 16, "2900"),   w(1022,324,53, 16, "13.35"),
+        ];
+
+        // Row 4 – 平安银行 SELL 11.5100 / 10000 / 69.68
+        let row4a = vec![
+            w(11, 365, 43, 26, "证"), w(68, 365, 14, 26, "券"),
+            w(97, 365, 13, 26, "卖"), w(109,361, 16, 41, "出"),
+            w(124,365, 76, 26, "-平安"),w(200,365,43, 26, "银行"),
+            w(732,368, 98, 21, "11.5100"),
+            w(1022,368,129, 21, "115033.71"),
+        ];
+        let row4b = vec![
+            w(12, 399, 19, 21, "卖"),
+            w(38, 402, 54, 16, "04-27"), w(99, 402, 53, 16, "09:34"),
+            w(732,402, 58, 16, "10000"),  w(1021,402,53, 16, "69.68"),
+        ];
+
+        // Row 5 – 招商银行 BUY 38.3800 / 2900 / 13.17
+        let row5a = vec![
+            w(11, 443, 44, 26, "证"), w(68, 445, 21, 24, "券"),
+            w(95, 445, 17, 24, "买"), w(112,438, 14, 42, "入"),
+            w(125,442, 74, 27, "-招商"),w(200,443,43, 26, "银行"),
+            w(731,446, 99, 21, "38.3800"),
+            w(1021,446,140, 21, "-111302.00"),
+        ];
+        let row5b = vec![
+            w(12, 479, 18, 19, "买"),
+            w(38, 480, 54, 16, "04-28"), w(100,480, 52, 16, "09:32"),
+            w(731,480, 47, 16, "2900"),   w(1022,480,53, 16, "13.17"),
+        ];
+
+        // Row 6 – 平安银行 SELL 11.4000 / 10000 / 69.02
+        let row6a = vec![
+            w(11, 521, 43, 26, "证"), w(68, 521, 14, 26, "券"),
+            w(97, 521, 13, 26, "卖"), w(109,517, 16, 41, "出"),
+            w(124,521, 76, 26, "-平安"),w(200,521,43, 26, "银行"),
+            w(732,524, 98, 21, "11.4000"),
+            w(1022,524,129, 21, "113930.98"),
+        ];
+        let row6b = vec![
+            w(12, 555, 19, 21, "卖"),
+            w(38, 558, 54, 16, "04-28"), w(99, 558, 53, 16, "09:32"),
+            w(732,558, 58, 16, "10000"),  w(1021,558,53, 16, "69.02"),
+        ];
+
+        // Row 7 – 平安银行 SELL 11.4600 / 10000 / 69.38
+        let row7a = vec![
+            w(11, 599, 43, 26, "证"), w(68, 599, 14, 26, "券"),
+            w(97, 599, 13, 26, "卖"), w(109,595, 16, 41, "出"),
+            w(124,599, 76, 26, "-平安"),w(200,599,43, 26, "银行"),
+            w(732,602, 98, 21, "11.4600"),
+            w(1022,602,129, 21, "114530.62"),
+        ];
+        let row7b = vec![
+            w(12, 633, 19, 21, "卖"),
+            w(38, 636, 54, 16, "04-29"), w(99, 636, 53, 16, "10:36"),
+            w(732,636, 58, 16, "10000"),  w(1021,636,53, 16, "69.38"),
+        ];
+
+        // Row 8 – 招商银行 BUY 38.3100 / 2900 / 12.91
+        let row8a = vec![
+            w(11, 677, 44, 26, "证"), w(68, 679, 21, 24, "券"),
+            w(95, 679, 17, 24, "买"), w(112,672, 14, 42, "入"),
+            w(125,676, 74, 27, "-招商"),w(200,677,43, 26, "银行"),
+            w(731,680, 99, 21, "38.3100"),
+            w(1021,680,140, 21, "-111099.00"),
+        ];
+        let row8b = vec![
+            w(12, 713, 18, 19, "买"),
+            w(38, 714, 54, 16, "04-29"), w(100,714, 52, 16, "10:37"),
+            w(731,714, 47, 16, "2900"),   w(1022,714,53, 16, "12.91"),
+        ];
+
+        // Row 9 – 中国平安 SELL 58.4490 / 1000 / 35.97
+        // NOTE: In actual Tesseract output, "出" (top=770) is 15 px below "卖"
+        // (top=755).  This exceeds the old 12 px tolerance (3/5 × 21 = 12) and
+        // caused the anchor to be missed entirely.  The new 16 px tolerance
+        // (4/5 × 21 = 16) keeps them on the same logical line.
+        let row9a = vec![
+            w(11,  755, 43, 26, "证"), w(68,  755, 14, 26, "券"),
+            w(97,  755, 13, 26, "卖"),
+            w(123, 770, 16, 41, "出"),   // ← 15 px baseline shift (actual Tesseract behavior)
+            w(127, 751, 30, 26, "-中"),  w(168, 756, 47, 22, "国平"), w(227, 755, 16, 26, "安"),
+            w(731, 754, 98, 21, "58.4490"),
+            w(1021,758,129, 21, "58413.03"),
+        ];
+        let row9b = vec![
+            w(12,  789, 19, 21, "卖"),
+            w(38,  792, 54, 16, "04-29"), w(100, 792, 52, 16, "10:49"),
+            w(732, 792, 46, 16, "1000"),   w(1021,792, 53, 16, "35.97"),
+        ];
+
+        let mut words: Vec<TsvWord> = Vec::new();
+        for chunk in [header,
+                      row1a, row1b, row2a, row2b, row3a, row3b,
+                      row4a, row4b, row5a, row5b, row6a, row6b,
+                      row7a, row7b, row8a, row8b, row9a, row9b] {
+            words.extend(chunk);
+        }
+
+        let rows = parse_ths_from_tsv(&words, 2026);
+        assert_eq!(rows.len(), 9, "expected 9 rows, got {}: {:?}", rows.len(),
+            rows.iter().map(|r| format!("{}/{}", r.stock_name, r.transaction_type)).collect::<Vec<_>>());
+
+        let sells: Vec<_> = rows.iter().filter(|r| r.transaction_type == "SELL").collect();
+        let buys:  Vec<_> = rows.iter().filter(|r| r.transaction_type == "BUY").collect();
+        assert_eq!(sells.len(), 5, "expected 5 SELLs");
+        assert_eq!(buys.len(),  4, "expected 4 BUYs");
+
+        // Row 1: 平安银行 SELL – critical: net amount 109435.40 must NOT become shares
+        let pa1 = sells.iter().find(|r| r.traded_at.contains("04-23")).unwrap();
+        assert_eq!(pa1.stock_name, "平安银行");
+        assert!((pa1.price  - 10.9500).abs() < 0.01, "pa1 price={}", pa1.price);
+        assert!((pa1.shares - 10000.0).abs() < 0.01,  "pa1 shares={}", pa1.shares);
+        assert!((pa1.commission - 66.29).abs() < 0.01, "pa1 comm={}", pa1.commission);
+
+        // Row 9: 中国平安 SELL
+        let zp = sells.iter().find(|r| r.stock_name.contains("中国平安")).unwrap();
+        assert!((zp.price  - 58.4490).abs() < 0.01, "zp price={}", zp.price);
+        assert!((zp.shares - 1000.0).abs() < 0.01,   "zp shares={}", zp.shares);
+        assert!((zp.commission - 35.97).abs() < 0.01, "zp comm={}", zp.commission);
+
+        // BUYs: all 招商银行
+        for b in &buys {
+            assert_eq!(b.stock_name, "招商银行", "unexpected buy name={}", b.stock_name);
+            assert!((b.shares - 2900.0).abs() < 0.01, "buy shares={}", b.shares);
+        }
+    }
+
+    /// Multiple rows on a page: 2 SELL + 1 BUY (legacy single-token format).
     #[test]
     fn test_parse_ths_from_tsv_multiple_rows() {
         let words = vec![

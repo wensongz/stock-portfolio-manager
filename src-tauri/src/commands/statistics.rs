@@ -98,18 +98,43 @@ pub async fn get_statistics_overview(
         .collect();
     stock_distribution.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Top gainers/losers by absolute PnL (in USD)
-    let mut pnl_items: Vec<PnlItem> = details
-        .iter()
-        .map(|d| {
-            let pnl_usd = to_usd_value(d.pnl, &d.currency, &rates);
-            let mv_usd = to_usd_value(d.market_value, &d.currency, &rates);
+    // Top gainers/losers: aggregate by symbol in USD so a stock held across
+    // multiple accounts/currencies counts as a single entry.
+    struct SymbolAgg {
+        name: String,
+        pnl_usd: f64,
+        cost_usd: f64,
+        market_value_usd: f64,
+    }
+    let mut symbol_map: std::collections::HashMap<String, SymbolAgg> = std::collections::HashMap::new();
+    for d in &details {
+        let pnl_usd = to_usd_value(d.pnl, &d.currency, &rates);
+        let cv_usd = to_usd_value(d.cost_value, &d.currency, &rates);
+        let mv_usd = to_usd_value(d.market_value, &d.currency, &rates);
+        let entry = symbol_map.entry(d.symbol.clone()).or_insert_with(|| SymbolAgg {
+            name: d.name.clone(),
+            pnl_usd: 0.0,
+            cost_usd: 0.0,
+            market_value_usd: 0.0,
+        });
+        entry.pnl_usd += pnl_usd;
+        entry.cost_usd += cv_usd;
+        entry.market_value_usd += mv_usd;
+    }
+    let mut pnl_items: Vec<PnlItem> = symbol_map
+        .into_iter()
+        .map(|(symbol, agg)| {
+            let pnl_percent = if agg.cost_usd != 0.0 {
+                agg.pnl_usd / agg.cost_usd * 100.0
+            } else {
+                0.0
+            };
             PnlItem {
-                symbol: d.symbol.clone(),
-                name: d.name.clone(),
-                pnl: pnl_usd,
-                pnl_percent: d.pnl_percent,
-                market_value: mv_usd,
+                symbol,
+                name: agg.name,
+                pnl: agg.pnl_usd,
+                pnl_percent,
+                market_value: agg.market_value_usd,
             }
         })
         .collect();

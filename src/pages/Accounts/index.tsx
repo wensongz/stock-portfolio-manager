@@ -9,7 +9,6 @@ import {
   Input,
   Select,
   Tag,
-  Popconfirm,
   message,
 } from "antd";
 import { PlusOutlined } from "@ant-design/icons";
@@ -36,6 +35,9 @@ export default function AccountsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
   const [form] = Form.useForm();
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<Account | null>(null);
+  const [deleteConfirmName, setDeleteConfirmName] = useState("");
 
   useEffect(() => {
     fetchAccounts();
@@ -77,6 +79,20 @@ export default function AccountsPage() {
     }
   };
 
+  const openDeleteModal = (account: Account) => {
+    setDeleteTarget(account);
+    setDeleteConfirmName("");
+    setDeleteModalOpen(true);
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!deleteTarget) return;
+    await handleDelete(deleteTarget.id);
+    setDeleteModalOpen(false);
+    setDeleteTarget(null);
+    setDeleteConfirmName("");
+  };
+
   const columns = [
     {
       title: "账户名称",
@@ -111,17 +127,9 @@ export default function AccountsPage() {
           <Button type="link" size="small" onClick={() => handleEdit(record)}>
             编辑
           </Button>
-          <Popconfirm
-            title="确认删除该账户？"
-            description="删除账户会同时删除相关持仓和交易记录。"
-            onConfirm={() => handleDelete(record.id)}
-            okText="确认"
-            cancelText="取消"
-          >
-            <Button type="link" size="small" danger>
-              删除
-            </Button>
-          </Popconfirm>
+          <Button type="link" size="small" danger onClick={() => openDeleteModal(record)}>
+            删除
+          </Button>
         </Space>
       ),
     },
@@ -189,6 +197,32 @@ export default function AccountsPage() {
             <Input.TextArea placeholder="账户备注信息" rows={3} />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        title="确认删除该账户？"
+        open={deleteModalOpen}
+        onOk={handleDeleteConfirm}
+        onCancel={() => {
+          setDeleteModalOpen(false);
+          setDeleteTarget(null);
+          setDeleteConfirmName("");
+        }}
+        okText="确认删除"
+        cancelText="取消"
+        okButtonProps={{ danger: true, disabled: deleteConfirmName !== (deleteTarget?.name ?? "") }}
+      >
+        <p>删除账户会同时删除相关持仓和交易记录。</p>
+        <p>请输入账户名称 <strong>{deleteTarget?.name}</strong> 以确认删除：</p>
+        <Input
+          placeholder="请输入账户名称"
+          value={deleteConfirmName}
+          onChange={(e) => setDeleteConfirmName(e.target.value)}
+          onPressEnter={() => {
+            if (deleteConfirmName === (deleteTarget?.name ?? "")) handleDeleteConfirm();
+          }}
+          autoFocus
+        />
       </Modal>
     </div>
   );

@@ -20,6 +20,7 @@ import {
 import { PlusOutlined, ReloadOutlined, SyncOutlined, FilterOutlined, DollarOutlined, UploadOutlined } from "@ant-design/icons";
 import ImportHoldingFromCsvModal from "./ImportHoldingFromCsvModal";
 import ImportHoldingFromIbCsvModal from "./ImportHoldingFromIbCsvModal";
+import ImportHoldingFromMoomooCsvModal from "./ImportHoldingFromMoomooCsvModal";
 import { invoke } from "@tauri-apps/api/core";
 import { useHoldingStore } from "../../stores/holdingStore";
 import { useAccountStore } from "../../stores/accountStore";
@@ -93,6 +94,7 @@ export default function HoldingsPage() {
   const [cashModalOpen, setCashModalOpen] = useState(false);
   const [holdingCsvImportModalOpen, setHoldingCsvImportModalOpen] = useState(false);
   const [holdingIbCsvImportModalOpen, setHoldingIbCsvImportModalOpen] = useState(false);
+  const [holdingMoomooCsvImportModalOpen, setHoldingMoomooCsvImportModalOpen] = useState(false);
   const [editingHolding, setEditingHolding] = useState<Holding | null>(null);
   const [detailModalOpen, setDetailModalOpen] = useState(false);
   const [detailHolding, setDetailHolding] = useState<HoldingWithQuote | null>(null);
@@ -364,6 +366,7 @@ export default function HoldingsPage() {
   const isCnAccountSelected = selectedAccount?.market === "CN";
   const isUsOrHkAccountSelected =
     selectedAccount?.market === "US" || selectedAccount?.market === "HK";
+  const isMoomooAccount = !!selectedAccount?.name.toLowerCase().includes("moomoo");
   const activeHoldingsForSelectedAccount =
     (isCnAccountSelected || isUsOrHkAccountSelected) && filterAccountId
       ? allDisplayData.filter(
@@ -372,8 +375,10 @@ export default function HoldingsPage() {
       : [];
   const showCsvImportButton =
     isCnAccountSelected && !holdingsLoading && activeHoldingsForSelectedAccount.length === 0;
+  const showMoomooCsvImportButton =
+    isUsOrHkAccountSelected && isMoomooAccount && !holdingsLoading && activeHoldingsForSelectedAccount.length === 0;
   const showIbCsvImportButton =
-    isUsOrHkAccountSelected && !holdingsLoading && activeHoldingsForSelectedAccount.length === 0;
+    isUsOrHkAccountSelected && !isMoomooAccount && !holdingsLoading && activeHoldingsForSelectedAccount.length === 0;
 
   // Extract unique (symbol, market) pairs from the visible holdings for
   // targeted refresh – only these symbols will be force-refreshed from the API.
@@ -581,6 +586,14 @@ export default function HoldingsPage() {
             <Button
               icon={<UploadOutlined />}
               onClick={() => setHoldingCsvImportModalOpen(true)}
+            >
+              从CSV导入
+            </Button>
+          )}
+          {showMoomooCsvImportButton && (
+            <Button
+              icon={<UploadOutlined />}
+              onClick={() => setHoldingMoomooCsvImportModalOpen(true)}
             >
               从CSV导入
             </Button>
@@ -931,6 +944,19 @@ export default function HoldingsPage() {
           onClose={() => setHoldingIbCsvImportModalOpen(false)}
           onImported={() => {
             setHoldingIbCsvImportModalOpen(false);
+            fetchHoldings();
+          }}
+        />
+      )}
+
+      {/* Import Holdings from Moomoo CSV Modal (US / HK) */}
+      {selectedAccount && (
+        <ImportHoldingFromMoomooCsvModal
+          open={holdingMoomooCsvImportModalOpen}
+          account={selectedAccount}
+          onClose={() => setHoldingMoomooCsvImportModalOpen(false)}
+          onImported={() => {
+            setHoldingMoomooCsvImportModalOpen(false);
             fetchHoldings();
           }}
         />

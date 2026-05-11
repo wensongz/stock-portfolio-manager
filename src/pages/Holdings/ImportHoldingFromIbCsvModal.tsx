@@ -12,11 +12,13 @@ import {
   Space,
   Checkbox,
   Tag,
+  Spin,
 } from "antd";
 import { InboxOutlined } from "@ant-design/icons";
 import type { UploadFile } from "antd/es/upload";
 import type { Account, Market, Currency } from "../../types";
 import { useHoldingStore } from "../../stores/holdingStore";
+import { invoke } from "@tauri-apps/api/core";
 
 const { Dragger } = Upload;
 const { Text, Paragraph } = Typography;
@@ -32,6 +34,7 @@ interface ParsedRow {
   name: string;
   shares: number;
   avgCost: number;
+  lookingUp?: boolean;
   importOk?: boolean;
   importError?: string;
 }
@@ -294,12 +297,68 @@ export default function ImportHoldingFromIbCsvModal({
 
       const text   = await readAs("utf-8");
       const result = parseIbOpenPositionsCsv(text, market);
-      setRows(result.rows);
+      // Mark every row as looking-up so the name column shows a spinner
+      const withLookup = result.rows.map((r) => ({ ...r, lookingUp: true }));
+      setRows(withLookup);
       setParseWarnings(result.warnings);
       setStep(1);
+      // Resolve names asynchronously (does not block navigation to step 1)
+      resolveStockNames(withLookup);
     },
-    [market],
+    [market], // eslint-disable-line react-hooks/exhaustive-deps
   );
+
+  /**
+   * Resolve stock names for parsed rows:
+   *  1. Look up from existing holdings in the DB (all accounts) — no network.
+   *  2. For any symbol still unknown, call `lookup_stock_name_by_symbol` (Xueqiu).
+   *  3. Fall back to the symbol itself if both fail.
+   */
+  const resolveStockNames = useCallback(async (parsedRows: ParsedRow[]) => {
+    // Step 1 – build symbol→name map from local holdings cache
+    const holdingNameMap = new Map<string, string>();
+    try {
+      const holdings = await invoke<{ symbol: string; name: string }[]>(
+        "get_holdings",
+        { accountId: null },
+      );
+      for (const h of holdings) {
+        holdingNameMap.set(h.symbol.toUpperCase(), h.name);
+      }
+    } catch {
+      // ignore – will fall back to Xueqiu for all symbols
+    }
+
+    const uniqueSymbols = [...new Set(parsedRows.map((r) => r.symbol.toUpperCase()))];
+    const symbolNameMap = new Map<string, string>();
+    for (const sym of uniqueSymbols) {
+      const cached = holdingNameMap.get(sym);
+      if (cached) symbolNameMap.set(sym, cached);
+    }
+
+    // Step 2 – query Xueqiu for symbols not found in the local cache
+    const needLookup = uniqueSymbols.filter((s) => !symbolNameMap.has(s));
+    await Promise.all(
+      needLookup.map(async (sym) => {
+        try {
+          const name = await invoke<string | null>("lookup_stock_name_by_symbol", {
+            symbol: sym,
+          });
+          if (name) symbolNameMap.set(sym, name);
+        } catch {
+          // ignore – user can edit manually
+        }
+      }),
+    );
+
+    // Step 3 – apply resolved names and clear the spinner flag
+    setRows((prev) =>
+      prev.map((r) => {
+        const resolved = symbolNameMap.get(r.symbol.toUpperCase());
+        return { ...r, name: resolved ?? r.symbol, lookingUp: false };
+      }),
+    );
+  }, []);
 
   const handleImport = async () => {
     setImporting(true);
@@ -390,7 +449,9 @@ export default function ImportHoldingFromIbCsvModal({
       key:   "name",
       width: 130,
       render: (_: unknown, record: ParsedRow) =>
-        step === 2 ? (
+        record.lookingUp ? (
+          <Spin size="small" />
+        ) : step === 2 ? (
           <Text>{record.name}</Text>
         ) : (
           <Input
@@ -462,6 +523,7 @@ export default function ImportHoldingFromIbCsvModal({
   ];
 
   const selectedCount = rows.filter((r) => r.selected).length;
+  const isLookingUp   = rows.some((r) => r.lookingUp);
 
   return (
     <Modal
@@ -576,7 +638,7 @@ export default function ImportHoldingFromIbCsvModal({
               <Button onClick={() => setStep(0)}>上一步</Button>
               <Button
                 type="primary"
-                disabled={rows.length === 0 || selectedCount === 0}
+                disabled={rows.length === 0 || selectedCount === 0 || isLookingUp}
                 loading={importing}
                 onClick={handleImport}
               >

@@ -144,7 +144,7 @@ function parseCsv(text: string): ParseResult {
         if (dataCols[0] === "人民币" || dataCols.some((c) => c === "人民币")) {
           const rmbIdx = dataCols.findIndex((c) => c === "人民币");
           const offset = rmbIdx >= 0 ? rmbIdx : 0;
-          const val = parseNum(dataCols[availIdx + offset - 0]);
+          const val = parseNum(dataCols[availIdx + offset]);
           if (!isNaN(val) && val > 0) cashAmount = val;
           break;
         }
@@ -226,9 +226,9 @@ function parseCsv(text: string): ParseResult {
     const cols = splitLine(line);
     const get = (j: number) => (j !== -1 ? (cols[j] ?? "").trim() : "");
 
-    // Normalise code to 6 digits (THS sometimes omits leading zeros)
+    // Normalise code to 6 digits (THS sometimes omits leading zeros for short codes)
     const rawCode = get(iCode);
-    const code = rawCode.replace(/^\d{1,5}$/, (s) => s.padStart(6, "0"));
+    const code = /^\d+$/.test(rawCode) ? rawCode.padStart(6, "0") : rawCode;
     if (!/^\d{6}$/.test(code)) continue;
 
     const shares = parseNum(get(iShares));
@@ -548,7 +548,7 @@ export default function ImportHoldingFromCsvModal({
             maxCount={1}
             fileList={fileList}
             beforeUpload={(file) => {
-              setFileList([file as unknown as UploadFile]);
+              setFileList([{ uid: file.name, name: file.name, originFileObj: file } as UploadFile]);
               handleFileParse(file);
               return false;
             }}

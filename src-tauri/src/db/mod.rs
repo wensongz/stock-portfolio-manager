@@ -116,7 +116,8 @@ impl Database {
                     notes TEXT,
                     created_at TEXT NOT NULL
                 );
-                INSERT INTO transactions SELECT * FROM transactions_old;
+                INSERT INTO transactions (id, holding_id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, notes, created_at)
+                SELECT id, holding_id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, notes, created_at FROM transactions_old;
                 DROP TABLE transactions_old;
                 COMMIT;
                 PRAGMA foreign_keys = ON;

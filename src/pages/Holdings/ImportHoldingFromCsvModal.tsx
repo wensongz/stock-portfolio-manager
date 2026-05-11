@@ -548,7 +548,7 @@ export default function ImportHoldingFromCsvModal({
             maxCount={1}
             fileList={fileList}
             beforeUpload={(file) => {
-              setFileList([{ uid: file.name, name: file.name, originFileObj: file } as UploadFile]);
+              setFileList([{ uid: `${file.name}-${Date.now()}`, name: file.name, originFileObj: file } as UploadFile]);
               handleFileParse(file);
               return false;
             }}

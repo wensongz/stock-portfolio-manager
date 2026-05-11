@@ -19,6 +19,7 @@ import {
 } from "antd";
 import { PlusOutlined, ReloadOutlined, SyncOutlined, FilterOutlined, DollarOutlined, UploadOutlined } from "@ant-design/icons";
 import ImportHoldingFromCsvModal from "./ImportHoldingFromCsvModal";
+import ImportHoldingFromIbCsvModal from "./ImportHoldingFromIbCsvModal";
 import { invoke } from "@tauri-apps/api/core";
 import { useHoldingStore } from "../../stores/holdingStore";
 import { useAccountStore } from "../../stores/accountStore";
@@ -91,6 +92,7 @@ export default function HoldingsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [cashModalOpen, setCashModalOpen] = useState(false);
   const [holdingCsvImportModalOpen, setHoldingCsvImportModalOpen] = useState(false);
+  const [holdingIbCsvImportModalOpen, setHoldingIbCsvImportModalOpen] = useState(false);
   const [editingHolding, setEditingHolding] = useState<Holding | null>(null);
   const [detailModalOpen, setDetailModalOpen] = useState(false);
   const [detailHolding, setDetailHolding] = useState<HoldingWithQuote | null>(null);
@@ -360,13 +362,18 @@ export default function HoldingsPage() {
     ? accounts.find((a) => a.id === filterAccountId)
     : undefined;
   const isCnAccountSelected = selectedAccount?.market === "CN";
-  const activeHoldingsForSelectedAccount = isCnAccountSelected && filterAccountId
-    ? allDisplayData.filter(
-        (h) => h.account_id === filterAccountId && (isCashSymbol(h.symbol) || h.shares > 0),
-      )
-    : [];
+  const isUsOrHkAccountSelected =
+    selectedAccount?.market === "US" || selectedAccount?.market === "HK";
+  const activeHoldingsForSelectedAccount =
+    (isCnAccountSelected || isUsOrHkAccountSelected) && filterAccountId
+      ? allDisplayData.filter(
+          (h) => h.account_id === filterAccountId && (isCashSymbol(h.symbol) || h.shares > 0),
+        )
+      : [];
   const showCsvImportButton =
     isCnAccountSelected && !holdingsLoading && activeHoldingsForSelectedAccount.length === 0;
+  const showIbCsvImportButton =
+    isUsOrHkAccountSelected && !holdingsLoading && activeHoldingsForSelectedAccount.length === 0;
 
   // Extract unique (symbol, market) pairs from the visible holdings for
   // targeted refresh – only these symbols will be force-refreshed from the API.
@@ -574,6 +581,14 @@ export default function HoldingsPage() {
             <Button
               icon={<UploadOutlined />}
               onClick={() => setHoldingCsvImportModalOpen(true)}
+            >
+              从CSV导入
+            </Button>
+          )}
+          {showIbCsvImportButton && (
+            <Button
+              icon={<UploadOutlined />}
+              onClick={() => setHoldingIbCsvImportModalOpen(true)}
             >
               从CSV导入
             </Button>
@@ -895,7 +910,7 @@ export default function HoldingsPage() {
         />
       </Modal>
 
-      {/* Import Holdings from CSV Modal */}
+      {/* Import Holdings from CSV Modal (CN) */}
       {selectedAccount && (
         <ImportHoldingFromCsvModal
           open={holdingCsvImportModalOpen}
@@ -903,6 +918,19 @@ export default function HoldingsPage() {
           onClose={() => setHoldingCsvImportModalOpen(false)}
           onImported={() => {
             setHoldingCsvImportModalOpen(false);
+            fetchHoldings();
+          }}
+        />
+      )}
+
+      {/* Import Holdings from IB CSV Modal (US / HK) */}
+      {selectedAccount && (
+        <ImportHoldingFromIbCsvModal
+          open={holdingIbCsvImportModalOpen}
+          account={selectedAccount}
+          onClose={() => setHoldingIbCsvImportModalOpen(false)}
+          onImported={() => {
+            setHoldingIbCsvImportModalOpen(false);
             fetchHoldings();
           }}
         />

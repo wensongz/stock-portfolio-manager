@@ -21,6 +21,7 @@ import { PlusOutlined, ReloadOutlined, SyncOutlined, FilterOutlined, DollarOutli
 import ImportHoldingFromCsvModal from "./ImportHoldingFromCsvModal";
 import ImportHoldingFromIbCsvModal from "./ImportHoldingFromIbCsvModal";
 import ImportHoldingFromMoomooCsvModal from "./ImportHoldingFromMoomooCsvModal";
+import ImportHoldingFromFirstradeCsvModal from "./ImportHoldingFromFirstradeCsvModal";
 import { invoke } from "@tauri-apps/api/core";
 import { useHoldingStore } from "../../stores/holdingStore";
 import { useAccountStore } from "../../stores/accountStore";
@@ -95,6 +96,7 @@ export default function HoldingsPage() {
   const [holdingCsvImportModalOpen, setHoldingCsvImportModalOpen] = useState(false);
   const [holdingIbCsvImportModalOpen, setHoldingIbCsvImportModalOpen] = useState(false);
   const [holdingMoomooCsvImportModalOpen, setHoldingMoomooCsvImportModalOpen] = useState(false);
+  const [holdingFirstradeCsvImportModalOpen, setHoldingFirstradeCsvImportModalOpen] = useState(false);
   const [editingHolding, setEditingHolding] = useState<Holding | null>(null);
   const [detailModalOpen, setDetailModalOpen] = useState(false);
   const [detailHolding, setDetailHolding] = useState<HoldingWithQuote | null>(null);
@@ -367,6 +369,7 @@ export default function HoldingsPage() {
   const isUsOrHkAccountSelected =
     selectedAccount?.market === "US" || selectedAccount?.market === "HK";
   const isMoomooAccount = !!selectedAccount?.name.toLowerCase().includes("moomoo");
+  const isFirstradeAccount = !!selectedAccount?.name.toLowerCase().includes("firstrade");
   const activeHoldingsForSelectedAccount =
     (isCnAccountSelected || isUsOrHkAccountSelected) && filterAccountId
       ? allDisplayData.filter(
@@ -377,8 +380,10 @@ export default function HoldingsPage() {
     isCnAccountSelected && !holdingsLoading && activeHoldingsForSelectedAccount.length === 0;
   const showMoomooCsvImportButton =
     isUsOrHkAccountSelected && isMoomooAccount && !holdingsLoading && activeHoldingsForSelectedAccount.length === 0;
+  const showFirstradeCsvImportButton =
+    isUsOrHkAccountSelected && isFirstradeAccount && !holdingsLoading && activeHoldingsForSelectedAccount.length === 0;
   const showIbCsvImportButton =
-    isUsOrHkAccountSelected && !isMoomooAccount && !holdingsLoading && activeHoldingsForSelectedAccount.length === 0;
+    isUsOrHkAccountSelected && !isMoomooAccount && !isFirstradeAccount && !holdingsLoading && activeHoldingsForSelectedAccount.length === 0;
 
   // Extract unique (symbol, market) pairs from the visible holdings for
   // targeted refresh – only these symbols will be force-refreshed from the API.
@@ -594,6 +599,14 @@ export default function HoldingsPage() {
             <Button
               icon={<UploadOutlined />}
               onClick={() => setHoldingMoomooCsvImportModalOpen(true)}
+            >
+              从CSV导入
+            </Button>
+          )}
+          {showFirstradeCsvImportButton && (
+            <Button
+              icon={<UploadOutlined />}
+              onClick={() => setHoldingFirstradeCsvImportModalOpen(true)}
             >
               从CSV导入
             </Button>
@@ -957,6 +970,19 @@ export default function HoldingsPage() {
           onClose={() => setHoldingMoomooCsvImportModalOpen(false)}
           onImported={() => {
             setHoldingMoomooCsvImportModalOpen(false);
+            fetchHoldings();
+          }}
+        />
+      )}
+
+      {/* Import Holdings from Firstrade CSV Modal (US) */}
+      {selectedAccount && (
+        <ImportHoldingFromFirstradeCsvModal
+          open={holdingFirstradeCsvImportModalOpen}
+          account={selectedAccount}
+          onClose={() => setHoldingFirstradeCsvImportModalOpen(false)}
+          onImported={() => {
+            setHoldingFirstradeCsvImportModalOpen(false);
             fetchHoldings();
           }}
         />

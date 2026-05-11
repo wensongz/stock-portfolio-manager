@@ -184,7 +184,24 @@ pub fn update_holding(
 #[tauri::command(rename_all = "camelCase")]
 pub fn delete_holding(db: State<Database>, id: String) -> Result<(), String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM holdings WHERE id = ?1", rusqlite::params![id])
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+    let result = (|| -> Result<(), String> {
+        // Delete all transactions that belong to this holding (including the
+        // initial BUY record created by create_holding).
+        conn.execute(
+            "DELETE FROM transactions WHERE holding_id = ?1",
+            rusqlite::params![id],
+        )
         .map_err(|e| e.to_string())?;
-    Ok(())
+        conn.execute("DELETE FROM holdings WHERE id = ?1", rusqlite::params![id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(|e| e.to_string()),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }

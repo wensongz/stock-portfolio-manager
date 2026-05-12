@@ -414,7 +414,7 @@ export default function HoldingsPage() {
           <strong>{symbol}</strong>
         </Space>
       ),
-      fixed: "left",
+      fixed: "left" as const,
     },
     { title: "股票名称", dataIndex: "name", key: "name", width: 120, ellipsis: true, },
     ...(!filterAccountId ? [{

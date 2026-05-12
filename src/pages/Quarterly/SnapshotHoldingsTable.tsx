@@ -138,7 +138,7 @@ export default function SnapshotHoldingsTable({ holdings, snapshotId, loading, s
       dataIndex: "symbol",
       key: "symbol",
       render: (s: string) => <Text strong>{s}</Text>,
-      fixed: "left",
+      fixed: "left" as const,
     },
     {
       title: "市场",

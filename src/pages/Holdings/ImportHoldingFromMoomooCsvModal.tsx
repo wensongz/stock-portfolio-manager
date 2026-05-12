@@ -155,7 +155,7 @@ function parseMoomooHoldingsCsv(text: string, market: Market): ParseResult {
         // Determine effective market from currency when account has mixed markets
         const effectiveMarket: Market =
           currency === "HKD" ? "HK"
-          : currency === "CNY" || currency === "CNH" ? "CN"
+          : currency === "CNY" ? "CN"
           : market === "HK" ? "US"   // HK account but USD stock → likely US-listed
           : market;
 

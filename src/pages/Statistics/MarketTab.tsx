@@ -129,6 +129,7 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
       title: "类别",
       dataIndex: "category_name",
       key: "category_name",
+      sorter: (a, b) => a.category_name.localeCompare(b.category_name),
       render: (name: string, record: AggregatedStock) => (
         <Tag color={record.category_color}>{name}</Tag>
       ),

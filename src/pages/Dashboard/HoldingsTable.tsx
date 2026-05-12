@@ -77,7 +77,6 @@ export default function HoldingsTable({ holdings, loading, hideAccountMarket = f
       title: "名称",
       dataIndex: "name",
       key: "name",
-      sorter: (a, b) => a.name.localeCompare(b.name),
       ellipsis: true,
       width: 140,
     },
@@ -107,6 +106,7 @@ export default function HoldingsTable({ holdings, loading, hideAccountMarket = f
       title: "类别",
       dataIndex: "category_name",
       key: "category_name",
+      sorter: (a, b) => a.category_name.localeCompare(b.category_name),
       render: (name: string, record: HoldingDetail) => (
         <Tag color={record.category_color}>{name}</Tag>
       ),

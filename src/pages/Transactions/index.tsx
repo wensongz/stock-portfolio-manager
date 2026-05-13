@@ -43,6 +43,12 @@ const marketCurrencyMap: Record<Market, Currency> = {
 
 const currencySymbol: Record<string, string> = { USD: "$", CNY: "¥", HKD: "HK$" };
 
+function shareInputProps(market?: Market) {
+  return market === "US"
+    ? { min: 0.000001, precision: 6, placeholder: "交易股数" }
+    : { min: 1, precision: 0, placeholder: "交易股数" };
+}
+
 // Default traded time: 1 hour after market open
 // US: 9:30 ET → 10:30 ET (use local hour 10, min 30)
 // CN: 9:30 CST → 10:30 CST (use local hour 10, min 30)
@@ -65,6 +71,7 @@ export default function TransactionsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
   const [form] = Form.useForm();
+  const selectedFormMarket = Form.useWatch("market", form) as Market | undefined;
   const [accountHoldings, setAccountHoldings] = useState<Holding[]>([]);
   const [symbolSearching, setSymbolSearching] = useState(false);
   const [filterAccountId, setFilterAccountId] = useState<string | undefined>(undefined);
@@ -497,7 +504,9 @@ export default function TransactionsPage() {
           </Form.Item>
           <Form.Item name="shares" label="交易股数"
             rules={[{ required: true, message: "请输入交易股数" }]}>
-            <InputNumber min={1} precision={0} style={{ width: "100%" }}
+            <InputNumber
+              {...shareInputProps(selectedFormMarket)}
+              style={{ width: "100%" }}
               onChange={handleAmountFieldChange} />
           </Form.Item>
           <Form.Item name="price" label="成交价格"

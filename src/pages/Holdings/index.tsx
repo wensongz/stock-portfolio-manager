@@ -66,6 +66,12 @@ const marketColors: Record<Market, string> = {
   HK: "green",
 };
 
+function shareInputProps(market?: Market) {
+  return market === "US"
+    ? { min: 0.000001, precision: 6, placeholder: "持有股数" }
+    : { min: 1, precision: 0, placeholder: "持有股数" };
+}
+
 function PnlText({ value, percent }: { value: number | null; percent: number | null }) {
   const { pnlColorDark } = usePnlColor();
   if (value === null || value === undefined) return <span>—</span>;
@@ -106,6 +112,7 @@ export default function HoldingsPage() {
   const [showCleared, setShowCleared] = useState(false);
   const [form] = Form.useForm();
   const [cashForm] = Form.useForm();
+  const selectedFormMarket = Form.useWatch("market", form) as Market | undefined;
   const [fetchingName, setFetchingName] = useState(false);
   const [filterAccountId, setFilterAccountId] = useState<string | undefined>(undefined);
   const [filterMarket, setFilterMarket] = useState<Market | undefined>(undefined);
@@ -802,7 +809,10 @@ export default function HoldingsPage() {
             label="持仓股数"
             rules={[{ required: true, message: "请输入持仓股数" }]}
           >
-            <InputNumber min={0} precision={0} style={{ width: "100%" }} placeholder="持有股数" />
+            <InputNumber
+              {...shareInputProps(selectedFormMarket)}
+              style={{ width: "100%" }}
+            />
           </Form.Item>
           <Form.Item
             name="avgCost"

@@ -24,6 +24,10 @@ import type { Account } from "../../types";
 const { Dragger } = Upload;
 const { Text } = Typography;
 
+function shareInputProps() {
+  return { min: 0.000001, precision: 6 };
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -473,8 +477,7 @@ export default function ImportFromFirstradeCsvModal({
         <InputNumber
           size="small"
           value={record.shares}
-          min={1}
-          precision={0}
+          {...shareInputProps()}
           onChange={(v) => updateRow(record.key, { shares: v ?? 1 })}
           style={{ width: 85 }}
         />

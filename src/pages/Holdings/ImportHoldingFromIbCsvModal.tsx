@@ -243,6 +243,10 @@ function isIbAccount(accountName: string): boolean {
   return /\b(ib|ibkr|interactive|盈透)\b/i.test(accountName);
 }
 
+function shareInputProps(market: Market) {
+  return market === "US" ? { min: 0.000001, precision: 6 } : { min: 1, precision: 0 };
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -472,8 +476,7 @@ export default function ImportHoldingFromIbCsvModal({
           <InputNumber
             size="small"
             value={record.shares}
-            min={0}
-            precision={0}
+            {...shareInputProps(market)}
             onChange={(v) => updateRow(record.key, "shares", v ?? 0)}
             style={{ width: "100%" }}
           />

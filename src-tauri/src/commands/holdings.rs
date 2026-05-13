@@ -2,6 +2,16 @@ use crate::db::Database;
 use crate::models::Holding;
 use tauri::State;
 
+fn validate_holding_shares(market: &str, symbol: &str, shares: f64) -> Result<(), String> {
+    if !shares.is_finite() || shares < 0.0 {
+        return Err("Holding shares must be a non-negative number".to_string());
+    }
+    if !symbol.starts_with("$CASH-") && market != "US" && shares.fract().abs() > 1e-9 {
+        return Err("Only US holdings support fractional shares; CN and HK holdings must use whole shares".to_string());
+    }
+    Ok(())
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub fn create_holding(
     db: State<Database>,
@@ -14,6 +24,8 @@ pub fn create_holding(
     avg_cost: f64,
     currency: String,
 ) -> Result<Holding, String> {
+    validate_holding_shares(&market, &symbol, shares)?;
+
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -146,6 +158,8 @@ pub fn update_holding(
     avg_cost: f64,
     currency: String,
 ) -> Result<Holding, String> {
+    validate_holding_shares(&market, &symbol, shares)?;
+
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().to_rfc3339();
     let rows_affected = conn

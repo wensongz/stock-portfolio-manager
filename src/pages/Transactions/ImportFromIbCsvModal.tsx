@@ -24,6 +24,10 @@ import type { Account, Market, Currency } from "../../types";
 const { Dragger } = Upload;
 const { Text } = Typography;
 
+function shareInputProps(market: Market) {
+  return market === "US" ? { min: 0.000001, precision: 6 } : { min: 1, precision: 0 };
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -631,8 +635,7 @@ export default function ImportFromIbCsvModal({
         <InputNumber
           size="small"
           value={record.shares}
-          min={1}
-          precision={0}
+          {...shareInputProps(market)}
           onChange={(v) => updateRow(record.key, { shares: v ?? 1 })}
           style={{ width: 85 }}
         />

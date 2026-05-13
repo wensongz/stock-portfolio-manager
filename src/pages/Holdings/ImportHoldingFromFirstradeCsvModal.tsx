@@ -23,6 +23,10 @@ import { invoke } from "@tauri-apps/api/core";
 const { Dragger } = Upload;
 const { Text, Paragraph } = Typography;
 
+function shareInputProps() {
+  return { min: 0.000001, precision: 6 };
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -371,8 +375,7 @@ export default function ImportHoldingFromFirstradeCsvModal({
           <InputNumber
             size="small"
             value={record.shares}
-            min={0}
-            precision={0}
+            {...shareInputProps()}
             onChange={(v) => updateRow(record.key, "shares", v ?? 0)}
             style={{ width: "100%" }}
           />

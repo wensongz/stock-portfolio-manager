@@ -21,6 +21,10 @@ import { useHoldingStore } from "../../stores/holdingStore";
 const { Dragger } = Upload;
 const { Text, Paragraph } = Typography;
 
+function shareInputProps(market: Market) {
+  return market === "US" ? { min: 0.000001, precision: 6 } : { min: 1, precision: 0 };
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -356,8 +360,7 @@ export default function ImportHoldingFromMoomooCsvModal({
           <InputNumber
             size="small"
             value={record.shares}
-            min={0}
-            precision={0}
+            {...shareInputProps(market)}
             onChange={(v) => updateRow(record.key, "shares", v ?? 0)}
             style={{ width: "100%" }}
           />

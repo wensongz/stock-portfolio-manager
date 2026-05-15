@@ -194,7 +194,7 @@ function parseThsCsv(text: string): EditableRow[] {
     // Skip rows without a valid 6-digit numeric code
     if (!/^\d{6}$/.test(code)) continue;
 
-    const operation = get(iOp).trim();
+    const operation = iOp !== -1 ? get(iOp).trim() : "";
     const isDividend = operation === "红股派息";
 
     const shares = parseNum(get(iShares));
@@ -209,8 +209,9 @@ function parseThsCsv(text: string): EditableRow[] {
 
     if (isDividend) {
       // Dividend: type=PAY, amount = 发生金额, no shares/price change
+      if (isNaN(happenAmt) || happenAmt === 0) continue;
       transaction_type = "PAY";
-      total_amount = isNaN(happenAmt) ? 0 : Math.abs(happenAmt);
+      total_amount = Math.abs(happenAmt);
     } else {
       total_amount = isNaN(tradeAmount) || tradeAmount === 0
         ? Math.round(Math.abs(price) * Math.abs(shares) * 100) / 100

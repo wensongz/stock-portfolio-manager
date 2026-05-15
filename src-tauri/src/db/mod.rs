@@ -334,8 +334,9 @@ fn migrate_transactions_check_constraint(conn: &Connection) -> Result<()> {
         ALTER TABLE transactions_new RENAME TO transactions;
 
         PRAGMA foreign_keys = ON;
-    ")
-}
+    ")?;
+
+    Ok(())
 
 #[cfg(test)]
 mod tests;

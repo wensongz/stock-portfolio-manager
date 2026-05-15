@@ -34,7 +34,8 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
     if (selectedCategoryId) {
       fetchCategoryStats(selectedCategoryId, baseCurrency);
     }
-  }, [selectedCategoryId, baseCurrency, fetchCategoryStats]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedCategoryId, baseCurrency]);
 
   const stats: CategoryStatistics | undefined = categoryStats[selectedCategoryId];
 

@@ -70,11 +70,16 @@ export default function StatisticsPage() {
   };
 
   useEffect(() => {
-    fetchOverview(baseCurrency);
     fetchAccounts();
     fetchCategories();
     fetchHoldings();
-  }, [fetchOverview, fetchAccounts, fetchCategories, fetchHoldings, baseCurrency]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    fetchOverview(baseCurrency);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [baseCurrency]);
 
   // Preselect first account and category
   useEffect(() => {

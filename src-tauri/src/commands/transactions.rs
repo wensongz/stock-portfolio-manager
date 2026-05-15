@@ -6,12 +6,14 @@ use tauri::State;
 /// Compute the cash delta for a transaction.
 /// BUY  → cash decreases by total_amount + commission (money leaves the account).
 /// SELL → cash increases by total_amount - commission (money enters the account).
+/// PAY  → cash increases by total_amount (dividend received).
 /// OPEN → no cash impact (initial position entry, not a real trade).
-/// Panics if `transaction_type` is not `"BUY"`, `"SELL"`, or `"OPEN"`.
+/// Panics if `transaction_type` is not `"BUY"`, `"SELL"`, `"PAY"`, or `"OPEN"`.
 pub(crate) fn cash_delta(transaction_type: &str, total_amount: f64, commission: f64) -> f64 {
     match transaction_type {
         "BUY" => -(total_amount + commission),
         "SELL" => total_amount - commission,
+        "PAY" => total_amount,
         "OPEN" => 0.0,
         other => panic!("Unexpected transaction_type for cash_delta: {}", other),
     }
@@ -110,43 +112,46 @@ pub fn create_transaction(
             holding_id = Some(new_hid);
         }
 
-        // Update holding shares and avg_cost based on transaction type
-        if let Some(ref hid) = holding_id {
-            let (current_shares, current_avg_cost): (f64, f64) = conn
-                .query_row(
-                    "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
-                    rusqlite::params![hid],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+        // Update holding shares and avg_cost based on transaction type.
+        // PAY (dividend) does not change the stock position.
+        if transaction_type != "PAY" {
+            if let Some(ref hid) = holding_id {
+                let (current_shares, current_avg_cost): (f64, f64) = conn
+                    .query_row(
+                        "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
+                        rusqlite::params![hid],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|e| e.to_string())?;
+
+                // Guard against selling more shares than currently held
+                if transaction_type == "SELL" && shares > current_shares {
+                    return Err(format!(
+                        "Cannot sell {} shares of {}: only {} shares held",
+                        shares, symbol, current_shares
+                    ));
+                }
+
+                let (new_shares, new_avg_cost) = if transaction_type == "BUY" {
+                    let total_shares = current_shares + shares;
+                    let new_avg = if total_shares > 0.0 {
+                        (current_shares * current_avg_cost + shares * price) / total_shares
+                    } else {
+                        price
+                    };
+                    (total_shares, new_avg)
+                } else {
+                    // SELL: shares decrease, avg_cost unchanged
+                    (current_shares - shares, current_avg_cost)
+                };
+
+                let updated_at = chrono::Utc::now().to_rfc3339();
+                conn.execute(
+                    "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
+                    rusqlite::params![hid, new_shares, new_avg_cost, updated_at],
                 )
                 .map_err(|e| e.to_string())?;
-
-            // Guard against selling more shares than currently held
-            if transaction_type == "SELL" && shares > current_shares {
-                return Err(format!(
-                    "Cannot sell {} shares of {}: only {} shares held",
-                    shares, symbol, current_shares
-                ));
             }
-
-            let (new_shares, new_avg_cost) = if transaction_type == "BUY" {
-                let total_shares = current_shares + shares;
-                let new_avg = if total_shares > 0.0 {
-                    (current_shares * current_avg_cost + shares * price) / total_shares
-                } else {
-                    price
-                };
-                (total_shares, new_avg)
-            } else {
-                // SELL: shares decrease, avg_cost unchanged
-                (current_shares - shares, current_avg_cost)
-            };
-
-            let updated_at = chrono::Utc::now().to_rfc3339();
-            conn.execute(
-                "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
-                rusqlite::params![hid, new_shares, new_avg_cost, updated_at],
-            )
-            .map_err(|e| e.to_string())?;
         }
 
         conn.execute(
@@ -316,44 +321,48 @@ pub fn update_transaction(
     conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
 
     let result = (|| -> Result<Option<String>, String> {
-        // 1) Reverse the old transaction's impact on its holding
-        if let Some(ref old_hid) = old_txn.holding_id {
-            let (cur_shares, cur_avg_cost): (f64, f64) = conn
-                .query_row(
-                    "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
-                    rusqlite::params![old_hid],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+        // 1) Reverse the old transaction's impact on its holding.
+        // PAY (dividend) does not affect stock position, so skip the reversal.
+        if old_txn.transaction_type != "PAY" {
+            if let Some(ref old_hid) = old_txn.holding_id {
+                let (cur_shares, cur_avg_cost): (f64, f64) = conn
+                    .query_row(
+                        "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
+                        rusqlite::params![old_hid],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|e| e.to_string())?;
+
+                let (rev_shares, rev_avg_cost) = if old_txn.transaction_type == "BUY" {
+                    // Reverse a BUY: subtract shares
+                    let new_shares = cur_shares - old_txn.shares;
+                    let new_avg = if new_shares > 0.0 {
+                        let total_cost = cur_shares * cur_avg_cost - old_txn.shares * old_txn.price;
+                        total_cost / new_shares
+                    } else {
+                        0.0
+                    };
+                    (new_shares, new_avg)
+                } else {
+                    // Reverse a SELL: add shares back, avg_cost unchanged
+                    (cur_shares + old_txn.shares, cur_avg_cost)
+                };
+
+                let updated_at = chrono::Utc::now().to_rfc3339();
+                conn.execute(
+                    "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
+                    rusqlite::params![old_hid, rev_shares, rev_avg_cost, updated_at],
                 )
                 .map_err(|e| e.to_string())?;
-
-            let (rev_shares, rev_avg_cost) = if old_txn.transaction_type == "BUY" {
-                // Reverse a BUY: subtract shares
-                let new_shares = cur_shares - old_txn.shares;
-                let new_avg = if new_shares > 0.0 {
-                    let total_cost = cur_shares * cur_avg_cost - old_txn.shares * old_txn.price;
-                    total_cost / new_shares
-                } else {
-                    0.0
-                };
-                (new_shares, new_avg)
-            } else {
-                // Reverse a SELL: add shares back, avg_cost unchanged
-                (cur_shares + old_txn.shares, cur_avg_cost)
-            };
-
-            let updated_at = chrono::Utc::now().to_rfc3339();
-            conn.execute(
-                "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
-                rusqlite::params![old_hid, rev_shares, rev_avg_cost, updated_at],
-            )
-            .map_err(|e| e.to_string())?;
+            }
         }
 
         // Reverse the old transaction's cash impact
         let old_cash_delta = cash_delta(&old_txn.transaction_type, old_txn.total_amount, old_txn.commission);
         adjust_cash_holding(&conn, &old_txn.account_id, &old_txn.currency, &old_txn.market, -old_cash_delta)?;
 
-        // 2) Apply the new transaction's impact on its holding
+        // 2) Apply the new transaction's impact on its holding.
+        // PAY (dividend) does not affect stock position.
         let holding_id: Option<String> = conn
             .query_row(
                 "SELECT id FROM holdings WHERE account_id = ?1 AND symbol = ?2",
@@ -362,40 +371,42 @@ pub fn update_transaction(
             )
             .ok();
 
-        if let Some(ref hid) = holding_id {
-            let (cur_shares, cur_avg_cost): (f64, f64) = conn
-                .query_row(
-                    "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
-                    rusqlite::params![hid],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+        if transaction_type != "PAY" {
+            if let Some(ref hid) = holding_id {
+                let (cur_shares, cur_avg_cost): (f64, f64) = conn
+                    .query_row(
+                        "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
+                        rusqlite::params![hid],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|e| e.to_string())?;
+
+                if transaction_type == "SELL" && shares > cur_shares {
+                    return Err(format!(
+                        "Cannot sell {} shares of {}: only {} shares held",
+                        shares, symbol, cur_shares
+                    ));
+                }
+
+                let (new_shares, new_avg_cost) = if transaction_type == "BUY" {
+                    let total_shares = cur_shares + shares;
+                    let new_avg = if total_shares > 0.0 {
+                        (cur_shares * cur_avg_cost + shares * price) / total_shares
+                    } else {
+                        price
+                    };
+                    (total_shares, new_avg)
+                } else {
+                    (cur_shares - shares, cur_avg_cost)
+                };
+
+                let updated_at = chrono::Utc::now().to_rfc3339();
+                conn.execute(
+                    "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
+                    rusqlite::params![hid, new_shares, new_avg_cost, updated_at],
                 )
                 .map_err(|e| e.to_string())?;
-
-            if transaction_type == "SELL" && shares > cur_shares {
-                return Err(format!(
-                    "Cannot sell {} shares of {}: only {} shares held",
-                    shares, symbol, cur_shares
-                ));
             }
-
-            let (new_shares, new_avg_cost) = if transaction_type == "BUY" {
-                let total_shares = cur_shares + shares;
-                let new_avg = if total_shares > 0.0 {
-                    (cur_shares * cur_avg_cost + shares * price) / total_shares
-                } else {
-                    price
-                };
-                (total_shares, new_avg)
-            } else {
-                (cur_shares - shares, cur_avg_cost)
-            };
-
-            let updated_at = chrono::Utc::now().to_rfc3339();
-            conn.execute(
-                "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
-                rusqlite::params![hid, new_shares, new_avg_cost, updated_at],
-            )
-            .map_err(|e| e.to_string())?;
         }
 
         // Apply the new transaction's cash impact

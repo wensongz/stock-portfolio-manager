@@ -31,7 +31,7 @@ const { Text, Paragraph } = Typography;
 interface EditableRow {
   key: string;
   selected: boolean;
-  transaction_type: string; // "BUY" | "SELL"
+  transaction_type: string; // "BUY" | "SELL" | "PAY"
   symbol: string;
   stock_name: string;
   traded_at: string; // ISO-8601
@@ -165,6 +165,7 @@ function parseThsCsv(text: string): EditableRow[] {
   const iTime = col("成交时间");
   const iCode = col("证券代码");
   const iName = col("证券名称");
+  const iOp = col("操作");
   const iExchange = col("交易所名称") !== -1 ? col("交易所名称") : col("交易市场");
   const iPrice = col("成交价格") !== -1 ? col("成交价格") : col("成交均价");
   const iShares = col("成交数量");
@@ -193,16 +194,31 @@ function parseThsCsv(text: string): EditableRow[] {
     // Skip rows without a valid 6-digit numeric code
     if (!/^\d{6}$/.test(code)) continue;
 
+    const operation = get(iOp).trim();
+    const isDividend = operation === "红股派息";
+
     const shares = parseNum(get(iShares));
-    if (isNaN(shares) || shares === 0) continue;
+    if (!isDividend && (isNaN(shares) || shares === 0)) continue;
 
     const price = parseNum(get(iPrice));
     const tradeAmount = parseNum(get(iAmount));
     const happenAmt = parseNum(get(iHappen));
 
-    const total_amount = isNaN(tradeAmount) || tradeAmount === 0
-      ? Math.round(Math.abs(price) * Math.abs(shares) * 100) / 100
-      : Math.abs(tradeAmount);
+    let transaction_type: string;
+    let total_amount: number;
+
+    if (isDividend) {
+      // Dividend: type=PAY, amount = 发生金额, no shares/price change
+      transaction_type = "PAY";
+      total_amount = isNaN(happenAmt) ? 0 : Math.abs(happenAmt);
+    } else {
+      total_amount = isNaN(tradeAmount) || tradeAmount === 0
+        ? Math.round(Math.abs(price) * Math.abs(shares) * 100) / 100
+        : Math.abs(tradeAmount);
+
+      // Transaction type from 发生金额 sign
+      transaction_type = !isNaN(happenAmt) && happenAmt > 0 ? "SELL" : "BUY";
+    }
 
     // Commission = sum of the four fee columns
     const commission = Math.round(
@@ -213,10 +229,6 @@ function parseThsCsv(text: string): EditableRow[] {
         (isNaN(parseNum(get(iTransfer))) ? 0 : Math.abs(parseNum(get(iTransfer))))
       ) * 100
     ) / 100;
-
-    // Transaction type from 发生金额 sign
-    const transaction_type =
-      !isNaN(happenAmt) && happenAmt > 0 ? "SELL" : "BUY";
 
     const exchange = get(iExchange);
     const symbol = deriveSymbol(code, exchange);
@@ -233,8 +245,8 @@ function parseThsCsv(text: string): EditableRow[] {
       symbol,
       stock_name: stock_name || symbol,
       traded_at,
-      price: Math.abs(price),
-      shares: Math.abs(shares),
+      price: isDividend ? 0 : Math.abs(price),
+      shares: isDividend ? 0 : Math.abs(shares),
       total_amount,
       commission,
     });
@@ -451,6 +463,9 @@ export default function ImportFromThsCsvModal({
           <Select.Option value="SELL">
             <Tag color="red">卖出</Tag>
           </Select.Option>
+          <Select.Option value="PAY">
+            <Tag color="orange">分红</Tag>
+          </Select.Option>
         </Select>
       ),
     },
@@ -521,9 +536,9 @@ export default function ImportFromThsCsvModal({
         <InputNumber
           size="small"
           value={record.shares}
-          min={1}
+          min={0}
           precision={0}
-          onChange={(v) => updateRow(record.key, { shares: v ?? 1 })}
+          onChange={(v) => updateRow(record.key, { shares: v ?? 0 })}
           style={{ width: 85 }}
         />
       ),

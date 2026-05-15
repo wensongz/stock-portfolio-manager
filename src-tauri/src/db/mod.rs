@@ -67,7 +67,7 @@ impl Database {
                 symbol TEXT NOT NULL,
                 name TEXT NOT NULL,
                 market TEXT NOT NULL CHECK(market IN ('US', 'CN', 'HK')),
-                transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL')),
+                transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'OPEN', 'PAY')),
                 shares REAL NOT NULL,
                 price REAL NOT NULL,
                 total_amount REAL NOT NULL,
@@ -287,8 +287,54 @@ impl Database {
             );
         ")?;
 
+        migrate_transactions_check_constraint(&conn)?;
+
         Ok(())
     }
+}
+
+fn migrate_transactions_check_constraint(conn: &Connection) -> Result<()> {
+    // Check if the transactions table already has 'PAY' in its CHECK constraint.
+    // If not, recreate the table with the updated constraint.
+    let schema: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+
+    if schema.contains("'PAY'") {
+        return Ok(());
+    }
+
+    conn.execute_batch("
+        PRAGMA foreign_keys = OFF;
+
+        CREATE TABLE transactions_new (
+            id TEXT PRIMARY KEY NOT NULL,
+            holding_id TEXT REFERENCES holdings(id) ON DELETE SET NULL,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            symbol TEXT NOT NULL,
+            name TEXT NOT NULL,
+            market TEXT NOT NULL CHECK(market IN ('US', 'CN', 'HK')),
+            transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'OPEN', 'PAY')),
+            shares REAL NOT NULL,
+            price REAL NOT NULL,
+            total_amount REAL NOT NULL,
+            commission REAL NOT NULL DEFAULT 0,
+            currency TEXT NOT NULL CHECK(currency IN ('USD', 'CNY', 'HKD')),
+            traded_at TEXT NOT NULL,
+            notes TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        INSERT INTO transactions_new SELECT * FROM transactions;
+        DROP TABLE transactions;
+        ALTER TABLE transactions_new RENAME TO transactions;
+
+        PRAGMA foreign_keys = ON;
+    ")
 }
 
 #[cfg(test)]

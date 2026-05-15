@@ -17,7 +17,9 @@ pub async fn get_statistics_overview(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
     quote_cache: State<'_, QuoteCache>,
+    base_currency: Option<String>,
 ) -> Result<StatisticsOverview, String> {
+    let base = base_currency.unwrap_or_else(|| "USD".to_string());
     let rates = get_cached_rates(&cache, &db).await.unwrap_or_else(|_| crate::models::ExchangeRates {
         usd_cny: 7.2,
         usd_hkd: 7.8,
@@ -27,7 +29,7 @@ pub async fn get_statistics_overview(
 
     let details = build_holding_details_pub(&db, &quote_cache, true).await?;
 
-    // Aggregate market distribution (values in USD for comparison)
+    // Aggregate distribution values in the requested base currency
     let mut market_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     let mut category_map: std::collections::HashMap<(String, Option<String>), f64> = std::collections::HashMap::new();
     let mut account_map: std::collections::HashMap<(String, String), f64> = std::collections::HashMap::new();
@@ -37,22 +39,22 @@ pub async fn get_statistics_overview(
     let mut total_cost = 0.0f64;
 
     for d in &details {
-        let mv_usd = to_usd_value(d.market_value, &d.currency, &rates);
-        let cv_usd = to_usd_value(d.cost_value, &d.currency, &rates);
+        let mv_base = convert_currency(d.market_value, &d.currency, &base, &rates);
+        let cv_base = convert_currency(d.cost_value, &d.currency, &base, &rates);
 
-        *market_map.entry(d.market.clone()).or_insert(0.0) += mv_usd;
+        *market_map.entry(d.market.clone()).or_insert(0.0) += mv_base;
         *category_map
             .entry((d.category_name.clone(), Some(d.category_color.clone())))
-            .or_insert(0.0) += mv_usd;
+            .or_insert(0.0) += mv_base;
         *account_map
             .entry((d.account_id.clone(), d.account_name.clone()))
-            .or_insert(0.0) += mv_usd;
+            .or_insert(0.0) += mv_base;
         *stock_map
             .entry(format!("{} {}", d.symbol, d.name))
-            .or_insert(0.0) += mv_usd;
+            .or_insert(0.0) += mv_base;
 
-        total_market_value += mv_usd;
-        total_cost += cv_usd;
+        total_market_value += mv_base;
+        total_cost += cv_base;
     }
 
     let market_label = |m: &str| match m {
@@ -98,43 +100,43 @@ pub async fn get_statistics_overview(
         .collect();
     stock_distribution.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Top gainers/losers: aggregate by symbol in USD so a stock held across
+    // Top gainers/losers: aggregate by symbol in base currency so a stock held across
     // multiple accounts/currencies counts as a single entry.
     struct SymbolAgg {
         name: String,
-        pnl_usd: f64,
-        cost_usd: f64,
-        market_value_usd: f64,
+        pnl_base: f64,
+        cost_base: f64,
+        market_value_base: f64,
     }
     let mut symbol_map: std::collections::HashMap<String, SymbolAgg> = std::collections::HashMap::new();
     for d in &details {
-        let pnl_usd = to_usd_value(d.pnl, &d.currency, &rates);
-        let cv_usd = to_usd_value(d.cost_value, &d.currency, &rates);
-        let mv_usd = to_usd_value(d.market_value, &d.currency, &rates);
+        let pnl_base = convert_currency(d.pnl, &d.currency, &base, &rates);
+        let cv_base = convert_currency(d.cost_value, &d.currency, &base, &rates);
+        let mv_base = convert_currency(d.market_value, &d.currency, &base, &rates);
         let entry = symbol_map.entry(d.symbol.clone()).or_insert_with(|| SymbolAgg {
             name: d.name.clone(),
-            pnl_usd: 0.0,
-            cost_usd: 0.0,
-            market_value_usd: 0.0,
+            pnl_base: 0.0,
+            cost_base: 0.0,
+            market_value_base: 0.0,
         });
-        entry.pnl_usd += pnl_usd;
-        entry.cost_usd += cv_usd;
-        entry.market_value_usd += mv_usd;
+        entry.pnl_base += pnl_base;
+        entry.cost_base += cv_base;
+        entry.market_value_base += mv_base;
     }
     let mut pnl_items: Vec<PnlItem> = symbol_map
         .into_iter()
         .map(|(symbol, agg)| {
-            let pnl_percent = if agg.cost_usd != 0.0 {
-                agg.pnl_usd / agg.cost_usd * 100.0
+            let pnl_percent = if agg.cost_base != 0.0 {
+                agg.pnl_base / agg.cost_base * 100.0
             } else {
                 0.0
             };
             PnlItem {
                 symbol,
                 name: agg.name,
-                pnl: agg.pnl_usd,
+                pnl: agg.pnl_base,
                 pnl_percent,
-                market_value: agg.market_value_usd,
+                market_value: agg.market_value_base,
             }
         })
         .collect();
@@ -316,7 +318,9 @@ pub async fn get_statistics_by_category(
     cache: State<'_, ExchangeRateCache>,
     quote_cache: State<'_, QuoteCache>,
     category_id: String,
+    base_currency: Option<String>,
 ) -> Result<CategoryStatistics, String> {
+    let base = base_currency.unwrap_or_else(|| "USD".to_string());
     let rates = get_cached_rates(&cache, &db).await.unwrap_or_else(|_| crate::models::ExchangeRates {
         usd_cny: 7.2,
         usd_hkd: 7.8,
@@ -364,8 +368,8 @@ pub async fn get_statistics_by_category(
     let mut total_cost = 0.0f64;
 
     for d in &details {
-        let mv_usd = to_usd_value(d.market_value, &d.currency, &rates);
-        let cv_usd = to_usd_value(d.cost_value, &d.currency, &rates);
+        let mv_base = convert_currency(d.market_value, &d.currency, &base, &rates);
+        let cv_base = convert_currency(d.cost_value, &d.currency, &base, &rates);
 
         let market_label = match d.market.as_str() {
             "US" => "🇺🇸 美股",
@@ -373,10 +377,10 @@ pub async fn get_statistics_by_category(
             "HK" => "🇭🇰 港股",
             _ => d.market.as_str(),
         };
-        *market_map.entry(market_label.to_string()).or_insert(0.0) += mv_usd;
+        *market_map.entry(market_label.to_string()).or_insert(0.0) += mv_base;
 
-        total_market_value += mv_usd;
-        total_cost += cv_usd;
+        total_market_value += mv_base;
+        total_cost += cv_base;
     }
 
     let mut market_distribution: Vec<PieSlice> = market_map

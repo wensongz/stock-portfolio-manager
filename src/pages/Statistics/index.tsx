@@ -1,24 +1,35 @@
-import { useState, useEffect } from "react";
-import { Typography, Tabs, Button } from "antd";
+import { useState, useEffect, useMemo } from "react";
+import { Typography, Tabs, Button, Select } from "antd";
 import { ReloadOutlined } from "@ant-design/icons";
 import { useStatisticsStore } from "../../stores/dashboardStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { useCategoryStore } from "../../stores/categoryStore";
 import { useHoldingStore } from "../../stores/holdingStore";
 import { useQuoteStore } from "../../stores/quoteStore";
+import { useExchangeRateStore } from "../../stores/exchangeRateStore";
+import type { Currency, Market } from "../../types";
 import OverviewTab from "./OverviewTab";
 import MarketTab from "./MarketTab";
 import AccountTab from "./AccountTab";
 import CategoryTab from "./CategoryTab";
 
-const { Title } = Typography;
+const { Title, Text } = Typography;
+
+const MARKET_STORAGE_KEY = "statistics_selected_market";
+const VALID_MARKETS = ["US", "CN", "HK"];
+
+function loadSelectedMarket(): string | null {
+  const stored = localStorage.getItem(MARKET_STORAGE_KEY);
+  return stored && VALID_MARKETS.includes(stored) ? stored : null;
+}
 
 export default function StatisticsPage() {
   const [activeTab, setActiveTab] = useState("overview");
-  const [selectedMarket, setSelectedMarket] = useState("US");
   const [selectedAccountId, setSelectedAccountId] = useState("");
   const [selectedCategoryId, setSelectedCategoryId] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+
+  const { baseCurrency, setBaseCurrency } = useExchangeRateStore();
 
   const {
     overview, loadingOverview,
@@ -29,12 +40,41 @@ export default function StatisticsPage() {
   const { holdings, fetchHoldings } = useHoldingStore();
   const { fetchHoldingQuotes } = useQuoteStore();
 
+  // Derive available markets from holdings
+  const availableMarkets = useMemo(() => {
+    const marketSet = new Set(holdings.map((h) => h.market));
+    return VALID_MARKETS.filter((m) => marketSet.has(m as Market));
+  }, [holdings]);
+
+  // Determine the initial selected market: prefer saved value, then first market with holdings
+  const [selectedMarket, setSelectedMarket] = useState<string>(() => {
+    return loadSelectedMarket() ?? "CN";
+  });
+
+  // Once holdings are loaded, if no saved preference exists, pick the first available market
   useEffect(() => {
-    fetchOverview();
+    if (availableMarkets.length > 0 && !loadSelectedMarket()) {
+      setSelectedMarket(availableMarkets[0]);
+    }
+  }, [availableMarkets]);
+
+  const handleMarketChange = (market: string) => {
+    localStorage.setItem(MARKET_STORAGE_KEY, market);
+    setSelectedMarket(market);
+  };
+
+  const handleCurrencyChange = (currency: Currency) => {
+    setBaseCurrency(currency);
+    fetchOverview(currency);
+    if (selectedCategoryId) fetchCategoryStats(selectedCategoryId, currency);
+  };
+
+  useEffect(() => {
+    fetchOverview(baseCurrency);
     fetchAccounts();
     fetchCategories();
     fetchHoldings();
-  }, [fetchOverview, fetchAccounts, fetchCategories, fetchHoldings]);
+  }, [fetchOverview, fetchAccounts, fetchCategories, fetchHoldings, baseCurrency]);
 
   // Preselect first account and category
   useEffect(() => {
@@ -70,10 +110,10 @@ export default function StatisticsPage() {
       }
       // Re-fetch all statistics data using the now-fresh cache.
       // Since the backend reads from cache only, these are fast.
-      const promises: Promise<void>[] = [fetchOverview()];
+      const promises: Promise<void>[] = [fetchOverview(baseCurrency)];
       promises.push(fetchMarketStats(selectedMarket));
       if (selectedAccountId) promises.push(fetchAccountStats(selectedAccountId));
-      if (selectedCategoryId) promises.push(fetchCategoryStats(selectedCategoryId));
+      if (selectedCategoryId) promises.push(fetchCategoryStats(selectedCategoryId, baseCurrency));
       await Promise.all(promises);
     } finally {
       setRefreshing(false);
@@ -84,7 +124,7 @@ export default function StatisticsPage() {
     {
       key: "overview",
       label: "整体统计",
-      children: <OverviewTab overview={overview} loading={loadingOverview} />,
+      children: <OverviewTab overview={overview} loading={loadingOverview} baseCurrency={baseCurrency} />,
     },
     {
       key: "market",
@@ -92,7 +132,7 @@ export default function StatisticsPage() {
       children: (
         <MarketTab
           selectedMarket={selectedMarket}
-          onMarketChange={setSelectedMarket}
+          onMarketChange={handleMarketChange}
         />
       ),
     },
@@ -113,6 +153,7 @@ export default function StatisticsPage() {
         <CategoryTab
           selectedCategoryId={selectedCategoryId}
           onCategoryChange={setSelectedCategoryId}
+          baseCurrency={baseCurrency}
         />
       ),
     },
@@ -124,14 +165,27 @@ export default function StatisticsPage() {
         <Title level={2} className="!mb-0">
           📈 统计分析
         </Title>
-        <Button
-          icon={<ReloadOutlined />}
-          onClick={handleRefresh}
-          loading={refreshing || loadingOverview}
-          size="small"
-        >
-          刷新
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            icon={<ReloadOutlined />}
+            onClick={handleRefresh}
+            loading={refreshing || loadingOverview}
+            size="small"
+          >
+            刷新
+          </Button>
+          <Text type="secondary">基准货币:</Text>
+          <Select
+            value={baseCurrency}
+            onChange={handleCurrencyChange}
+            size="small"
+            style={{ width: 120 }}
+          >
+            <Select.Option value="USD">USD 美元</Select.Option>
+            <Select.Option value="CNY">CNY 人民币</Select.Option>
+            <Select.Option value="HKD">HKD 港元</Select.Option>
+          </Select>
+        </div>
       </div>
 
       <Tabs

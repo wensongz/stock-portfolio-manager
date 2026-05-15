@@ -2,15 +2,25 @@ import { Row, Col, Card, Statistic, Spin, Empty } from "antd";
 import PieChart from "../../components/charts/PieChart";
 import BarChart from "../../components/charts/BarChart";
 import type { StatisticsOverview } from "../../types";
+import type { Currency } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
+
+const currencySymbol: Record<string, string> = {
+  USD: "$",
+  CNY: "¥",
+  HKD: "HK$",
+};
 
 interface Props {
   overview: StatisticsOverview | null;
   loading: boolean;
+  baseCurrency: Currency;
 }
 
-export default function OverviewTab({ overview, loading }: Props) {
+export default function OverviewTab({ overview, loading, baseCurrency }: Props) {
   const { pnlColor } = usePnlColor();
+  const symbol = currencySymbol[baseCurrency] ?? "$";
+
   if (loading && !overview) {
     return (
       <div className="flex justify-center py-16">
@@ -40,28 +50,28 @@ export default function OverviewTab({ overview, loading }: Props) {
         <Col xs={24} sm={8}>
           <Card>
             <Statistic
-              title="总市值 (USD)"
+              title={`总市值 (${baseCurrency})`}
               value={overview.total_market_value.toFixed(2)}
-              prefix="$"
+              prefix={symbol}
             />
           </Card>
         </Col>
         <Col xs={24} sm={8}>
           <Card>
             <Statistic
-              title="总成本 (USD)"
+              title={`总成本 (${baseCurrency})`}
               value={overview.total_cost.toFixed(2)}
-              prefix="$"
+              prefix={symbol}
             />
           </Card>
         </Col>
         <Col xs={24} sm={8}>
           <Card>
             <Statistic
-              title="总盈亏 (USD)"
+              title={`总盈亏 (${baseCurrency})`}
               value={`${totalPnlPos ? "+" : ""}${overview.total_pnl.toFixed(2)}`}
               valueStyle={{ color: pnlColor(overview.total_pnl) }}
-              prefix="$"
+              prefix={symbol}
               suffix={`(${totalPnlPos ? "+" : ""}${overview.total_pnl_percent.toFixed(2)}%)`}
             />
           </Card>
@@ -72,17 +82,17 @@ export default function OverviewTab({ overview, loading }: Props) {
       <Row gutter={[16, 16]}>
         <Col xs={24} md={8}>
           <Card title="市场分布">
-            <PieChart data={overview.market_distribution} height={260} />
+            <PieChart data={overview.market_distribution} height={260} currencyCode={baseCurrency} />
           </Card>
         </Col>
         <Col xs={24} md={8}>
           <Card title="类别分布">
-            <PieChart data={overview.category_distribution} height={260} />
+            <PieChart data={overview.category_distribution} height={260} currencyCode={baseCurrency} />
           </Card>
         </Col>
         <Col xs={24} md={8}>
           <Card title="账户分布">
-            <PieChart data={overview.account_distribution} height={260} />
+            <PieChart data={overview.account_distribution} height={260} currencyCode={baseCurrency} />
           </Card>
         </Col>
       </Row>
@@ -92,7 +102,7 @@ export default function OverviewTab({ overview, loading }: Props) {
         <Row gutter={[16, 16]} className="mt-4">
           <Col xs={24}>
             <Card title="个股分布">
-              <PieChart data={overview.stock_distribution} height={360} />
+              <PieChart data={overview.stock_distribution} height={360} currencyCode={baseCurrency} />
             </Card>
           </Col>
         </Row>

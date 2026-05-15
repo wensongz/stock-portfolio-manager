@@ -27,10 +27,10 @@ interface StatisticsState {
   categoryStats: Record<string, CategoryStatistics>;
   loadingOverview: boolean;
   errorOverview: string | null;
-  fetchOverview: () => Promise<void>;
+  fetchOverview: (baseCurrency?: string) => Promise<void>;
   fetchMarketStats: (market: string) => Promise<void>;
   fetchAccountStats: (accountId: string) => Promise<void>;
-  fetchCategoryStats: (categoryId: string) => Promise<void>;
+  fetchCategoryStats: (categoryId: string, baseCurrency?: string) => Promise<void>;
 }
 
 export const useDashboardStore = create<DashboardState>((set) => ({
@@ -72,10 +72,12 @@ export const useStatisticsStore = create<StatisticsState>((set) => ({
   loadingOverview: false,
   errorOverview: null,
 
-  fetchOverview: async () => {
+  fetchOverview: async (baseCurrency?: string) => {
     set({ loadingOverview: true, errorOverview: null });
     try {
-      const overview = await invoke<StatisticsOverview>("get_statistics_overview");
+      const overview = await invoke<StatisticsOverview>("get_statistics_overview", {
+        baseCurrency: baseCurrency ?? null,
+      });
       set({ overview, loadingOverview: false });
     } catch (err) {
       set({ errorOverview: String(err), loadingOverview: false });
@@ -100,9 +102,12 @@ export const useStatisticsStore = create<StatisticsState>((set) => ({
     }
   },
 
-  fetchCategoryStats: async (categoryId: string) => {
+  fetchCategoryStats: async (categoryId: string, baseCurrency?: string) => {
     try {
-      const stats = await invoke<CategoryStatistics>("get_statistics_by_category", { categoryId });
+      const stats = await invoke<CategoryStatistics>("get_statistics_by_category", {
+        categoryId,
+        baseCurrency: baseCurrency ?? null,
+      });
       set((state) => ({ categoryStats: { ...state.categoryStats, [categoryId]: stats } }));
     } catch (err) {
       console.error("fetchCategoryStats error:", err);

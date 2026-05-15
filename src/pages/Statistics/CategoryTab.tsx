@@ -5,17 +5,26 @@ import HoldingsTable from "../Dashboard/HoldingsTable";
 import { useStatisticsStore } from "../../stores/dashboardStore";
 import { useCategoryStore } from "../../stores/categoryStore";
 import type { CategoryStatistics } from "../../types";
+import type { Currency } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
+
+const currencySymbol: Record<string, string> = {
+  USD: "$",
+  CNY: "¥",
+  HKD: "HK$",
+};
 
 interface Props {
   selectedCategoryId: string;
   onCategoryChange: (id: string) => void;
+  baseCurrency: Currency;
 }
 
-export default function CategoryTab({ selectedCategoryId, onCategoryChange }: Props) {
+export default function CategoryTab({ selectedCategoryId, onCategoryChange, baseCurrency }: Props) {
   const { pnlColor } = usePnlColor();
   const { categoryStats, fetchCategoryStats } = useStatisticsStore();
   const { categories, fetchCategories } = useCategoryStore();
+  const symbol = currencySymbol[baseCurrency] ?? "$";
 
   useEffect(() => {
     fetchCategories();
@@ -23,9 +32,9 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange }: Pr
 
   useEffect(() => {
     if (selectedCategoryId) {
-      fetchCategoryStats(selectedCategoryId);
+      fetchCategoryStats(selectedCategoryId, baseCurrency);
     }
-  }, [selectedCategoryId, fetchCategoryStats]);
+  }, [selectedCategoryId, baseCurrency, fetchCategoryStats]);
 
   const stats: CategoryStatistics | undefined = categoryStats[selectedCategoryId];
 
@@ -62,21 +71,21 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange }: Pr
           <Row gutter={[16, 16]} className="mb-4">
             <Col xs={24} sm={8}>
               <Card>
-                <Statistic title="类别总市值 (USD)" value={stats.total_market_value.toFixed(2)} prefix="$" />
+                <Statistic title={`类别总市值 (${baseCurrency})`} value={stats.total_market_value.toFixed(2)} prefix={symbol} />
               </Card>
             </Col>
             <Col xs={24} sm={8}>
               <Card>
-                <Statistic title="类别总成本 (USD)" value={stats.total_cost.toFixed(2)} prefix="$" />
+                <Statistic title={`类别总成本 (${baseCurrency})`} value={stats.total_cost.toFixed(2)} prefix={symbol} />
               </Card>
             </Col>
             <Col xs={24} sm={8}>
               <Card>
                 <Statistic
-                  title="类别总盈亏 (USD)"
+                  title={`类别总盈亏 (${baseCurrency})`}
                   value={`${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl.toFixed(2)}`}
                   valueStyle={{ color: pnlColor(stats.total_pnl) }}
-                  prefix="$"
+                  prefix={symbol}
                   suffix={`(${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl_percent.toFixed(2)}%)`}
                 />
               </Card>
@@ -87,7 +96,7 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange }: Pr
             <Row gutter={[16, 16]} className="mb-4">
               <Col xs={24} md={12}>
                 <Card title="市场分布">
-                  <PieChart data={stats.market_distribution} height={260} />
+                  <PieChart data={stats.market_distribution} height={260} currencyCode={baseCurrency} />
                 </Card>
               </Col>
             </Row>

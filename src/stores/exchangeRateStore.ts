@@ -13,9 +13,17 @@ interface ExchangeRateState {
   convertWithCachedRates: (amount: number, from: Currency, to: Currency) => number;
 }
 
+const BASE_CURRENCY_STORAGE_KEY = "base_currency";
+const VALID_CURRENCIES: Currency[] = ["USD", "CNY", "HKD"];
+
+function loadBaseCurrency(): Currency {
+  const stored = localStorage.getItem(BASE_CURRENCY_STORAGE_KEY);
+  return VALID_CURRENCIES.includes(stored as Currency) ? (stored as Currency) : "USD";
+}
+
 export const useExchangeRateStore = create<ExchangeRateState>((set, get) => ({
   rates: null,
-  baseCurrency: "USD",
+  baseCurrency: loadBaseCurrency(),
   loading: false,
   error: null,
 
@@ -42,6 +50,7 @@ export const useExchangeRateStore = create<ExchangeRateState>((set, get) => ({
   },
 
   setBaseCurrency: (currency: Currency) => {
+    localStorage.setItem(BASE_CURRENCY_STORAGE_KEY, currency);
     set({ baseCurrency: currency });
   },
 

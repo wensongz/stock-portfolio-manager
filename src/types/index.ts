@@ -632,5 +632,11 @@ export interface QuoteProviderConfig {
   cn_provider: QuoteProvider;
   xueqiu_cookie?: string | null;
   xueqiu_u?: string | null;
+  /** A-share: adjust avg_cost on SELL and dividend. Default true. */
+  cn_adjust_sell_pay_cost?: boolean;
+  /** US stock: adjust avg_cost on SELL and dividend. Default false. */
+  us_adjust_sell_pay_cost?: boolean;
+  /** HK stock: adjust avg_cost on SELL and dividend. Default false. */
+  hk_adjust_sell_pay_cost?: boolean;
 }
 

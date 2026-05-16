@@ -164,6 +164,7 @@ pub fn run() {
             commands::transactions::get_transactions,
             commands::transactions::update_transaction,
             commands::transactions::delete_transaction,
+            commands::transactions::recalculate_holdings_cost,
             commands::quotes::get_real_time_quotes,
             commands::quotes::get_holding_quotes,
             commands::quotes::get_us_quote,

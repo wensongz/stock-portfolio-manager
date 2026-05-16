@@ -249,6 +249,20 @@ impl Database {
         // previously only had xueqiu_cookie set will need to enter their
         // u value separately via the settings UI.
 
+        // Add per-market cost adjustment setting columns (migration).
+        // CN defaults to 1 (true) because A-share investors traditionally adjust
+        // cost basis on every transaction. US and HK default to 0 (false) because
+        // those markets realise gains on SELL and dividends are taxed separately.
+        let _ = conn.execute_batch("
+            ALTER TABLE quote_provider_config ADD COLUMN cn_adjust_sell_pay_cost INTEGER NOT NULL DEFAULT 1;
+        ");
+        let _ = conn.execute_batch("
+            ALTER TABLE quote_provider_config ADD COLUMN us_adjust_sell_pay_cost INTEGER NOT NULL DEFAULT 0;
+        ");
+        let _ = conn.execute_batch("
+            ALTER TABLE quote_provider_config ADD COLUMN hk_adjust_sell_pay_cost INTEGER NOT NULL DEFAULT 0;
+        ");
+
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS ai_config (
                 id INTEGER PRIMARY KEY DEFAULT 1,

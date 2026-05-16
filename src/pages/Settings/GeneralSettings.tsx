@@ -122,58 +122,6 @@ export default function GeneralSettings() {
 
   return (
     <div className="space-y-6">
-      <Card title="盈亏配色">
-        <Form layout="vertical" style={{ maxWidth: 400 }}>
-          <Form.Item label="盈亏颜色方案">
-            <Radio.Group
-              value={colorScheme}
-              onChange={(e) => {
-                setColorScheme(e.target.value);
-                message.success("配色方案已更新");
-              }}
-            >
-              {COLOR_SCHEME_OPTIONS.map((opt) => (
-                <Radio.Button key={opt.value} value={opt.value}>
-                  {opt.label}
-                </Radio.Button>
-              ))}
-            </Radio.Group>
-          </Form.Item>
-        </Form>
-        <Paragraph type="secondary">
-          设置盈亏数值的显示颜色。红涨绿跌为A股习惯（赚钱红色、亏钱绿色），绿涨红跌为欧美习惯（赚钱绿色、亏钱红色）。
-        </Paragraph>
-      </Card>
-
-      <Card title="行情数据源设置">
-        <Form layout="vertical" style={{ maxWidth: 400 }}>
-          <Form.Item label="美股数据源">
-            <Select
-              value={providerConfig.us_provider}
-              onChange={(v) => handleProviderChange("us_provider", v)}
-              options={PROVIDER_OPTIONS_US_HK}
-            />
-          </Form.Item>
-          <Form.Item label="港股数据源">
-            <Select
-              value={providerConfig.hk_provider}
-              onChange={(v) => handleProviderChange("hk_provider", v)}
-              options={PROVIDER_OPTIONS_US_HK}
-            />
-          </Form.Item>
-          <Form.Item label="A股数据源">
-            <Select
-              value={providerConfig.cn_provider}
-              onChange={(v) => handleProviderChange("cn_provider", v)}
-              options={PROVIDER_OPTIONS_CN}
-            />
-          </Form.Item>
-        </Form>
-        <Paragraph type="secondary">
-          各市场的行情数据来源：A股支持东方财富和雪球，港股和美股支持 Yahoo Finance、东方财富和雪球。修改后将在下次刷新时生效。
-        </Paragraph>
-      </Card>
-
       {isXueqiuUsed && (
         <Card title="雪球 Cookie 设置">
           <Form layout="vertical" style={{ maxWidth: 400 }}>
@@ -210,6 +158,35 @@ export default function GeneralSettings() {
         </Card>
       )}
 
+      <Card title="行情数据源设置">
+        <Form layout="vertical" style={{ maxWidth: 400 }}>
+          <Form.Item label="美股数据源">
+            <Select
+              value={providerConfig.us_provider}
+              onChange={(v) => handleProviderChange("us_provider", v)}
+              options={PROVIDER_OPTIONS_US_HK}
+            />
+          </Form.Item>
+          <Form.Item label="港股数据源">
+            <Select
+              value={providerConfig.hk_provider}
+              onChange={(v) => handleProviderChange("hk_provider", v)}
+              options={PROVIDER_OPTIONS_US_HK}
+            />
+          </Form.Item>
+          <Form.Item label="A股数据源">
+            <Select
+              value={providerConfig.cn_provider}
+              onChange={(v) => handleProviderChange("cn_provider", v)}
+              options={PROVIDER_OPTIONS_CN}
+            />
+          </Form.Item>
+        </Form>
+        <Paragraph type="secondary">
+          各市场的行情数据来源：A股支持东方财富和雪球，港股和美股支持 Yahoo Finance、东方财富和雪球。修改后将在下次刷新时生效。
+        </Paragraph>
+      </Card>
+
       <Card title="行情刷新设置">
         <Form layout="vertical" style={{ maxWidth: 400 }}>
           <Form.Item label="自动刷新频率">
@@ -225,46 +202,63 @@ export default function GeneralSettings() {
         </Paragraph>
       </Card>
 
+      <Card title="盈亏配色">
+        <Form layout="vertical" style={{ maxWidth: 400 }}>
+          <Form.Item label="盈亏颜色方案">
+            <Radio.Group
+              value={colorScheme}
+              onChange={(e) => {
+                setColorScheme(e.target.value);
+                message.success("配色方案已更新");
+              }}
+            >
+              {COLOR_SCHEME_OPTIONS.map((opt) => (
+                <Radio.Button key={opt.value} value={opt.value}>
+                  {opt.label}
+                </Radio.Button>
+              ))}
+            </Radio.Group>
+          </Form.Item>
+        </Form>
+        <Paragraph type="secondary">
+          设置盈亏数值的显示颜色。红涨绿跌为A股习惯（赚钱红色、亏钱绿色），绿涨红跌为欧美习惯（赚钱绿色、亏钱红色）。
+        </Paragraph>
+      </Card>
+
       <Card title="持仓成本调整设置">
         <Paragraph>
           买入交易始终会更新持仓均摊成本。卖出和分红是否同步调整均摊成本，可按市场单独设置。
           更改后系统将自动从历史交易记录中重新计算所有持仓成本，请稍候。
         </Paragraph>
-        <Form layout="vertical" style={{ maxWidth: 480 }}>
-          <Form.Item>
-            <Checkbox
-              checked={providerConfig.cn_adjust_sell_pay_cost ?? true}
-              disabled={recalculating}
-              onChange={(e) =>
-                handleCostAdjustChange("cn_adjust_sell_pay_cost", e.target.checked)
-              }
-            >
-              A 股：卖出与分红同步调整持仓均摊成本（默认开启，符合 A 股券商惯例）
-            </Checkbox>
-          </Form.Item>
-          <Form.Item>
-            <Checkbox
-              checked={providerConfig.us_adjust_sell_pay_cost ?? false}
-              disabled={recalculating}
-              onChange={(e) =>
-                handleCostAdjustChange("us_adjust_sell_pay_cost", e.target.checked)
-              }
-            >
-              美股：卖出与分红同步调整持仓均摊成本（默认关闭，符合 IB 等券商惯例）
-            </Checkbox>
-          </Form.Item>
-          <Form.Item style={{ marginBottom: 0 }}>
-            <Checkbox
-              checked={providerConfig.hk_adjust_sell_pay_cost ?? false}
-              disabled={recalculating}
-              onChange={(e) =>
-                handleCostAdjustChange("hk_adjust_sell_pay_cost", e.target.checked)
-              }
-            >
-              港股：卖出与分红同步调整持仓均摊成本（默认关闭，符合 IB 等券商惯例）
-            </Checkbox>
-          </Form.Item>
-        </Form>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, maxWidth: 680 }}>
+          <Checkbox
+            checked={providerConfig.cn_adjust_sell_pay_cost ?? true}
+            disabled={recalculating}
+            onChange={(e) =>
+              handleCostAdjustChange("cn_adjust_sell_pay_cost", e.target.checked)
+            }
+          >
+            A 股：卖出与分红同步调整持仓均摊成本（默认开启，符合 A 股券商惯例）
+          </Checkbox>
+          <Checkbox
+            checked={providerConfig.us_adjust_sell_pay_cost ?? false}
+            disabled={recalculating}
+            onChange={(e) =>
+              handleCostAdjustChange("us_adjust_sell_pay_cost", e.target.checked)
+            }
+          >
+            美股：卖出与分红同步调整持仓均摊成本（默认关闭，符合 IB 等券商惯例）
+          </Checkbox>
+          <Checkbox
+            checked={providerConfig.hk_adjust_sell_pay_cost ?? false}
+            disabled={recalculating}
+            onChange={(e) =>
+              handleCostAdjustChange("hk_adjust_sell_pay_cost", e.target.checked)
+            }
+          >
+            港股：卖出与分红同步调整持仓均摊成本（默认关闭，符合 IB 等券商惯例）
+          </Checkbox>
+        </div>
         <Paragraph type="secondary" style={{ marginTop: 12 }}>
           A 股投资收益免税，国内券商通常在卖出或分红后同步调低均摊成本，方便投资者追踪实际持仓成本。
           港股和美股的卖出盈亏需缴所得税、分红需缴红利税，IB 等券商不调整成本，便于准确计算应税收益。

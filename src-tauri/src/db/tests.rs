@@ -868,7 +868,12 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Apply the SELL net-cost formula directly:
-    ///   new_avg = (shares * avg_cost - total_amount + commission) / remaining
+    ///   remaining_cost = (shares × avg_cost) - (total_amount - commission)
+    ///   new_avg = remaining_cost / remaining_shares
+    ///
+    /// `total_amount` is gross proceeds (shares_sold × price). Adding `commission`
+    /// back effectively subtracts only net proceeds from the cost basis, because
+    /// the commission paid is a trading cost that the seller does not receive.
     fn apply_sell_net_cost(shares: f64, avg_cost: f64, sold: f64, total_amount: f64, commission: f64) -> f64 {
         let remaining = shares - sold;
         if remaining > 0.0 {
@@ -879,7 +884,10 @@ mod tests {
     }
 
     /// Reverse the SELL net-cost adjustment:
-    ///   rev_avg = (cur_shares * cur_avg_cost + total_amount - commission) / new_shares
+    ///   Adds back the net proceeds (total_amount - commission) that were previously
+    ///   subtracted from the cost basis, and restores the pre-SELL share count.
+    ///   rev_avg = (cur_total_cost + net_proceeds) / (cur_shares + sold_shares)
+    ///           = (cur_shares × cur_avg_cost + total_amount - commission) / new_shares
     fn reverse_sell_net_cost(cur_shares: f64, cur_avg_cost: f64, sold: f64, total_amount: f64, commission: f64) -> f64 {
         let new_shares = cur_shares + sold;
         if new_shares > 0.0 {

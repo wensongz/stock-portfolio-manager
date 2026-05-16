@@ -124,7 +124,7 @@ export default function GeneralSettings() {
     <div className="space-y-6">
       {isXueqiuUsed && (
         <Card title="雪球 Cookie 设置">
-          <Form layout="vertical" style={{ maxWidth: 400 }}>
+          <Form layout="vertical" style={{ maxWidth: 680 }}>
             <Form.Item
               label="雪球 Cookie"
               extra="登录 xueqiu.com → F12 → Application → Cookies → 复制 xq_a_token 的值"

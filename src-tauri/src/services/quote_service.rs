@@ -412,11 +412,6 @@ pub async fn fetch_us_quote_with_provider(symbol: &str, provider: &str) -> Resul
     }
 }
 
-/// Fetch a HK stock quote using the configured provider. Appends ".HK" if not present for Yahoo.
-pub async fn fetch_hk_quote(symbol: &str) -> Result<StockQuote, String> {
-    fetch_hk_quote_with_provider(symbol, "eastmoney").await
-}
-
 /// Fetch a HK stock quote using the specified provider.
 pub async fn fetch_hk_quote_with_provider(symbol: &str, provider: &str) -> Result<StockQuote, String> {
     match provider {
@@ -434,6 +429,7 @@ pub async fn fetch_hk_quote_with_provider(symbol: &str, provider: &str) -> Resul
 }
 
 /// Fetch a CN A-share stock quote using East Money.
+#[cfg(test)]
 pub async fn fetch_cn_quote(symbol: &str) -> Result<StockQuote, String> {
     fetch_cn_quote_with_provider(symbol, "eastmoney").await
 }
@@ -1231,14 +1227,6 @@ async fn fetch_xueqiu_hk_quote(symbol: &str) -> Result<StockQuote, String> {
 
     let resp = parse_xueqiu_body(&body, symbol)?;
     parse_xueqiu_quote(symbol, "HK", resp)
-}
-
-/// Batch fetch quotes for multiple symbols with their markets.
-/// Market is "US", "CN", or "HK".
-pub async fn fetch_quotes_batch(
-    symbols: Vec<(String, String)>,
-) -> Result<Vec<StockQuote>, String> {
-    fetch_quotes_batch_with_providers(symbols, "eastmoney", "eastmoney", "eastmoney").await
 }
 
 /// Batch fetch quotes using the specified providers for US, HK and CN markets.

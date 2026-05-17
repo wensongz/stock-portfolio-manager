@@ -229,36 +229,6 @@ pub async fn take_daily_snapshot(
     Ok(())
 }
 
-/// Check if the latest market-closed day's snapshot has already been taken;
-/// if not, take it.  Uses `last_closed_market_date()` so we never attempt to
-/// snapshot a date whose closing prices are not yet available.
-pub async fn auto_snapshot_check(
-    db: &Database,
-    cache: &ExchangeRateCache,
-    quote_cache: &QuoteCache,
-) -> Result<(), String> {
-    let today = last_closed_market_date();
-    let today_str = today.format("%Y-%m-%d").to_string();
-
-    let already_taken: bool = {
-        let conn = db.conn.lock().map_err(|e| e.to_string())?;
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM daily_portfolio_values WHERE date = ?1",
-                rusqlite::params![today_str],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        count > 0
-    };
-
-    if !already_taken {
-        take_daily_snapshot(db, cache, quote_cache, today).await?;
-    }
-
-    Ok(())
-}
-
 /// Query daily portfolio values in a date range.
 pub fn get_daily_values(
     db: &Database,

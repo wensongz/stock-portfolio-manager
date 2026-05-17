@@ -9,9 +9,7 @@ use crate::services::exchange_rate_service::{
     convert_currency, get_cached_rates, ExchangeRateCache,
 };
 use crate::services::quote_provider_service;
-use crate::services::quote_service::{
-    fetch_quotes_batch_cached_with_providers, QuoteCache, CASH_SYMBOL_PREFIX,
-};
+use crate::services::quote_service::{fetch_quotes_batch_cached_with_providers, QuoteCache};
 use chrono::{Datelike, NaiveDate, Utc};
 use std::collections::HashMap;
 
@@ -576,154 +574,6 @@ pub fn delete_quarterly_snapshot(db: &Database, snapshot_id: &str) -> Result<boo
     Ok(rows > 0)
 }
 
-/// Compute portfolio positions as they stood at the close of `end_date` by
-/// replaying all transactions chronologically up to (and including) that date.
-///
-/// Cash symbols (those starting with `$CASH-`) are excluded.  The same
-/// BUY / SELL / PAY / OPEN replay logic used by `recalculate_holdings_cost`
-/// is applied here, honouring the current per-market cost-adjustment settings.
-///
-/// Returns a list of `(account_id, symbol, name, market, shares, avg_cost)`
-/// tuples for every position that has a positive share count on `end_date`.
-fn compute_holdings_at_date(
-    db: &Database,
-    end_date: NaiveDate,
-) -> Result<Vec<(String, String, String, String, f64, f64)>, String> {
-    let end_date_str = end_date.format("%Y-%m-%d").to_string();
-
-    // ── 1. Read per-market cost-adjustment settings ──────────────────────────
-    let (cn_adjust, us_adjust, hk_adjust) = {
-        let conn = db.conn.lock().map_err(|e| e.to_string())?;
-        (
-            quote_provider_service::market_adjusts_sell_pay_cost(&conn, "CN"),
-            quote_provider_service::market_adjusts_sell_pay_cost(&conn, "US"),
-            quote_provider_service::market_adjusts_sell_pay_cost(&conn, "HK"),
-        )
-    };
-
-    // ── 2. Load all non-cash transactions up to end_date, oldest first ───────
-    struct TxRow {
-        account_id: String,
-        symbol: String,
-        name: String,
-        market: String,
-        tx_type: String,
-        shares: f64,
-        price: f64,
-        total_amount: f64,
-        commission: f64,
-    }
-
-    let tx_rows: Vec<TxRow> = {
-        let conn = db.conn.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT account_id, symbol, name, market, transaction_type,
-                        shares, price, total_amount, commission
-                 FROM transactions
-                 WHERE date(traded_at) <= ?1
-                   AND symbol NOT LIKE ?2
-                 ORDER BY account_id ASC, symbol ASC, date(traded_at) ASC, created_at ASC",
-            )
-            .map_err(|e| e.to_string())?;
-        let cash_glob = format!("{}%", CASH_SYMBOL_PREFIX);
-        let rows = stmt
-            .query_map(rusqlite::params![end_date_str, cash_glob], |row| {
-                Ok(TxRow {
-                    account_id: row.get(0)?,
-                    symbol: row.get(1)?,
-                    name: row.get(2)?,
-                    market: row.get(3)?,
-                    tx_type: row.get(4)?,
-                    shares: row.get(5)?,
-                    price: row.get(6)?,
-                    total_amount: row.get(7)?,
-                    commission: row.get(8)?,
-                })
-            })
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-    };
-
-    // ── 3. Replay transactions to arrive at positions on end_date ─────────────
-    // Key: (account_id, symbol) → (name, market, shares, avg_cost)
-    let mut position_map: HashMap<(String, String), (String, String, f64, f64)> = HashMap::new();
-
-    for tx in tx_rows {
-        let adjust = match tx.market.as_str() {
-            "CN" => cn_adjust,
-            "US" => us_adjust,
-            "HK" => hk_adjust,
-            _ => true,
-        };
-
-        let key = (tx.account_id.clone(), tx.symbol.clone());
-        let entry = position_map
-            .entry(key)
-            .or_insert_with(|| (tx.name.clone(), tx.market.clone(), 0.0, 0.0));
-        // Keep the most-recent name in case it was renamed in a later transaction.
-        entry.0 = tx.name.clone();
-
-        let (cur_shares, cur_avg_cost) = (entry.2, entry.3);
-
-        let (new_shares, new_avg_cost) = match tx.tx_type.as_str() {
-            "OPEN" => {
-                // Initial position entry: set state directly.
-                (tx.shares, tx.price)
-            }
-            "BUY" => {
-                let new_total = cur_shares + tx.shares;
-                let new_avg = if new_total > 0.0 {
-                    (cur_shares * cur_avg_cost + tx.shares * tx.price + tx.commission) / new_total
-                } else {
-                    tx.price
-                };
-                (new_total, new_avg)
-            }
-            "SELL" => {
-                let remaining = cur_shares - tx.shares;
-                let new_avg = if adjust {
-                    if remaining > 0.0 {
-                        (cur_shares * cur_avg_cost - tx.total_amount + tx.commission) / remaining
-                    } else {
-                        0.0
-                    }
-                } else {
-                    cur_avg_cost
-                };
-                (remaining, new_avg)
-            }
-            "PAY" => {
-                let new_avg = if adjust && cur_shares > 0.0 {
-                    (cur_shares * cur_avg_cost - tx.total_amount) / cur_shares
-                } else {
-                    cur_avg_cost
-                };
-                (cur_shares, new_avg)
-            }
-            _ => (cur_shares, cur_avg_cost),
-        };
-
-        entry.2 = new_shares;
-        entry.3 = new_avg_cost;
-    }
-
-    // ── 4. Collect positions where shares > 0 ─────────────────────────────────
-    let mut result: Vec<(String, String, String, String, f64, f64)> = position_map
-        .into_iter()
-        .filter(|(_, (_, _, shares, _))| *shares > 1e-9)
-        .map(|((account_id, symbol), (name, market, shares, avg_cost))| {
-            (account_id, symbol, name, market, shares, avg_cost)
-        })
-        .collect();
-
-    // Sort for deterministic output: by market then symbol.
-    result.sort_by(|a, b| a.3.cmp(&b.3).then(a.1.cmp(&b.1)));
-
-    Ok(result)
-}
-
 /// Refresh a quarterly snapshot.
 ///
 /// **Current quarter**: re-syncs the full position list from the live
@@ -731,10 +581,9 @@ fn compute_holdings_at_date(
 /// shares/avg_cost) then reprices with live quotes.  Per-holding notes
 /// written by the user are preserved for symbols that still exist.
 ///
-/// **Past quarters**: recomputes positions from transaction history up to the
-/// quarter-end date (so holdings reflect what was actually held on that day),
-/// updates prices to the quarter-end closing price, and preserves any
-/// user-written per-holding notes.
+/// **Past quarters**: prices (close_price, market_value, pnl, weight) are
+/// updated to the quarter-end closing price for every existing holding row.
+/// Holdings (shares, avg_cost, symbol list) are never modified.
 pub async fn refresh_quarterly_snapshot(
     db: &Database,
     cache: &ExchangeRateCache,

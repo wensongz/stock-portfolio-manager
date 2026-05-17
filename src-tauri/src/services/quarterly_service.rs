@@ -608,95 +608,103 @@ pub async fn refresh_quarterly_snapshot(
                      WHERE quarterly_snapshot_id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
-            stmt.query_map(rusqlite::params![snapshot_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<HashMap<_, _>, _>>()
-            .map_err(|e| e.to_string())?
+            let rows = stmt
+                .query_map(rusqlite::params![snapshot_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<HashMap<_, _>, _>>()
+                .map_err(|e| e.to_string())?
         };
 
-        // 3b. Read live positions
-        let conn = db.conn.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT h.account_id, COALESCE(a.name, '') AS account_name,
-                        h.symbol, h.name, h.market,
-                        COALESCE(c.name, '未分类') AS category_name,
-                        COALESCE(c.color, '#8B8B8B') AS category_color,
-                        h.shares, h.avg_cost
-                 FROM holdings h
-                 LEFT JOIN accounts a ON h.account_id = a.id
-                 LEFT JOIN categories c ON h.category_id = c.id
-                 WHERE h.shares > 0
-                 ORDER BY h.market, h.symbol",
-            )
-            .map_err(|e| e.to_string())?;
-
-        stmt.query_map([], |row| {
-            let symbol: String = row.get(2)?;
-            Ok((
-                row.get::<_, String>(0)?,  // account_id
-                row.get::<_, String>(1)?,  // account_name
-                symbol.clone(),
-                row.get::<_, String>(3)?,  // name
-                row.get::<_, String>(4)?,  // market
-                row.get::<_, String>(5)?,  // category_name
-                row.get::<_, String>(6)?,  // category_color
-                row.get::<_, f64>(7)?,     // shares
-                row.get::<_, f64>(8)?,     // avg_cost
-                existing_notes.get(&symbol).cloned().flatten(),
-            ))
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|(account_id, account_name, symbol, name, market, category_name, category_color, shares, avg_cost, notes)| {
-            WorkingHolding {
-                snapshot_row_id: None, // will INSERT all rows fresh
-                account_id,
-                account_name,
-                symbol,
-                name,
-                market,
-                category_name,
-                category_color,
-                shares,
-                avg_cost,
-                notes,
-            }
-        })
-        .collect()
+        // 3b. Read live positions into owned tuples, then map to WorkingHolding.
+        let live_rows: Vec<(String, String, String, String, String, String, String, f64, f64)> = {
+            let conn = db.conn.lock().map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT h.account_id, COALESCE(a.name, '') AS account_name,
+                            h.symbol, h.name, h.market,
+                            COALESCE(c.name, '未分类') AS category_name,
+                            COALESCE(c.color, '#8B8B8B') AS category_color,
+                            h.shares, h.avg_cost
+                     FROM holdings h
+                     LEFT JOIN accounts a ON h.account_id = a.id
+                     LEFT JOIN categories c ON h.category_id = c.id
+                     WHERE h.shares > 0
+                     ORDER BY h.market, h.symbol",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,  // account_id
+                        row.get::<_, String>(1)?,  // account_name
+                        row.get::<_, String>(2)?,  // symbol
+                        row.get::<_, String>(3)?,  // name
+                        row.get::<_, String>(4)?,  // market
+                        row.get::<_, String>(5)?,  // category_name
+                        row.get::<_, String>(6)?,  // category_color
+                        row.get::<_, f64>(7)?,     // shares
+                        row.get::<_, f64>(8)?,     // avg_cost
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        live_rows
+            .into_iter()
+            .map(|(account_id, account_name, symbol, name, market, category_name, category_color, shares, avg_cost)| {
+                let notes = existing_notes.get(&symbol).cloned().flatten();
+                WorkingHolding {
+                    snapshot_row_id: None,
+                    account_id,
+                    account_name,
+                    symbol,
+                    name,
+                    market,
+                    category_name,
+                    category_color,
+                    shares,
+                    avg_cost,
+                    notes,
+                }
+            })
+            .collect()
     } else {
         // For past quarters: use the frozen snapshot positions.
-        let conn = db.conn.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, account_id, account_name, symbol, name, market,
-                        category_name, category_color, shares, avg_cost, notes
-                 FROM quarterly_holding_snapshots
-                 WHERE quarterly_snapshot_id = ?1",
-            )
-            .map_err(|e| e.to_string())?;
-        stmt.query_map(rusqlite::params![snapshot_id], |row| {
-            Ok(WorkingHolding {
-                snapshot_row_id: Some(row.get(0)?),
-                account_id: row.get(1)?,
-                account_name: row.get(2)?,
-                symbol: row.get(3)?,
-                name: row.get(4)?,
-                market: row.get(5)?,
-                category_name: row.get(6)?,
-                category_color: row.get(7)?,
-                shares: row.get(8)?,
-                avg_cost: row.get(9)?,
-                notes: row.get(10)?,
-            })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?
+        let rows: Vec<WorkingHolding> = {
+            let conn = db.conn.lock().map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, account_id, account_name, symbol, name, market,
+                            category_name, category_color, shares, avg_cost, notes
+                     FROM quarterly_holding_snapshots
+                     WHERE quarterly_snapshot_id = ?1",
+                )
+                .map_err(|e| e.to_string())?;
+            let mapped = stmt
+                .query_map(rusqlite::params![snapshot_id], |row| {
+                    Ok(WorkingHolding {
+                        snapshot_row_id: Some(row.get(0)?),
+                        account_id: row.get(1)?,
+                        account_name: row.get(2)?,
+                        symbol: row.get(3)?,
+                        name: row.get(4)?,
+                        market: row.get(5)?,
+                        category_name: row.get(6)?,
+                        category_color: row.get(7)?,
+                        shares: row.get(8)?,
+                        avg_cost: row.get(9)?,
+                        notes: row.get(10)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        rows
     };
 
     if holdings.is_empty() {

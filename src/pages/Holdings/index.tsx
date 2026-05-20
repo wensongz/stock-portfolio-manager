@@ -56,6 +56,29 @@ function isClearedPosition(holding: { symbol: string; shares: number }): boolean
   return !isCashSymbol(holding.symbol) && holding.shares === 0;
 }
 
+/**
+ * Compute the cash flow delta caused by a single transaction.
+ * Cash-symbol BUY/OPEN → deposit, positive.
+ * Stock BUY → cash out (negative). Commission is added to the outflow because
+ *   it further reduces available cash on top of the purchase cost.
+ * Stock SELL → cash in (positive). Commission is subtracted from the inflow
+ *   because it is deducted from the proceeds, reducing available cash.
+ * PAY (dividend) → cash in (positive).
+ * Stock OPEN → 0 (initial position entry, no real cash movement).
+ */
+function computeCashDelta(txn: Transaction): number {
+  if (isCashSymbol(txn.symbol)) {
+    // Cash deposit (BUY or OPEN for the cash symbol itself)
+    return txn.total_amount;
+  }
+  switch (txn.transaction_type) {
+    case "BUY": return -(txn.total_amount + txn.commission);
+    case "SELL": return txn.total_amount - txn.commission;
+    case "PAY": return txn.total_amount;
+    default: return 0; // OPEN for stocks
+  }
+}
+
 /** Shared formatting options for displaying currency amounts. */
 const CURRENCY_FORMAT_OPTIONS: Intl.NumberFormatOptions = {
   minimumFractionDigits: 2,
@@ -321,10 +344,26 @@ export default function HoldingsPage() {
     setDetailModalOpen(true);
     setDetailLoading(true);
     try {
-      const txns = await invoke<Transaction[]>("get_transactions", {
-        accountId: holding.account_id,
-        symbol: holding.symbol,
-      });
+      let txns: Transaction[];
+      if (isCashSymbol(holding.symbol)) {
+        // For cash holdings, fetch all account transactions so we can show the
+        // full cash flow history (deposits + stock buys/sells/dividends).
+        txns = await invoke<Transaction[]>("get_transactions", {
+          accountId: holding.account_id,
+        });
+        // Keep only transactions that match the cash currency, and skip OPEN
+        // records for non-cash symbols (those have zero cash impact).
+        txns = txns.filter(
+          (t) =>
+            t.currency === holding.currency &&
+            !(t.transaction_type === "OPEN" && !isCashSymbol(t.symbol)),
+        );
+      } else {
+        txns = await invoke<Transaction[]>("get_transactions", {
+          accountId: holding.account_id,
+          symbol: holding.symbol,
+        });
+      }
       setDetailTransactions(txns);
     } catch (err) {
       message.error(`获取交易记录失败: ${err}`);
@@ -336,6 +375,23 @@ export default function HoldingsPage() {
 
   const accountMap = Object.fromEntries(accounts.map((a) => [a.id, a.name]));
   const categoryMap = Object.fromEntries(categories.map((c) => [c.id, c]));
+
+  // Compute cash flow rows for the cash holding detail modal.
+  // Transactions are sorted chronologically (ascending) to compute the running
+  // balance, then reversed so the table shows the most recent entry first.
+  const cashFlowRows = useMemo(() => {
+    if (!detailHolding || !isCashSymbol(detailHolding.symbol)) return [];
+    const sorted = [...detailTransactions].sort(
+      (a, b) => new Date(a.traded_at).getTime() - new Date(b.traded_at).getTime(),
+    );
+    let balance = 0;
+    const rows = sorted.map((txn) => {
+      const delta = computeCashDelta(txn);
+      balance += delta;
+      return { ...txn, cashDelta: delta, runningBalance: balance };
+    });
+    return rows.reverse();
+  }, [detailHolding, detailTransactions]);
 
   // Merge holdings with realtime quotes
   const quoteMap = Object.fromEntries(holdingQuotes.map((h) => [h.id, h as HoldingWithQuote]));
@@ -905,68 +961,160 @@ export default function HoldingsPage() {
           setDetailTransactions([]);
         }}
         footer={null}
-        width={900}
+        width={detailHolding && isCashSymbol(detailHolding.symbol) ? 1000 : 900}
       >
-        <Table
-          dataSource={detailTransactions}
-          rowKey="id"
-          loading={detailLoading}
-          pagination={false}
-          scroll={{ y: 400 }}
-          columns={[
-            {
-              title: "日期",
-              dataIndex: "traded_at",
-              key: "traded_at",
-              width: 160,
-              render: (date: string) => dayjs(date).format("YYYY-MM-DD HH:mm"),
-            },
-            {
-              title: "类型",
-              dataIndex: "transaction_type",
-              key: "transaction_type",
-              width: 80,
-              render: (type: TransactionType) => (
-                <Tag color={type === "BUY" ? "green" : type === "OPEN" ? "blue" : type === "PAY" ? "orange" : "red"}>
-                  {type === "BUY" ? "买入" : type === "OPEN" ? "建仓" : type === "PAY" ? "分红" : "卖出"}
-                </Tag>
-              ),
-            },
-            {
-              title: "股数",
-              dataIndex: "shares",
-              key: "shares",
-              width: 100,
-              render: (v: number) => v.toLocaleString(),
-            },
-            {
-              title: "价格",
-              dataIndex: "price",
-              key: "price",
-              width: 100,
-              render: (v: number, record: Transaction) => `${currencySymbol[record.currency]}${v.toFixed(2)}`,
-            },
-            {
-              title: "总金额",
-              dataIndex: "total_amount",
-              key: "total_amount",
-              render: (v: number, record: Transaction) => `${currencySymbol[record.currency]}${v.toFixed(2)}`,
-            },
-            {
-              title: "手续费",
-              dataIndex: "commission",
-              key: "commission",
-              width: 100,
-              render: (v: number, record: Transaction) => `${currencySymbol[record.currency]}${v.toFixed(2)}`,
-            },
-            {
-              title: "备注",
-              dataIndex: "notes",
-              key: "notes",
-              render: (v: string | null) => v || "—",
-            },
-          ]}
-        />
+        {detailHolding && isCashSymbol(detailHolding.symbol) ? (
+          /* Cash flow history: shows all account transactions with cash impact */
+          <Table
+            dataSource={cashFlowRows}
+            rowKey="id"
+            loading={detailLoading}
+            pagination={false}
+            scroll={{ y: 400 }}
+            columns={[
+              {
+                title: "日期",
+                dataIndex: "traded_at",
+                key: "traded_at",
+                width: 160,
+                render: (date: string) => dayjs(date).format("YYYY-MM-DD HH:mm"),
+              },
+              {
+                title: "类型",
+                dataIndex: "transaction_type",
+                key: "transaction_type",
+                width: 80,
+                render: (type: TransactionType, record: Transaction & { cashDelta: number }) => {
+                  if (isCashSymbol(record.symbol)) {
+                    return <Tag color="blue">存入</Tag>;
+                  }
+                  // In the cash flow view, colors reflect the cash impact:
+                  // BUY → red (cash decreases), SELL → green (cash increases).
+                  // This intentionally differs from the stock detail view where
+                  // colors reflect the stock position change (BUY=green, SELL=red).
+                  if (type === "BUY") return <Tag color="red">买入</Tag>;
+                  if (type === "SELL") return <Tag color="green">卖出</Tag>;
+                  if (type === "PAY") return <Tag color="orange">分红</Tag>;
+                  return <Tag>{type}</Tag>;
+                },
+              },
+              {
+                title: "股票",
+                key: "stock",
+                render: (_: unknown, record: Transaction) => {
+                  if (isCashSymbol(record.symbol)) {
+                    return <span className="text-gray-500">—</span>;
+                  }
+                  return (
+                    <Space>
+                      <strong>{record.symbol}</strong>
+                      <span className="text-gray-500 text-sm">{record.name}</span>
+                    </Space>
+                  );
+                },
+              },
+              {
+                title: "现金变动",
+                key: "cashDelta",
+                width: 140,
+                align: "right" as const,
+                render: (_: unknown, record: Transaction & { cashDelta: number }) => {
+                  const delta = record.cashDelta;
+                  const sym = currencySymbol[record.currency] ?? "";
+                  const isPositive = delta >= 0;
+                  return (
+                    <span style={{ color: isPositive ? "#16a34a" : "#dc2626", fontWeight: 500 }}>
+                      {isPositive ? "+" : ""}
+                      {sym}{Math.abs(delta).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </span>
+                  );
+                },
+              },
+              {
+                title: "余额",
+                key: "runningBalance",
+                width: 140,
+                align: "right" as const,
+                render: (_: unknown, record: Transaction & { runningBalance: number }) => {
+                  const sym = currencySymbol[record.currency] ?? "";
+                  return (
+                    <span style={{ fontWeight: 500 }}>
+                      {sym}{record.runningBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </span>
+                  );
+                },
+              },
+              {
+                title: "备注",
+                dataIndex: "notes",
+                key: "notes",
+                render: (v: string | null) => v || "—",
+              },
+            ]}
+          />
+        ) : (
+          /* Regular stock holding: show standard transaction details */
+          <Table
+            dataSource={detailTransactions}
+            rowKey="id"
+            loading={detailLoading}
+            pagination={false}
+            scroll={{ y: 400 }}
+            columns={[
+              {
+                title: "日期",
+                dataIndex: "traded_at",
+                key: "traded_at",
+                width: 160,
+                render: (date: string) => dayjs(date).format("YYYY-MM-DD HH:mm"),
+              },
+              {
+                title: "类型",
+                dataIndex: "transaction_type",
+                key: "transaction_type",
+                width: 80,
+                render: (type: TransactionType) => (
+                  <Tag color={type === "BUY" ? "green" : type === "OPEN" ? "blue" : type === "PAY" ? "orange" : "red"}>
+                    {type === "BUY" ? "买入" : type === "OPEN" ? "建仓" : type === "PAY" ? "分红" : "卖出"}
+                  </Tag>
+                ),
+              },
+              {
+                title: "股数",
+                dataIndex: "shares",
+                key: "shares",
+                width: 100,
+                render: (v: number) => v.toLocaleString(),
+              },
+              {
+                title: "价格",
+                dataIndex: "price",
+                key: "price",
+                width: 100,
+                render: (v: number, record: Transaction) => `${currencySymbol[record.currency]}${v.toFixed(2)}`,
+              },
+              {
+                title: "总金额",
+                dataIndex: "total_amount",
+                key: "total_amount",
+                render: (v: number, record: Transaction) => `${currencySymbol[record.currency]}${v.toFixed(2)}`,
+              },
+              {
+                title: "手续费",
+                dataIndex: "commission",
+                key: "commission",
+                width: 100,
+                render: (v: number, record: Transaction) => `${currencySymbol[record.currency]}${v.toFixed(2)}`,
+              },
+              {
+                title: "备注",
+                dataIndex: "notes",
+                key: "notes",
+                render: (v: string | null) => v || "—",
+              },
+            ]}
+          />
+        )}
       </Modal>
 
       {/* Import Holdings from CSV Modal (CN) */}

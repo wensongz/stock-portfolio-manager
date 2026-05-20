@@ -18,6 +18,21 @@ pub fn create_holding(
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
 
+    // Reject duplicate: same symbol already held in this account.
+    let existing: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM holdings WHERE account_id = ?1 AND symbol = ?2",
+            rusqlite::params![account_id, symbol],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if existing > 0 {
+        return Err(format!(
+            "账户中已存在股票代码为「{}」的持仓记录。若需调整持仓数量，请前往「交易记录」页面新增买入或卖出记录，而非重复创建持仓。",
+            symbol
+        ));
+    }
+
     conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
 
     let result = (|| -> Result<(), String> {

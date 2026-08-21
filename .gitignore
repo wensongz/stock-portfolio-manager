@@ -43,3 +43,6 @@ package-lock.json
 # AI Assistant files
 .zcode/
 .mimocode/
+
+# Local Git worktrees
+.worktrees/

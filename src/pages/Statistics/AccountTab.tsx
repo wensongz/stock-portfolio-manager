@@ -79,7 +79,7 @@ export default function AccountTab({ selectedAccountId, onAccountChange }: Props
               <Card>
                 <Statistic
                   title={`账户总盈亏 (${currencyCode})`}
-                  value={`${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl.toFixed(2)}`}
+                  value={stats.total_pnl.toFixed(2)}
                   styles={{ content: {  color: pnlColor(stats.total_pnl)  } }}
                   suffix={`(${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl_percent.toFixed(2)}%)`}
                 />

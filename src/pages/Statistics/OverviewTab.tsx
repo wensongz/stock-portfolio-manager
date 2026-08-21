@@ -234,7 +234,7 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
       sorter: (a, b) => a.symbol.localeCompare(b.symbol),
       render: (symbol: string) => <Text strong>{symbol}</Text>,
       fixed: "left" as const,
-      width: 110,
+      width: 100,
     },
     {
       title: "名称",
@@ -251,7 +251,7 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
       render: (name: string, record: AggregatedStock) => (
         <Tag color={record.category_color}>{name}</Tag>
       ),
-      width: 80,
+      width: 60,
     },
     {
       title: "持仓数量",
@@ -260,7 +260,7 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
       sorter: (a, b) => a.shares - b.shares,
       render: (shares: number) => shares.toLocaleString(),
       align: "right" as const,
-      width: 100,
+      width: 90,
     },
     {
       title: "均价",
@@ -282,7 +282,7 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
         return `${sym}${price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
       },
       align: "right" as const,
-      width: 110,
+      width: 90,
     },
     {
       title: "市值",
@@ -307,7 +307,7 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
         return `${pct.toFixed(2)}%`;
       },
       align: "right" as const,
-      width: 80,
+      width: 70,
     },
     {
       title: "盈亏金额",
@@ -340,7 +340,7 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
           <span>-</span>
         ),
       align: "right" as const,
-      width: 100,
+      width: 80,
     },
   ], [aggregatedStocks, pnlColor]);
 
@@ -375,7 +375,7 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
         dataIndex: "shares",
         key: "shares",
         align: "right" as const,
-        width: 100,
+        width: 90,
         render: (shares: number) => shares.toLocaleString(),
       },
       {
@@ -383,7 +383,7 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
         dataIndex: "avg_cost",
         key: "avg_cost",
         align: "right" as const,
-        width: 100,
+        width: 90,
         render: (price: number) =>
           price.toLocaleString("en-US", { minimumFractionDigits: 3, maximumFractionDigits: 3 }),
       },
@@ -403,7 +403,7 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
         dataIndex: "position_pct",
         key: "position_pct",
         align: "right" as const,
-        width: 90,
+        width: 70,
         render: (pct: number) => `${pct.toFixed(2)}%`,
       },
       {
@@ -427,7 +427,7 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
         dataIndex: "pnl_percent",
         key: "pnl_percent",
         align: "right" as const,
-        width: 100,
+        width: 80,
         render: (pnl: number | null) =>
           pnl != null ? (
             <span style={{ color: pnlColor(pnl) }}>
@@ -505,9 +505,8 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
           <Card>
             <Statistic
               title={`总盈亏 (${baseCurrency})`}
-              value={`${totalPnlPos ? "+" : ""}${overview.total_pnl.toFixed(2)}`}
+              value={overview.total_pnl.toFixed(2)}
               styles={{ content: {  color: pnlColor(overview.total_pnl)  } }}
-              prefix={currency}
               suffix={`(${totalPnlPos ? "+" : ""}${overview.total_pnl_percent.toFixed(2)}%)`}
             />
           </Card>

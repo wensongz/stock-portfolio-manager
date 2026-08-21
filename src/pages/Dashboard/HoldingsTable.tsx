@@ -71,7 +71,7 @@ export default function HoldingsTable({ holdings, loading, hideAccountMarket = f
       sorter: (a, b) => a.symbol.localeCompare(b.symbol),
       render: (symbol: string) => <Text strong>{symbol}</Text>,
       fixed: "left",
-      width: 110,
+      width: 100,
     },
     {
       title: "名称",
@@ -110,7 +110,7 @@ export default function HoldingsTable({ holdings, loading, hideAccountMarket = f
       render: (name: string, record: HoldingDetail) => (
         <Tag color={record.category_color}>{name}</Tag>
       ),
-      width: 80,
+      width: 60,
     },
     {
       title: "持仓数量",
@@ -119,7 +119,7 @@ export default function HoldingsTable({ holdings, loading, hideAccountMarket = f
       sorter: (a, b) => a.shares - b.shares,
       render: (shares: number) => shares.toLocaleString(),
       align: "right",
-      width: 100,
+      width: 90,
     },
     {
       title: "均价",
@@ -142,7 +142,7 @@ export default function HoldingsTable({ holdings, loading, hideAccountMarket = f
       render: (price: number, record: HoldingDetail) =>
         fmtMoney(price, record.currency),
       align: "right",
-      width: 100,
+      width: 90,
     },
     {
       title: "市值",
@@ -164,7 +164,7 @@ export default function HoldingsTable({ holdings, loading, hideAccountMarket = f
         return `${pct.toFixed(2)}%`;
       },
       align: "right",
-      width: 80,
+      width: 70,
     },
     {
       title: "盈亏金额",
@@ -194,7 +194,7 @@ export default function HoldingsTable({ holdings, loading, hideAccountMarket = f
           <span>-</span>
         ),
       align: "right",
-      width: 100,
+      width: 80,
     },
     ];
     return hideAccountMarket

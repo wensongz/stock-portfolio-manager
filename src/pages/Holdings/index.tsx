@@ -545,7 +545,7 @@ export default function HoldingsPage() {
       title: "股票代码",
       dataIndex: "symbol",
       key: "symbol",
-      width: 155,
+      width: 100,
       ellipsis: true,
       sorter: (a: HoldingWithQuote, b: HoldingWithQuote) => a.symbol.localeCompare(b.symbol),
       render: (symbol: string, record: HoldingWithQuote) => (
@@ -570,7 +570,7 @@ export default function HoldingsPage() {
       title: "投资类别",
       dataIndex: "category_id",
       key: "category_id",
-      width: 105,
+      width: 60,
       sorter: (a: HoldingWithQuote, b: HoldingWithQuote) => {
         const nameA = (a.category_id && categoryMap[a.category_id]?.name) || "";
         const nameB = (b.category_id && categoryMap[b.category_id]?.name) || "";
@@ -590,7 +590,7 @@ export default function HoldingsPage() {
       title: "持仓数量 / 金额",
       dataIndex: "shares",
       key: "shares",
-      width: 100,
+      width: 90,
       ellipsis: true,
       render: (v: number, record: HoldingWithQuote) =>
         isCashSymbol(record.symbol)
@@ -612,7 +612,7 @@ export default function HoldingsPage() {
     {
       title: "实时价格",
       key: "current_price",
-      width: 100,
+      width: 90,
       ellipsis: true,
       render: (_: unknown, record: HoldingWithQuote) => {
         if (!record.quote) return quotesLoading ? <Spin size="small" /> : <span>—</span>;

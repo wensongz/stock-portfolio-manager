@@ -2,7 +2,12 @@ use crate::db::Database;
 use crate::models::Holding;
 use tauri::State;
 
-fn validate_holding_shares(market: &str, symbol: &str, shares: f64) -> Result<(), String> {
+fn validate_holding_values(
+    market: &str,
+    symbol: &str,
+    shares: f64,
+    avg_cost: f64,
+) -> Result<(), String> {
     if !shares.is_finite() || shares < 0.0 {
         return Err("Holding shares must be a non-negative number".to_string());
     }
@@ -11,6 +16,9 @@ fn validate_holding_shares(market: &str, symbol: &str, shares: f64) -> Result<()
             "Only US holdings support fractional shares; CN and HK holdings must use whole shares"
                 .to_string(),
         );
+    }
+    if !avg_cost.is_finite() || avg_cost < 0.0 {
+        return Err("Holding average cost must be a non-negative number".to_string());
     }
     Ok(())
 }
@@ -28,7 +36,7 @@ pub fn create_holding(
     avg_cost: f64,
     currency: String,
 ) -> Result<Holding, String> {
-    validate_holding_shares(&market, &symbol, shares)?;
+    validate_holding_values(&market, &symbol, shares, avg_cost)?;
 
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -183,7 +191,7 @@ pub fn update_holding(
     avg_cost: f64,
     currency: String,
 ) -> Result<Holding, String> {
-    validate_holding_shares(&market, &symbol, shares)?;
+    validate_holding_values(&market, &symbol, shares, avg_cost)?;
 
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().to_rfc3339();
@@ -254,5 +262,22 @@ pub fn delete_holding(db: State<Database>, id: String) -> Result<(), String> {
             let _ = conn.execute_batch("ROLLBACK");
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_holding_values;
+
+    #[test]
+    fn validate_holding_values_rejects_invalid_average_cost() {
+        for avg_cost in [-0.01, f64::NAN, f64::INFINITY] {
+            assert!(validate_holding_values("US", "AAPL", 1.0, avg_cost).is_err());
+        }
+    }
+
+    #[test]
+    fn validate_holding_values_accepts_zero_average_cost() {
+        assert!(validate_holding_values("US", "AAPL", 1.0, 0.0).is_ok());
     }
 }

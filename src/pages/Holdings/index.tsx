@@ -972,7 +972,7 @@ export default function HoldingsPage() {
                 style={{ marginBottom: 12 }}
                 rules={[{ required: true, message: "请输入平均成本价" }]}
               >
-                <InputNumber precision={4} style={{ width: "100%" }} placeholder="买入均价" />
+                <InputNumber min={0} precision={4} style={{ width: "100%" }} placeholder="买入均价" />
               </Form.Item>
             </Col>
           </Row>

@@ -1145,8 +1145,7 @@ mod tests {
         )
         .unwrap();
         let err = validate_cash_withdrawal(&conn, &account_id, "$CASH-USD", 500.0)
-            .err()
-            .expect("over-withdrawal must be rejected");
+            .expect_err("over-withdrawal must be rejected");
         assert!(err.contains("Cannot withdraw"), "got: {}", err);
         // Within balance passes
         assert!(validate_cash_withdrawal(&conn, &account_id, "$CASH-USD", 100.0).is_ok());

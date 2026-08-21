@@ -52,8 +52,8 @@ function App() {
   // quoteWarning in the global store is the single source of truth for the
   // Xueqiu warning banner. All delivery paths write to it; the JSX below
   // reads from it. This avoids a split between local pendingWarning state
-  // and the store copy that caused warnings set by fetchHoldingQuotes /
-  // fetchQuotes to never reach the Alert.
+  // and the store copy that caused warnings set by fetchHoldingQuotes to
+  // never reach the Alert.
   const quoteWarning = useQuoteStore((s) => s.quoteWarning);
   const setQuoteWarning = useQuoteStore((s) => s.setQuoteWarning);
 
@@ -108,7 +108,7 @@ function App() {
       {/* Xueqiu warning banner — rendered in the React tree (not a portal) so
           it is guaranteed to display in Tauri's webview regardless of startup
           timing. Driven by quoteStore.quoteWarning, the single source of truth
-          written by fetchHoldingQuotes, fetchQuotes, and the event/poll paths. */}
+          written by fetchHoldingQuotes and the event/poll paths. */}
       {quoteWarning && (
         <div style={{
           position: "fixed",

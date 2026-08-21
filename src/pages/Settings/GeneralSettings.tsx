@@ -2,21 +2,11 @@ import { useCallback, useEffect, useState } from "react";
 import { Button, Card, Checkbox, Form, Input, Modal, Radio, Select, Space, Tabs, Typography, message } from "antd";
 import { invoke } from "@tauri-apps/api/core";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
-import { useQuoteStore } from "../../stores/quoteStore";
 import { useSettingsStore, type ColorScheme, type ThemeMode } from "../../stores/settingsStore";
 import { useXueqiuLogin } from "../../hooks/useXueqiuLogin";
 import type { QuoteProviderConfig } from "../../types";
 
 const { Paragraph } = Typography;
-
-const INTERVAL_OPTIONS = [
-  { value: 60_000, label: "1 分钟" },
-  { value: 2 * 60_000, label: "2 分钟" },
-  { value: 5 * 60_000, label: "5 分钟（默认）" },
-  { value: 10 * 60_000, label: "10 分钟" },
-  { value: 15 * 60_000, label: "15 分钟" },
-  { value: 30 * 60_000, label: "30 分钟" },
-];
 
 const PROVIDER_OPTIONS_US_HK = [
   { value: "yahoo", label: "Yahoo Finance" },
@@ -59,14 +49,12 @@ const DEFAULT_PROVIDER_CONFIG: QuoteProviderConfig = {
 const LOCAL_STORAGE_KEYS = [
   "pnl_color_scheme",
   "app_theme_mode",
-  "quote_refresh_interval_ms",
   "base_currency",
   "statistics_selected_market",
   "options_selected_account_id",
 ] as const;
 
 export default function GeneralSettings() {
-  const { refreshIntervalMs, setRefreshInterval } = useQuoteStore();
   const { colorScheme, setColorScheme, themeMode, setThemeMode } = useSettingsStore();
   const { setBaseCurrency } = useExchangeRateStore();
   const [providerConfig, setProviderConfig] = useState<QuoteProviderConfig>({
@@ -108,11 +96,6 @@ export default function GeneralSettings() {
         // Use defaults on error
       });
   }, []);
-
-  const handleIntervalChange = (value: number) => {
-    setRefreshInterval(value);
-    message.success("刷新频率已更新");
-  };
 
   const handleProviderChange = async (
     market: keyof QuoteProviderConfig,
@@ -231,7 +214,6 @@ export default function GeneralSettings() {
       //    immediately, even before the full-page reload below.
       setColorScheme("red-up");
       setThemeMode("system");
-      setRefreshInterval(5 * 60_000);
       setBaseCurrency("USD");
       setProviderConfig(DEFAULT_PROVIDER_CONFIG);
 
@@ -384,21 +366,6 @@ export default function GeneralSettings() {
         </Form>
         <Paragraph type="secondary">
           各市场的行情数据来源：A股支持东方财富和雪球，港股和美股支持 Yahoo Finance、东方财富和雪球。修改后将在下次刷新时生效。
-        </Paragraph>
-      </Card>
-
-      <Card title="行情刷新设置">
-        <Form layout="vertical" style={{ maxWidth: 400 }}>
-          <Form.Item label="自动刷新频率">
-            <Select
-              value={refreshIntervalMs}
-              onChange={handleIntervalChange}
-              options={INTERVAL_OPTIONS}
-            />
-          </Form.Item>
-        </Form>
-        <Paragraph type="secondary">
-          设置持仓行情的自动刷新间隔时间，应用到所有行情数据的自动刷新。修改后将立即生效。
         </Paragraph>
       </Card>
 

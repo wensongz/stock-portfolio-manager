@@ -282,8 +282,8 @@ export default function HoldingsPage() {
   // and the user can click the refresh button for on-demand updates.
   useEffect(() => {
     if (!showRealtime) return;
-    const { startAutoRefresh } = useQuoteStore.getState();
-    return startAutoRefresh();
+    const { startQuoteSync } = useQuoteStore.getState();
+    return startQuoteSync();
   }, [showRealtime]);
 
   const handleSubmit = async (values: {

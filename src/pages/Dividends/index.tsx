@@ -213,7 +213,8 @@ export function MarketTable({ market }: { market: MarketDividend }) {
         dataIndex: "symbol",
         key: "symbol",
         fixed: "left" as const,
-        width: 180,
+        ellipsis: true,
+        width: 175,
         render: (_: unknown, row: { symbol: string; name: string }) => (
           <span>
             <strong>{row.symbol}</strong>
@@ -229,7 +230,7 @@ export function MarketTable({ market }: { market: MarketDividend }) {
         dataIndex: "perAccount",
         key: a.accountId,
         align: "right" as const,
-        width: 140,
+        width: 130,
         render: (_: unknown, row: { perAccount: [string, number][] }) => {
           const entry = (Array.isArray(row.perAccount) ? row.perAccount : []).find(
             (e) => Array.isArray(e) && e[0] === a.accountId

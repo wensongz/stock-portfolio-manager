@@ -7,24 +7,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            target: aarch64-apple-darwin
-          - platform: macos-latest
-            target: x86_64-apple-darwin
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-          - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-
-    runs-on: ${{ matrix.platform }}
+    runs-on: windows-latest
 
     steps:
       - name: Checkout repository
@@ -34,13 +21,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.97.1'
-          targets: ${{ matrix.target }}
-
-      - name: Install Linux dependencies
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          targets: x86_64-pc-windows-msvc
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -48,16 +29,22 @@ jobs:
           bun-version: latest
 
       - name: Install frontend dependencies
-        run: bun install --frozen-lockfile
+        run: bun install
+
+      - name: Test CSV import
+        working-directory: src-tauri
+        run: cargo test parse_import_csv_keeps_all_valid_rows_for_confirm_import
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Stock Portfolio Manager ${{ github.ref_name }}'
-          releaseBody: 'See the assets below to download and install.'
-          releaseDraft: true
-          prerelease: false
-          args: --target ${{ matrix.target }}
+          args: --target x86_64-pc-windows-msvc
+
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-portfolio-manager-windows
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error

@@ -357,7 +357,10 @@ pub fn parse_import_csv(content: &str, data_type: &str) -> Result<ImportPreview,
             }
         }
 
-        if !has_error && preview_data.len() < 20 {
+        // `preview_data` is also the payload submitted by the frontend when the
+        // user confirms the import. Keep every valid row here; the frontend is
+        // responsible for limiting how many rows are rendered in the preview.
+        if !has_error {
             preview_data.push(serde_json::Value::Object(row_map));
         }
     }
@@ -732,4 +735,30 @@ pub fn confirm_import(db: &Database, import_data: &ImportData) -> Result<ImportR
         skipped_rows,
         errors,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_import_csv;
+
+    #[test]
+    fn parse_import_csv_keeps_all_valid_rows_for_confirm_import() {
+        let mut csv = String::from(
+            "traded_at,symbol,name,market,transaction_type,shares,price,total_amount,commission,currency,notes\n",
+        );
+        for index in 1..=25 {
+            csv.push_str(&format!(
+                "2026-01-{index:02},{index:06},Test {index},CN,BUY,100,10,,5,CNY,test\n"
+            ));
+        }
+
+        let preview = parse_import_csv(&csv, "transactions").expect("CSV should parse");
+
+        assert_eq!(preview.total_rows, 25);
+        assert_eq!(preview.valid_rows, 25);
+        assert!(preview.error_rows.is_empty());
+        assert_eq!(preview.preview_data.len(), 25);
+        assert_eq!(preview.preview_data[20]["symbol"], "000021");
+        assert_eq!(preview.preview_data[24]["symbol"], "000025");
+    }
 }

@@ -10,6 +10,8 @@ interface Props {
 
 export default function RiskMetricsPanel({ metrics, loading }: Props) {
   const { pnlColorDark, lossColor } = usePnlColor();
+  const sharpe = metrics?.sharpe_ratio ?? null;
+  const calmar = metrics?.calmar_ratio ?? null;
   return (
     <div>
       <Row gutter={[12, 12]}>
@@ -55,17 +57,17 @@ export default function RiskMetricsPanel({ metrics, loading }: Props) {
               title={
                 <span>
                   夏普比率{" "}
-                  <Tooltip title={`(年化收益 − 无风险利率 ${metrics?.risk_free_rate?.toFixed(1) ?? 4.5}%) / 年化波动率`}>
+                  <Tooltip title={`日均超额收益 / 日收益标准差 × √252（无风险利率固定假设 ${metrics?.risk_free_rate?.toFixed(1) ?? 4.5}%）`}>
                     <InfoCircleOutlined style={{ fontSize: 11, color: "var(--color-text-tertiary)" }} />
                   </Tooltip>
                 </span>
               }
-              value={metrics?.sharpe_ratio ?? 0}
+              value={sharpe ?? "—"}
               precision={2}
               styles={{
                 content: {
                   fontSize: 12,
-                  color: (metrics?.sharpe_ratio ?? 0) >= 1 ? pnlColorDark(1) : (metrics?.sharpe_ratio ?? 0) >= 0 ? "#d46b08" : pnlColorDark(-1),
+                  color: sharpe == null ? undefined : sharpe >= 1 ? pnlColorDark(1) : sharpe >= 0 ? "#d46b08" : pnlColorDark(-1),
                 },
               }}
             />
@@ -93,12 +95,12 @@ export default function RiskMetricsPanel({ metrics, loading }: Props) {
                   </Tooltip>
                 </span>
               }
-              value={metrics?.calmar_ratio ?? 0}
+              value={calmar ?? "—"}
               precision={2}
               styles={{
                 content: {
                   fontSize: 12,
-                  color: (metrics?.calmar_ratio ?? 0) >= 1 ? pnlColorDark(1) : "#d46b08",
+                  color: calmar == null ? undefined : calmar >= 1 ? pnlColorDark(1) : "#d46b08",
                 },
               }}
             />

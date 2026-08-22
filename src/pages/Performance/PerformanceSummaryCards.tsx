@@ -50,6 +50,7 @@ function PctStat({
 
 export default function PerformanceSummaryCards({ summary, loading, currency = "CNY" }: Props) {
   const { pnlColorDark } = usePnlColor();
+  const sharpe = summary?.sharpe_ratio ?? null;
   return (
     <Row gutter={[16, 16]}>
       <Col xs={12} sm={8} md={6} lg={4}>
@@ -110,14 +111,14 @@ export default function PerformanceSummaryCards({ summary, loading, currency = "
             title={
               <span>
                 夏普比率{" "}
-                <Tooltip title="（年化收益率 − 无风险利率）/ 年化波动率，无风险利率默认 4.5%">
+                <Tooltip title="日均超额收益 / 日收益标准差 × √252，无风险利率固定假设为 4.5%">
                   <InfoCircleOutlined style={{ fontSize: 12, color: "var(--color-text-tertiary)" }} />
                 </Tooltip>
               </span>
             }
-            value={Math.abs(summary?.sharpe_ratio ?? 0)}
+            value={sharpe ?? "—"}
             precision={2}
-            styles={{ content: {  color: pnlColorDark(summary?.sharpe_ratio ?? 0)  } }}
+            styles={{ content: { color: sharpe == null ? undefined : pnlColorDark(sharpe) } }}
           />
         </Card>
       </Col>

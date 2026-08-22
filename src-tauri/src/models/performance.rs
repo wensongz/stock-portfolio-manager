@@ -12,7 +12,7 @@ pub struct PerformanceSummary {
     pub total_pnl: f64,
     pub max_drawdown: f64,
     pub volatility: f64,
-    pub sharpe_ratio: f64,
+    pub sharpe_ratio: Option<f64>,
     /// The daily return series computed from the same DB query used for
     /// the summary metrics.  Returned here so the frontend can render
     /// both the summary card and the cumulative-return chart from a
@@ -88,10 +88,10 @@ pub struct HoldingPerformance {
 pub struct RiskMetrics {
     pub daily_volatility: f64,
     pub annualized_volatility: f64,
-    pub sharpe_ratio: f64,
+    pub sharpe_ratio: Option<f64>,
     pub risk_free_rate: f64,
     pub max_drawdown: f64,
-    pub calmar_ratio: f64,
+    pub calmar_ratio: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -99,31 +99,6 @@ pub struct BenchmarkDataPoint {
     pub date: String,
     pub close_price: f64,
     pub change_percent: f64,
-}
-
-// Internal helpers (not serialised to frontend)
-#[allow(dead_code)]
-pub(crate) struct SubPeriod {
-    pub start_value: f64,
-    pub end_value: f64,
-    pub cash_flow: f64,
-}
-
-impl SubPeriod {
-    #[cfg(test)]
-    pub fn period_return(&self) -> f64 {
-        if self.start_value == 0.0 {
-            return 0.0;
-        }
-        (self.end_value - self.start_value - self.cash_flow) / self.start_value
-    }
-}
-
-/// Calculate Time-Weighted Return from a slice of sub-periods.
-#[cfg(test)]
-pub fn calculate_twr_from_periods(periods: &[SubPeriod]) -> f64 {
-    let product: f64 = periods.iter().map(|p| 1.0 + p.period_return()).product();
-    product - 1.0
 }
 
 /// Annualise a TWR over the given number of calendar days.

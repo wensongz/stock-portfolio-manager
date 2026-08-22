@@ -269,7 +269,7 @@ export interface PerformanceSummary {
   total_pnl: number;
   max_drawdown: number;
   volatility: number;
-  sharpe_ratio: number;
+  sharpe_ratio: number | null;
   /** Daily return series computed from the same DB query as the summary. */
   return_series: ReturnDataPoint[];
 }
@@ -334,10 +334,10 @@ export interface HoldingPerformance {
 export interface RiskMetrics {
   daily_volatility: number;
   annualized_volatility: number;
-  sharpe_ratio: number;
+  sharpe_ratio: number | null;
   risk_free_rate: number;
   max_drawdown: number;
-  calmar_ratio: number;
+  calmar_ratio: number | null;
 }
 
 export interface CreateTransactionPayload {
@@ -945,4 +945,3 @@ export interface DividendAnalysis {
   markets: MarketDividend[];
   grandTotal: number;
 }
-

@@ -182,8 +182,10 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
           invoke<HoldingPerformance[]>("get_holding_performance_ranking", {
             startDate,
             endDate,
-            sortBy: "return_rate",
-            limit: 100,
+            // The chart independently selects the largest gains and losses by
+            // PnL, so request the complete practical universe in PnL units.
+            sortBy: "pnl",
+            limit: 10_000,
             ...filterParams,
           }),
           invoke<RiskMetrics>("get_risk_metrics", { startDate, endDate, ...filterParams }),

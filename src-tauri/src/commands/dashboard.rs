@@ -1,7 +1,7 @@
 use crate::db::Database;
 use crate::models::{DashboardSummary, ExchangeRates, HoldingDetail};
 use crate::services::exchange_rate_service::{
-    convert_currency, get_cached_rates, ExchangeRateCache,
+    convert_currency, convert_quote_amount, get_cached_rates, ExchangeRateCache,
 };
 use crate::services::quote_provider_service;
 use crate::services::quote_service::{fetch_quotes_batch_cached_with_providers, QuoteCache};
@@ -22,14 +22,16 @@ pub async fn build_holding_details_pub(
     db: &Database,
     quote_cache: &QuoteCache,
     cache_only: bool,
+    rates: &ExchangeRates,
 ) -> Result<Vec<HoldingDetail>, String> {
-    build_holding_details(db, quote_cache, cache_only).await
+    build_holding_details(db, quote_cache, cache_only, rates).await
 }
 
 async fn build_holding_details(
     db: &Database,
     quote_cache: &QuoteCache,
     cache_only: bool,
+    rates: &ExchangeRates,
 ) -> Result<Vec<HoldingDetail>, String> {
     // Load holdings and lookup data in one DB operation
     struct Row {
@@ -117,7 +119,12 @@ async fn build_holding_details(
     let details = rows
         .into_iter()
         .map(|r| {
-            let (current_price, change) = *quote_map.get(&r.symbol).unwrap_or(&(0.0, 0.0));
+            let (quote_price, quote_change) = *quote_map.get(&r.symbol).unwrap_or(&(0.0, 0.0));
+            // Quotes are denominated in the market's native currency, which
+            // can differ from the holding's settlement currency (for example,
+            // HK Stock Connect quotes are HKD while costs are often CNY).
+            let current_price = convert_quote_amount(quote_price, &r.market, &r.currency, rates);
+            let change = convert_quote_amount(quote_change, &r.market, &r.currency, rates);
             let market_value = r.shares * current_price;
             let cost_value = r.shares * r.avg_cost;
             let pnl = market_value - cost_value;
@@ -161,10 +168,6 @@ pub async fn get_holdings_with_quotes(
     cache: State<'_, ExchangeRateCache>,
     quote_cache: State<'_, QuoteCache>,
 ) -> Result<Vec<HoldingDetail>, String> {
-    let mut details = build_holding_details(&db, &quote_cache, false).await?;
-
-    // Normalise market_value_usd so holdings across different currencies
-    // are sorted on a common USD basis.
     let rates = get_cached_rates(&cache, &db)
         .await
         .unwrap_or_else(|_| ExchangeRates {
@@ -173,6 +176,10 @@ pub async fn get_holdings_with_quotes(
             cny_hkd: 7.8 / 7.2,
             updated_at: chrono::Utc::now().to_rfc3339(),
         });
+    let mut details = build_holding_details(&db, &quote_cache, false, &rates).await?;
+
+    // Normalise market_value_usd so holdings across different currencies
+    // are sorted on a common USD basis.
     for d in &mut details {
         d.market_value_usd = to_usd_value(d.market_value, &d.currency, &rates);
     }
@@ -199,7 +206,7 @@ pub async fn get_dashboard_summary(
                 updated_at: chrono::Utc::now().to_rfc3339(),
             });
 
-    let details = build_holding_details(&db, &quote_cache, false).await?;
+    let details = build_holding_details(&db, &quote_cache, false, &rates).await?;
 
     let mut us_market_value = 0.0f64;
     let mut cn_market_value = 0.0f64;

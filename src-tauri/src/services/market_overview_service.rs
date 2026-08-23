@@ -131,17 +131,17 @@ pub async fn get_market_overview(
     }
 
     // User holdings daily P&L, normalised to USD.
+    let rates = get_cached_rates(rate_cache, db).await.unwrap_or_else(|_| {
+        crate::models::quote::ExchangeRates {
+            usd_cny: 7.2,
+            usd_hkd: 7.8,
+            cny_hkd: 7.8 / 7.2,
+            updated_at: Utc::now().to_rfc3339(),
+        }
+    });
     let (holdings_daily_pnl_usd, holdings_count, top_movers) =
-        match build_holding_details_pub(db, quote_cache, true).await {
+        match build_holding_details_pub(db, quote_cache, true, &rates).await {
             Ok(details) => {
-                let rates = get_cached_rates(rate_cache, db).await.unwrap_or_else(|_| {
-                    crate::models::quote::ExchangeRates {
-                        usd_cny: 7.2,
-                        usd_hkd: 7.8,
-                        cny_hkd: 7.8 / 7.2,
-                        updated_at: Utc::now().to_rfc3339(),
-                    }
-                });
                 let total: f64 = details
                     .iter()
                     .map(|d| convert_currency(d.daily_pnl, &d.currency, "USD", &rates))

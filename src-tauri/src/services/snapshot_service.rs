@@ -1,6 +1,8 @@
 use crate::db::Database;
 use crate::models::{DailyHoldingSnapshot, DailyPortfolioValue};
-use crate::services::exchange_rate_service::ExchangeRateCache;
+use crate::services::exchange_rate_service::{
+    convert_currency, market_quote_currency, ExchangeRateCache,
+};
 use crate::services::quote_provider_service;
 use crate::services::quote_service::{
     fetch_quotes_batch_cached_with_providers, fetch_stock_history, QuoteCache,
@@ -59,7 +61,7 @@ pub async fn take_daily_snapshot(
         let mut stmt = conn
             .prepare(
                 "SELECT h.account_id, h.symbol, h.market,
-                        h.shares, h.avg_cost, c.name as category_name
+                        h.shares, h.avg_cost, h.currency, c.name as category_name
                  FROM holdings h
                  LEFT JOIN categories c ON h.category_id = c.id
                  WHERE h.shares > 0",
@@ -73,6 +75,7 @@ pub async fn take_daily_snapshot(
             market: String,
             shares: f64,
             avg_cost: f64,
+            currency: String,
             category_name: Option<String>,
         }
 
@@ -84,7 +87,8 @@ pub async fn take_daily_snapshot(
                     market: row.get(2)?,
                     shares: row.get(3)?,
                     avg_cost: row.get(4)?,
-                    category_name: row.get(5)?,
+                    currency: row.get(5)?,
+                    category_name: row.get(6)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -135,7 +139,19 @@ pub async fn take_daily_snapshot(
     for holding in &holdings {
         let close_price = *quote_map.get(&holding.symbol).unwrap_or(&0.0);
         let market_value = holding.shares * close_price;
-        let cost = holding.shares * holding.avg_cost;
+        let quote_currency =
+            market_quote_currency(&holding.market).unwrap_or(holding.currency.as_str());
+        let cost = convert_currency(
+            holding.shares * holding.avg_cost,
+            &holding.currency,
+            quote_currency,
+            &rates,
+        );
+        let snapshot_avg_cost = if holding.shares > 0.0 {
+            cost / holding.shares
+        } else {
+            0.0
+        };
 
         match holding.market.as_str() {
             "US" => {
@@ -161,7 +177,7 @@ pub async fn take_daily_snapshot(
             market: holding.market.clone(),
             category_name: holding.category_name.clone(),
             shares: holding.shares,
-            avg_cost: holding.avg_cost,
+            avg_cost: snapshot_avg_cost,
             close_price,
             market_value,
         });
@@ -321,7 +337,7 @@ pub async fn backfill_snapshots(
         market: String,
         shares: f64,
         avg_cost: f64,
-        _currency: String,
+        currency: String,
         category_name: Option<String>,
     }
 
@@ -354,7 +370,7 @@ pub async fn backfill_snapshots(
                     market: row.get(4)?,
                     shares: row.get(5)?,
                     avg_cost: row.get(6)?,
-                    _currency: row.get(7)?,
+                    currency: row.get(7)?,
                     category_name: row.get(8)?,
                 })
             })
@@ -688,7 +704,19 @@ pub async fn backfill_snapshots(
             }
 
             let market_value = adjusted_shares * close_price;
-            let cost = adjusted_shares * holding.avg_cost;
+            let quote_currency =
+                market_quote_currency(&holding.market).unwrap_or(holding.currency.as_str());
+            let cost = convert_currency(
+                adjusted_shares * holding.avg_cost,
+                &holding.currency,
+                quote_currency,
+                &rates,
+            );
+            let snapshot_avg_cost = if adjusted_shares.abs() > 1e-9 {
+                cost / adjusted_shares
+            } else {
+                0.0
+            };
 
             match holding.market.as_str() {
                 "US" => {
@@ -714,7 +742,7 @@ pub async fn backfill_snapshots(
                 market: holding.market.clone(),
                 category_name: holding.category_name.clone(),
                 shares: adjusted_shares,
-                avg_cost: holding.avg_cost,
+                avg_cost: snapshot_avg_cost,
                 close_price,
                 market_value,
             });

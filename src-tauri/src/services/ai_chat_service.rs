@@ -143,7 +143,6 @@ pub async fn build_portfolio_context(
     cache: &ExchangeRateCache,
     quote_cache: &QuoteCache,
 ) -> Result<String, String> {
-    let details = build_holding_details_pub(db, quote_cache, true).await?;
     let rates =
         get_cached_rates(cache, db)
             .await
@@ -153,6 +152,7 @@ pub async fn build_portfolio_context(
                 cny_hkd: 7.8 / 7.2,
                 updated_at: Utc::now().to_rfc3339(),
             });
+    let details = build_holding_details_pub(db, quote_cache, true, &rates).await?;
 
     // Normalise every holding's market value to USD for cross-currency totals.
     let to_usd = |amount: f64, currency: &str| {

@@ -31,9 +31,16 @@ jobs:
       - name: Install frontend dependencies
         run: bun install
 
+      - name: Build frontend assets for Rust tests
+        run: bun run build
+
       - name: Test CSV import
         working-directory: src-tauri
         run: cargo test parse_import_csv_keeps_all_valid_rows_for_confirm_import
+
+      - name: Test quote currency conversion
+        working-directory: src-tauri
+        run: cargo test test_convert_hk_quote_to_cny_holding_currency
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v1

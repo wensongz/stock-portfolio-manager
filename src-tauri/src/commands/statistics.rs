@@ -31,7 +31,7 @@ pub async fn get_statistics_overview(
                 updated_at: chrono::Utc::now().to_rfc3339(),
             });
 
-    let details = build_holding_details_pub(&db, &quote_cache, true).await?;
+    let details = build_holding_details_pub(&db, &quote_cache, true, &rates).await?;
 
     // Aggregate distribution values in the requested base currency
     let mut market_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
@@ -213,11 +213,20 @@ pub async fn get_statistics_overview(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_statistics_by_market(
     db: State<'_, Database>,
-    _cache: State<'_, ExchangeRateCache>,
+    cache: State<'_, ExchangeRateCache>,
     quote_cache: State<'_, QuoteCache>,
     market: String,
 ) -> Result<MarketStatistics, String> {
-    let all_details = build_holding_details_pub(&db, &quote_cache, true).await?;
+    let rates =
+        get_cached_rates(&cache, &db)
+            .await
+            .unwrap_or_else(|_| crate::models::ExchangeRates {
+                usd_cny: 7.2,
+                usd_hkd: 7.8,
+                cny_hkd: 7.8 / 7.2,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            });
+    let all_details = build_holding_details_pub(&db, &quote_cache, true, &rates).await?;
     let details: Vec<_> = all_details
         .into_iter()
         .filter(|d| d.market == market)
@@ -313,11 +322,20 @@ pub async fn get_statistics_by_market(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_statistics_by_account(
     db: State<'_, Database>,
-    _cache: State<'_, ExchangeRateCache>,
+    cache: State<'_, ExchangeRateCache>,
     quote_cache: State<'_, QuoteCache>,
     account_id: String,
 ) -> Result<AccountStatistics, String> {
-    let all_details = build_holding_details_pub(&db, &quote_cache, true).await?;
+    let rates =
+        get_cached_rates(&cache, &db)
+            .await
+            .unwrap_or_else(|_| crate::models::ExchangeRates {
+                usd_cny: 7.2,
+                usd_hkd: 7.8,
+                cny_hkd: 7.8 / 7.2,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            });
+    let all_details = build_holding_details_pub(&db, &quote_cache, true, &rates).await?;
     let details: Vec<_> = all_details
         .into_iter()
         .filter(|d| d.account_id == account_id)
@@ -455,7 +473,7 @@ pub async fn get_statistics_by_category(
         ),
     };
 
-    let all_details = build_holding_details_pub(&db, &quote_cache, true).await?;
+    let all_details = build_holding_details_pub(&db, &quote_cache, true, &rates).await?;
     let mut details: Vec<_> = all_details
         .into_iter()
         .filter(|d| d.category_name == cat_name)

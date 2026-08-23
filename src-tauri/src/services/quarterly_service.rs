@@ -6,7 +6,7 @@ use crate::models::quarterly::{
 };
 use crate::models::transaction::Transaction;
 use crate::services::exchange_rate_service::{
-    convert_currency, get_cached_rates, ExchangeRateCache,
+    convert_currency, get_cached_rates, market_quote_currency, ExchangeRateCache,
 };
 use crate::services::quote_provider_service;
 use crate::services::quote_service::{
@@ -99,6 +99,7 @@ pub async fn create_quarterly_snapshot(
         category_color: String,
         shares: f64,
         avg_cost: f64,
+        currency: String,
     }
 
     let rows: Vec<HoldingRow> = {
@@ -109,7 +110,7 @@ pub async fn create_quarterly_snapshot(
                         h.symbol, h.name, h.market,
                         COALESCE(c.name, '未分类') AS category_name,
                         COALESCE(c.color, '#8B8B8B') AS category_color,
-                        h.shares, h.avg_cost
+                        h.shares, h.avg_cost, h.currency
                  FROM holdings h
                  LEFT JOIN accounts a ON h.account_id = a.id
                  LEFT JOIN categories c ON h.category_id = c.id
@@ -130,6 +131,7 @@ pub async fn create_quarterly_snapshot(
                     category_color: row.get(7)?,
                     shares: row.get(8)?,
                     avg_cost: row.get(9)?,
+                    currency: row.get(10)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -172,10 +174,19 @@ pub async fn create_quarterly_snapshot(
 
     let mut holding_rows_for_insert: Vec<(HoldingRow, f64, f64, f64)> = Vec::new();
 
-    for row in rows {
+    for mut row in rows {
         let close_price = *price_map.get(&row.symbol).unwrap_or(&0.0);
         let market_value = row.shares * close_price;
-        let cost_value = row.shares * row.avg_cost;
+        let quote_currency = market_quote_currency(&row.market).unwrap_or(row.currency.as_str());
+        let cost_value = convert_currency(
+            row.shares * row.avg_cost,
+            &row.currency,
+            quote_currency,
+            &rates,
+        );
+        if row.shares > 0.0 {
+            row.avg_cost = cost_value / row.shares;
+        }
 
         match row.market.as_str() {
             "US" => {
@@ -822,6 +833,7 @@ pub async fn refresh_quarterly_snapshot(
         category_color: String,
         shares: f64,
         avg_cost: f64,
+        currency: String,
         notes: Option<String>,
     }
 
@@ -860,6 +872,7 @@ pub async fn refresh_quarterly_snapshot(
             String, // category_color
             f64,    // shares
             f64,    // avg_cost
+            String, // currency
         );
         let live_rows: Vec<LiveRow> = {
             let conn = db.conn.lock().map_err(|e| e.to_string())?;
@@ -869,7 +882,7 @@ pub async fn refresh_quarterly_snapshot(
                             h.symbol, h.name, h.market,
                             COALESCE(c.name, '未分类') AS category_name,
                             COALESCE(c.color, '#8B8B8B') AS category_color,
-                            h.shares, h.avg_cost
+                            h.shares, h.avg_cost, h.currency
                      FROM holdings h
                      LEFT JOIN accounts a ON h.account_id = a.id
                      LEFT JOIN categories c ON h.category_id = c.id
@@ -889,6 +902,7 @@ pub async fn refresh_quarterly_snapshot(
                         row.get::<_, String>(6)?, // category_color
                         row.get::<_, f64>(7)?,    // shares
                         row.get::<_, f64>(8)?,    // avg_cost
+                        row.get::<_, String>(9)?, // currency
                     ))
                 })
                 .map_err(|e| e.to_string())?;
@@ -908,6 +922,7 @@ pub async fn refresh_quarterly_snapshot(
                     category_color,
                     shares,
                     avg_cost,
+                    currency,
                 )| {
                     let notes = existing_notes.get(&symbol).cloned().flatten();
                     WorkingHolding {
@@ -920,6 +935,7 @@ pub async fn refresh_quarterly_snapshot(
                         category_color,
                         shares,
                         avg_cost,
+                        currency,
                         notes,
                     }
                 },
@@ -1023,6 +1039,7 @@ pub async fn refresh_quarterly_snapshot(
             category_color: String,
             shares: f64,
             avg_cost: f64,
+            currency: String,
         }
 
         let rebuilt: Vec<RebuiltHolding> = {
@@ -1042,11 +1059,12 @@ pub async fn refresh_quarterly_snapshot(
                     String, // account_name
                     String, // category_name
                     String, // category_color
+                    String, // currency
                 )> = conn
                     .query_row(
                         "SELECT h.name, h.market, COALESCE(a.name, ''),
                                 COALESCE(c.name, '未分类'),
-                                COALESCE(c.color, '#8B8B8B')
+                                COALESCE(c.color, '#8B8B8B'), h.currency
                          FROM holdings h
                          LEFT JOIN accounts a ON h.account_id = a.id
                          LEFT JOIN categories c ON h.category_id = c.id
@@ -1059,12 +1077,13 @@ pub async fn refresh_quarterly_snapshot(
                                 row.get(2)?,
                                 row.get(3)?,
                                 row.get(4)?,
+                                row.get(5)?,
                             ))
                         },
                     )
                     .ok();
 
-                let (name, market, acct_name, cat_name, cat_color) = match holding_info {
+                let (name, market, acct_name, cat_name, cat_color, currency) = match holding_info {
                     Some(h) => h,
                     None => continue,
                 };
@@ -1157,6 +1176,7 @@ pub async fn refresh_quarterly_snapshot(
                         category_color: cat_color,
                         shares,
                         avg_cost,
+                        currency,
                     });
                 }
             }
@@ -1187,6 +1207,7 @@ pub async fn refresh_quarterly_snapshot(
                     category_color: rp.category_color,
                     shares: rp.shares,
                     avg_cost: rp.avg_cost,
+                    currency: rp.currency,
                     notes,
                 }
             })
@@ -1296,6 +1317,7 @@ pub async fn refresh_quarterly_snapshot(
 
     struct ComputedRow<'a> {
         holding: &'a WorkingHolding,
+        avg_cost_quote: f64,
         close_price: f64,
         market_value: f64,
         cost_value: f64,
@@ -1308,7 +1330,14 @@ pub async fn refresh_quarterly_snapshot(
     for h in &holdings {
         let close_price = *price_map.get(&h.symbol).unwrap_or(&0.0);
         let market_value = h.shares * close_price;
-        let cost_value = h.shares * h.avg_cost;
+        let quote_currency = market_quote_currency(&h.market).unwrap_or(h.currency.as_str());
+        let cost_value =
+            convert_currency(h.shares * h.avg_cost, &h.currency, quote_currency, &rates);
+        let avg_cost_quote = if h.shares > 0.0 {
+            cost_value / h.shares
+        } else {
+            0.0
+        };
         let pnl = market_value - cost_value;
         let pnl_percent = if cost_value > 0.0 {
             Some(pnl / cost_value * 100.0)
@@ -1334,6 +1363,7 @@ pub async fn refresh_quarterly_snapshot(
 
         computed.push(ComputedRow {
             holding: h,
+            avg_cost_quote,
             close_price,
             market_value,
             cost_value,
@@ -1399,7 +1429,7 @@ pub async fn refresh_quarterly_snapshot(
                         c.holding.category_name,
                         c.holding.category_color,
                         c.holding.shares,
-                        c.holding.avg_cost,
+                        c.avg_cost_quote,
                         c.close_price,
                         c.market_value,
                         c.cost_value,
@@ -1479,7 +1509,7 @@ pub async fn refresh_quarterly_snapshot(
                        AND symbol = ?11",
                     rusqlite::params![
                         c.holding.shares,
-                        c.holding.avg_cost,
+                        c.avg_cost_quote,
                         c.close_price,
                         c.market_value,
                         c.cost_value,

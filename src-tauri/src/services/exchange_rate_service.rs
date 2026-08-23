@@ -209,6 +209,32 @@ pub fn convert_currency(amount: f64, from: &str, to: &str, rates: &ExchangeRates
     from_usd(usd_amount, to, rates)
 }
 
+/// Return the native currency used by a market quote provider.
+///
+/// A holding's settlement/cost currency may differ from this currency.  The
+/// common example is Stock Connect: the holding is settled in CNY while the HK
+/// quote is still denominated in HKD.
+pub fn market_quote_currency(market: &str) -> Option<&'static str> {
+    match market {
+        "US" => Some("USD"),
+        "CN" => Some("CNY"),
+        "HK" => Some("HKD"),
+        _ => None,
+    }
+}
+
+/// Convert an amount produced from a native market quote into the holding's
+/// settlement/cost currency before comparing it with cost basis values.
+pub fn convert_quote_amount(
+    amount: f64,
+    market: &str,
+    holding_currency: &str,
+    rates: &ExchangeRates,
+) -> f64 {
+    let quote_currency = market_quote_currency(market).unwrap_or(holding_currency);
+    convert_currency(amount, quote_currency, holding_currency, rates)
+}
+
 fn to_usd(amount: f64, currency: &str, rates: &ExchangeRates) -> f64 {
     match currency {
         "USD" => amount,
@@ -274,6 +300,20 @@ mod tests {
         let result = convert_currency(7.2, "CNY", "HKD", &rates);
         // 7.2 CNY = 1 USD = 7.8 HKD
         assert!((result - 7.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_convert_hk_quote_to_cny_holding_currency() {
+        let rates = sample_rates();
+        let result = convert_quote_amount(780.0, "HK", "CNY", &rates);
+        assert!((result - 720.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_quote_amount_is_unchanged_when_currencies_match() {
+        let rates = sample_rates();
+        assert!((convert_quote_amount(123.45, "HK", "HKD", &rates) - 123.45).abs() < 0.001);
+        assert!((convert_quote_amount(123.45, "CN", "CNY", &rates) - 123.45).abs() < 0.001);
     }
 
     #[test]

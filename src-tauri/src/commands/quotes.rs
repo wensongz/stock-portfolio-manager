@@ -1,5 +1,8 @@
 use crate::db::Database;
 use crate::models::{HoldingWithQuote, StockQuote};
+use crate::services::exchange_rate_service::{
+    convert_quote_amount, get_cached_rates, ExchangeRateCache,
+};
 use crate::services::quote_provider_service;
 use crate::services::quote_service::{
     fetch_cn_quote_with_provider, fetch_hk_quote_with_provider,
@@ -41,9 +44,18 @@ pub async fn get_real_time_quotes(
 pub async fn get_holding_quotes(
     db: State<'_, Database>,
     quote_cache: State<'_, QuoteCache>,
+    exchange_rate_cache: State<'_, ExchangeRateCache>,
     refresh_symbols: Option<Vec<(String, String)>>,
 ) -> Result<Vec<HoldingWithQuote>, String> {
     let config = quote_provider_service::get_quote_provider_config(&db)?;
+    let rates = get_cached_rates(&exchange_rate_cache, &db)
+        .await
+        .unwrap_or_else(|_| crate::models::ExchangeRates {
+            usd_cny: 7.2,
+            usd_hkd: 7.8,
+            cny_hkd: 7.8 / 7.2,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        });
     let should_refresh_from_api = match refresh_symbols.as_ref() {
         Some(symbols) => !symbols.is_empty(),
         None => true,
@@ -179,7 +191,17 @@ pub async fn get_holding_quotes(
     let result = holdings
         .into_iter()
         .map(|h| {
-            let quote = quote_map.get(&h.symbol).cloned();
+            let quote = quote_map.get(&h.symbol).cloned().map(|mut q| {
+                let factor = convert_quote_amount(1.0, &h.market, &h.currency, &rates);
+                q.current_price *= factor;
+                q.previous_close *= factor;
+                q.change *= factor;
+                q.high *= factor;
+                q.low *= factor;
+                q.market_cap = q.market_cap.map(|value| value * factor);
+                q.eps = q.eps.map(|value| value * factor);
+                q
+            });
             let cleared = h.shares == 0.0 && !h.symbol.starts_with(CASH_SYMBOL_PREFIX);
             let (market_value, total_cost, unrealized_pnl, unrealized_pnl_percent) = if cleared {
                 // Cleared position: report realized PnL from transaction history.

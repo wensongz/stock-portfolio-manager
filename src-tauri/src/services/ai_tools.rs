@@ -798,7 +798,15 @@ async fn tool_portfolio_overview(ctx: &ToolCtx<'_>) -> ToolResult {
 async fn tool_holdings_detail(ctx: &ToolCtx<'_>) -> ToolResult {
     // cache_only = true: tools should not trigger cascading network fetches.
     // The model can call get_stock_quote explicitly for fresh prices.
-    match build_holding_details_pub(ctx.db, ctx.quote_cache, true).await {
+    let rates = get_cached_rates(ctx.cache, ctx.db)
+        .await
+        .unwrap_or_else(|_| crate::models::quote::ExchangeRates {
+            usd_cny: 7.2,
+            usd_hkd: 7.8,
+            cny_hkd: 7.8 / 7.2,
+            updated_at: Utc::now().to_rfc3339(),
+        });
+    match build_holding_details_pub(ctx.db, ctx.quote_cache, true, &rates).await {
         Ok(details) => ToolResult::ok_json(json!({ "holdings": details })),
         Err(e) => ToolResult::err_json(format!("获取持仓明细失败：{e}")),
     }
@@ -1011,7 +1019,7 @@ async fn tool_dashboard_summary(ctx: &ToolCtx<'_>) -> ToolResult {
             updated_at: Utc::now().to_rfc3339(),
         });
     let base = "USD";
-    match build_holding_details_pub(ctx.db, ctx.quote_cache, true).await {
+    match build_holding_details_pub(ctx.db, ctx.quote_cache, true, &rates).await {
         Ok(details) => {
             let mut us_mv = 0.0f64;
             let mut cn_mv = 0.0f64;

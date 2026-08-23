@@ -51,7 +51,8 @@ export default function PieChart({ data, title, centerText, height = 300, curren
           ? {
               show: true,
               position: "center",
-              formatter: () => centerText,
+              formatter: (params: { dataIndex: number }) =>
+                params.dataIndex === 0 ? centerText : "",
               fontSize: 12,
               color: "var(--color-text-secondary)",
             }

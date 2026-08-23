@@ -955,20 +955,15 @@ async fn tool_monthly_returns(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 async fn tool_drawdown_analysis(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let (start, end) = period_window(args);
     let filter = PerformanceFilter::default();
-    // get_drawdown_analysis command builds the series then calls the pure
-    // calculate_max_drawdown; replicate that here.
-    match performance_service::get_return_series(ctx.db, start, end, &filter) {
-        Ok(series) => {
-            let dd = performance_service::calculate_max_drawdown(&series);
-            ToolResult::ok_json(json!({
-                "max_drawdown": dd.max_drawdown,
-                "peak_date": dd.peak_date,
-                "trough_date": dd.trough_date,
-                "recovery_date": dd.recovery_date,
-                "drawdown_duration_days": dd.drawdown_duration,
-                "recovery_duration_days": dd.recovery_duration,
-            }))
-        }
+    match performance_service::get_drawdown_analysis(ctx.db, start, end, &filter) {
+        Ok(dd) => ToolResult::ok_json(json!({
+            "max_drawdown": dd.max_drawdown,
+            "peak_date": dd.peak_date,
+            "trough_date": dd.trough_date,
+            "recovery_date": dd.recovery_date,
+            "drawdown_duration_days": dd.drawdown_duration,
+            "recovery_duration_days": dd.recovery_duration,
+        })),
         Err(e) => ToolResult::err_json(format!("回撤分析失败：{e}")),
     }
 }

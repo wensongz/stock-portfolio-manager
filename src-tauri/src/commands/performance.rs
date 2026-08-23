@@ -148,6 +148,5 @@ pub async fn get_drawdown_analysis(
     let start = parse_date(&start_date)?;
     let end = parse_date(&end_date)?;
     let filter = build_filter(market, account_id);
-    let series = performance_service::get_return_series(&db, start, end, &filter)?;
-    Ok(performance_service::calculate_max_drawdown(&series))
+    performance_service::get_drawdown_analysis(&db, start, end, &filter)
 }

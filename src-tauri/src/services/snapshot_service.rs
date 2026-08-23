@@ -8,7 +8,7 @@ use crate::services::quote_service::{
     fetch_quotes_batch_cached_with_providers, fetch_stock_history, QuoteCache,
 };
 use chrono::{Datelike, NaiveDate, Timelike};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Number of calendar days to look back before the first missing date when
 /// fetching historical prices.  This ensures that stocks suspended (停牌)
@@ -64,7 +64,8 @@ pub async fn take_daily_snapshot(
                         h.shares, h.avg_cost, h.currency, c.name as category_name
                  FROM holdings h
                  LEFT JOIN categories c ON h.category_id = c.id
-                 WHERE h.shares > 0",
+                 WHERE ABS(h.shares) > 0.000000001
+                    OR UPPER(h.symbol) LIKE '$CASH-%'",
             )
             .map_err(|e| e.to_string())?;
 
@@ -295,6 +296,214 @@ pub fn get_daily_values(
     Ok(values)
 }
 
+type HoldingKey = (String, String);
+
+#[derive(Debug, Clone)]
+struct HoldingRow {
+    _id: String,
+    account_id: String,
+    symbol: String,
+    _name: String,
+    market: String,
+    shares: f64,
+    avg_cost: f64,
+    currency: String,
+    category_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TxInfo {
+    account_id: String,
+    symbol: String,
+    transaction_type: String,
+    shares: f64,
+    price: f64,
+    total_amount: f64,
+    commission: f64,
+    currency: String,
+    trade_date: NaiveDate,
+}
+
+#[derive(Debug, Default)]
+struct SymbolPricePlan {
+    active_symbols_by_date: std::collections::HashMap<NaiveDate, std::collections::HashSet<String>>,
+    fetch_windows: std::collections::HashMap<String, (NaiveDate, NaiveDate)>,
+}
+
+impl SymbolPricePlan {
+    fn is_active(&self, date: NaiveDate, symbol: &str) -> bool {
+        self.active_symbols_by_date
+            .get(&date)
+            .is_some_and(|symbols| symbols.contains(symbol))
+    }
+}
+
+/// Add the share/cash delta that reverses one transaction from the current
+/// holdings state. Backfill uses these deltas to reconstruct each historical
+/// end-of-day position.
+#[allow(clippy::too_many_arguments)]
+fn accumulate_transaction_unwind(
+    unwind: &mut std::collections::HashMap<HoldingKey, f64>,
+    account_id: &str,
+    symbol: &str,
+    transaction_type: &str,
+    shares: f64,
+    total_amount: f64,
+    commission: f64,
+    currency: &str,
+) {
+    let key = (account_id.to_string(), symbol.to_string());
+    if crate::services::quote_service::is_cash_symbol(symbol) {
+        let cash_delta = match transaction_type {
+            "BUY" => -(total_amount + commission),
+            "SELL" => total_amount + commission,
+            _ => 0.0,
+        };
+        *unwind.entry(key).or_insert(0.0) += cash_delta;
+        return;
+    }
+
+    let cash_key = (
+        account_id.to_string(),
+        format!(
+            "{}{}",
+            crate::services::quote_service::CASH_SYMBOL_PREFIX,
+            currency
+        ),
+    );
+    match transaction_type {
+        "OPEN" => {
+            *unwind.entry(key).or_insert(0.0) -= shares;
+        }
+        "BUY" => {
+            *unwind.entry(key).or_insert(0.0) -= shares;
+            *unwind.entry(cash_key).or_insert(0.0) += total_amount + commission;
+        }
+        "SELL" => {
+            *unwind.entry(key).or_insert(0.0) += shares;
+            *unwind.entry(cash_key).or_insert(0.0) -= total_amount - commission;
+        }
+        "PAY" => {
+            *unwind.entry(cash_key).or_insert(0.0) -= total_amount - commission;
+        }
+        _ => {}
+    }
+}
+
+fn active_non_cash_symbols(
+    holdings: &[HoldingRow],
+    shares_by_key: &std::collections::HashMap<HoldingKey, f64>,
+) -> std::collections::HashSet<String> {
+    holdings
+        .iter()
+        .filter(|holding| {
+            !crate::services::quote_service::is_cash_symbol(&holding.symbol)
+                && shares_by_key
+                    .get(&(holding.account_id.clone(), holding.symbol.clone()))
+                    .copied()
+                    .unwrap_or(0.0)
+                    .abs()
+                    >= 1e-9
+        })
+        .map(|holding| holding.symbol.clone())
+        .collect()
+}
+
+/// Replay position changes before any network request so historical prices are
+/// fetched and resolved only while a stock was actually held. Positions that
+/// predate the requested range keep a lookback window for suspension/holiday
+/// forward-fill; positions opened inside the range are capped at that date.
+fn build_symbol_price_plan(
+    holdings: &[HoldingRow],
+    transactions: &[TxInfo],
+    total_unwind: &std::collections::HashMap<HoldingKey, f64>,
+    missing_dates: &[NaiveDate],
+) -> SymbolPricePlan {
+    let mut plan = SymbolPricePlan::default();
+    if missing_dates.is_empty() {
+        return plan;
+    }
+
+    // `current + total_unwind` is the position immediately before start_date;
+    // each transaction's unwind is then reversed to move forward through time.
+    let mut shares_by_key: std::collections::HashMap<HoldingKey, f64> = holdings
+        .iter()
+        .map(|holding| {
+            let key = (holding.account_id.clone(), holding.symbol.clone());
+            let shares = holding.shares + total_unwind.get(&key).copied().unwrap_or(0.0);
+            (key, shares)
+        })
+        .collect();
+
+    // None means the current active episode began before the loaded range, so
+    // its exact acquisition date is unknown and the lookback must be retained.
+    let mut episode_start: std::collections::HashMap<String, Option<NaiveDate>> =
+        active_non_cash_symbols(holdings, &shares_by_key)
+            .into_iter()
+            .map(|symbol| (symbol, None))
+            .collect();
+    let mut transaction_index = 0usize;
+
+    for date in missing_dates {
+        while transaction_index < transactions.len()
+            && transactions[transaction_index].trade_date <= *date
+        {
+            let transaction_date = transactions[transaction_index].trade_date;
+            let active_before = active_non_cash_symbols(holdings, &shares_by_key);
+
+            // Apply all same-day transactions before evaluating the end-of-day
+            // holding state used by a daily portfolio snapshot.
+            while transaction_index < transactions.len()
+                && transactions[transaction_index].trade_date == transaction_date
+            {
+                let tx = &transactions[transaction_index];
+                let mut transaction_unwind = std::collections::HashMap::new();
+                accumulate_transaction_unwind(
+                    &mut transaction_unwind,
+                    &tx.account_id,
+                    &tx.symbol,
+                    &tx.transaction_type,
+                    tx.shares,
+                    tx.total_amount,
+                    tx.commission,
+                    &tx.currency,
+                );
+                for (key, reverse_delta) in transaction_unwind {
+                    *shares_by_key.entry(key).or_insert(0.0) -= reverse_delta;
+                }
+                transaction_index += 1;
+            }
+
+            let active_after = active_non_cash_symbols(holdings, &shares_by_key);
+            for symbol in active_after.difference(&active_before) {
+                episode_start.insert(symbol.clone(), Some(transaction_date));
+            }
+            for symbol in active_before.difference(&active_after) {
+                episode_start.remove(symbol);
+            }
+        }
+
+        let active_symbols = active_non_cash_symbols(holdings, &shares_by_key);
+        for symbol in &active_symbols {
+            let lookback_start = *date - chrono::Duration::days(SUSPENSION_LOOKBACK_DAYS);
+            let fetch_start = match episode_start.get(symbol) {
+                Some(Some(start)) => (*start).max(lookback_start),
+                _ => lookback_start,
+            };
+            plan.fetch_windows
+                .entry(symbol.clone())
+                .and_modify(|window| {
+                    window.0 = window.0.min(fetch_start);
+                    window.1 = window.1.max(*date);
+                })
+                .or_insert((fetch_start, *date));
+        }
+        plan.active_symbols_by_date.insert(*date, active_symbols);
+    }
+
+    plan
+}
+
 /// Backfill missing daily portfolio snapshots for the given date range.
 /// Fetches historical closing prices from Yahoo Finance, calculates portfolio
 /// values for every missing weekday, and stores them in the database.
@@ -311,6 +520,31 @@ pub async fn backfill_snapshots(
     end_date: NaiveDate,
     force: bool,
 ) -> Result<i32, String> {
+    backfill_snapshots_with_fetcher(
+        db,
+        cache,
+        start_date,
+        end_date,
+        force,
+        |symbol, market, fetch_start, fetch_end, provider| async move {
+            fetch_stock_history(&symbol, &market, fetch_start, fetch_end, &provider).await
+        },
+    )
+    .await
+}
+
+async fn backfill_snapshots_with_fetcher<Fetch, FetchFuture>(
+    db: &Database,
+    cache: &ExchangeRateCache,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+    force: bool,
+    fetch_history: Fetch,
+) -> Result<i32, String>
+where
+    Fetch: Fn(String, String, NaiveDate, NaiveDate, String) -> FetchFuture,
+    FetchFuture: std::future::Future<Output = Result<Vec<(NaiveDate, f64)>, String>>,
+{
     // Clamp end_date to the last date for which closing prices are
     // available.  Before CN/HK market close (≈15:00 UTC+8), today's
     // prices do not exist yet, so we use yesterday.
@@ -328,19 +562,6 @@ pub async fn backfill_snapshots(
     // 1. Load all relevant holdings: current active ones PLUS any that had
     //    transactions in the backfill period (they may be sold now but were
     //    held on historical dates).
-    #[derive(Debug, Clone)]
-    struct HoldingRow {
-        _id: String,
-        account_id: String,
-        symbol: String,
-        _name: String,
-        market: String,
-        shares: f64,
-        avg_cost: f64,
-        currency: String,
-        category_name: Option<String>,
-    }
-
     let holdings = {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
         let start_str = start_date.format("%Y-%m-%d").to_string();
@@ -350,7 +571,8 @@ pub async fn backfill_snapshots(
                         h.shares, h.avg_cost, h.currency, c.name as category_name
                  FROM holdings h
                  LEFT JOIN categories c ON h.category_id = c.id
-                 WHERE h.shares > 0
+                 WHERE ABS(h.shares) > 0.000000001
+                    OR UPPER(h.symbol) LIKE '$CASH-%'
                     OR EXISTS (
                         SELECT 1 FROM transactions t
                         WHERE t.account_id = h.account_id
@@ -385,23 +607,12 @@ pub async fn backfill_snapshots(
 
     // 1b. Load transactions from start_date onwards so we can reconstruct
     //     historical holdings by unwinding future transactions.
-    struct TxInfo {
-        account_id: String,
-        symbol: String,
-        transaction_type: String,
-        shares: f64,
-        total_amount: f64,
-        commission: f64,
-        currency: String,
-        trade_date: NaiveDate,
-    }
-
     let transactions: Vec<TxInfo> = {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
         let start_str = start_date.format("%Y-%m-%d").to_string();
         let mut stmt = conn
             .prepare(
-                "SELECT account_id, symbol, transaction_type, shares,
+                "SELECT account_id, symbol, transaction_type, shares, price,
                         total_amount, commission, currency, DATE(traded_at) as trade_date
                  FROM transactions
                  WHERE DATE(traded_at) >= ?1
@@ -410,7 +621,7 @@ pub async fn backfill_snapshots(
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(rusqlite::params![start_str], |row| {
-                let td_str: String = row.get(7)?;
+                let td_str: String = row.get(8)?;
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -418,7 +629,8 @@ pub async fn backfill_snapshots(
                     row.get::<_, f64>(3)?,
                     row.get::<_, f64>(4)?,
                     row.get::<_, f64>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, f64>(6)?,
+                    row.get::<_, String>(7)?,
                     td_str,
                 ))
             })
@@ -426,7 +638,7 @@ pub async fn backfill_snapshots(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         rows.into_iter()
-            .filter_map(|(aid, sym, tt, sh, ta, com, cur, ds)| {
+            .filter_map(|(aid, sym, tt, sh, price, ta, com, cur, ds)| {
                 NaiveDate::parse_from_str(&ds, "%Y-%m-%d")
                     .ok()
                     .map(|td| TxInfo {
@@ -434,6 +646,7 @@ pub async fn backfill_snapshots(
                         symbol: sym,
                         transaction_type: tt,
                         shares: sh,
+                        price,
                         total_amount: ta,
                         commission: com,
                         currency: cur,
@@ -443,30 +656,57 @@ pub async fn backfill_snapshots(
             .collect()
     };
 
+    // Seed pre-range acquisition prices so a newly allotted stock remains
+    // valued correctly even when the requested performance window begins
+    // after its allotment date but before its first market close.
+    let initial_transaction_prices: std::collections::HashMap<HoldingKey, f64> = {
+        let conn = db.conn.lock().map_err(|error| error.to_string())?;
+        let start_str = start_date.format("%Y-%m-%d").to_string();
+        let mut stmt = conn
+            .prepare(
+                "SELECT account_id, symbol, price
+                 FROM transactions
+                 WHERE DATE(traded_at) < ?1
+                   AND UPPER(transaction_type) IN ('BUY', 'OPEN')
+                   AND price > 0
+                 ORDER BY traded_at ASC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![start_str], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut prices = std::collections::HashMap::new();
+        for row in rows {
+            let (account_id, symbol, price) = row.map_err(|error| error.to_string())?;
+            if !crate::services::quote_service::is_cash_symbol(&symbol) {
+                prices.insert((account_id, symbol), price);
+            }
+        }
+        prices
+    };
+
     // Pre-compute the TOTAL unwind delta across ALL loaded transactions.
     // For a given date D, the adjustment = total_unwind - running_unwind(up to D)
     // gives the unwind of all transactions AFTER D, yielding the shares at D.
-    let mut total_unwind: std::collections::HashMap<(String, String), f64> =
+    let mut total_unwind: std::collections::HashMap<HoldingKey, f64> =
         std::collections::HashMap::new();
     for tx in &transactions {
-        let key = (tx.account_id.clone(), tx.symbol.clone());
-        let cash_sym = format!(
-            "{}{}",
-            crate::services::quote_service::CASH_SYMBOL_PREFIX,
-            tx.currency
+        accumulate_transaction_unwind(
+            &mut total_unwind,
+            &tx.account_id,
+            &tx.symbol,
+            &tx.transaction_type,
+            tx.shares,
+            tx.total_amount,
+            tx.commission,
+            &tx.currency,
         );
-        let cash_key = (tx.account_id.clone(), cash_sym);
-        match tx.transaction_type.as_str() {
-            "BUY" => {
-                *total_unwind.entry(key).or_insert(0.0) -= tx.shares;
-                *total_unwind.entry(cash_key).or_insert(0.0) += tx.total_amount + tx.commission;
-            }
-            "SELL" => {
-                *total_unwind.entry(key).or_insert(0.0) += tx.shares;
-                *total_unwind.entry(cash_key).or_insert(0.0) -= tx.total_amount - tx.commission;
-            }
-            _ => {}
-        }
     }
 
     // 2. Find all weekdays in range that are missing snapshots
@@ -519,18 +759,11 @@ pub async fn backfill_snapshots(
 
     let config = quote_provider_service::get_quote_provider_config(db)?;
 
-    // Narrow the fetch window to cover only the missing dates.  When most
-    // snapshots are already cached (e.g. a new day just started), this avoids
-    // re-fetching weeks of historical prices that are already in the DB.
-    //
-    // We add a 30-calendar-day look-back before the first missing date so
-    // that `forward_fill_price` can find the last trading-day close for
-    // stocks that were suspended (停牌) around the start of the window.
-    // Without this, a stock suspended on the first missing date would have
-    // no earlier price to forward-fill from.
-    let fetch_start = missing_dates.first().copied().unwrap_or(start_date)
-        - chrono::Duration::days(SUSPENSION_LOOKBACK_DAYS);
-    let fetch_end = missing_dates.last().copied().unwrap_or(end_date);
+    // Reconstruct symbol activity before hitting the quote provider. This
+    // prevents querying or warning about dates before a position was opened,
+    // while retaining lookback data for positions held before the range.
+    let price_plan =
+        build_symbol_price_plan(&holdings, &transactions, &total_unwind, &missing_dates);
 
     // Deduplicate symbols – multiple accounts may hold the same stock;
     // we only need to fetch historical prices once per unique symbol.
@@ -555,6 +788,10 @@ pub async fn backfill_snapshots(
             continue;
         }
 
+        let Some((fetch_start, fetch_end)) = price_plan.fetch_windows.get(symbol).copied() else {
+            continue;
+        };
+
         // Select the configured provider for the holding's market.
         let provider = match market.as_str() {
             "US" => config.us_provider.as_str(),
@@ -562,7 +799,15 @@ pub async fn backfill_snapshots(
             _ => config.cn_provider.as_str(),
         };
 
-        match fetch_stock_history(symbol, market, fetch_start, fetch_end, provider).await {
+        match fetch_history(
+            symbol.clone(),
+            market.clone(),
+            fetch_start,
+            fetch_end,
+            provider.to_string(),
+        )
+        .await
+        {
             Ok(prices) => {
                 let date_price_map: std::collections::HashMap<NaiveDate, f64> =
                     prices.into_iter().collect();
@@ -603,8 +848,11 @@ pub async fn backfill_snapshots(
     //    per-statement fsync in autocommit mode).
     let mut count = 0i32;
     let mut txn_idx = 0usize;
-    let mut running_unwind: std::collections::HashMap<(String, String), f64> =
+    let mut running_unwind: std::collections::HashMap<HoldingKey, f64> =
         std::collections::HashMap::new();
+    let mut transaction_prices = initial_transaction_prices;
+    let mut logged_transaction_price_fallbacks: std::collections::HashSet<HoldingKey> =
+        std::collections::HashSet::new();
 
     // Collect all rows to persist, then batch-write inside a transaction.
     struct DateRow {
@@ -628,26 +876,22 @@ pub async fn backfill_snapshots(
         // Advance running_unwind past transactions on or before this date.
         while txn_idx < transactions.len() && transactions[txn_idx].trade_date <= *date {
             let tx = &transactions[txn_idx];
-            let key = (tx.account_id.clone(), tx.symbol.clone());
-            let cash_sym = format!(
-                "{}{}",
-                crate::services::quote_service::CASH_SYMBOL_PREFIX,
-                tx.currency
-            );
-            let cash_key = (tx.account_id.clone(), cash_sym);
-            match tx.transaction_type.as_str() {
-                "BUY" => {
-                    *running_unwind.entry(key).or_insert(0.0) -= tx.shares;
-                    *running_unwind.entry(cash_key).or_insert(0.0) +=
-                        tx.total_amount + tx.commission;
-                }
-                "SELL" => {
-                    *running_unwind.entry(key).or_insert(0.0) += tx.shares;
-                    *running_unwind.entry(cash_key).or_insert(0.0) -=
-                        tx.total_amount - tx.commission;
-                }
-                _ => {}
+            if matches!(tx.transaction_type.as_str(), "BUY" | "OPEN")
+                && tx.price > 0.0
+                && !crate::services::quote_service::is_cash_symbol(&tx.symbol)
+            {
+                transaction_prices.insert((tx.account_id.clone(), tx.symbol.clone()), tx.price);
             }
+            accumulate_transaction_unwind(
+                &mut running_unwind,
+                &tx.account_id,
+                &tx.symbol,
+                &tx.transaction_type,
+                tx.shares,
+                tx.total_amount,
+                tx.commission,
+                &tx.currency,
+            );
             txn_idx += 1;
         }
 
@@ -663,25 +907,23 @@ pub async fn backfill_snapshots(
         // Pre-resolve the closing price for each unique symbol on this date.
         // This avoids redundant forward_fill_price calls when the same stock
         // is held in multiple accounts, and naturally deduplicates warnings.
-        let mut resolved_prices: std::collections::HashMap<String, f64> =
+        let mut resolved_prices: std::collections::HashMap<String, Option<f64>> =
             std::collections::HashMap::new();
-        for (symbol, market) in &unique_symbols {
-            let price = history_map
-                .get(symbol)
-                .and_then(|date_map| {
-                    history_sorted
-                        .get(symbol)
-                        .and_then(|sorted| forward_fill_price(date_map, sorted, date))
-                })
-                .unwrap_or_else(|| {
-                    warn!(
-                        "no historical price for {} ({}) on {}",
-                        symbol, market, date_str
-                    );
-                    0.0
-                });
+        for (symbol, _market) in &unique_symbols {
+            if !crate::services::quote_service::is_cash_symbol(symbol)
+                && !price_plan.is_active(*date, symbol)
+            {
+                continue;
+            }
+            let price = history_map.get(symbol).and_then(|date_map| {
+                history_sorted
+                    .get(symbol)
+                    .and_then(|sorted| forward_fill_price(date_map, sorted, date))
+            });
             resolved_prices.insert(symbol.clone(), price);
         }
+
+        let mut warned_missing_symbols = std::collections::HashSet::new();
 
         for holding in &holdings {
             // Compute adjusted shares for this holding on this date:
@@ -693,11 +935,35 @@ pub async fn backfill_snapshots(
             let adjusted_shares = holding.shares + adjustment;
 
             // Skip holdings with no shares on this date
-            if adjusted_shares.abs() < 1e-9 {
+            if adjusted_shares.abs() < 1e-9
+                && !crate::services::quote_service::is_cash_symbol(&holding.symbol)
+            {
                 continue;
             }
-            // Look up the pre-resolved closing price for this symbol.
-            let close_price = resolved_prices.get(&holding.symbol).copied().unwrap_or(0.0);
+            // Prefer an actual market close. For a newly allotted stock whose
+            // first trading day has not arrived, retain its transaction price
+            // so the cash-to-stock conversion is performance-neutral.
+            let market_price = resolved_prices.get(&holding.symbol).copied().flatten();
+            let transaction_price = transaction_prices.get(&key).copied();
+            let close_price = market_price.or(transaction_price).unwrap_or_else(|| {
+                if warned_missing_symbols.insert(holding.symbol.clone()) {
+                    warn!(
+                        "no historical or transaction price for {} ({}) on {}",
+                        holding.symbol, holding.market, date_str
+                    );
+                }
+                0.0
+            });
+
+            if market_price.is_none()
+                && transaction_price.is_some()
+                && logged_transaction_price_fallbacks.insert(key.clone())
+            {
+                info!(
+                    "using transaction price {} for {} ({}) from {} until market history becomes available",
+                    close_price, holding.symbol, holding.market, date_str
+                );
+            }
 
             if close_price > 0.0 {
                 has_any_price = true;
@@ -867,6 +1133,744 @@ fn forward_fill_price(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct TestLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TestLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const IPO_XUEQIU_HISTORY_BODY: &str = r#"{
+      "data": {
+        "symbol": "SZ001248",
+        "column": [
+          "timestamp", "volume", "open", "high", "low", "close",
+          "chg", "percent", "turnoverrate", "amount",
+          "volume_post", "amount_post"
+        ],
+        "item": [
+          [1782921600000, 721697718, 21.6, 30.16, 21.6, 23.95,
+           13.84, 136.89, 67.93, 17692297780.0, null, null]
+        ]
+      },
+      "error_code": 0,
+      "error_description": ""
+    }"#;
+
+    async fn fetch_ipo_history_fixture(
+        symbol: String,
+        market: String,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        eastmoney_fallbacks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        yahoo_fallbacks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<Vec<(NaiveDate, f64)>, String> {
+        let outcome = crate::services::quote_service::parse_xueqiu_history_response(
+            IPO_XUEQIU_HISTORY_BODY,
+            &symbol,
+            &market,
+            start_date,
+            end_date,
+            "https://example.test/kline",
+        )?;
+        crate::services::quote_service::resolve_xueqiu_history_outcome(
+            &symbol,
+            &market,
+            Ok(outcome),
+            move || async move {
+                eastmoney_fallbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+            move || async move {
+                yahoo_fallbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+        )
+        .await
+    }
+
+    #[test]
+    fn test_price_plan_starts_at_first_purchase_and_skips_pre_purchase_dates() {
+        let purchase_date = NaiveDate::from_ymd_opt(2026, 6, 24).unwrap();
+        let may_22 = NaiveDate::from_ymd_opt(2026, 5, 22).unwrap();
+        let may_25 = NaiveDate::from_ymd_opt(2026, 5, 25).unwrap();
+        let june_25 = NaiveDate::from_ymd_opt(2026, 6, 25).unwrap();
+        let holdings = vec![HoldingRow {
+            _id: "holding-cn".to_string(),
+            account_id: "acct-cn".to_string(),
+            symbol: "sz001248".to_string(),
+            _name: "华菱线缆".to_string(),
+            market: "CN".to_string(),
+            shares: 100.0,
+            avg_cost: 10.0,
+            _currency: "CNY".to_string(),
+            category_name: None,
+        }];
+        let transactions = vec![TxInfo {
+            account_id: "acct-cn".to_string(),
+            symbol: "sz001248".to_string(),
+            transaction_type: "BUY".to_string(),
+            shares: 100.0,
+            price: 10.0,
+            total_amount: 1_000.0,
+            commission: 0.0,
+            currency: "CNY".to_string(),
+            trade_date: purchase_date,
+        }];
+        let mut total_unwind = std::collections::HashMap::new();
+        accumulate_transaction_unwind(
+            &mut total_unwind,
+            "acct-cn",
+            "sz001248",
+            "BUY",
+            100.0,
+            1_000.0,
+            0.0,
+            "CNY",
+        );
+        let missing_dates = vec![may_22, may_25, purchase_date, june_25];
+
+        let plan = build_symbol_price_plan(&holdings, &transactions, &total_unwind, &missing_dates);
+
+        assert!(!plan.is_active(may_22, "sz001248"));
+        assert!(!plan.is_active(may_25, "sz001248"));
+        assert!(plan.is_active(purchase_date, "sz001248"));
+        assert_eq!(
+            plan.fetch_windows.get("sz001248"),
+            Some(&(purchase_date, june_25))
+        );
+    }
+
+    #[test]
+    fn test_price_plan_keeps_lookback_for_position_held_before_window() {
+        let may_22 = NaiveDate::from_ymd_opt(2026, 5, 22).unwrap();
+        let may_25 = NaiveDate::from_ymd_opt(2026, 5, 25).unwrap();
+        let holdings = vec![HoldingRow {
+            _id: "holding-cn".to_string(),
+            account_id: "acct-cn".to_string(),
+            symbol: "sz001248".to_string(),
+            _name: "华菱线缆".to_string(),
+            market: "CN".to_string(),
+            shares: 100.0,
+            avg_cost: 10.0,
+            _currency: "CNY".to_string(),
+            category_name: None,
+        }];
+
+        let plan = build_symbol_price_plan(
+            &holdings,
+            &[],
+            &std::collections::HashMap::new(),
+            &[may_22, may_25],
+        );
+
+        assert!(plan.is_active(may_22, "sz001248"));
+        assert_eq!(
+            plan.fetch_windows.get("sz001248"),
+            Some(&(
+                may_22 - chrono::Duration::days(SUSPENSION_LOOKBACK_DAYS),
+                may_25,
+            ))
+        );
+    }
+
+    #[test]
+    fn test_price_plan_caps_sparse_missing_date_fetch_to_lookback_window() {
+        let purchase_date = NaiveDate::from_ymd_opt(2026, 6, 24).unwrap();
+        let missing_date = NaiveDate::from_ymd_opt(2026, 8, 22).unwrap();
+        let holdings = vec![HoldingRow {
+            _id: "holding-cn".to_string(),
+            account_id: "acct-cn".to_string(),
+            symbol: "sz001248".to_string(),
+            _name: "华菱线缆".to_string(),
+            market: "CN".to_string(),
+            shares: 100.0,
+            avg_cost: 10.0,
+            _currency: "CNY".to_string(),
+            category_name: None,
+        }];
+        let transactions = vec![TxInfo {
+            account_id: "acct-cn".to_string(),
+            symbol: "sz001248".to_string(),
+            transaction_type: "BUY".to_string(),
+            shares: 100.0,
+            price: 10.0,
+            total_amount: 1_000.0,
+            commission: 0.0,
+            currency: "CNY".to_string(),
+            trade_date: purchase_date,
+        }];
+        let mut total_unwind = std::collections::HashMap::new();
+        accumulate_transaction_unwind(
+            &mut total_unwind,
+            "acct-cn",
+            "sz001248",
+            "BUY",
+            100.0,
+            1_000.0,
+            0.0,
+            "CNY",
+        );
+
+        let plan =
+            build_symbol_price_plan(&holdings, &transactions, &total_unwind, &[missing_date]);
+
+        assert_eq!(
+            plan.fetch_windows.get("sz001248"),
+            Some(&(
+                missing_date - chrono::Duration::days(SUSPENSION_LOOKBACK_DAYS),
+                missing_date,
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ipo_is_excluded_before_allotment_and_uses_issue_price_until_listing() {
+        let db = Database::new(":memory:").unwrap();
+        let rate_cache = ExchangeRateCache::new();
+        rate_cache.set(crate::models::ExchangeRates {
+            usd_cny: 1.0,
+            usd_hkd: 1.0,
+            cny_hkd: 1.0,
+            updated_at: "2026-05-22".to_string(),
+        });
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, name, market, description, created_at, updated_at)
+                 VALUES ('acct-cn', 'CN account', 'CN', NULL, '2026-05-22', '2026-06-24')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost,
+                  currency, created_at, updated_at)
+                 VALUES ('stock-cn', 'acct-cn', 'sz001248', '华润新能源', 'CN', NULL,
+                         100, 10.11, 'CNY', '2026-06-24', '2026-06-24')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost,
+                  currency, created_at, updated_at)
+                 VALUES ('cash-cny', 'acct-cn', '$CASH-CNY', 'CNY Cash', 'CN', NULL,
+                         0, 1, 'CNY', '2026-05-22', '2026-06-24')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO transactions
+                 (id, holding_id, account_id, symbol, name, market, transaction_type,
+                  shares, price, total_amount, commission, currency, traded_at, notes, created_at)
+                 VALUES ('buy-stock', 'stock-cn', 'acct-cn', 'sz001248', '华润新能源', 'CN', 'BUY',
+                         100, 10.11, 1011, 0, 'CNY', '2026-06-24T09:00:00Z', NULL,
+                         '2026-06-24T09:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let start = NaiveDate::from_ymd_opt(2026, 5, 22).unwrap();
+        let pre_buy_end = NaiveDate::from_ymd_opt(2026, 5, 25).unwrap();
+        let buy_date = NaiveDate::from_ymd_opt(2026, 6, 24).unwrap();
+        let pre_listing_end = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        let listing_date = NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+        let fetch_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_for_fetcher = fetch_calls.clone();
+        let eastmoney_fallbacks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let yahoo_fallbacks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let eastmoney_fallbacks_for_fetcher = eastmoney_fallbacks.clone();
+        let yahoo_fallbacks_for_fetcher = yahoo_fallbacks.clone();
+        let captured_logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let logs_for_writer = captured_logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || TestLogWriter(logs_for_writer.clone()))
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        backfill_snapshots_with_fetcher(
+            &db,
+            &rate_cache,
+            start,
+            pre_listing_end,
+            false,
+            move |symbol, market, fetch_start, fetch_end, provider| {
+                let calls = calls_for_fetcher.clone();
+                let eastmoney_fallbacks = eastmoney_fallbacks_for_fetcher.clone();
+                let yahoo_fallbacks = yahoo_fallbacks_for_fetcher.clone();
+                async move {
+                    calls.lock().unwrap().push((
+                        symbol.clone(),
+                        market.clone(),
+                        fetch_start,
+                        fetch_end,
+                        provider,
+                    ));
+                    fetch_ipo_history_fixture(
+                        symbol,
+                        market,
+                        fetch_start,
+                        fetch_end,
+                        eastmoney_fallbacks,
+                        yahoo_fallbacks,
+                    )
+                    .await
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let calls_for_listing_fetcher = fetch_calls.clone();
+        let eastmoney_fallbacks_for_listing = eastmoney_fallbacks.clone();
+        let yahoo_fallbacks_for_listing = yahoo_fallbacks.clone();
+        backfill_snapshots_with_fetcher(
+            &db,
+            &rate_cache,
+            start,
+            listing_date,
+            false,
+            move |symbol, market, fetch_start, fetch_end, provider| {
+                let calls = calls_for_listing_fetcher.clone();
+                let eastmoney_fallbacks = eastmoney_fallbacks_for_listing.clone();
+                let yahoo_fallbacks = yahoo_fallbacks_for_listing.clone();
+                async move {
+                    calls.lock().unwrap().push((
+                        symbol.clone(),
+                        market.clone(),
+                        fetch_start,
+                        fetch_end,
+                        provider,
+                    ));
+                    fetch_ipo_history_fixture(
+                        symbol,
+                        market,
+                        fetch_start,
+                        fetch_end,
+                        eastmoney_fallbacks,
+                        yahoo_fallbacks,
+                    )
+                    .await
+                }
+            },
+        )
+        .await
+        .unwrap();
+        drop(subscriber_guard);
+
+        {
+            let calls = fetch_calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].0, "sz001248");
+            assert_eq!(calls[0].1, "CN");
+            assert_eq!(calls[0].2, buy_date);
+            assert_eq!(calls[0].3, pre_listing_end);
+            assert_eq!(calls[1].0, "sz001248");
+            assert_eq!(calls[1].1, "CN");
+            assert_eq!(calls[1].2, buy_date);
+            assert_eq!(calls[1].3, listing_date);
+        }
+        assert_eq!(
+            eastmoney_fallbacks.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(yahoo_fallbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let log_output = String::from_utf8(captured_logs.lock().unwrap().clone()).unwrap();
+        assert!(!log_output.contains("no historical or transaction price for sz001248"));
+        assert!(!log_output.contains("falling back to eastmoney"));
+        assert!(log_output.contains("using transaction price 10.11 for sz001248"));
+
+        let values = get_daily_values(&db, start, pre_buy_end).unwrap();
+        assert_eq!(values.len(), 2);
+        assert!(values
+            .iter()
+            .all(|value| (value.total_value - 1_011.0).abs() < 1e-9));
+
+        let stock_snapshot_count: i64 = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM daily_holding_snapshots
+                 WHERE symbol = 'sz001248' AND date < '2026-06-24'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(stock_snapshot_count, 0);
+
+        let pre_listing_prices: Vec<(String, f64)> = {
+            let conn = db.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT date, close_price FROM daily_holding_snapshots
+                     WHERE symbol = 'sz001248'
+                       AND date BETWEEN '2026-06-24' AND '2026-07-01'
+                     ORDER BY date",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(pre_listing_prices.len(), 6);
+        assert!(pre_listing_prices
+            .iter()
+            .all(|(_, price)| (*price - 10.11).abs() < 1e-9));
+
+        let listing_price: f64 = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT close_price FROM daily_holding_snapshots
+                 WHERE symbol = 'sz001248' AND date = '2026-07-02'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!((listing_price - 23.95).abs() < 1e-9);
+
+        let filter = crate::services::performance_service::PerformanceFilter::default();
+        let summary = crate::services::performance_service::get_performance_summary(
+            &db,
+            start,
+            pre_buy_end,
+            &filter,
+        )
+        .unwrap();
+        assert!(summary.total_pnl.abs() < 1e-9);
+        assert!(summary.total_return.abs() < 1e-9);
+
+        let attribution = crate::services::performance_service::get_return_attribution(
+            &db,
+            start,
+            pre_buy_end,
+            &filter,
+        )
+        .unwrap();
+        assert!(attribution.by_holding.is_empty());
+        assert!(attribution.total_pnl.abs() < 1e-9);
+
+        let ranking = crate::services::performance_service::get_holding_performance_ranking(
+            &db,
+            start,
+            pre_buy_end,
+            "return_rate",
+            10,
+            &filter,
+        )
+        .unwrap();
+        assert!(ranking.is_empty());
+        let post_buy_summary = crate::services::performance_service::get_performance_summary(
+            &db,
+            buy_date,
+            pre_listing_end,
+            &filter,
+        )
+        .unwrap();
+        assert!(post_buy_summary.total_pnl.abs() < 1e-9);
+        assert!(post_buy_summary.total_return.abs() < 1e-9);
+
+        let listing_summary = crate::services::performance_service::get_performance_summary(
+            &db,
+            pre_listing_end,
+            listing_date,
+            &filter,
+        )
+        .unwrap();
+        assert!((listing_summary.total_pnl - 1_384.0).abs() < 1e-9);
+        assert!((listing_summary.total_return - 136.894_164_193_867_46).abs() < 1e-9);
+
+        let post_buy_attribution = crate::services::performance_service::get_return_attribution(
+            &db,
+            buy_date,
+            listing_date,
+            &filter,
+        )
+        .unwrap();
+        assert_eq!(post_buy_attribution.by_holding.len(), 1);
+        assert_eq!(
+            post_buy_attribution.by_holding[0].name,
+            "sz001248 华润新能源"
+        );
+        assert!((post_buy_attribution.by_holding[0].pnl - 1_384.0).abs() < 1e-9);
+
+        let post_buy_ranking =
+            crate::services::performance_service::get_holding_performance_ranking(
+                &db,
+                buy_date,
+                listing_date,
+                "return_rate",
+                10,
+                &filter,
+            )
+            .unwrap();
+        assert_eq!(post_buy_ranking.len(), 1);
+        assert_eq!(post_buy_ranking[0].symbol, "sz001248");
+        assert!(post_buy_ranking[0].start_value.abs() < 1e-9);
+        assert!((post_buy_ranking[0].end_value - 2_395.0).abs() < 1e-9);
+        assert!((post_buy_ranking[0].pnl - 1_384.0).abs() < 1e-9);
+        assert!((post_buy_ranking[0].return_rate - 136.894_164_193_867_46).abs() < 1e-9);
+
+        // Rebuild a range that starts after the allotment date. The issue
+        // price must still be available even though the BUY is before the
+        // requested snapshot window.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("DELETE FROM daily_holding_snapshots", [])
+                .unwrap();
+            conn.execute("DELETE FROM daily_portfolio_values", [])
+                .unwrap();
+        }
+        backfill_snapshots_with_fetcher(
+            &db,
+            &rate_cache,
+            pre_listing_end,
+            pre_listing_end,
+            false,
+            |_symbol, _market, _fetch_start, _fetch_end, _provider| async { Ok(Vec::new()) },
+        )
+        .await
+        .unwrap();
+        let pre_listing_price_after_late_start: f64 = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT close_price FROM daily_holding_snapshots
+                 WHERE symbol = 'sz001248' AND date = '2026-07-01'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!((pre_listing_price_after_late_start - 10.11).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_transaction_unwind_matches_stock_open_buy_sell_and_pay_cash_semantics() {
+        let mut unwind = std::collections::HashMap::new();
+
+        accumulate_transaction_unwind(
+            &mut unwind,
+            "acct-us",
+            "AAPL",
+            "OPEN",
+            2.0,
+            200.0,
+            1.0,
+            "USD",
+        );
+        accumulate_transaction_unwind(
+            &mut unwind,
+            "acct-us",
+            "AAPL",
+            "BUY",
+            1.0,
+            110.0,
+            2.0,
+            "USD",
+        );
+        accumulate_transaction_unwind(
+            &mut unwind,
+            "acct-us",
+            "AAPL",
+            "SELL",
+            0.5,
+            60.0,
+            1.0,
+            "USD",
+        );
+        accumulate_transaction_unwind(&mut unwind, "acct-us", "AAPL", "PAY", 0.0, 10.0, 1.0, "USD");
+
+        // Reverse OPEN (-2), BUY (-1), and SELL (+0.5).
+        assert!((unwind[&("acct-us".to_string(), "AAPL".to_string())] + 2.5).abs() < 1e-9);
+        // Reverse BUY cash (+112), SELL cash (-59), and net dividend cash (-9).
+        assert!((unwind[&("acct-us".to_string(), "$CASH-USD".to_string())] - 44.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_and_performance_neutralize_cash_deposits_and_withdrawals() {
+        let db = Database::new(":memory:").unwrap();
+        let rate_cache = ExchangeRateCache::new();
+        rate_cache.set(crate::models::ExchangeRates {
+            usd_cny: 7.2,
+            usd_hkd: 7.8,
+            cny_hkd: 7.8 / 7.2,
+            updated_at: "2024-01-01".to_string(),
+        });
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, name, market, description, created_at, updated_at)
+                 VALUES ('acct-us', 'US account', 'US', NULL, '2024-01-01', '2024-01-03')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost,
+                  currency, created_at, updated_at)
+                 VALUES ('cash-usd', 'acct-us', '$CASH-USD', 'USD Cash', 'US', NULL,
+                         130, 1, 'USD', '2024-01-01', '2024-01-03')",
+                [],
+            )
+            .unwrap();
+            for (id, transaction_type, amount, commission, traded_at) in [
+                ("initial-deposit", "BUY", 100.0, 0.0, "2024-01-01T09:00:00Z"),
+                ("deposit", "BUY", 50.0, 1.0, "2024-01-02T09:00:00Z"),
+                ("withdrawal", "SELL", 20.0, 1.0, "2024-01-03T09:00:00Z"),
+            ] {
+                conn.execute(
+                    "INSERT INTO transactions
+                     (id, holding_id, account_id, symbol, name, market, transaction_type,
+                      shares, price, total_amount, commission, currency, traded_at, notes, created_at)
+                     VALUES (?1, 'cash-usd', 'acct-us', '$CASH-USD', 'USD Cash', 'US', ?2,
+                             0, 1, ?3, ?4, 'USD', ?5, NULL, ?5)",
+                    rusqlite::params![id, transaction_type, amount, commission, traded_at],
+                )
+                .unwrap();
+            }
+        }
+
+        let start = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 1, 3).unwrap();
+        backfill_snapshots(&db, &rate_cache, start, end, false)
+            .await
+            .unwrap();
+
+        let values = get_daily_values(&db, start, end).unwrap();
+        assert_eq!(values.len(), 3);
+        assert!((values[0].total_value - 100.0).abs() < 1e-9);
+        assert!((values[1].total_value - 151.0).abs() < 1e-9);
+        assert!((values[2].total_value - 130.0).abs() < 1e-9);
+
+        let summary = crate::services::performance_service::get_performance_summary(
+            &db,
+            NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            end,
+            &crate::services::performance_service::PerformanceFilter::default(),
+        )
+        .unwrap();
+        assert!(summary.total_return.abs() < 1e-9);
+        assert!(summary.total_pnl.abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_preserves_terminal_zero_after_full_withdrawal() {
+        let db = Database::new(":memory:").unwrap();
+        let rate_cache = ExchangeRateCache::new();
+        rate_cache.set(crate::models::ExchangeRates {
+            usd_cny: 7.2,
+            usd_hkd: 7.8,
+            cny_hkd: 7.8 / 7.2,
+            updated_at: "2024-01-01".to_string(),
+        });
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, name, market, description, created_at, updated_at)
+                 VALUES ('acct-us', 'US account', 'US', NULL, '2024-01-01', '2024-01-02')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost,
+                  currency, created_at, updated_at)
+                 VALUES ('cash-usd', 'acct-us', '$CASH-USD', 'USD Cash', 'US', NULL,
+                         0, 1, 'USD', '2024-01-01', '2024-01-02')",
+                [],
+            )
+            .unwrap();
+            for (id, transaction_type, traded_at) in [
+                ("deposit", "BUY", "2024-01-01T09:00:00Z"),
+                ("full-withdrawal", "SELL", "2024-01-02T09:00:00Z"),
+            ] {
+                conn.execute(
+                    "INSERT INTO transactions
+                     (id, holding_id, account_id, symbol, name, market, transaction_type,
+                      shares, price, total_amount, commission, currency, traded_at, notes, created_at)
+                     VALUES (?1, 'cash-usd', 'acct-us', '$CASH-USD', 'USD Cash', 'US', ?2,
+                             0, 1, 100, 0, 'USD', ?3, NULL, ?3)",
+                    rusqlite::params![id, transaction_type, traded_at],
+                )
+                .unwrap();
+            }
+        }
+
+        let start = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        backfill_snapshots(&db, &rate_cache, start, end, false)
+            .await
+            .unwrap();
+
+        let values = get_daily_values(&db, start, end).unwrap();
+        assert_eq!(values.len(), 2);
+        assert!((values[0].total_value - 100.0).abs() < 1e-9);
+        assert!(values[1].total_value.abs() < 1e-9);
+
+        let summary = crate::services::performance_service::get_performance_summary(
+            &db,
+            end,
+            end,
+            &crate::services::performance_service::PerformanceFilter::default(),
+        )
+        .unwrap();
+        assert!(summary.total_return.abs() < 1e-9);
+        assert!(summary.total_pnl.abs() < 1e-9);
+        assert!(summary.end_value.abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_daily_snapshot_includes_negative_cash_balance() {
+        let db = Database::new(":memory:").unwrap();
+        let rate_cache = ExchangeRateCache::new();
+        rate_cache.set(crate::models::ExchangeRates {
+            usd_cny: 7.2,
+            usd_hkd: 7.8,
+            cny_hkd: 7.8 / 7.2,
+            updated_at: "2024-01-02".to_string(),
+        });
+        let quote_cache = QuoteCache::new();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, name, market, description, created_at, updated_at)
+                 VALUES ('acct-us', 'US account', 'US', NULL, '2024-01-01', '2024-01-02')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost,
+                  currency, created_at, updated_at)
+                 VALUES ('cash-usd', 'acct-us', '$CASH-USD', 'USD Cash', 'US', NULL,
+                         -50, 1, 'USD', '2024-01-01', '2024-01-02')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let date = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        take_daily_snapshot(&db, &rate_cache, &quote_cache, date)
+            .await
+            .unwrap();
+
+        let values = get_daily_values(&db, date, date).unwrap();
+        assert_eq!(values.len(), 1);
+        assert!((values[0].total_value - (-50.0)).abs() < 1e-9);
+    }
 
     #[test]
     fn test_forward_fill_price_exact_match() {

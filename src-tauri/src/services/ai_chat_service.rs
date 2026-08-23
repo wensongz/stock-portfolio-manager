@@ -257,8 +257,12 @@ pub async fn build_portfolio_context(
     };
     match performance_service::get_performance_summary(db, start, end, &filter) {
         Ok(p) if p.end_value > 0.0 || !p.return_series.is_empty() => {
+            let sharpe = p
+                .sharpe_ratio
+                .map(|value| format!("{:.2}", value))
+                .unwrap_or_else(|| "—".to_string());
             out.push_str(&format!(
-                "- 期初市值：{:.2}\n- 期末市值：{:.2}\n- 累计收益率：{:.2}%\n- 年化收益率：{:.2}%\n- 累计盈亏：{:.2}\n- 最大回撤：{:.2}%\n- 波动率：{:.2}%\n- 夏普比率：{:.2}\n\n",
+                "- 期初市值：{:.2}\n- 期末市值：{:.2}\n- 累计收益率：{:.2}%\n- 年化收益率：{:.2}%\n- 累计盈亏：{:.2}\n- 最大回撤：{:.2}%\n- 波动率：{:.2}%\n- 夏普比率：{}\n\n",
                 p.start_value,
                 p.end_value,
                 p.total_return,
@@ -266,7 +270,7 @@ pub async fn build_portfolio_context(
                 p.total_pnl,
                 p.max_drawdown,
                 p.volatility,
-                p.sharpe_ratio,
+                sharpe,
             ));
         }
         _ => out.push_str("（暂无足够的历史数据）\n\n"),
@@ -1804,7 +1808,9 @@ async fn chat_stream_anthropic(
                             }
                             "error" => {
                                 if let Some(e) = ev.error {
-                                    let msg = e.message.unwrap_or_else(|| "未知 Anthropic 错误".to_string());
+                                    let msg = e
+                                        .message
+                                        .unwrap_or_else(|| "未知 Anthropic 错误".to_string());
                                     emit_error(&app, msg.clone());
                                     return Err(msg);
                                 }
@@ -1886,7 +1892,9 @@ async fn chat_stream_anthropic(
                     },
                 );
                 let start = std::time::Instant::now();
-                let result = crate::services::ai_tools::execute_tool(&tool_ctx, &tu.name, &tu.arguments).await;
+                let result =
+                    crate::services::ai_tools::execute_tool(&tool_ctx, &tu.name, &tu.arguments)
+                        .await;
                 let duration = start.elapsed().as_millis() as u64;
                 // ToolResult carries `content` (JSON string) and `ok`. Errors
                 // are returned as error-shaped JSON so the model can recover.
@@ -1907,7 +1915,11 @@ async fn chat_stream_anthropic(
                         } else {
                             Some(truncate_for_display(&result.content))
                         },
-                        error: if is_err { Some(result.content.clone()) } else { None },
+                        error: if is_err {
+                            Some(result.content.clone())
+                        } else {
+                            None
+                        },
                         duration_ms: Some(duration),
                     },
                 );
@@ -1974,7 +1986,10 @@ mod tests {
         assert_eq!(converted[0]["name"], "get_stock_quote");
         assert_eq!(converted[0]["description"], "获取股票行情");
         assert_eq!(converted[0]["input_schema"]["type"], "object");
-        assert_eq!(converted[0]["input_schema"]["properties"]["symbol"]["type"], "string");
+        assert_eq!(
+            converted[0]["input_schema"]["properties"]["symbol"]["type"],
+            "string"
+        );
         // Anthropic tools must NOT carry the OpenAI "function" wrapper.
         assert!(converted[0].get("function").is_none());
         assert!(converted[0].get("type").is_none());
@@ -1995,17 +2010,17 @@ mod tests {
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好"}}"#,
         )
         .unwrap();
-        assert_eq!(
-            delta.delta.as_ref().unwrap().text.as_deref(),
-            Some("你好")
-        );
+        assert_eq!(delta.delta.as_ref().unwrap().text.as_deref(), Some("你好"));
 
         // content_block_start (tool_use) + input_json_delta
         let tool_start: AnthropicStreamEvent = serde_json::from_str(
             r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_stock_quote"}}"#,
         )
         .unwrap();
-        assert_eq!(tool_start.content_block.as_ref().unwrap().block_type, "tool_use");
+        assert_eq!(
+            tool_start.content_block.as_ref().unwrap().block_type,
+            "tool_use"
+        );
 
         let json_delta: AnthropicStreamEvent = serde_json::from_str(
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"symbol\":"}}"#,

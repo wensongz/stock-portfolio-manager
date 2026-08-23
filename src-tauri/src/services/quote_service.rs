@@ -1400,6 +1400,123 @@ struct XueqiuKlineData {
     item: Option<Vec<Vec<serde_json::Value>>>,
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum XueqiuHistoryOutcome {
+    Prices(Vec<(chrono::NaiveDate, f64)>),
+    StartsAfterRange {
+        first_available_date: chrono::NaiveDate,
+    },
+    Empty,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn parse_xueqiu_history_response(
+    body: &str,
+    symbol: &str,
+    market: &str,
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+    url: &str,
+) -> Result<XueqiuHistoryOutcome, String> {
+    let resp: XueqiuKlineResponse = serde_json::from_str(body).map_err(|e| {
+        let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
+        format!(
+            "fetch_stock_history_xueqiu: parse error for {}: {}. Preview: {}",
+            symbol, e, preview
+        )
+    })?;
+
+    if let Some(err_code) = resp.error_code {
+        if err_code != 0 {
+            let desc = resp.error_description.unwrap_or_default();
+            return Err(format!(
+                "fetch_stock_history_xueqiu: API error for {}: code={}, message={}",
+                symbol, err_code, desc
+            ));
+        }
+    }
+
+    let mut data = resp
+        .data
+        .ok_or_else(|| format!("fetch_stock_history_xueqiu: no data for {}", symbol))?;
+    let columns = data.column.take().unwrap_or_default();
+    if columns.is_empty() {
+        let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
+        return Err(format!(
+            "fetch_stock_history_xueqiu: empty or missing 'column' field for {}. \
+             The Xueqiu kline API requires a `u` cookie value. \
+             Provide it in Settings → Quote Provider → 雪球用户ID. \
+             URL: {} Response preview: {}",
+            symbol, url, preview
+        ));
+    }
+    let ts_idx = columns
+        .iter()
+        .position(|column| column == "timestamp")
+        .ok_or_else(|| {
+            format!(
+                "fetch_stock_history_xueqiu: missing 'timestamp' column for {}, got columns: {:?}",
+                symbol, columns
+            )
+        })?;
+    let close_idx = columns
+        .iter()
+        .position(|column| column == "close")
+        .ok_or_else(|| {
+            format!(
+                "fetch_stock_history_xueqiu: missing 'close' column for {}, got columns: {:?}",
+                symbol, columns
+            )
+        })?;
+
+    let items = data.item.unwrap_or_default();
+    let mut parsed_prices = Vec::new();
+    for item in &items {
+        let ts_ms = item.get(ts_idx).and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_f64().map(|number| number.round() as i64))
+        });
+        let close = item.get(close_idx).and_then(|value| value.as_f64());
+
+        if let (Some(ts_ms), Some(close_price)) = (ts_ms, close) {
+            if let Some(date) = timestamp_to_market_date(ts_ms / 1000, market) {
+                parsed_prices.push((date, close_price));
+            }
+        }
+    }
+
+    let first_available_date = parsed_prices.iter().map(|(date, _)| *date).min();
+    let mut prices: Vec<(chrono::NaiveDate, f64)> = parsed_prices
+        .into_iter()
+        .filter(|(date, _)| *date >= start_date && *date <= end_date)
+        .collect();
+    prices.sort_by_key(|(date, _)| *date);
+
+    if !prices.is_empty() {
+        return Ok(XueqiuHistoryOutcome::Prices(prices));
+    }
+    if let Some(first_available_date) = first_available_date.filter(|date| *date > end_date) {
+        return Ok(XueqiuHistoryOutcome::StartsAfterRange {
+            first_available_date,
+        });
+    }
+
+    if !items.is_empty() {
+        let preview: String = items
+            .iter()
+            .take(2)
+            .map(|row| format!("{:?}", row))
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            "fetch_stock_history_xueqiu: {} items received for {} but none matched date range {}/{}. First items: [{}]",
+            items.len(), symbol, start_date, end_date, preview
+        );
+    }
+    Ok(XueqiuHistoryOutcome::Empty)
+}
+
 /// Parse a Xueqiu JSON response body into a [`XueqiuResponse`].
 fn parse_xueqiu_body(body: &str, symbol: &str) -> Result<XueqiuResponse, String> {
     serde_json::from_str(body).map_err(|e| {
@@ -2191,12 +2308,27 @@ reportName=RPT_F10_FINANCE_MAINFINADATA&columns={}&filter=(SECURITY_CODE=\"{}\")
 
 /// Uses the Xueqiu kline API (`/v5/stock/chart/kline.json`).
 /// Returns a list of (date, close_price) pairs sorted by date ascending.
+#[allow(dead_code)] // Retained as the provider-specific API for callers that do not want fallback.
 pub async fn fetch_stock_history_xueqiu(
     symbol: &str,
     market: &str,
     start_date: chrono::NaiveDate,
     end_date: chrono::NaiveDate,
 ) -> Result<Vec<(chrono::NaiveDate, f64)>, String> {
+    match fetch_stock_history_xueqiu_outcome(symbol, market, start_date, end_date).await? {
+        XueqiuHistoryOutcome::Prices(prices) => Ok(prices),
+        XueqiuHistoryOutcome::StartsAfterRange { .. } | XueqiuHistoryOutcome::Empty => {
+            Ok(Vec::new())
+        }
+    }
+}
+
+async fn fetch_stock_history_xueqiu_outcome(
+    symbol: &str,
+    market: &str,
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+) -> Result<XueqiuHistoryOutcome, String> {
     let xueqiu_symbol = match market {
         "CN" => to_xueqiu_cn_symbol(symbol)?,
         "HK" => to_xueqiu_hk_symbol(symbol)?,
@@ -2250,100 +2382,72 @@ pub async fn fetch_stock_history_xueqiu(
         )
     })?;
 
-    let resp: XueqiuKlineResponse = serde_json::from_str(&body).map_err(|e| {
-        let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
-        format!(
-            "fetch_stock_history_xueqiu: parse error for {}: {}. Preview: {}",
-            symbol, e, preview
-        )
-    })?;
+    parse_xueqiu_history_response(&body, symbol, market, start_date, end_date, &url)
+}
 
-    if let Some(err_code) = resp.error_code {
-        if err_code != 0 {
-            let desc = resp.error_description.unwrap_or_default();
-            return Err(format!(
-                "fetch_stock_history_xueqiu: API error for {}: code={}, message={}",
-                symbol, err_code, desc
-            ));
+pub(crate) async fn resolve_xueqiu_history_outcome<EastMoney, EastMoneyFuture, Yahoo, YahooFuture>(
+    symbol: &str,
+    market: &str,
+    outcome: Result<XueqiuHistoryOutcome, String>,
+    fetch_eastmoney: EastMoney,
+    fetch_yahoo: Yahoo,
+) -> Result<Vec<(chrono::NaiveDate, f64)>, String>
+where
+    EastMoney: FnOnce() -> EastMoneyFuture,
+    EastMoneyFuture: std::future::Future<Output = Result<Vec<(chrono::NaiveDate, f64)>, String>>,
+    Yahoo: FnOnce() -> YahooFuture,
+    YahooFuture: std::future::Future<Output = Result<Vec<(chrono::NaiveDate, f64)>, String>>,
+{
+    match outcome {
+        Ok(XueqiuHistoryOutcome::Prices(prices)) => return Ok(prices),
+        Ok(XueqiuHistoryOutcome::StartsAfterRange {
+            first_available_date,
+        }) => {
+            info!(
+                "fetch_stock_history: {} ({}) has no market history in the requested range; first available trading date is {}",
+                symbol, market, first_available_date
+            );
+            return Ok(Vec::new());
+        }
+        Ok(XueqiuHistoryOutcome::Empty) => {
+            info!(
+                "fetch_stock_history: Xueqiu returned empty history for {} ({}), falling back to eastmoney",
+                symbol, market
+            );
+        }
+        Err(error) => {
+            warn!(
+                "fetch_stock_history: Xueqiu history failed for {} ({}): {}, falling back to eastmoney",
+                symbol, market, error
+            );
         }
     }
 
-    let mut data = resp
-        .data
-        .ok_or_else(|| format!("fetch_stock_history_xueqiu: no data for {}", symbol))?;
-
-    let columns = data.column.take().unwrap_or_default();
-    if columns.is_empty() {
-        let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
-        return Err(format!(
-            "fetch_stock_history_xueqiu: empty or missing 'column' field for {}. \
-             The Xueqiu kline API requires a `u` cookie value. \
-             Provide it in Settings → Quote Provider → 雪球用户ID. \
-             URL: {} Response preview: {}",
-            symbol, url, preview
-        ));
-    }
-    let ts_idx = columns
-        .iter()
-        .position(|c| c == "timestamp")
-        .ok_or_else(|| {
-            format!(
-                "fetch_stock_history_xueqiu: missing 'timestamp' column for {}, got columns: {:?}",
-                symbol, columns
-            )
-        })?;
-    let close_idx = columns.iter().position(|c| c == "close").ok_or_else(|| {
-        format!(
-            "fetch_stock_history_xueqiu: missing 'close' column for {}, got columns: {:?}",
-            symbol, columns
-        )
-    })?;
-
-    let items = data.item.unwrap_or_default();
-    let mut result: Vec<(chrono::NaiveDate, f64)> = Vec::new();
-
-    for item in &items {
-        // Xueqiu may return timestamps as JSON floats (e.g. 1692892800000.0)
-        // instead of integers, so try as_i64() first, then fall back to
-        // as_f64() with rounding.
-        let ts_ms = item
-            .get(ts_idx)
-            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64)));
-        let close = item.get(close_idx).and_then(|v| v.as_f64());
-
-        if let (Some(ts_ms), Some(close_price)) = (ts_ms, close) {
-            if let Some(date) = timestamp_to_market_date(ts_ms / 1000, market) {
-                if date >= start_date && date <= end_date {
-                    result.push((date, close_price));
-                }
-            }
+    match fetch_eastmoney().await {
+        Ok(prices) if !prices.is_empty() => Ok(prices),
+        Ok(_empty) => {
+            warn!(
+                "fetch_stock_history: EastMoney also returned empty history for {} ({}), falling back to yahoo",
+                symbol, market
+            );
+            fetch_yahoo().await
+        }
+        Err(error) => {
+            warn!(
+                "fetch_stock_history: EastMoney fallback also failed for {} ({}): {}, falling back to yahoo",
+                symbol, market, error
+            );
+            fetch_yahoo().await
         }
     }
-
-    if !items.is_empty() && result.is_empty() {
-        // Log a diagnostic when the API returned items but none survived
-        // parsing or date filtering – helps diagnose future issues.
-        let preview: String = items
-            .iter()
-            .take(2)
-            .map(|row| format!("{:?}", row))
-            .collect::<Vec<_>>()
-            .join(", ");
-        warn!(
-            "fetch_stock_history_xueqiu: {} items received for {} but none matched date range {}/{}. First items: [{}]",
-            items.len(), symbol, start_date, end_date, preview
-        );
-    }
-
-    result.sort_by_key(|(d, _)| *d);
-    Ok(result)
 }
 
 /// Fetch historical daily closing prices using the appropriate provider
 /// based on the market and the configured provider name.
 /// Falls back to Yahoo Finance for unknown providers.
-/// When Xueqiu is selected but returns an error or empty results, East Money
-/// is used as an automatic fallback.
+/// When Xueqiu is selected but returns an error or a genuinely empty result,
+/// East Money is used as an automatic fallback. A first trading date after
+/// the requested range is treated as a valid pre-listing response.
 pub async fn fetch_stock_history(
     symbol: &str,
     market: &str,
@@ -2352,55 +2456,18 @@ pub async fn fetch_stock_history(
     provider: &str,
 ) -> Result<Vec<(chrono::NaiveDate, f64)>, String> {
     match provider {
-        "xueqiu" => match fetch_stock_history_xueqiu(symbol, market, start_date, end_date).await {
-            Ok(prices) if !prices.is_empty() => Ok(prices),
-            Ok(_empty) => {
-                info!(
-                        "fetch_stock_history: Xueqiu returned empty history for {} ({}), falling back to eastmoney",
-                        symbol, market
-                    );
-                match fetch_stock_history_eastmoney(symbol, market, start_date, end_date).await {
-                    Ok(prices) if !prices.is_empty() => Ok(prices),
-                    Ok(_empty) => {
-                        warn!(
-                                "fetch_stock_history: EastMoney also returned empty history for {} ({}), falling back to yahoo",
-                                symbol, market
-                            );
-                        fetch_stock_history_yahoo(symbol, market, start_date, end_date).await
-                    }
-                    Err(e) => {
-                        warn!(
-                                "fetch_stock_history: EastMoney fallback also failed for {} ({}): {}, falling back to yahoo",
-                                symbol, market, e
-                            );
-                        fetch_stock_history_yahoo(symbol, market, start_date, end_date).await
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                        "fetch_stock_history: Xueqiu history failed for {} ({}): {}, falling back to eastmoney",
-                        symbol, market, e
-                    );
-                match fetch_stock_history_eastmoney(symbol, market, start_date, end_date).await {
-                    Ok(prices) if !prices.is_empty() => Ok(prices),
-                    Ok(_empty) => {
-                        warn!(
-                                "fetch_stock_history: EastMoney also returned empty history for {} ({}), falling back to yahoo",
-                                symbol, market
-                            );
-                        fetch_stock_history_yahoo(symbol, market, start_date, end_date).await
-                    }
-                    Err(e2) => {
-                        warn!(
-                                "fetch_stock_history: EastMoney fallback also failed for {} ({}): {}, falling back to yahoo",
-                                symbol, market, e2
-                            );
-                        fetch_stock_history_yahoo(symbol, market, start_date, end_date).await
-                    }
-                }
-            }
-        },
+        "xueqiu" => {
+            let outcome =
+                fetch_stock_history_xueqiu_outcome(symbol, market, start_date, end_date).await;
+            resolve_xueqiu_history_outcome(
+                symbol,
+                market,
+                outcome,
+                || fetch_stock_history_eastmoney(symbol, market, start_date, end_date),
+                || fetch_stock_history_yahoo(symbol, market, start_date, end_date),
+            )
+            .await
+        }
         "eastmoney" => {
             match fetch_stock_history_eastmoney(symbol, market, start_date, end_date).await {
                 Ok(prices) if !prices.is_empty() => Ok(prices),
@@ -3738,6 +3805,78 @@ mod tests {
     }
 
     // ── Xueqiu kline response parsing tests ────────────────────────────
+
+    #[test]
+    fn test_parse_xueqiu_kline_identifies_first_trading_day_after_range() {
+        // Exact shape and row returned for the newly listed sz001248.  The
+        // timestamp is 2026-07-01 16:00 UTC, which is 2026-07-02 in China.
+        let body = r#"{
+          "data": {
+            "symbol": "SZ001248",
+            "column": [
+              "timestamp", "volume", "open", "high", "low", "close",
+              "chg", "percent", "turnoverrate", "amount",
+              "volume_post", "amount_post"
+            ],
+            "item": [
+              [1782921600000, 721697718, 21.6, 30.16, 21.6, 23.95,
+               13.84, 136.89, 67.93, 17692297780.0, null, null]
+            ]
+          },
+          "error_code": 0,
+          "error_description": ""
+        }"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 6, 24).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+
+        let outcome = parse_xueqiu_history_response(
+            body,
+            "sz001248",
+            "CN",
+            start,
+            end,
+            "https://example.test/kline",
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            XueqiuHistoryOutcome::StartsAfterRange {
+                first_available_date: chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_xueqiu_history_does_not_fallback_before_first_trading_day() {
+        let first_trading_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+        let eastmoney_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let yahoo_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let eastmoney_called_by_fetcher = eastmoney_called.clone();
+        let yahoo_called_by_fetcher = yahoo_called.clone();
+
+        let prices = resolve_xueqiu_history_outcome(
+            "sz001248",
+            "CN",
+            Ok(XueqiuHistoryOutcome::StartsAfterRange {
+                first_available_date: first_trading_date,
+            }),
+            move || async move {
+                eastmoney_called_by_fetcher.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+            move || async move {
+                yahoo_called_by_fetcher.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(prices.is_empty());
+        assert!(!eastmoney_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!yahoo_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     /// Helper: parse a raw Xueqiu kline JSON body into (date, close) pairs
     /// using the same logic as `fetch_stock_history_xueqiu`.

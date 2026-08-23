@@ -181,8 +181,8 @@ export default function ImportPage() {
       message.warning("请至少选择一份汇丰电子结单");
       return;
     }
-    if (broker === "everbright" && ordinaryFiles.length + creditFiles.length < 2) {
-      message.warning("普通账户与信用账户主对账单合计至少需要 2 个文件");
+    if (broker === "everbright" && ordinaryFiles.length + creditFiles.length === 0) {
+      message.warning("请至少选择一份普通账户或信用账户主对账单");
       return;
     }
     if (broker === "everbright" && supplementFiles.length > 0 && ordinaryFiles.length === 0) {
@@ -384,6 +384,13 @@ export default function ImportPage() {
 
         {currentStep === 0 && (
           <Space orientation="vertical" style={{ width: "100%" }}>
+            <Button
+              icon={<BankOutlined />}
+              onClick={() => setBrokerModalOpen(true)}
+              style={{ alignSelf: "flex-start" }}
+            >
+              导入券商对账单
+            </Button>
             <Space>
               <Text>数据类型：</Text>
               <Select
@@ -398,12 +405,6 @@ export default function ImportPage() {
               />
               <Button icon={<DownloadOutlined />} onClick={handleDownloadTemplate}>
                 下载模板
-              </Button>
-              <Button
-                icon={<BankOutlined />}
-                onClick={() => setBrokerModalOpen(true)}
-              >
-                导入券商数据
               </Button>
             </Space>
             <Upload.Dragger
@@ -523,7 +524,7 @@ export default function ImportPage() {
 
       <Modal
         open={brokerModalOpen}
-        title="导入券商数据"
+        title="导入券商对账单"
         width={720}
         maskClosable={!brokerConverting}
         closable={!brokerConverting}
@@ -582,7 +583,7 @@ export default function ImportPage() {
                 <Alert
                   type="info"
                   showIcon
-                  title="普通账户与信用账户主对账单合计至少选择 2 个文件；补充记录不计入该数量。"
+                  title="普通账户与信用账户主对账单可任选一类，至少选择 1 个文件；补充记录不能单独导入。"
                 />
                 <BrokerFileBox
                   title="普通账户主对账单"

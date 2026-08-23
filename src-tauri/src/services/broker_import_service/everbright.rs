@@ -206,8 +206,8 @@ pub fn convert_everbright(
     let ordinary = checked_paths(ordinary_files, "xls")?;
     let credit = checked_paths(credit_files, "xls")?;
     let supplements = checked_paths(supplement_files, "xls")?;
-    if ordinary.len() + credit.len() <= 1 {
-        return Err("普通账户与信用账户主对账单合计必须至少上传 2 个文件".to_string());
+    if ordinary.is_empty() && credit.is_empty() {
+        return Err("请至少上传一份普通账户或信用账户主对账单".to_string());
     }
     if !supplements.is_empty() && ordinary.is_empty() {
         return Err("上传普通账户补充记录时，必须同时上传普通账户主对账单".to_string());

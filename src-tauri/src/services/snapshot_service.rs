@@ -1211,7 +1211,7 @@ mod tests {
             market: "CN".to_string(),
             shares: 100.0,
             avg_cost: 10.0,
-            _currency: "CNY".to_string(),
+            currency: "CNY".to_string(),
             category_name: None,
         }];
         let transactions = vec![TxInfo {
@@ -1261,7 +1261,7 @@ mod tests {
             market: "CN".to_string(),
             shares: 100.0,
             avg_cost: 10.0,
-            _currency: "CNY".to_string(),
+            currency: "CNY".to_string(),
             category_name: None,
         }];
 
@@ -1294,7 +1294,7 @@ mod tests {
             market: "CN".to_string(),
             shares: 100.0,
             avg_cost: 10.0,
-            _currency: "CNY".to_string(),
+            currency: "CNY".to_string(),
             category_name: None,
         }];
         let transactions = vec![TxInfo {

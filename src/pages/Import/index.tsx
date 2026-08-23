@@ -13,18 +13,84 @@ import {
   Tag,
   Divider,
   Form,
+  Modal,
+  Empty,
 } from "antd";
 import {
   UploadOutlined,
   DownloadOutlined,
   CheckCircleOutlined,
   ImportOutlined,
+  BankOutlined,
+  FileTextOutlined,
+  DeleteOutlined,
 } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { ImportPreview, ImportResult, ExportFilters, ImportOptionsResult } from "../../types";
 import { useAccountStore } from "../../stores/accountStore";
 
 const { Title, Text } = Typography;
+
+type BrokerType = "hsbc_hk" | "everbright";
+
+interface BrokerFileBoxProps {
+  title: string;
+  description: string;
+  files: string[];
+  accept: "pdf" | "xls";
+  onChange: (files: string[]) => void;
+}
+
+function BrokerFileBox({ title, description, files, accept, onChange }: BrokerFileBoxProps) {
+  const selectFiles = async () => {
+    const selected = await openDialog({
+      multiple: true,
+      directory: false,
+      filters: [{
+        name: accept === "pdf" ? "PDF 文件" : "光大对账单",
+        extensions: [accept],
+      }],
+    });
+    if (!selected) return;
+    onChange(Array.isArray(selected) ? selected : [selected]);
+  };
+
+  const fileName = (path: string) => path.split(/[\\/]/).pop() || path;
+
+  return (
+    <div style={{ border: "1px dashed #d9d9d9", borderRadius: 8, padding: 16 }}>
+      <Space orientation="vertical" size={6} style={{ width: "100%" }}>
+        <Space style={{ justifyContent: "space-between", width: "100%" }}>
+          <div>
+            <Text strong>{title}</Text>
+            <Text type="secondary" style={{ display: "block", fontSize: 12 }}>
+              {description}
+            </Text>
+          </div>
+          <Space>
+            <Button icon={<FileTextOutlined />} onClick={selectFiles}>选择文件</Button>
+            {files.length > 0 && (
+              <Button icon={<DeleteOutlined />} onClick={() => onChange([])} aria-label={`清空${title}`} />
+            )}
+          </Space>
+        </Space>
+        {files.length === 0 ? (
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚未选择文件" styles={{ image: { height: 26 } }} />
+        ) : (
+          <div style={{ maxHeight: 96, overflowY: "auto" }}>
+            {files.map((path) => (
+              <div key={path} style={{ lineHeight: "24px" }} title={path}>
+                <FileTextOutlined style={{ marginRight: 8, color: "#1677ff" }} />
+                {fileName(path)}
+              </div>
+            ))}
+          </div>
+        )}
+      </Space>
+    </div>
+  );
+}
 
 export default function ImportPage() {
   const { accounts, fetchAccounts } = useAccountStore();
@@ -37,6 +103,14 @@ export default function ImportPage() {
   const [selectedAccountId, setSelectedAccountId] = useState("");
   const [loading, setLoading] = useState(false);
   const [rawCsvContent, setRawCsvContent] = useState("");
+  const [brokerModalOpen, setBrokerModalOpen] = useState(false);
+  const [brokerStep, setBrokerStep] = useState(0);
+  const [broker, setBroker] = useState<BrokerType>("hsbc_hk");
+  const [hsbcFiles, setHsbcFiles] = useState<string[]>([]);
+  const [ordinaryFiles, setOrdinaryFiles] = useState<string[]>([]);
+  const [creditFiles, setCreditFiles] = useState<string[]>([]);
+  const [supplementFiles, setSupplementFiles] = useState<string[]>([]);
+  const [brokerConverting, setBrokerConverting] = useState(false);
 
   // Export state
   const [exportFilters, setExportFilters] = useState<ExportFilters>({});
@@ -94,6 +168,54 @@ export default function ImportPage() {
     };
     reader.readAsText(file, "UTF-8");
     return false;
+  };
+
+  const closeBrokerModal = () => {
+    if (brokerConverting) return;
+    setBrokerModalOpen(false);
+    setBrokerStep(0);
+  };
+
+  const handleBrokerConvert = async () => {
+    if (broker === "hsbc_hk" && hsbcFiles.length === 0) {
+      message.warning("请至少选择一份汇丰电子结单");
+      return;
+    }
+    if (broker === "everbright" && ordinaryFiles.length + creditFiles.length < 2) {
+      message.warning("普通账户与信用账户主对账单合计至少需要 2 个文件");
+      return;
+    }
+    if (broker === "everbright" && supplementFiles.length > 0 && ordinaryFiles.length === 0) {
+      message.warning("上传普通账户补充记录时，还需选择普通账户主对账单");
+      return;
+    }
+
+    setBrokerConverting(true);
+    try {
+      const content = await invoke<string>("convert_broker_statements", {
+        broker,
+        ordinaryFiles,
+        creditFiles,
+        supplementFiles,
+        hsbcFiles,
+      });
+      const result = await invoke<ImportPreview>("parse_import_csv", {
+        content,
+        dataType: "transactions",
+      });
+      setDataType("transactions");
+      setRawCsvContent(content);
+      setPreview(result);
+      setSelectedAccountId("");
+      setCurrentStep(1);
+      setBrokerModalOpen(false);
+      setBrokerStep(0);
+      message.success(`已识别 ${result.valid_rows} 条交易，请预览后确认导入`);
+    } catch (err) {
+      message.error("转换券商文件失败: " + String(err));
+    } finally {
+      setBrokerConverting(false);
+    }
   };
 
   const handleConfirmImport = async () => {
@@ -277,6 +399,12 @@ export default function ImportPage() {
               <Button icon={<DownloadOutlined />} onClick={handleDownloadTemplate}>
                 下载模板
               </Button>
+              <Button
+                icon={<BankOutlined />}
+                onClick={() => setBrokerModalOpen(true)}
+              >
+                导入券商数据
+              </Button>
             </Space>
             <Upload.Dragger
               accept=".csv"
@@ -392,6 +520,96 @@ export default function ImportPage() {
           </Space>
         )}
       </Card>
+
+      <Modal
+        open={brokerModalOpen}
+        title="导入券商数据"
+        width={720}
+        maskClosable={!brokerConverting}
+        closable={!brokerConverting}
+        onCancel={closeBrokerModal}
+        footer={
+          brokerStep === 0
+            ? [
+                <Button key="cancel" onClick={closeBrokerModal}>取消</Button>,
+                <Button key="next" type="primary" onClick={() => setBrokerStep(1)}>下一步</Button>,
+              ]
+            : [
+                <Button key="back" disabled={brokerConverting} onClick={() => setBrokerStep(0)}>上一步</Button>,
+                <Button key="convert" type="primary" loading={brokerConverting} onClick={handleBrokerConvert}>
+                  生成预览
+                </Button>,
+              ]
+        }
+      >
+        <Steps
+          current={brokerStep}
+          size="small"
+          style={{ marginBottom: 24 }}
+          items={[{ title: "选择券商" }, { title: "上传文件" }]}
+        />
+
+        {brokerStep === 0 ? (
+          <Form layout="vertical">
+            <Form.Item label="券商">
+              <Select<BrokerType>
+                value={broker}
+                onChange={setBroker}
+                options={[
+                  { value: "hsbc_hk", label: "香港汇丰" },
+                  { value: "everbright", label: "光大证券" },
+                ]}
+              />
+            </Form.Item>
+            <Alert
+              type="info"
+              showIcon
+              title={broker === "hsbc_hk" ? "支持汇丰投资服务综合结单（PDF）" : "支持普通账户、信用账户对账单及普通账户补充记录"}
+            />
+          </Form>
+        ) : (
+          <Space orientation="vertical" size={12} style={{ width: "100%" }}>
+            {broker === "hsbc_hk" ? (
+              <BrokerFileBox
+                title="汇丰电子结单"
+                description="PDF 格式，可一次选择多份；重叠结单中的同一笔交易会自动去重"
+                files={hsbcFiles}
+                accept="pdf"
+                onChange={setHsbcFiles}
+              />
+            ) : (
+              <>
+                <Alert
+                  type="info"
+                  showIcon
+                  title="普通账户与信用账户主对账单合计至少选择 2 个文件；补充记录不计入该数量。"
+                />
+                <BrokerFileBox
+                  title="普通账户主对账单"
+                  description="券商导出的 .xls 对账单，可多选"
+                  files={ordinaryFiles}
+                  accept="xls"
+                  onChange={setOrdinaryFiles}
+                />
+                <BrokerFileBox
+                  title="信用账户主对账单"
+                  description="券商导出的 .xls 对账单，可多选"
+                  files={creditFiles}
+                  accept="xls"
+                  onChange={setCreditFiles}
+                />
+                <BrokerFileBox
+                  title="普通账户补充记录（可选）"
+                  description="选择补充记录时，必须同时选择普通账户主对账单"
+                  files={supplementFiles}
+                  accept="xls"
+                  onChange={setSupplementFiles}
+                />
+              </>
+            )}
+          </Space>
+        )}
+      </Modal>
     </div>
   );
 }

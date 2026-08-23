@@ -252,6 +252,7 @@ pub fn run() {
             commands::import_export::export_transactions_csv,
             commands::import_export::get_import_template,
             commands::import_export::parse_import_csv,
+            commands::import_export::convert_broker_statements,
             commands::import_export::confirm_import,
             // Phase 6: Price Alerts
             commands::alerts::create_alert,

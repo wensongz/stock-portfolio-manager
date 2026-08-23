@@ -1,5 +1,9 @@
 use crate::db::Database;
 use crate::models::Transaction;
+use crate::services::holding_cost_service::{
+    apply_transaction_with_config, replay_transactions_with_config, CostTransaction,
+    HoldingCostState,
+};
 use crate::services::quote_provider_service::market_adjusts_sell_pay_cost;
 use crate::services::quote_service::{cash_display_name, is_cash_symbol, CASH_SYMBOL_PREFIX};
 use tauri::State;
@@ -208,51 +212,26 @@ pub fn create_transaction(
                     ));
                 }
 
-                let adjust = market_adjusts_sell_pay_cost(&conn, &market);
-
-                let (new_shares, new_avg_cost) = if transaction_type == "BUY" {
-                    let total_shares = current_shares + shares;
-                    let new_avg = if total_shares > 0.0 {
-                        (current_shares * current_avg_cost + shares * price + commission)
-                            / total_shares
-                    } else {
-                        price
-                    };
-                    (total_shares, new_avg)
-                } else if transaction_type == "PAY" {
-                    // Dividend: shares unchanged.  Net dividend = total_amount - commission
-                    // (the commission/fee is deducted from the gross dividend).
-                    // Adjust avg_cost only when the market setting is enabled.
-                    let net_amount = total_amount - commission;
-                    let new_avg = if adjust && current_shares > 0.0 {
-                        (current_shares * current_avg_cost - net_amount) / current_shares
-                    } else {
-                        current_avg_cost
-                    };
-                    (current_shares, new_avg)
-                } else {
-                    // SELL: shares always decrease.
-                    // Adjust avg_cost (net cost method) only when the market setting is enabled.
-                    // The commission paid on a sale is a trading cost, so net proceeds are
-                    // total_amount - commission. The remaining cost basis is reduced by net proceeds.
-                    let remaining = current_shares - shares;
-                    let new_avg = if adjust {
-                        if remaining > 0.0 {
-                            (current_shares * current_avg_cost - total_amount + commission)
-                                / remaining
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        current_avg_cost
-                    };
-                    (remaining, new_avg)
-                };
+                let updated = apply_transaction_with_config(
+                    &conn,
+                    &market,
+                    HoldingCostState {
+                        shares: current_shares,
+                        avg_cost: current_avg_cost,
+                    },
+                    CostTransaction {
+                        transaction_type: &transaction_type,
+                        shares,
+                        price,
+                        total_amount,
+                        commission,
+                    },
+                );
 
                 let updated_at = chrono::Utc::now().to_rfc3339();
                 conn.execute(
                     "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
-                    rusqlite::params![hid, new_shares, new_avg_cost, updated_at],
+                    rusqlite::params![hid, updated.shares, updated.avg_cost, updated_at],
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -607,46 +586,26 @@ pub fn update_transaction(
                     ));
                 }
 
-                let adjust = market_adjusts_sell_pay_cost(&conn, &market);
-
-                let (new_shares, new_avg_cost) = if transaction_type == "BUY" {
-                    let total_shares = cur_shares + shares;
-                    let new_avg = if total_shares > 0.0 {
-                        (cur_shares * cur_avg_cost + shares * price + commission) / total_shares
-                    } else {
-                        price
-                    };
-                    (total_shares, new_avg)
-                } else if transaction_type == "PAY" {
-                    // Dividend: shares unchanged.  Net = total_amount - commission.
-                    let net_amount = total_amount - commission;
-                    let new_avg = if adjust && cur_shares > 0.0 {
-                        (cur_shares * cur_avg_cost - net_amount) / cur_shares
-                    } else {
-                        cur_avg_cost
-                    };
-                    (cur_shares, new_avg)
-                } else {
-                    // SELL: shares always decrease.
-                    // Adjust avg_cost (net cost method) only when the market setting is enabled.
-                    // Net proceeds = total_amount - commission; remaining cost is reduced by net proceeds.
-                    let remaining = cur_shares - shares;
-                    let new_avg = if adjust {
-                        if remaining > 0.0 {
-                            (cur_shares * cur_avg_cost - total_amount + commission) / remaining
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        cur_avg_cost
-                    };
-                    (remaining, new_avg)
-                };
+                let updated = apply_transaction_with_config(
+                    &conn,
+                    &market,
+                    HoldingCostState {
+                        shares: cur_shares,
+                        avg_cost: cur_avg_cost,
+                    },
+                    CostTransaction {
+                        transaction_type: &transaction_type,
+                        shares,
+                        price,
+                        total_amount,
+                        commission,
+                    },
+                );
 
                 let updated_at = chrono::Utc::now().to_rfc3339();
                 conn.execute(
                     "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
-                    rusqlite::params![hid, new_shares, new_avg_cost, updated_at],
+                    rusqlite::params![hid, updated.shares, updated.avg_cost, updated_at],
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -815,11 +774,6 @@ pub fn delete_transaction(db: State<Database>, id: String) -> Result<(), String>
 pub fn recalculate_holdings_cost(db: State<Database>) -> Result<(), String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
 
-    // Read per-market settings once.
-    let cn_adjust = market_adjusts_sell_pay_cost(&conn, "CN");
-    let us_adjust = market_adjusts_sell_pay_cost(&conn, "US");
-    let hk_adjust = market_adjusts_sell_pay_cost(&conn, "HK");
-
     // Fetch all non-cash holdings and their (account_id, symbol) pairs.
     let mut stmt = conn
         .prepare(
@@ -856,9 +810,13 @@ pub fn recalculate_holdings_cost(db: State<Database>) -> Result<(), String> {
     // up orphan transactions with NULL holding_id.
     let mut groups: std::collections::HashMap<(String, String), Vec<&HoldingInfo>> =
         std::collections::HashMap::new();
+    let mut group_markets: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
     for h in &all_holdings {
+        let key = (h.account_id.clone(), h.symbol.clone());
+        group_markets.insert(key.clone(), h.market.clone());
         groups
-            .entry((h.account_id.clone(), h.symbol.clone()))
+            .entry(key)
             .or_default()
             .push(h);
     }
@@ -878,8 +836,9 @@ pub fn recalculate_holdings_cost(db: State<Database>) -> Result<(), String> {
             .collect::<Result<_, _>>()
             .map_err(|e: rusqlite::Error| e.to_string())?;
 
-        for (acct_id, sym, _mkt) in orphan_pairs {
+        for (acct_id, sym, market) in orphan_pairs {
             let key = (acct_id.clone(), sym.clone());
+            group_markets.entry(key.clone()).or_insert(market);
             if !groups.contains_key(&key) {
                 // Create a virtual entry so we synthesise a holding for these orphans
                 groups.entry(key).or_default();
@@ -894,14 +853,8 @@ pub fn recalculate_holdings_cost(db: State<Database>) -> Result<(), String> {
         let market = holding_list
             .first()
             .map(|h| h.market.clone())
+            .or_else(|| group_markets.get(&(account_id.clone(), symbol.clone())).cloned())
             .unwrap_or_else(|| "US".to_string());
-
-        let adjust = match market.as_str() {
-            "CN" => cn_adjust,
-            "US" => us_adjust,
-            "HK" => hk_adjust,
-            _ => true,
-        };
 
         // Load ALL transactions for this (account_id, symbol), including those
         // with NULL holding_id, oldest first.
@@ -911,7 +864,7 @@ pub fn recalculate_holdings_cost(db: State<Database>) -> Result<(), String> {
                  FROM transactions \
                  WHERE account_id = ?1 AND UPPER(symbol) = UPPER(?2) \
                    AND symbol NOT LIKE '$CASH-%' \
-                 ORDER BY traded_at ASC, created_at ASC",
+                 ORDER BY traded_at ASC, created_at ASC, rowid ASC",
             )
             .map_err(|e| e.to_string())?;
 
@@ -937,41 +890,19 @@ pub fn recalculate_holdings_cost(db: State<Database>) -> Result<(), String> {
             .collect::<Result<_, _>>()
             .map_err(|e: rusqlite::Error| e.to_string())?;
 
-        let mut shares: f64 = 0.0;
-        let mut avg_cost: f64 = 0.0;
-
-        for tx in &txs {
-            match tx.tx_type.as_str() {
-                "OPEN" => {
-                    shares = tx.shares;
-                    avg_cost = tx.price;
-                }
-                "BUY" => {
-                    let new_total = shares + tx.shares;
-                    if new_total > 0.0 {
-                        avg_cost =
-                            (shares * avg_cost + tx.shares * tx.price + tx.commission) / new_total;
-                    }
-                    shares = new_total;
-                }
-                "SELL" => {
-                    let remaining = shares - tx.shares;
-                    if adjust {
-                        avg_cost = if remaining > 0.0 {
-                            (shares * avg_cost - tx.total_amount + tx.commission) / remaining
-                        } else {
-                            0.0
-                        };
-                    }
-                    shares = remaining;
-                }
-                "PAY" if adjust && shares > 0.0 => {
-                    let net_amount = tx.total_amount - tx.commission;
-                    avg_cost = (shares * avg_cost - net_amount) / shares;
-                }
-                _ => {}
-            }
-        }
+        let updated = replay_transactions_with_config(
+            &conn,
+            &market,
+            txs.iter().map(|tx| CostTransaction {
+                transaction_type: &tx.tx_type,
+                shares: tx.shares,
+                price: tx.price,
+                total_amount: tx.total_amount,
+                commission: tx.commission,
+            }),
+        );
+        let shares = updated.shares;
+        let avg_cost = updated.avg_cost;
 
         // Update/create the primary holding.  Use the first existing holding
         // row if available, otherwise create a new one.

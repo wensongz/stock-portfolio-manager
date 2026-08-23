@@ -2,7 +2,9 @@ use crate::db::Database;
 use crate::models::import_export::{
     ExportFilters, ImportData, ImportError, ImportPreview, ImportResult, ImportSkipped,
 };
-use crate::services::quote_provider_service::market_adjusts_sell_pay_cost;
+use crate::services::holding_cost_service::{
+    apply_transaction_with_config, CostTransaction, HoldingCostState,
+};
 use chrono::Utc;
 use csv::WriterBuilder;
 use std::collections::HashMap;
@@ -651,44 +653,25 @@ pub fn confirm_import(db: &Database, import_data: &ImportData) -> Result<ImportR
                     continue;
                 }
 
-                let adjust = market_adjusts_sell_pay_cost(&conn, &market);
-
-                let (new_shares, new_avg_cost) = if tx_type == "BUY" {
-                    let total = cur_shares + shares;
-                    let avg = if total > 0.0 {
-                        (cur_shares * cur_avg_cost + shares * price + commission) / total
-                    } else {
-                        price
-                    };
-                    (total, avg)
-                } else if tx_type == "PAY" {
-                    // Dividend: shares unchanged.  Net = total_amount - commission.
-                    let net_amount = total_amount - commission;
-                    let new_avg = if adjust && cur_shares > 0.0 {
-                        (cur_shares * cur_avg_cost - net_amount) / cur_shares
-                    } else {
-                        cur_avg_cost
-                    };
-                    (cur_shares, new_avg)
-                } else {
-                    // SELL: shares always decrease.
-                    // Adjust avg_cost (net cost method) only when the market setting is enabled.
-                    let remaining = cur_shares - shares;
-                    let new_avg = if adjust {
-                        if remaining > 0.0 {
-                            (cur_shares * cur_avg_cost - total_amount) / remaining
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        cur_avg_cost
-                    };
-                    (remaining, new_avg)
-                };
+                let updated = apply_transaction_with_config(
+                    &conn,
+                    &market,
+                    HoldingCostState {
+                        shares: cur_shares,
+                        avg_cost: cur_avg_cost,
+                    },
+                    CostTransaction {
+                        transaction_type: &tx_type,
+                        shares,
+                        price,
+                        total_amount,
+                        commission,
+                    },
+                );
 
                 if let Err(e) = conn.execute(
                     "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
-                    rusqlite::params![hid, new_shares, new_avg_cost, now],
+                    rusqlite::params![hid, updated.shares, updated.avg_cost, now],
                 ) {
                     errors.push(ImportError {
                         row: row_num,

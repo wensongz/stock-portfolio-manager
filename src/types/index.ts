@@ -927,22 +927,36 @@ export interface AccountDividend {
 export interface DividendRow {
   symbol: string;
   name: string;
-  /** [accountId, amount][] — amounts in the market's native currency. */
+  /** [accountId, amount][] — amounts in the transaction's actual currency. */
   perAccount: [string, number][];
   total: number;
 }
 
-export interface MarketDividend {
-  market: Market;
+export interface CurrencyDividend {
   currency: Currency;
   accounts: AccountDividend[];
   rows: DividendRow[];
   total: number;
 }
 
+export interface DividendEntry {
+  accountId: string;
+  accountName: string;
+  accountMarket: string;
+  symbol: string;
+  name: string;
+  market: string;
+  currency: Currency;
+  /** Calendar month in YYYYMM form. */
+  month: string;
+  total: number;
+}
+
 export interface DividendAnalysis {
-  year: number;
-  markets: MarketDividend[];
+  /** Selected year, or null when all dividend history is included. */
+  year: number | null;
+  currencies: CurrencyDividend[];
+  entries: DividendEntry[];
   grandTotal: number;
 }
 

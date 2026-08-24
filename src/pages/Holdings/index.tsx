@@ -29,6 +29,7 @@ import { useHoldingStore } from "../../stores/holdingStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { useCategoryStore } from "../../stores/categoryStore";
 import { useQuoteStore } from "../../stores/quoteStore";
+import { toQuoteWarning } from "../../stores/quoteErrors";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
 import { usePnlColor } from "../../hooks/usePnlColor";
 import type { Holding, HoldingWithQuote, Market, Currency, StockQuote, Transaction, TransactionType } from "../../types";
@@ -129,7 +130,7 @@ export default function HoldingsPage() {
     useHoldingStore();
   const { accounts, fetchAccounts } = useAccountStore();
   const { categories, fetchCategories } = useCategoryStore();
-  const { holdingQuotes, loading: quotesLoading, lastUpdatedAt, fetchHoldingQuotes } = useQuoteStore();
+  const { holdingQuotes, loading: quotesLoading, lastUpdatedAt, fetchHoldingQuotes, setQuoteWarning } = useQuoteStore();
   const { pnlColorDark: pnlColorDarkFn } = usePnlColor();
   const { convertWithCachedRates, fetchRates } = useExchangeRateStore();
 
@@ -212,6 +213,7 @@ export default function HoldingsPage() {
       const market: Market | undefined = form.getFieldValue("market");
       if (!market) return;
 
+      setQuoteWarning(null);
       setFetchingName(true);
       try {
         const commandMap: Record<Market, string> = {
@@ -225,13 +227,16 @@ export default function HoldingsPage() {
         if (quote && quote.name) {
           form.setFieldsValue({ name: quote.name });
         }
-      } catch {
-        // Silently ignore - user can still type the name manually
+        const warning = await invoke<string | null>("take_quote_warning").catch(() => null);
+        if (warning) setQuoteWarning(warning);
+      } catch (error) {
+        const warning = await invoke<string | null>("take_quote_warning").catch(() => null);
+        setQuoteWarning(warning ?? toQuoteWarning(error));
       } finally {
         setFetchingName(false);
       }
     },
-    [form],
+    [form, setQuoteWarning],
   );
 
   const handleSymbolBlur = useCallback(

@@ -468,6 +468,7 @@ pub async fn fetch_us_quote_with_provider(
         "xueqiu" => match fetch_xueqiu_us_quote(symbol).await {
             Ok(q) => Ok(q),
             Err(e) => {
+                record_xueqiu_warning(&e);
                 info!(
                     "fetch_us_quote: Xueqiu failed for {}: {}, falling back to eastmoney",
                     symbol, e
@@ -506,6 +507,7 @@ pub async fn fetch_hk_quote_with_provider(
         "xueqiu" => match fetch_xueqiu_hk_quote(symbol).await {
             Ok(q) => Ok(q),
             Err(e) => {
+                record_xueqiu_warning(&e);
                 info!(
                     "fetch_hk_quote: Xueqiu failed for {}: {}, falling back to eastmoney",
                     symbol, e
@@ -559,6 +561,7 @@ pub async fn fetch_cn_quote_with_provider(
         "xueqiu" => match fetch_xueqiu_cn_quote(symbol).await {
             Ok(q) => Ok(q),
             Err(e) => {
+                record_xueqiu_warning(&e);
                 info!(
                     "fetch_cn_quote: Xueqiu failed for {}: {}, falling back to eastmoney",
                     symbol, e
@@ -1070,6 +1073,23 @@ fn is_xueqiu_cookie_expired_error(err: &str) -> bool {
 
 fn is_xueqiu_request_error(err: &str) -> bool {
     err.contains("Xueqiu") || err.contains("xueqiu.com") || err.contains("stock.xueqiu.com")
+}
+
+fn record_xueqiu_warning(err: &str) {
+    let warning = if is_xueqiu_cookie_expired_error(err) {
+        XUEQIU_COOKIE_EXPIRED_HINT
+    } else if is_xueqiu_request_error(err) {
+        XUEQIU_API_FAILED_HINT
+    } else {
+        return;
+    };
+
+    let mut current = LAST_QUOTE_WARNING.lock().unwrap();
+    if current.as_deref() != Some(XUEQIU_COOKIE_EXPIRED_HINT)
+        || warning == XUEQIU_COOKIE_EXPIRED_HINT
+    {
+        *current = Some(warning.to_string());
+    }
 }
 
 pub fn clear_quote_warning() {
@@ -3603,6 +3623,18 @@ mod tests {
         let result = parse_xueqiu_quote("SH600519", "CN", resp);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Xueqiu API error"));
+    }
+
+    #[test]
+    fn test_record_xueqiu_warning_preserves_fallback_failure_for_frontend() {
+        clear_quote_warning();
+
+        record_xueqiu_warning("Network error fetching AAPL from Xueqiu: operation timed out");
+
+        assert_eq!(
+            take_quote_warning().as_deref(),
+            Some(XUEQIU_API_FAILED_HINT)
+        );
     }
 
     #[test]

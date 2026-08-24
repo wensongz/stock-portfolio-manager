@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { HoldingWithQuote } from "../types";
+import { toQuoteWarning } from "./quoteErrors";
 
 interface QuoteState {
   holdingQuotes: HoldingWithQuote[];
@@ -53,8 +54,8 @@ export const useQuoteStore = create<QuoteState>((set, get) => ({
         // a warning that was already being displayed.
         ...(isRefreshFetch ? { quoteWarning: qw } : qw ? { quoteWarning: qw } : {}),
       });
-    } catch {
-      set({ loading: false });
+    } catch (error) {
+      set({ loading: false, quoteWarning: toQuoteWarning(error) });
     }
   },
 

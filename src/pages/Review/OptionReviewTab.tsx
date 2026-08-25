@@ -27,6 +27,7 @@ import type {
   OptionUnderlyingReview,
 } from "../../types";
 import {
+  OPTION_REVIEW_ANNUALIZED_YIELD_LABEL,
   formatReviewPercent,
   getOptionReviewEmptyDescription,
   selectDefaultUnderlying,
@@ -168,7 +169,7 @@ export default function OptionReviewTab() {
         row.completed_campaigns > 0 ? renderPercent(value) : "—",
     },
     {
-      title: "年化收益率",
+      title: OPTION_REVIEW_ANNUALIZED_YIELD_LABEL,
       dataIndex: "annualized_yield_on_notional",
       align: "right",
       width: 120,
@@ -261,7 +262,7 @@ export default function OptionReviewTab() {
         campaign.status === "active" ? "—" : renderPercent(value),
     },
     {
-      title: "年化收益率",
+      title: OPTION_REVIEW_ANNUALIZED_YIELD_LABEL,
       dataIndex: "annualized_yield_on_notional",
       align: "right",
       width: 120,
@@ -368,7 +369,7 @@ export default function OptionReviewTab() {
             <Col xs={24} sm={12} xl={6}>
               <Card>
                 <Statistic
-                  title="年化收益率"
+                  title={OPTION_REVIEW_ANNUALIZED_YIELD_LABEL}
                   value={
                     hasCompletedCampaigns
                       ? formatReviewPercent(report.summary.annualized_yield_on_notional)

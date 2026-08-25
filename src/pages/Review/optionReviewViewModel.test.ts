@@ -3,11 +3,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  OPTION_REVIEW_ANNUALIZED_YIELD_LABEL,
   formatReviewPercent,
   getOptionReviewEmptyDescription,
   selectDefaultUnderlying,
   sortUnderlyingReviews,
 } from "./optionReviewViewModel.ts";
+
+test("annualized yield label states the secured-notional basis", () => {
+  assert.equal(
+    OPTION_REVIEW_ANNUALIZED_YIELD_LABEL,
+    "年化收益率（担保名义资本口径）",
+  );
+});
 
 const underlying = (symbol: string, pnl: number, flags: string[] = []) => ({
   underlying: symbol,

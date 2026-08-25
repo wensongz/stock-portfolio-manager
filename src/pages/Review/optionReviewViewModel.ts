@@ -4,6 +4,8 @@ import type {
   OptionUnderlyingReview,
 } from "../../types";
 
+export const OPTION_REVIEW_ANNUALIZED_YIELD_LABEL = "年化收益率（担保名义资本口径）";
+
 export function sortUnderlyingReviews(items: OptionUnderlyingReview[]) {
   return [...items].sort(
     (a, b) =>

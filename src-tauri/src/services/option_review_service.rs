@@ -3,7 +3,7 @@ use crate::models::{
     OptionCampaign, OptionReviewDataQuality, OptionReviewReport, OptionReviewSummary,
     OptionUnderlyingReview, OptionWorstCampaign,
 };
-use chrono::{NaiveDate, Utc};
+use chrono::{NaiveDate, NaiveDateTime, Utc};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -22,6 +22,7 @@ struct RawOptionRecord {
     fee: f64,
     traded_at: Option<String>,
     trade_date: Option<NaiveDate>,
+    trade_timestamp: Option<NaiveDateTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +133,7 @@ fn load_inputs(db: &Database, account_id: &str) -> Result<LoadedInputs, String> 
     let records = statement
         .query_map([account_id], |row| {
             let traded_at = row.get::<_, Option<String>>(12)?;
+            let trade_timestamp = traded_at.as_deref().and_then(parse_trade_timestamp);
             Ok(RawOptionRecord {
                 id: row.get(0)?,
                 option_symbol: row.get(1)?,
@@ -146,6 +148,7 @@ fn load_inputs(db: &Database, account_id: &str) -> Result<LoadedInputs, String> 
                 commission: row.get(10)?,
                 fee: row.get(11)?,
                 trade_date: traded_at.as_deref().and_then(parse_trade_date),
+                trade_timestamp,
                 traded_at,
             })
         })
@@ -202,6 +205,27 @@ fn parse_trade_date(raw: &str) -> Option<NaiveDate> {
         .find_map(|format| NaiveDate::parse_from_str(date, format).ok())
 }
 
+fn parse_trade_timestamp(raw: &str) -> Option<NaiveDateTime> {
+    let raw = raw.trim();
+    [
+        "%Y-%m-%d, %H:%M:%S",
+        "%Y-%m-%d, %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d, %H:%M:%S",
+        "%Y/%m/%d, %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%d%b%y, %H:%M:%S",
+        "%d%b%y, %H:%M",
+        "%d%b%y %H:%M:%S",
+        "%d%b%y %H:%M",
+    ]
+    .iter()
+    .find_map(|format| NaiveDateTime::parse_from_str(raw, format).ok())
+    .or_else(|| parse_trade_date(raw)?.and_hms_opt(0, 0, 0))
+}
+
 fn parse_expiry_date(raw: &str) -> Option<NaiveDate> {
     parse_trade_date(raw)
 }
@@ -236,8 +260,13 @@ fn split_matches(open: &OpenLot, close: &RawOptionRecord, splits: &[SplitInput])
     let Some(expiry) = parse_expiry_date(&close.expiry_date) else {
         return false;
     };
+    let (Some(opened_at), Some(closed_at)) = (open.record.trade_date, close.trade_date) else {
+        return false;
+    };
     splits.iter().any(|split| {
         if split.stock_code != open.record.underlying
+            || split.split_date <= opened_at
+            || split.split_date > closed_at
             || split.split_date > expiry
             || split.ratio_from == 0
             || split.ratio_to == 0
@@ -311,9 +340,8 @@ fn pair_cycles_fifo(
         .filter(|record| is_open(record) || is_close(record))
         .collect();
     valid.sort_by(|left, right| {
-        left.trade_date
-            .cmp(&right.trade_date)
-            .then_with(|| left.traded_at.cmp(&right.traded_at))
+        left.trade_timestamp
+            .cmp(&right.trade_timestamp)
             .then_with(|| match (left.action.as_str(), right.action.as_str()) {
                 ("SELL", "BUY") => std::cmp::Ordering::Less,
                 ("BUY", "SELL") => std::cmp::Ordering::Greater,
@@ -1309,6 +1337,50 @@ mod tests {
     }
 
     #[test]
+    fn mixed_supported_timestamp_formats_preserve_intraday_fifo() {
+        let (db, account_id) = db_with_account();
+        insert_record(
+            &db,
+            "mixed-earlier-close",
+            &account_id,
+            "AAPL MIXED P",
+            "AAPL",
+            "31DEC26",
+            100.0,
+            "P",
+            "BUY",
+            "C;P",
+            1,
+            50.0,
+            0.0,
+            0.0,
+            Some("2026/01/01 09:00"),
+        );
+        insert_record(
+            &db,
+            "mixed-later-open",
+            &account_id,
+            "AAPL MIXED P",
+            "AAPL",
+            "31DEC26",
+            100.0,
+            "P",
+            "SELL",
+            "O",
+            1,
+            100.0,
+            0.0,
+            0.0,
+            Some("2026-01-01 10:00"),
+        );
+
+        let report = fixed_review(&db, &account_id, None);
+        assert_eq!(report.data_quality.unmatched_records, 1);
+        assert_eq!(report.summary.active_campaigns, 1);
+        assert!((report.underlyings[0].campaigns[0].gross_premium - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn split_adjusted_close_matches_existing_open() {
         let (db, account_id) = db_with_account();
         {
@@ -1361,6 +1433,66 @@ mod tests {
         assert_eq!(report.data_quality.unmatched_records, 0);
         assert!((report.summary.gross_premium - 250.0).abs() < 1e-9);
         assert!((report.summary.net_premium_pnl - 248.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn split_outside_open_close_window_does_not_match() {
+        for (case, split_date) in [("before-open", "2026-04-30"), ("after-close", "2026-06-02")] {
+            let (db, account_id) = db_with_account();
+            {
+                let conn = db.conn.lock().unwrap();
+                conn.execute(
+                    "INSERT INTO stock_splits
+                     (stock_code, split_date, ratio_from, ratio_to, created_at)
+                     VALUES ('BRK B', ?1, 1, 2, ?1)",
+                    [split_date],
+                )
+                .unwrap();
+            }
+            insert_record(
+                &db,
+                &format!("{case}-open"),
+                &account_id,
+                "BRK B 31DEC26 330 C",
+                "BRK B",
+                "31DEC26",
+                330.0,
+                "C",
+                "SELL",
+                "O",
+                1,
+                250.0,
+                1.0,
+                0.0,
+                Some("2026-05-01"),
+            );
+            insert_record(
+                &db,
+                &format!("{case}-close"),
+                &account_id,
+                "BRK B 31DEC26 165 C",
+                "BRK B",
+                "31DEC26",
+                165.0,
+                "C",
+                "BUY",
+                "C;P",
+                1,
+                50.0,
+                0.5,
+                0.0,
+                Some("2026-06-01"),
+            );
+
+            let report = fixed_review(&db, &account_id, None);
+            assert_eq!(report.data_quality.unmatched_records, 1, "{case}");
+            assert_eq!(report.summary.completed_campaigns, 0, "{case}");
+            assert_eq!(report.summary.active_campaigns, 1, "{case}");
+            assert!(
+                (report.underlyings[0].campaigns[0].gross_premium - 250.0).abs() < 1e-9,
+                "{case}"
+            );
+        }
     }
 
     #[test]

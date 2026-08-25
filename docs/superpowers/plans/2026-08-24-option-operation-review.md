@@ -1143,19 +1143,19 @@ git commit -m "feat: connect option review to AI assistant"
 - Consumes: Tasks 1–5全部产物。
 - Produces: 一个测试通过、口径与文档一致的第一版功能。
 
-- [ ] **Step 1: 运行前端测试**
+- [x] **Step 1: 运行前端测试**
 
 Run: `node --test src/pages/AiAssistant/prefill.test.ts src/pages/Review/optionReviewViewModel.test.ts`
 
 Expected: 全部PASS。
 
-- [ ] **Step 2: 运行前端生产构建**
+- [x] **Step 2: 运行前端生产构建**
 
 Run: `npm run build`
 
 Expected: TypeScript和Vite构建exit 0；已有chunk-size advisory可保留。
 
-- [ ] **Step 3: 运行Rust格式、测试和静态检查**
+- [x] **Step 3: 运行Rust格式、测试和静态检查**
 
 Run: `cd src-tauri && cargo fmt --check`
 
@@ -1165,7 +1165,7 @@ Run: `cd src-tauri && cargo check`
 
 Expected: 三条命令均exit 0，无新增warning。
 
-- [ ] **Step 4: 检查指标守恒和误导性文案**
+- [x] **Step 4: 检查指标守恒和误导性文案**
 
 在测试数据或本地开发数据中逐项验证：
 
@@ -1177,7 +1177,7 @@ Expected: 三条命令均exit 0，无新增warning。
 - 所有年化收益率旁都有「担保名义资本口径」。
 - Campaign表或Alert明确写「系统推定」。
 
-- [ ] **Step 5: 检查Git差异与文档**
+- [x] **Step 5: 检查Git差异与文档**
 
 Run: `git diff --check`
 
@@ -1185,7 +1185,7 @@ Run: `git status --short`
 
 Expected: 无空白错误；只有本功能相关文件。确认 `docs/ai-tools.md` 的工具数量和名称与代码一致，设计规格状态为「已确认」。
 
-- [ ] **Step 6: 最终提交**
+- [x] **Step 6: 最终提交**
 
 如果前面任务提交后还有格式、文案或文档修正：
 

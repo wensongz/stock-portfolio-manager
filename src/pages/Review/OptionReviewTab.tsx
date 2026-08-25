@@ -12,12 +12,13 @@ import {
   Statistic,
   Table,
   Tag,
-  Tooltip,
   Typography,
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
+import { useNavigate } from "react-router-dom";
 import { usePnlColor } from "../../hooks/usePnlColor";
 import { useAccountStore } from "../../stores/accountStore";
+import { useChatStore } from "../../stores/chatStore";
 import { useOptionReviewStore } from "../../stores/optionReviewStore";
 import type {
   Currency,
@@ -61,7 +62,11 @@ function formatCampaignPeriod(campaign: OptionCampaign) {
 }
 
 export default function OptionReviewTab() {
+  const navigate = useNavigate();
   const { accounts, loading: accountsLoading, fetchAccounts } = useAccountStore();
+  const setActiveSkillsForNextTurn = useChatStore(
+    (state) => state.setActiveSkillsForNextTurn,
+  );
   const { report, loading, error, fetchOptionReview, clearOptionReview } =
     useOptionReviewStore();
   const [accountId, setAccountId] = useState(
@@ -71,6 +76,7 @@ export default function OptionReviewTab() {
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const [accountsReady, setAccountsReady] = useState(false);
   const { pnlColorDark, pnlTag } = usePnlColor();
+  const selectedAccount = accounts.find((account) => account.id === accountId) ?? null;
 
   useEffect(() => {
     void fetchAccounts().finally(() => setAccountsReady(true));
@@ -113,6 +119,17 @@ export default function OptionReviewTab() {
       ),
     [selectedUnderlying],
   );
+
+  const handleAiReview = () => {
+    if (!selectedUnderlying || !selectedAccount) return;
+    setActiveSkillsForNextTurn(["options-review"]);
+    const period = periodDays == null ? "全部历史" : `最近 ${periodDays} 天`;
+    navigate("/ai-assistant", {
+      state: {
+        prefillPrompt: `请复盘账户 ${selectedAccount.name} 在${period}的 ${selectedUnderlying.underlying} 期权交易，分别说明做得好的、做得不好的和最值得改进的地方。请使用确定性期权复盘数据并说明样本限制。`,
+      },
+    });
+  };
 
   const currency = report?.currency ?? "USD";
 
@@ -419,11 +436,7 @@ export default function OptionReviewTab() {
             <Card
               title={`${selectedUnderlying.underlying} Campaign详情`}
               extra={
-                <Tooltip title="AI入口将在下一任务接入">
-                  <span>
-                    <Button disabled>AI复盘这只股票</Button>
-                  </span>
-                </Tooltip>
+                <Button onClick={handleAiReview}>AI复盘这只股票</Button>
               }
               style={{ overflow: "hidden" }}
             >

@@ -38,6 +38,7 @@ export const TOOL_LABELS: Record<string, string> = {
   get_dividend_income: "分红收入",
   check_price_alerts: "价格提醒",
   get_option_positions: "期权持仓",
+  get_option_review: "期权操作复盘",
 };
 
 /** Pick an icon for a tool based on its category, inferred from the name. */

@@ -22,7 +22,7 @@ import {
   SyncOutlined,
   CopyOutlined,
 } from "@ant-design/icons";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useChatStore, selectSessionTotalTokens } from "../../stores/chatStore";
 import { useChatSessionStore } from "../../stores/chatSessionStore";
 import { useAiStore } from "../../stores/aiStore";
@@ -31,6 +31,7 @@ import { ReasoningBlock } from "../../components/ai/ReasoningBlock";
 import { ToolCallList } from "../../components/ai/ToolCallCard";
 import { MarkdownRenderer } from "../../components/ai/MarkdownRenderer";
 import type { AiModelInfo, ChatMessageWithMeta, ChatSession, ChatUsage, Skill } from "../../types";
+import { readAiPrefill } from "./prefill";
 
 const { Title, Text } = Typography;
 const { TextArea } = Input;
@@ -120,10 +121,13 @@ const TOOL_LABELS: Record<string, string> = {
   get_dividend_income: "分红收入",
   check_price_alerts: "价格提醒",
   get_option_positions: "期权持仓",
+  get_option_review: "期权操作复盘",
 };
 
 export default function AiAssistantPage() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const [initialPrompt] = useState(() => readAiPrefill(location.state));
   const {
     sessions,
     currentSessionId,
@@ -141,6 +145,11 @@ export default function AiAssistantPage() {
   const { fetchSkills } = useSkillStore();
 
   const [bootstrapped, setBootstrapped] = useState(false);
+
+  useEffect(() => {
+    if (!initialPrompt) return;
+    navigate(location.pathname, { replace: true, state: null });
+  }, [initialPrompt, location.pathname, navigate]);
 
   // One-time bootstrap: bind streaming listeners, load AI config, load the
   // session list. We deliberately leave currentSessionId null so the page
@@ -192,6 +201,7 @@ export default function AiAssistantPage() {
           <ChatPanel
             sessionId={currentSessionId}
             navigate={navigate}
+            initialPrompt={initialPrompt}
           />
         ) : (
           <div className="flex-1 flex items-center justify-center" style={{ color: "var(--color-text-tertiary)" }}>
@@ -571,11 +581,13 @@ function ModelSwitcher() {
 function ChatPanel({
   sessionId,
   navigate,
+  initialPrompt,
 }: {
   // null means "no active session" (welcome screen). A session is created
   // lazily on the first send.
   sessionId: string | null;
   navigate: ReturnType<typeof useNavigate>;
+  initialPrompt: string | null;
 }) {
   const {
     messages,
@@ -620,6 +632,12 @@ function ChatPanel({
   const setCurrentSession = useChatSessionStore((s) => s.setCurrentSession);
 
   const [input, setInput] = useState("");
+  const seededPromptRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!initialPrompt || seededPromptRef.current === initialPrompt) return;
+    seededPromptRef.current = initialPrompt;
+    setInput((current) => current.trim().length > 0 ? current : initialPrompt);
+  }, [initialPrompt]);
   // Seed for the random suggestion picker. Bumping it reshuffles which 6 of
   // SUGGESTION_POOL are shown in the empty state ("换一批" button).
   const [suggestionSeed, setSuggestionSeed] = useState(0);

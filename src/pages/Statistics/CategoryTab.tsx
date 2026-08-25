@@ -7,6 +7,7 @@ import { useCategoryStore } from "../../stores/categoryStore";
 import type { CategoryStatistics, HoldingDetail } from "../../types";
 import type { Currency } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { useTablePageSize } from "../../hooks/tablePageSize";
 import AccountStockTransactionsModal from "./AccountStockTransactionsModal";
 import { filterActiveStockHoldings } from "./categoryHoldings";
 
@@ -34,6 +35,7 @@ interface AggregatedStock extends HoldingDetail {
 }
 
 export default function CategoryTab({ selectedCategoryId, onCategoryChange, baseCurrency }: Props) {
+  const { pageSize, onShowSizeChange } = useTablePageSize();
   const { pnlColor } = usePnlColor();
   const { categoryStats, fetchCategoryStats } = useStatisticsStore();
   const { categories, fetchCategories } = useCategoryStore();
@@ -209,7 +211,7 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
                     size="small"
                     className="account-detail-table"
                     scroll={{ x: 1200 }}
-                    pagination={{ pageSize: 20, showSizeChanger: true }}
+                    pagination={{ pageSize, showSizeChanger: true, onShowSizeChange }}
                     expandable={{
                       expandedRowRender: (record) => (
                         <Table

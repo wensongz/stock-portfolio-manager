@@ -5,6 +5,7 @@ import PieChart from "../../components/charts/PieChart";
 import { useStatisticsStore } from "../../stores/dashboardStore";
 import type { MarketStatistics } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { useTablePageSize } from "../../hooks/tablePageSize";
 import AccountStockTransactionsModal from "./AccountStockTransactionsModal";
 
 const { Text } = Typography;
@@ -81,6 +82,7 @@ interface StockAccumulator {
 }
 
 export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
+  const { pageSize, onShowSizeChange } = useTablePageSize();
   const { pnlColor } = usePnlColor();
   const { marketStats, fetchMarketStats } = useStatisticsStore();
 
@@ -495,7 +497,7 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
               className="account-detail-table"
               scroll={{ x: 1200 }}
               size="small"
-              pagination={{ pageSize: 20, showSizeChanger: true }}
+              pagination={{ pageSize, showSizeChanger: true, onShowSizeChange }}
               expandable={{
                 expandedRowRender: (record: AggregatedStock) => (
                   // Same styling as the overview tab sub-table: ml-8 indent,

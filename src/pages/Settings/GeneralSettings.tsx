@@ -51,6 +51,7 @@ const LOCAL_STORAGE_KEYS = [
   "app_theme_mode",
   "base_currency",
   "statistics_selected_market",
+  "holdings_table_page_size",
   "options_selected_account_id",
 ] as const;
 

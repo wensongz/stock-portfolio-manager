@@ -3,6 +3,7 @@ import { Table, Tag, Typography } from "antd";
 import type { ColumnsType, TableProps } from "antd/es/table";
 import type { HoldingDetail } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { useTablePageSize } from "../../hooks/tablePageSize";
 
 const { Text } = Typography;
 
@@ -29,6 +30,7 @@ function fmtMoney(value: number, currency: string) {
 
 export default function HoldingsTable({ holdings, loading, hideAccountMarket = false }: Props) {
   const { pnlColor } = usePnlColor();
+  const { pageSize, onShowSizeChange } = useTablePageSize();
 
   // Track which filter values are currently active for account and market columns.
   // This lets us recompute the denominator whenever holdings or filters change.
@@ -210,7 +212,7 @@ export default function HoldingsTable({ holdings, loading, hideAccountMarket = f
       loading={loading}
       scroll={{ x: hideAccountMarket ? 1100 : 1310 }}
       size="small"
-      pagination={{ pageSize: 20, showSizeChanger: true }}
+      pagination={{ pageSize, showSizeChanger: true, onShowSizeChange }}
       bordered
       onChange={handleTableChange}
     />

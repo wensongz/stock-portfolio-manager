@@ -6,6 +6,7 @@ import BarChart from "../../components/charts/BarChart";
 import type { StatisticsOverview } from "../../types";
 import type { Currency } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { useTablePageSize } from "../../hooks/tablePageSize";
 import { useQuoteStore } from "../../stores/quoteStore";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
 import { useCategoryStore } from "../../stores/categoryStore";
@@ -61,6 +62,7 @@ interface Props {
 }
 
 export default function OverviewTab({ overview, loading, baseCurrency }: Props) {
+  const { pageSize, onShowSizeChange } = useTablePageSize();
   const { pnlColor } = usePnlColor();
   const currency = currencySymbol[baseCurrency] ?? "$";
   const holdingQuotes = useQuoteStore((s) => s.holdingQuotes);
@@ -571,7 +573,7 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
                 size="small"
                 className="account-detail-table"
                 scroll={{ x: 1200 }}
-                pagination={{ pageSize: 20, showSizeChanger: true }}
+                pagination={{ pageSize, showSizeChanger: true, onShowSizeChange }}
                 expandable={{
                   expandedRowRender: (record: AggregatedStock) => (
                     // ml-8 indentation like the quarterly sub-table. The

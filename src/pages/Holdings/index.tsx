@@ -1118,7 +1118,7 @@ export default function HoldingsPage() {
               {
                 title: "现金变动",
                 key: "cashDelta",
-                width: 140,
+                width: 160,
                 align: "right" as const,
                 render: (_: unknown, record: CashFlowRow) => {
                   const delta = record.cashDelta;
@@ -1135,7 +1135,7 @@ export default function HoldingsPage() {
               {
                 title: "余额",
                 key: "runningBalance",
-                width: 140,
+                width: 160,
                 align: "right" as const,
                 render: (_: unknown, record: CashFlowRow) => {
                   const sym = currencySymbol[record.currency] ?? "";
@@ -1150,6 +1150,7 @@ export default function HoldingsPage() {
                 title: "备注",
                 dataIndex: "notes",
                 key: "notes",
+                ellipsis: true,
                 render: (v: string | null) => v || "—",
               },
             ]}
@@ -1212,6 +1213,7 @@ export default function HoldingsPage() {
                 title: "备注",
                 dataIndex: "notes",
                 key: "notes",
+                ellipsis: true,
                 render: (v: string | null) => v || "—",
               },
             ]}

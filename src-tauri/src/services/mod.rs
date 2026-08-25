@@ -8,6 +8,7 @@ pub mod http_client;
 pub mod import_export_service;
 pub mod indicators;
 pub mod market_overview_service;
+pub mod option_review_service;
 pub mod performance_service;
 pub mod quarterly_service;
 pub mod quote_provider_service;

@@ -7,6 +7,7 @@ pub mod dividend;
 pub mod holding;
 pub mod import_export;
 pub mod option;
+pub mod option_review;
 pub mod option_share_lot;
 pub mod performance;
 pub mod quarterly;
@@ -22,6 +23,7 @@ pub use account::Account;
 pub use category::Category;
 pub use dashboard::{DashboardSummary, HoldingDetail};
 pub use holding::Holding;
+pub use option_review::*;
 pub use quote::{
     DailyHoldingSnapshot, DailyPortfolioValue, ExchangeRates, FinancialReport, HoldingWithQuote,
     PriceCandle, StockQuote,

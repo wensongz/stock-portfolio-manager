@@ -1,14 +1,19 @@
 ---
 name: 期权策略复盘
-description: 复盘期权（卖权）持仓与到期情况，适用于用户询问"期权""卖期权""到期""权利金""covered call""cash secured put"时
-trigger: 期权,卖期权,权利金,到期,covered call,cash secured put,put,call,被行权
+description: 复盘期权历史Campaign与卖方策略执行质量，适用于用户询问"期权复盘""期权历史表现""卖期权复盘""权利金留存率""历史Campaign"时
+trigger: 期权复盘,期权历史表现,卖期权复盘,权利金留存率,Campaign复盘,历史Campaign
 enabled: true
 ---
 
 # 期权策略复盘
 
 ## 你的任务
-调用 `get_option_review` 工具获取确定性期权历史复盘数据，评价 CSP 和 Covered Call 的历史执行情况。
+对期权历史执行进行确定性复盘，评价 CSP 和 Covered Call 的已完成Campaign。
+
+## 工具路由
+- 历史执行复盘使用 `get_option_review`。
+- 当前持仓、到期风险、ITM/OTM、被行权准备使用 `get_option_positions`；需要现价时再调用 `get_stock_quote`。
+- 不将当前未平仓浮盈亏或风险敞口混入已完成Campaign指标。
 
 ## 分析步骤
 1. 确认账户和可选标的，调用 `get_option_review`。

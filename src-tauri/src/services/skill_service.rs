@@ -705,14 +705,33 @@ mod tests {
     }
 
     #[test]
-    fn options_review_uses_deterministic_review_tool() {
+    fn options_review_routes_historical_and_current_risk_tools() {
         let (_, body) = BUILTIN_SKILLS
             .iter()
             .find(|(stem, _)| *stem == "options-review")
             .expect("options-review builtin");
-        assert!(body.contains("get_option_review"));
-        assert!(body.contains("做得好的"));
-        assert!(body.contains("值得改进"));
+        let parsed =
+            parse_skill_from_str("options-review", body, Path::new("options-review.md")).unwrap();
+
+        assert!(parsed.content.contains("get_option_review"));
+        assert!(parsed.content.contains("get_option_positions"));
+        assert!(parsed.content.contains("历史执行复盘"));
+        assert!(parsed
+            .content
+            .contains("当前持仓、到期风险、ITM/OTM、被行权准备"));
+        assert!(parsed.content.contains("未平仓"));
+        assert!(parsed.content.contains("做得好的"));
+        assert!(parsed.content.contains("值得改进"));
+
+        for broad_trigger in ["到期", "put", "call", "被行权"] {
+            assert!(
+                !parsed
+                    .trigger
+                    .iter()
+                    .any(|trigger| trigger == broad_trigger),
+                "broad current-risk trigger must be absent: {broad_trigger}"
+            );
+        }
     }
 
     // --- parse_frontmatter ---------------------------------------------------

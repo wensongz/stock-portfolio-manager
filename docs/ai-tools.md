@@ -27,7 +27,7 @@
 
 ## 内置工具清单
 
-共 17 个工具，按用途分组：
+共 21 个工具，按用途分组：
 
 ### 行情类
 
@@ -37,6 +37,14 @@
 | `get_stock_quote` | `symbol`，`market?` | 某只股票的实时行情 |
 | `get_price_history` | `symbol`，`market?`，`days?=30` | 近 N 日收盘价序列 |
 | `search_stock` | `query`，`direction?` | 名称查代码 / 代码查名称（不确定代码时先调用） |
+
+### 基本面与技术分析
+
+| 工具名 | 参数 | 作用 |
+| --- | --- | --- |
+| `get_stock_fundamentals` | `symbol`，`market?` | 估值与基本面指标（PE、PB、市值、股息率、EPS、ROE、换手率） |
+| `get_technical_indicators` | `symbol`，`market?`，`days?=120` | 均线、MACD、RSI 与布林带技术指标 |
+| `get_financial_statements` | `symbol`，`periods?=4` | A股近几期营收、净利润、EPS、ROE、资产负债率及同比增速 |
 
 ### 组合类
 

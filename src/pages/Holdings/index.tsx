@@ -550,7 +550,7 @@ export default function HoldingsPage() {
       title: "股票代码",
       dataIndex: "symbol",
       key: "symbol",
-      width: 100,
+      width: 150,
       ellipsis: true,
       sorter: (a: HoldingWithQuote, b: HoldingWithQuote) => a.symbol.localeCompare(b.symbol),
       render: (symbol: string, record: HoldingWithQuote) => (
@@ -572,10 +572,10 @@ export default function HoldingsPage() {
       render: (id: string) => accountMap[id] || id,
     }] : []),
     {
-      title: "投资类别",
+      title: "类别",
       dataIndex: "category_id",
       key: "category_id",
-      width: 60,
+      width: 90,
       sorter: (a: HoldingWithQuote, b: HoldingWithQuote) => {
         const nameA = (a.category_id && categoryMap[a.category_id]?.name) || "";
         const nameB = (b.category_id && categoryMap[b.category_id]?.name) || "";
@@ -631,7 +631,7 @@ export default function HoldingsPage() {
     {
       title: "涨跌幅",
       key: "change_percent",
-      width: 140,
+      width: 145,
       render: (_: unknown, record: HoldingWithQuote) => {
         if (!record.quote) return <span>—</span>;
         const { change, change_percent } = record.quote;
@@ -648,7 +648,7 @@ export default function HoldingsPage() {
     {
       title: "当前市值",
       key: "market_value",
-      width: 145,
+      width: 130,
       sorter: (a: HoldingWithQuote, b: HoldingWithQuote) => {
         const aUsd = convertWithCachedRates(a.market_value ?? 0, a.currency, "USD");
         const bUsd = convertWithCachedRates(b.market_value ?? 0, b.currency, "USD");
@@ -658,7 +658,7 @@ export default function HoldingsPage() {
       render: (_: unknown, record: HoldingWithQuote) => {
         if (record.market_value === null || record.market_value === undefined)
           return <span>—</span>;
-        return `${currencySymbol[record.currency]}${record.market_value.toFixed(2)}`;
+        return `${currencySymbol[record.currency]}${record.market_value.toFixed(0)}`;
       },
     },
     {

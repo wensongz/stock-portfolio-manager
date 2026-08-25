@@ -601,6 +601,73 @@ export interface TriggeredAlert {
   message: string;
 }
 
+export interface OptionReviewReport {
+  account_id: string;
+  currency: Currency;
+  period_days: number | null;
+  generated_at: string;
+  summary: OptionReviewSummary;
+  underlyings: OptionUnderlyingReview[];
+  data_quality: OptionReviewDataQuality;
+}
+
+export interface OptionReviewSummary {
+  completed_campaigns: number;
+  active_campaigns: number;
+  gross_premium: number;
+  net_premium_pnl: number;
+  retention_rate: number | null;
+  annualized_yield_on_notional: number | null;
+  worst_campaign: OptionWorstCampaign | null;
+}
+
+export interface OptionWorstCampaign {
+  campaign_id: string;
+  underlying: string;
+  started_at: string;
+  ended_at: string;
+  strategy_path: string[];
+  net_premium_pnl: number;
+}
+
+export interface OptionUnderlyingReview {
+  underlying: string;
+  completed_campaigns: number;
+  active_campaigns: number;
+  gross_premium: number;
+  net_premium_pnl: number;
+  retention_rate: number | null;
+  annualized_yield_on_notional: number | null;
+  worst_campaign_pnl: number | null;
+  flags: string[];
+  campaigns: OptionCampaign[];
+}
+
+export interface OptionCampaign {
+  id: string;
+  underlying: string;
+  started_at: string;
+  ended_at: string | null;
+  status: "completed" | "active";
+  inferred: boolean;
+  strategy_path: string[];
+  gross_premium: number;
+  close_cost: number;
+  fees: number;
+  net_premium_pnl: number | null;
+  secured_notional: number;
+  capital_days: number;
+  retention_rate: number | null;
+  annualized_yield_on_notional: number | null;
+}
+
+export interface OptionReviewDataQuality {
+  excluded_open_campaigns: number;
+  unmatched_records: number;
+  missing_trade_dates: number;
+  notes: string[];
+}
+
 // Phase 6: Review types
 export interface QuarterlyHoldingStatus {
   snapshot_id: string;

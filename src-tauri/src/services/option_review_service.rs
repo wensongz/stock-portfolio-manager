@@ -60,7 +60,6 @@ struct SplitInput {
     ratio_to: i64,
 }
 
-#[allow(dead_code)] // Task 2 wires this public service into the Tauri command layer.
 pub fn get_option_review(
     db: &Database,
     account_id: &str,

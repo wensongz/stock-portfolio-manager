@@ -58,13 +58,19 @@
 | `get_risk_metrics` | `periodDays?=365` | 波动率/夏普/Calmar/最大回撤 |
 | `get_holding_ranking` | `sortBy?=pnl`，`limit?=10`，`periodDays?=365` | 个股绩效排名 |
 
+### 期权
+
+| 工具名 | 参数 | 作用 |
+| --- | --- | --- |
+| `get_option_positions` | `accountId` | 当前持仓和到期风险 |
+| `get_option_review` | `accountId`，`symbol?`，`periodDays?=365` | 历史Campaign和确定性复盘指标 |
+
 ### 其他
 
 | 工具名 | 参数 | 作用 |
 | --- | --- | --- |
 | `get_dividend_income` | `days?=365` | 分红/利息收入汇总（按标的聚合，PAY 类型） |
 | `check_price_alerts` | 无 | 价格提醒触发情况（基于缓存行情） |
-| `get_option_positions` | `accountId` | 期权持仓（标的/行权价/到期日/权利金/状态） |
 
 > `periodDays` 默认 365（近 1 年），最大 3650。`sortBy` 可选 `pnl`（盈亏金额）或 `return_rate`（收益率）。
 

@@ -86,7 +86,7 @@ pub fn skills_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// whose on-disk version is older than this — but ONLY if the user hasn't
 /// edited it (the `.builtin/{stem}` marker still exists). User-edited skills
 /// (marker removed by `save_skill`) are never auto-overwritten.
-const BUILTIN_SKILLS_VERSION: u32 = 4;
+const BUILTIN_SKILLS_VERSION: u32 = 5;
 
 /// Materialise built-in skills into the user directory on first launch, and
 /// auto-update them when [`BUILTIN_SKILLS_VERSION`] bumps.
@@ -693,10 +693,26 @@ mod tests {
             .iter()
             .find(|(stem, _)| *stem == "munger-perspective")
             .expect("munger-perspective must be a builtin skill");
-        let parsed = parse_skill_from_str("munger-perspective", body, Path::new("munger-perspective.md")).unwrap();
+        let parsed = parse_skill_from_str(
+            "munger-perspective",
+            body,
+            Path::new("munger-perspective.md"),
+        )
+        .unwrap();
         assert_eq!(parsed.name, "芒格视角");
         assert_eq!(parsed.trigger, vec!["芒格视角", "芒格"]);
         assert!(parsed.content.contains("查理·芒格"));
+    }
+
+    #[test]
+    fn options_review_uses_deterministic_review_tool() {
+        let (_, body) = BUILTIN_SKILLS
+            .iter()
+            .find(|(stem, _)| *stem == "options-review")
+            .expect("options-review builtin");
+        assert!(body.contains("get_option_review"));
+        assert!(body.contains("做得好的"));
+        assert!(body.contains("值得改进"));
     }
 
     // --- parse_frontmatter ---------------------------------------------------

@@ -16,6 +16,7 @@ use crate::commands::options::get_option_contracts_inner;
 use crate::commands::transactions::query_transactions_inner;
 use crate::db::Database;
 use crate::models::dashboard::DashboardSummary;
+use crate::models::option_review::OptionReviewReport;
 use crate::services::ai_chat_service::build_portfolio_context;
 use crate::services::alert_service;
 use crate::services::exchange_rate_service::{
@@ -23,6 +24,7 @@ use crate::services::exchange_rate_service::{
 };
 use crate::services::indicators;
 use crate::services::market_overview_service;
+use crate::services::option_review_service;
 use crate::services::performance_service::{self, PerformanceFilter};
 use crate::services::quote_provider_service;
 use crate::services::quote_service::{self, resolve_index_secid, QuoteCache};
@@ -354,6 +356,22 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "get_option_review",
+                "description": "确定性期权历史复盘：按账户和可选个股返回已完成Campaign、净权利金、留存率、担保名义资本年化收益率、最差Campaign及数据质量。用于评价CSP/Covered Call哪些做得好、哪些需要改进；不要用于当前到期风险。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "accountId": { "type": "string", "description": "账户 ID" },
+                        "symbol": { "type": "string", "description": "可选标的，例如 AAPL" },
+                        "periodDays": { "type": "integer", "minimum": 1, "maximum": 3650, "default": 365 }
+                    },
+                    "required": ["accountId"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "get_stock_fundamentals",
                 "description": "获取某只股票的估值与基本面指标：市盈率(PE-TTM)、市净率(PB)、总市值、股息率、每股收益(EPS)、净资产收益率(ROE)、换手率。当用户询问\"这只股票贵不贵\"\"估值\"\"市盈率\"\"市净率\"\"市值\"\"分红\"等估值/基本面问题时调用，是做投资价值分析的关键数据之一。",
                 "parameters": {
@@ -495,6 +513,7 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, arguments: &str) -> Too
         "get_dividend_income" => tool_dividend_income(ctx, &args).await,
         "check_price_alerts" => tool_check_alerts(ctx).await,
         "get_option_positions" => tool_option_positions(ctx, &args).await,
+        "get_option_review" => tool_option_review(ctx, &args).await,
         "get_stock_fundamentals" => tool_stock_fundamentals(ctx, &args).await,
         "get_technical_indicators" => tool_technical_indicators(ctx, &args).await,
         "get_financial_statements" => tool_financial_statements(ctx, &args).await,
@@ -1147,14 +1166,116 @@ async fn tool_option_positions(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     }
 }
 
+fn option_review_payload(
+    mut report: OptionReviewReport,
+    symbol: Option<&str>,
+) -> Result<Value, String> {
+    let symbol = symbol.map(str::trim).filter(|symbol| !symbol.is_empty());
+    if let Some(symbol) = symbol {
+        report
+            .underlyings
+            .retain(|review| review.underlying.eq_ignore_ascii_case(symbol));
+        if report.underlyings.is_empty() {
+            return Err(format!("账户中没有 {symbol} 的期权复盘数据"));
+        }
+        let mut payload = serde_json::to_value(report).map_err(|error| error.to_string())?;
+        let object = payload
+            .as_object_mut()
+            .ok_or_else(|| "期权复盘结果序列化失败".to_string())?;
+        object.insert(
+            "scope_note".to_string(),
+            json!("summary为账户级；underlyings已按个股过滤"),
+        );
+        return Ok(payload);
+    }
+    serde_json::to_value(report).map_err(|error| error.to_string())
+}
+
+async fn tool_option_review(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+    let account_id = match args.get("accountId").and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => value.trim(),
+        _ => return ToolResult::err_json("缺少参数 accountId"),
+    };
+    let period_days = Some(
+        args.get("periodDays")
+            .and_then(Value::as_i64)
+            .unwrap_or(365)
+            .clamp(1, 3650),
+    );
+    let report = match option_review_service::get_option_review(ctx.db, account_id, period_days) {
+        Ok(report) => report,
+        Err(error) => return ToolResult::err_json(format!("期权复盘失败：{error}")),
+    };
+    let symbol = args.get("symbol").and_then(Value::as_str);
+    match option_review_payload(report, symbol) {
+        Ok(payload) => ToolResult::ok_json(payload),
+        Err(error) => ToolResult::err_json(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn option_review_fixture() -> crate::models::option_review::OptionReviewReport {
+        use crate::models::option_review::{
+            OptionReviewDataQuality, OptionReviewReport, OptionReviewSummary,
+            OptionUnderlyingReview,
+        };
+
+        OptionReviewReport {
+            account_id: "account-1".to_string(),
+            currency: "USD".to_string(),
+            period_days: Some(365),
+            generated_at: "2026-08-24".to_string(),
+            summary: OptionReviewSummary {
+                completed_campaigns: 2,
+                active_campaigns: 0,
+                gross_premium: 300.0,
+                net_premium_pnl: 240.0,
+                retention_rate: Some(0.8),
+                annualized_yield_on_notional: Some(0.12),
+                worst_campaign: None,
+            },
+            underlyings: vec![
+                OptionUnderlyingReview {
+                    underlying: "AAPL".to_string(),
+                    completed_campaigns: 1,
+                    active_campaigns: 0,
+                    gross_premium: 200.0,
+                    net_premium_pnl: 180.0,
+                    retention_rate: Some(0.9),
+                    annualized_yield_on_notional: Some(0.15),
+                    worst_campaign_pnl: Some(180.0),
+                    flags: Vec::new(),
+                    campaigns: Vec::new(),
+                },
+                OptionUnderlyingReview {
+                    underlying: "MSFT".to_string(),
+                    completed_campaigns: 1,
+                    active_campaigns: 0,
+                    gross_premium: 100.0,
+                    net_premium_pnl: 60.0,
+                    retention_rate: Some(0.6),
+                    annualized_yield_on_notional: Some(0.09),
+                    worst_campaign_pnl: Some(60.0),
+                    flags: Vec::new(),
+                    campaigns: Vec::new(),
+                },
+            ],
+            data_quality: OptionReviewDataQuality {
+                excluded_open_campaigns: 0,
+                unmatched_records: 0,
+                missing_trade_dates: 0,
+                notes: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn tool_definitions_are_valid_json() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 20);
+        assert_eq!(defs.len(), 21);
         for d in &defs {
             assert_eq!(d["type"], "function");
             assert!(d["function"]["name"].is_string());
@@ -1170,7 +1291,40 @@ mod tests {
             .iter()
             .map(|d| d["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 20);
+        assert_eq!(names.len(), 21);
+    }
+
+    #[test]
+    fn option_review_tool_requires_account_and_supports_filters() {
+        let defs = tool_definitions();
+        let tool = defs
+            .iter()
+            .find(|d| d["function"]["name"] == "get_option_review")
+            .expect("get_option_review definition");
+        assert_eq!(
+            tool["function"]["parameters"]["required"],
+            json!(["accountId"])
+        );
+        assert_eq!(
+            tool["function"]["parameters"]["properties"]["periodDays"]["maximum"],
+            3650
+        );
+        assert!(tool["function"]["parameters"]["properties"]["symbol"].is_object());
+    }
+
+    #[test]
+    fn option_review_symbol_filter_is_case_insensitive_and_preserves_account_summary() {
+        let payload = option_review_payload(option_review_fixture(), Some("aapl")).unwrap();
+        assert_eq!(payload["summary"]["completed_campaigns"], 2);
+        assert_eq!(payload["underlyings"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["underlyings"][0]["underlying"], "AAPL");
+        assert!(payload["scope_note"].as_str().unwrap().contains("账户级"));
+    }
+
+    #[test]
+    fn option_review_symbol_filter_reports_missing_symbol() {
+        let error = option_review_payload(option_review_fixture(), Some("NVDA")).unwrap_err();
+        assert!(error.contains("NVDA"));
     }
 
     #[test]

@@ -309,6 +309,7 @@ pub fn run() {
             commands::options::delete_option_records,
             commands::options::export_options_csv,
             commands::options::parse_options_csv,
+            commands::option_review::get_option_review,
             // Stock Splits (for option contract matching)
             commands::stock_splits::get_stock_splits,
             commands::stock_splits::add_stock_split,

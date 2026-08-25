@@ -14,7 +14,7 @@
 第一版把「操作复盘」升级为股票与期权共用的复盘入口：
 
 - 页面上区分「股票操作复盘」和「期权操作复盘」。
-- 期权复盘按账户、周期和个股汇总已完成的卖方期权Campaign。
+- 期权复盘按账户、周期和个股汇总卖方期权Campaign及已完成绩效。
 - 核心金额与指标由Rust服务确定性计算，页面和AI使用同一个结果对象。
 - 页面展示事实，AI Skill负责解释“做得好的、做得不好的、值得改进的”。
 - 对现有数据无法可靠支持的指标明确显示限制，不生成看似精确的结果。
@@ -73,13 +73,14 @@
 - 数据源为所选账户的 `option_records`。
 - 默认周期为最近365天，可切换到全部历史。
 - 已完成Campaign的周期筛选以Campaign结束日期为准；进行中Campaign始终展示，因为它仍代表当前期权风险。
-- 只有所有期权腿都已结束的Campaign进入绩效指标。
-- 含有未平仓腿的Campaign标记为「进行中」，单独展示但不进入净收益率、留存率和最差Campaign统计。
+- 每条SELL开仓记录形成一个Campaign；同一开仓记录的部分平仓和剩余敞口属于同一Campaign。
+- 累计现金净权利金包含已完成和进行中Campaign；只有已完成Campaign进入留存率、年化收益率、最差Campaign和绩效事实标签。
+- 含有未平仓敞口的Campaign标记为「进行中」；其现金净权利金不等于已实现利润，也不包含未平仓市值盈亏。
 - 无交易日期或无法匹配开平仓数量的记录不进入指标，并进入数据质量提示。
 
 ### 开平仓配对
 
-期权记录金额均为正数，因此买卖方向由 `action` 决定：
+买卖方向由 `action` 决定；金额字段可能因导入来源带正负号，计算成本时使用绝对值：
 
 - `SELL` 且 `code` 以 `O` 开头：卖出开仓。
 - `BUY` 且代码为 `C`、`C;Ep`、`A;C`、`C;P`：结束记录。
@@ -102,7 +103,7 @@
 
 ```text
 gross_premium = SELL开仓金额
-close_cost = BUY结束金额
+close_cost = |BUY结束金额|
 fees = 开仓与结束记录的 |commission| + |fee|
 net_premium_pnl = gross_premium - close_cost - fees
 
@@ -113,34 +114,35 @@ capital_days = secured_notional × holding_days
 
 对CSP，`secured_notional`近似现金担保金额；对CC，它是以执行价计算的覆盖名义金额，不等于股票实际成本或市值。页面必须把合并指标标记为「担保名义资本口径」。
 
-### 推定Campaign
+### Campaign边界
 
-由于数据库没有展期链或Wheel链的显式ID，第一版采用可解释的推定规则。相同账户和标的的 `OptionCycle` 按开仓日排序，在以下情况连接到同一个Campaign：
+数据库没有展期链或Wheel链的显式ID。为避免时间重叠、连续卖出或推测的Wheel关系把多笔独立开仓错误合并，Campaign使用稳定、可审计的交易记录边界：
 
-1. 周期时间重叠；或
-2. 相同期权类型，后一周期在前一周期结束后7个自然日内开仓，视为连续卖出或展期；或
-3. 前一周期是被指派的Put，后一周期是Call，且在30个自然日内开仓，视为可能的Wheel后续CC。
+1. 每条SELL开仓记录形成一个Campaign。
+2. 由FIFO或拆分换算匹配到该开仓记录的结束份额归入同一Campaign。
+3. 同一开仓记录的部分平仓与剩余未平仓份额保留在同一Campaign。
+4. 不因时间重叠、7天内连续开仓或Put指派后出现Call而合并不同开仓记录。
 
-连接关系具有传递性。Campaign在页面标记为「系统推定」，避免把启发式归组当成用户确认事实。
-
-如果Campaign含有未结束周期，则整个Campaign为进行中，不进入已完成指标。
+Campaign由系统根据交易记录自动推导，页面不得把它描述成用户明确制定的策略链。如果同一开仓记录仍有未平仓份额，该Campaign为进行中；其现金净权利金计入累计净权利金，但不进入已完成绩效指标。
 
 ## 核心指标
 
-所有核心指标仅使用筛选范围内的已完成Campaign。
+核心金额和绩效比率采用两种明确口径：累计现金净权利金使用筛选范围内全部Campaign；留存率、年化收益率和最差Campaign只使用已完成Campaign。
 
 ### 净权利金
 
 ```text
-sum(completed_campaign.net_premium_pnl)
+sum(all_filtered_campaign.net_premium_pnl)
 ```
 
-这是已经扣除买回成本、佣金和费用后的期权现金损益。
+这是截至当前已经扣除买回成本、佣金和费用后的期权现金流口径结果，页面标记为「累计净权利金（含进行中）」。进行中Campaign的该值不代表已实现利润，也没有计入未平仓合约的市值盈亏。
+
+报告中的 `gross_premium` 和 `net_premium_pnl` 均为上述全Campaign累计口径。为让已完成绩效可以独立审计，报告同时返回 `completed_gross_premium` 和 `completed_net_premium_pnl`；留存率使用后两者，不能用累计字段重建。
 
 ### 权利金留存率
 
 ```text
-sum(net_premium_pnl) / sum(gross_premium)
+sum(completed_campaign.net_premium_pnl) / sum(completed_campaign.gross_premium)
 ```
 
 结果不截断在0%到100%之间；发生净亏损时可以为负数。
@@ -148,7 +150,7 @@ sum(net_premium_pnl) / sum(gross_premium)
 ### 年化净权利金收益率
 
 ```text
-sum(net_premium_pnl) × 365 / sum(capital_days)
+sum(completed_campaign.net_premium_pnl) × 365 / sum(completed_campaign.capital_days)
 ```
 
 该指标使用担保名义资本，并非账户TWR或IRR。没有有效资本天数时返回空值；页面显示 `—` 和原因，不显示0%。
@@ -168,7 +170,7 @@ min(completed_campaign.net_premium_pnl)
 - `样本不足`：已完成Campaign少于3个。
 - `高留存`：已完成Campaign不少于3个且留存率不低于70%。
 - `低留存`：留存率低于40%。
-- `净亏损`：净权利金小于0。
+- `净亏损`：已完成Campaign净权利金合计小于0。
 - `单次损失较大`：最差Campaign亏损绝对值大于正收益Campaign中位数的3倍；没有正收益Campaign时不计算该标签。
 - `有进行中仓位`：存在未完成Campaign。
 
@@ -196,6 +198,8 @@ struct OptionReviewSummary {
     active_campaigns: usize,
     gross_premium: f64,
     net_premium_pnl: f64,
+    completed_gross_premium: f64,
+    completed_net_premium_pnl: f64,
     retention_rate: Option<f64>,
     annualized_yield_on_notional: Option<f64>,
     worst_campaign: Option<OptionWorstCampaign>,
@@ -216,6 +220,8 @@ struct OptionUnderlyingReview {
     active_campaigns: usize,
     gross_premium: f64,
     net_premium_pnl: f64,
+    completed_gross_premium: f64,
+    completed_net_premium_pnl: f64,
     retention_rate: Option<f64>,
     annualized_yield_on_notional: Option<f64>,
     worst_campaign_pnl: Option<f64>,
@@ -284,8 +290,8 @@ get_option_review(accountId, symbol?, periodDays?, allHistory?)
 
 - 优先调用 `get_option_review`，不再用 `get_option_positions` 推测历史绩效。
 - 输出「做得好的」「做得不好的」「值得改进的」。
-- 明确样本量、推定Campaign和数据质量限制。
-- 不把进行中Campaign的开仓权利金当作已实现收益。
+- 明确样本量、Campaign边界和数据质量限制。
+- 明确累计现金净权利金包含进行中Campaign，但不把它当作已实现利润或未平仓市值盈亏。
 
 保留 `get_option_positions`，继续服务当前持仓与到期风险问题。
 
@@ -313,7 +319,7 @@ get_option_review(accountId, symbol?, periodDays?, allHistory?)
 
 四张指标卡：
 
-1. 净权利金。
+1. 累计净权利金（含进行中）。
 2. 权利金留存率。
 3. 年化净权利金收益率，并标注「担保名义资本口径」。
 4. 最差已完成Campaign。
@@ -322,7 +328,7 @@ get_option_review(accountId, symbol?, periodDays?, allHistory?)
 
 - 标的。
 - 已完成/进行中Campaign数。
-- 净权利金。
+- 累计净权利金（含进行中）。
 - 留存率。
 - 年化收益率。
 - 最差Campaign。
@@ -336,11 +342,11 @@ Campaign表字段：
 - 毛权利金。
 - 买回成本。
 - 费用。
-- 净权利金。
+- 净权利金（含进行中现金流）。
 - 留存率。
 - 年化收益率。
 
-页面顶部或表格上方显示数据质量Alert：进行中Campaign未计入绩效、多少记录因缺日期或无法匹配被排除，以及Campaign为系统推定。
+页面顶部或表格上方显示数据质量Alert：每条SELL开仓对应一个系统推导Campaign；进行中Campaign计入累计现金净权利金但不计入已完成绩效；同时说明多少记录因缺日期或无法匹配被排除。
 
 ### AI入口
 
@@ -360,7 +366,7 @@ Campaign表字段：
 
 - 没有账户：提示先创建账户。
 - 账户没有期权记录：显示空状态并引导去期权管理导入CSV。
-- 只有进行中Campaign：展示进行中列表，核心绩效卡显示 `—`，说明尚无已完成Campaign。
+- 只有进行中Campaign：展示进行中列表及累计现金净权利金；留存率、年化收益率和最差Campaign显示 `—`，说明尚无已完成Campaign。
 - 没有有效交易日期：不进行时间归组，报告数据质量问题。
 - 无法匹配开平仓：排除对应数量，不用0填补。
 - 除数为0：比率字段返回空值。
@@ -374,10 +380,12 @@ Campaign表字段：
 - 买回成本高于开仓权利金时，净损益和留存率为负。
 - 多笔开仓、部分平仓按FIFO和数量比例正确分摊。
 - 开平仓双方的佣金与费用均计入。
-- 同类型7天内连续周期归入同一推定Campaign。
-- 超过7天的独立周期分开。
-- Put指派后30天内的Call连接为Wheel路径。
-- 含未平仓周期的Campaign不进入已完成指标。
+- 每条SELL开仓记录分别形成Campaign，时间重叠或7天内连续开仓也不合并。
+- Put指派后的Call开仓形成新的Campaign，不推测合并为Wheel路径。
+- 同一SELL开仓记录的部分平仓和剩余敞口保留在同一Campaign。
+- 进行中Campaign计入累计现金净权利金，但不进入留存率、年化收益率和最差Campaign。
+- BUY结束金额为负数时按绝对值计入买回成本。
+- Excel序列日期可参与开平仓配对和周期筛选。
 - 周期筛选按结束日期工作。
 - 缺失日期和无法匹配记录进入数据质量统计。
 - 股份拆分后的结束记录沿用拆分匹配。
@@ -402,8 +410,8 @@ Campaign表字段：
 
 第一版稳定后再增加：
 
-1. Campaign手工合并、拆分和确认，替代部分推定规则。
-2. 把指派股票交易和后续CC与Campaign显式关联。
+1. Campaign手工合并、拆分和确认，在用户确认后构建跨开仓策略链。
+2. 把指派股票交易和后续CC与跨Campaign策略链显式关联。
 3. 获取历史股票价格，计算策略总回报与同期持股基准。
 4. 获取历史期权估值，计算进行中盈亏和最大回撤。
 5. 增加复盘总览、跨账户对比和趋势图。

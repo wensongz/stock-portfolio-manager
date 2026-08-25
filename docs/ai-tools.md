@@ -71,7 +71,7 @@
 | 工具名 | 参数 | 作用 |
 | --- | --- | --- |
 | `get_option_positions` | `accountId` | 当前持仓和到期风险 |
-| `get_option_review` | `accountId`，`symbol?`，`periodDays?=365`，`allHistory?=false` | 历史Campaign和确定性复盘指标；`allHistory=true` 返回全部历史并覆盖 `periodDays` |
+| `get_option_review` | `accountId`，`symbol?`，`periodDays?=365`，`allHistory?=false` | 每笔SELL开仓对应一个Campaign；`gross_premium`/`net_premium_pnl`为含进行中Campaign的累计现金口径，`completed_gross_premium`/`completed_net_premium_pnl`及留存率、年化收益率和最差Campaign为已完成口径；`allHistory=true` 返回全部历史并覆盖 `periodDays` |
 
 ### 其他
 

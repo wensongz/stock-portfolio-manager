@@ -8,6 +8,7 @@ import {
   formatReviewPercent,
   getOptionReviewEmptyDescription,
   selectDefaultUnderlying,
+  shouldShowNetPremium,
   sortUnderlyingReviews,
 } from "./optionReviewViewModel.ts";
 
@@ -80,6 +81,17 @@ test("default selection uses the largest absolute net premium", () => {
 test("percentage formatter preserves negative values and missing state", () => {
   assert.equal(formatReviewPercent(-0.31), "-31.0%");
   assert.equal(formatReviewPercent(null), "—");
+});
+
+test("cumulative net premium remains visible for active-only reports", () => {
+  assert.equal(
+    shouldShowNetPremium({ completed_campaigns: 0, active_campaigns: 2 }),
+    true,
+  );
+  assert.equal(
+    shouldShowNetPremium({ completed_campaigns: 0, active_campaigns: 0 }),
+    false,
+  );
 });
 
 test("empty review with excluded records directs to the quality notice", () => {

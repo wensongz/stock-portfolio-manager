@@ -15,8 +15,14 @@ pub struct OptionReviewReport {
 pub struct OptionReviewSummary {
     pub completed_campaigns: usize,
     pub active_campaigns: usize,
+    /// Opening premium across all filtered Campaigns, including active ones.
     pub gross_premium: f64,
+    /// Cash net across all filtered Campaigns, including active ones.
     pub net_premium_pnl: f64,
+    /// Opening premium used as the denominator of completed-only retention.
+    pub completed_gross_premium: f64,
+    /// Cash net used as the numerator of completed-only performance metrics.
+    pub completed_net_premium_pnl: f64,
     pub retention_rate: Option<f64>,
     pub annualized_yield_on_notional: Option<f64>,
     pub worst_campaign: Option<OptionWorstCampaign>,
@@ -37,8 +43,14 @@ pub struct OptionUnderlyingReview {
     pub underlying: String,
     pub completed_campaigns: usize,
     pub active_campaigns: usize,
+    /// Opening premium across all filtered Campaigns, including active ones.
     pub gross_premium: f64,
+    /// Cash net across all filtered Campaigns, including active ones.
     pub net_premium_pnl: f64,
+    /// Opening premium used as the denominator of completed-only retention.
+    pub completed_gross_premium: f64,
+    /// Cash net used as the numerator of completed-only performance metrics.
+    pub completed_net_premium_pnl: f64,
     pub retention_rate: Option<f64>,
     pub annualized_yield_on_notional: Option<f64>,
     pub worst_campaign_pnl: Option<f64>,

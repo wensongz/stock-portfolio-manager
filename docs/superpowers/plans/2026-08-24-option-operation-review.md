@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-24-option-operation-review-design.md`
 
+> **2026-08-26 correctness amendment:** 本计划保留初版实施历史，其中关于按时间重叠/7天/Wheel合并Campaign、进行中Campaign不计净权利金及旧聚合字段的步骤已经失效。当前实现与验收以设计文档的「Campaign边界」和混合口径修正版为准：每条SELL开仓记录形成一个Campaign，累计毛/净权利金包含进行中Campaign，已完成毛/净字段用于留存率、年化收益率和最差Campaign。
+
 ## Global Constraints
 
 - 第一版不新增数据库表或迁移。

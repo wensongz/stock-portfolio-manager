@@ -28,10 +28,12 @@ import type {
 } from "../../types";
 import {
   OPTION_REVIEW_ANNUALIZED_YIELD_LABEL,
+  OPTION_REVIEW_NET_PREMIUM_LABEL,
   buildOptionReviewPrompt,
   formatReviewPercent,
   getOptionReviewEmptyDescription,
   selectDefaultUnderlying,
+  shouldShowNetPremium,
   sortUnderlyingReviews,
 } from "./optionReviewViewModel";
 
@@ -49,7 +51,10 @@ function formatCurrency(value: number, currency: Currency) {
 }
 
 function describeDataQuality(dataQuality: OptionReviewDataQuality) {
-  const descriptions = ["Campaign为系统推定", "进行中Campaign未计入绩效"];
+  const descriptions = [
+    "每条卖出开仓记录生成一个Campaign",
+    "进行中Campaign计入累计净权利金，但不计入留存率、年化收益率和最差Campaign",
+  ];
   if (dataQuality.unmatched_records > 0) {
     descriptions.push(`${dataQuality.unmatched_records}条记录未匹配`);
   }
@@ -158,12 +163,11 @@ export default function OptionReviewTab() {
         `${row.completed_campaigns} 完成 / ${row.active_campaigns} 进行中`,
     },
     {
-      title: "净权利金",
+      title: OPTION_REVIEW_NET_PREMIUM_LABEL,
       dataIndex: "net_premium_pnl",
       align: "right",
       width: 140,
-      render: (value: number, row) =>
-        row.completed_campaigns > 0 ? renderPnl(value) : "—",
+      render: (value: number) => renderPnl(value),
     },
     {
       title: "留存率",
@@ -251,12 +255,11 @@ export default function OptionReviewTab() {
       render: (value: number) => formatCurrency(value, currency),
     },
     {
-      title: "净权利金",
+      title: "净权利金（含进行中）",
       dataIndex: "net_premium_pnl",
       align: "right",
       width: 140,
-      render: (value: number | null, campaign) =>
-        campaign.status === "active" || value == null ? "—" : renderPnl(value),
+      render: (value: number | null) => (value == null ? "—" : renderPnl(value)),
     },
     {
       title: "留存率",
@@ -277,6 +280,7 @@ export default function OptionReviewTab() {
   ];
 
   const hasCompletedCampaigns = (report?.summary.completed_campaigns ?? 0) > 0;
+  const hasNetPremium = report ? shouldShowNetPremium(report.summary) : false;
   const worstCampaign = report?.summary.worst_campaign ?? null;
   const dataQualityNotice = report ? (
     <Alert
@@ -335,15 +339,15 @@ export default function OptionReviewTab() {
             <Col xs={24} sm={12} xl={6}>
               <Card>
                 <Statistic
-                  title="净权利金"
+                  title={OPTION_REVIEW_NET_PREMIUM_LABEL}
                   value={
-                    hasCompletedCampaigns
+                    hasNetPremium
                       ? formatCurrency(report.summary.net_premium_pnl, report.currency)
                       : "—"
                   }
                   styles={{
                     content: {
-                      color: hasCompletedCampaigns
+                      color: hasNetPremium
                         ? pnlColorDark(report.summary.net_premium_pnl)
                         : undefined,
                     },

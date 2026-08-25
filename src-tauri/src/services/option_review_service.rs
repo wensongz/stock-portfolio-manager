@@ -120,6 +120,7 @@ fn greatest_common_divisor(mut left: i128, mut right: i128) -> i128 {
 
 #[derive(Debug, Clone)]
 struct OptionCycle {
+    open_record_id: String,
     underlying: String,
     option_type: String,
     opened_at: NaiveDate,
@@ -130,12 +131,6 @@ struct OptionCycle {
     fees: f64,
     secured_notional: f64,
     capital_days: f64,
-}
-
-impl OptionCycle {
-    fn effective_end(&self) -> NaiveDate {
-        self.ended_at.unwrap_or(NaiveDate::MAX)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +289,12 @@ fn parse_trade_date(raw: &str) -> Option<NaiveDate> {
     ["%Y-%m-%d", "%Y/%m/%d", "%d%b%y"]
         .iter()
         .find_map(|format| NaiveDate::parse_from_str(date, format).ok())
+        .or_else(|| {
+            let serial = date.parse::<i64>().ok()?;
+            (serial > 0).then_some(())?;
+            NaiveDate::from_ymd_opt(1899, 12, 30)?
+                .checked_add_signed(chrono::Duration::days(serial))
+        })
 }
 
 fn parse_trade_timestamp(raw: &str) -> Option<NaiveDateTime> {
@@ -414,13 +415,14 @@ fn cycle_from_match(
         .abs() as f64;
     let secured_notional = matched_open * shares_per_contract * open.record.strike_price.abs();
     let close_cost = close
-        .map(|record| record.amount * close_fraction)
+        .map(|record| record.amount.abs() * close_fraction)
         .unwrap_or(0.0);
     let fees = (open.record.commission.abs() + open.record.fee.abs()) * open_fraction
         + close
             .map(|record| (record.commission.abs() + record.fee.abs()) * close_fraction)
             .unwrap_or(0.0);
     OptionCycle {
+        open_record_id: open.record.id.clone(),
         underlying: open.record.underlying.clone(),
         option_type: open.record.option_type.clone(),
         opened_at,
@@ -592,22 +594,10 @@ fn pair_cycles_fifo(
     )
 }
 
-fn should_connect(previous: &OptionCycle, next: &OptionCycle) -> bool {
-    if next.opened_at <= previous.effective_end() {
-        return true;
-    }
-    let gap = (next.opened_at - previous.effective_end()).num_days();
-    (previous.option_type == next.option_type && gap <= 7)
-        || (previous.option_type == "P"
-            && previous.status == "assigned"
-            && next.option_type == "C"
-            && gap <= 30)
-}
-
 fn campaign_from_cycles(
     account_id: &str,
     underlying: &str,
-    ordinal: usize,
+    open_record_id: &str,
     cycles: &[OptionCycle],
 ) -> OptionCampaign {
     let started_at = cycles
@@ -624,7 +614,7 @@ fn campaign_from_cycles(
     let fees: f64 = cycles.iter().map(|cycle| cycle.fees).sum();
     let secured_notional: f64 = cycles.iter().map(|cycle| cycle.secured_notional).sum();
     let capital_days: f64 = cycles.iter().map(|cycle| cycle.capital_days).sum();
-    let net = (!active).then_some(gross_premium - close_cost - fees);
+    let net_premium = gross_premium - close_cost - fees;
     let mut strategy_path = Vec::new();
     for cycle in cycles {
         let strategy = if cycle.option_type == "P" {
@@ -637,10 +627,7 @@ fn campaign_from_cycles(
         }
     }
     OptionCampaign {
-        id: format!(
-            "option-review:{account_id}:{underlying}:{}:{ordinal}",
-            started_at.format("%Y-%m-%d")
-        ),
+        id: format!("option-review:{account_id}:{underlying}:{open_record_id}"),
         underlying: underlying.to_string(),
         started_at: started_at.format("%Y-%m-%d").to_string(),
         ended_at: ended_at.map(|date| date.format("%Y-%m-%d").to_string()),
@@ -650,11 +637,15 @@ fn campaign_from_cycles(
         gross_premium,
         close_cost,
         fees,
-        net_premium_pnl: net,
+        net_premium_pnl: Some(net_premium),
         secured_notional,
         capital_days,
-        retention_rate: net.and_then(|value| safe_ratio(value, gross_premium)),
-        annualized_yield_on_notional: net.and_then(|value| safe_ratio(value * 365.0, capital_days)),
+        retention_rate: (!active)
+            .then(|| safe_ratio(net_premium, gross_premium))
+            .flatten(),
+        annualized_yield_on_notional: (!active)
+            .then(|| safe_ratio(net_premium * 365.0, capital_days))
+            .flatten(),
     }
 }
 
@@ -663,37 +654,26 @@ fn group_campaigns(
     cycles: Vec<OptionCycle>,
     _today: NaiveDate,
 ) -> Vec<OptionCampaign> {
-    let mut by_underlying: BTreeMap<String, Vec<OptionCycle>> = BTreeMap::new();
+    let mut by_open_record: BTreeMap<(String, String), Vec<OptionCycle>> = BTreeMap::new();
     for cycle in cycles {
-        by_underlying
-            .entry(cycle.underlying.clone())
+        by_open_record
+            .entry((cycle.underlying.clone(), cycle.open_record_id.clone()))
             .or_default()
             .push(cycle);
     }
     let mut campaigns = Vec::new();
-    for (underlying, mut underlying_cycles) in by_underlying {
-        underlying_cycles.sort_by(|left, right| left.opened_at.cmp(&right.opened_at));
-        let mut groups: Vec<Vec<OptionCycle>> = Vec::new();
-        for next in underlying_cycles {
-            if let Some(current_cycles) = groups.last_mut() {
-                if current_cycles
-                    .iter()
-                    .any(|cycle| should_connect(cycle, &next))
-                {
-                    current_cycles.push(next);
-                    continue;
-                }
-            }
-            groups.push(vec![next]);
-        }
-        for (index, group) in groups.iter().enumerate() {
-            campaigns.push(campaign_from_cycles(
-                account_id,
-                &underlying,
-                index + 1,
-                group,
-            ));
-        }
+    for ((underlying, open_record_id), mut open_cycles) in by_open_record {
+        open_cycles.sort_by(|left, right| {
+            left.opened_at
+                .cmp(&right.opened_at)
+                .then(left.ended_at.cmp(&right.ended_at))
+        });
+        campaigns.push(campaign_from_cycles(
+            account_id,
+            &underlying,
+            &open_record_id,
+            &open_cycles,
+        ));
     }
     campaigns
 }
@@ -788,17 +768,25 @@ fn build_underlying(
         .collect();
     let completed_campaigns = completed.len();
     let active_campaigns = campaigns.len() - completed_campaigns;
-    let gross_premium = completed
+    let completed_gross_premium = completed
         .iter()
         .map(|campaign| campaign.gross_premium)
         .sum();
-    let net_premium_pnl = completed
+    let completed_net_premium_pnl = completed
+        .iter()
+        .filter_map(|campaign| campaign.net_premium_pnl)
+        .sum();
+    let gross_premium = campaigns
+        .iter()
+        .map(|campaign| campaign.gross_premium)
+        .sum();
+    let net_premium_pnl = campaigns
         .iter()
         .filter_map(|campaign| campaign.net_premium_pnl)
         .sum();
     let capital_days = completed.iter().map(|campaign| campaign.capital_days).sum();
-    let retention_rate = safe_ratio(net_premium_pnl, gross_premium);
-    let annualized_yield_on_notional = safe_ratio(net_premium_pnl * 365.0, capital_days);
+    let retention_rate = safe_ratio(completed_net_premium_pnl, completed_gross_premium);
+    let annualized_yield_on_notional = safe_ratio(completed_net_premium_pnl * 365.0, capital_days);
     let worst_campaign_pnl = completed
         .iter()
         .filter_map(|campaign| campaign.net_premium_pnl)
@@ -806,7 +794,7 @@ fn build_underlying(
     let flags = fact_flags(
         completed_campaigns,
         active_campaigns,
-        net_premium_pnl,
+        completed_net_premium_pnl,
         retention_rate,
         &completed,
     );
@@ -816,6 +804,8 @@ fn build_underlying(
         active_campaigns,
         gross_premium,
         net_premium_pnl,
+        completed_gross_premium,
+        completed_net_premium_pnl,
         retention_rate,
         annualized_yield_on_notional,
         worst_campaign_pnl,
@@ -838,11 +828,19 @@ fn build_report(
         .collect();
     let completed_campaigns = completed.len();
     let active_campaigns = campaigns.len() - completed_campaigns;
-    let gross_premium = completed
+    let completed_gross_premium = completed
         .iter()
         .map(|campaign| campaign.gross_premium)
         .sum();
-    let net_premium_pnl = completed
+    let completed_net_premium_pnl = completed
+        .iter()
+        .filter_map(|campaign| campaign.net_premium_pnl)
+        .sum();
+    let gross_premium = campaigns
+        .iter()
+        .map(|campaign| campaign.gross_premium)
+        .sum();
+    let net_premium_pnl = campaigns
         .iter()
         .filter_map(|campaign| campaign.net_premium_pnl)
         .sum();
@@ -883,8 +881,13 @@ fn build_report(
             active_campaigns,
             gross_premium,
             net_premium_pnl,
-            retention_rate: safe_ratio(net_premium_pnl, gross_premium),
-            annualized_yield_on_notional: safe_ratio(net_premium_pnl * 365.0, capital_days),
+            completed_gross_premium,
+            completed_net_premium_pnl,
+            retention_rate: safe_ratio(completed_net_premium_pnl, completed_gross_premium),
+            annualized_yield_on_notional: safe_ratio(
+                completed_net_premium_pnl * 365.0,
+                capital_days,
+            ),
             worst_campaign,
         },
         underlyings,
@@ -895,7 +898,9 @@ fn build_report(
 fn data_quality_notes(quality: &OptionReviewDataQuality) -> Vec<String> {
     let mut notes = Vec::new();
     if quality.excluded_open_campaigns > 0 {
-        notes.push("进行中Campaign未计入绩效指标".to_string());
+        notes.push(
+            "进行中Campaign计入累计净权利金，但不计入留存率、年化收益率和最差Campaign".to_string(),
+        );
     }
     if quality.missing_trade_dates > 0 {
         notes.push("缺少有效交易日期的记录已排除".to_string());
@@ -1177,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn rolls_within_seven_days_share_a_campaign() {
+    fn separate_open_records_remain_separate_campaigns_within_seven_days() {
         let (db, account_id) = db_with_account();
         insert_cycle(
             &db,
@@ -1205,9 +1210,10 @@ mod tests {
         );
 
         let underlying = &fixed_review(&db, &account_id, None).underlyings[0];
-        assert_eq!(underlying.campaigns.len(), 1);
-        assert!((underlying.campaigns[0].gross_premium - 220.0).abs() < 1e-9);
-        assert!((underlying.campaigns[0].close_cost - 30.0).abs() < 1e-9);
+        assert_eq!(underlying.campaigns.len(), 2);
+        assert_eq!(underlying.completed_campaigns, 2);
+        assert!((underlying.gross_premium - 220.0).abs() < 1e-9);
+        assert!((underlying.net_premium_pnl - 190.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1253,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn overlap_checks_every_cycle_in_current_campaign() {
+    fn overlapping_open_records_remain_separate_campaigns() {
         let (db, account_id) = db_with_account();
         for (id, opened, ended, gross) in [
             ("overlap-a", "2026-01-01", "2026-01-30", 100.0),
@@ -1275,12 +1281,18 @@ mod tests {
         }
 
         let campaigns = &fixed_review(&db, &account_id, None).underlyings[0].campaigns;
-        assert_eq!(campaigns.len(), 1);
-        assert!((campaigns[0].gross_premium - 600.0).abs() < 1e-9);
+        assert_eq!(campaigns.len(), 3);
+        assert_eq!(
+            campaigns
+                .iter()
+                .map(|campaign| campaign.gross_premium)
+                .sum::<f64>(),
+            600.0
+        );
     }
 
     #[test]
-    fn assigned_put_links_to_call_within_thirty_days() {
+    fn assigned_put_and_later_call_remain_separate_campaigns() {
         let (db, account_id) = db_with_account();
         insert_cycle(
             &db,
@@ -1308,13 +1320,20 @@ mod tests {
         );
 
         let campaigns = &fixed_review(&db, &account_id, None).underlyings[0].campaigns;
-        assert_eq!(campaigns.len(), 1);
-        assert_eq!(campaigns[0].strategy_path, vec!["CSP", "Covered Call"]);
-        assert!((campaigns[0].gross_premium - 180.0).abs() < 1e-9);
+        assert_eq!(campaigns.len(), 2);
+        assert_eq!(campaigns[0].strategy_path, vec!["CSP"]);
+        assert_eq!(campaigns[1].strategy_path, vec!["Covered Call"]);
+        assert_eq!(
+            campaigns
+                .iter()
+                .map(|campaign| campaign.gross_premium)
+                .sum::<f64>(),
+            180.0
+        );
     }
 
     #[test]
-    fn active_campaign_is_excluded_from_summary() {
+    fn active_campaign_premium_is_included_but_completed_metrics_stay_completed_only() {
         let (db, account_id) = db_with_account();
         insert_cycle(
             &db,
@@ -1347,13 +1366,467 @@ mod tests {
         );
 
         let report = fixed_review(&db, &account_id, None);
-        assert_eq!(report.summary.completed_campaigns, 0);
+        assert_eq!(report.summary.completed_campaigns, 1);
         assert_eq!(report.summary.active_campaigns, 1);
-        let campaign = &report.underlyings[0].campaigns[0];
-        assert_eq!(campaign.net_premium_pnl, None);
-        assert_eq!(campaign.retention_rate, None);
-        assert_eq!(campaign.annualized_yield_on_notional, None);
+        assert!((report.summary.gross_premium - 220.0).abs() < 1e-9);
+        assert!((report.summary.net_premium_pnl - 219.0).abs() < 1e-9);
+        assert!((report.summary.retention_rate.unwrap() - 1.0).abs() < 1e-9);
+        let summary_json = serde_json::to_value(&report.summary).expect("serialize summary");
+        assert_eq!(summary_json["completed_gross_premium"], 100.0);
+        assert_eq!(summary_json["completed_net_premium_pnl"], 100.0);
+        let active = report.underlyings[0]
+            .campaigns
+            .iter()
+            .find(|campaign| campaign.status == "active")
+            .expect("active campaign");
+        assert_eq!(active.net_premium_pnl, Some(119.0));
+        assert_eq!(active.retention_rate, None);
+        assert_eq!(active.annualized_yield_on_notional, None);
         assert_eq!(report.data_quality.excluded_open_campaigns, 1);
+    }
+
+    #[test]
+    fn negative_buy_amount_is_treated_as_positive_close_cost() {
+        let (db, account_id) = db_with_account();
+        insert_cycle(
+            &db,
+            &account_id,
+            "negative-close-amount",
+            "857",
+            "C",
+            "2023-09-06, 22:47:47",
+            "2023-09-13, 01:08:34",
+            52_000.0,
+            -14_000.0,
+            "C",
+        );
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE option_records SET commission = -204 WHERE id = 'open-negative-close-amount'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE option_records SET commission = -78 WHERE id = 'close-negative-close-amount'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let campaign = &fixed_review(&db, &account_id, None).underlyings[0].campaigns[0];
+        assert!((campaign.close_cost - 14_000.0).abs() < 1e-9);
+        assert!((campaign.net_premium_pnl.unwrap() - 37_718.0).abs() < 1e-9);
+        assert!((campaign.retention_rate.unwrap() - 37_718.0 / 52_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn excel_serial_trade_date_closes_the_matching_campaign() {
+        let (db, account_id) = db_with_account();
+        insert_record(
+            &db,
+            "excel-open",
+            &account_id,
+            "1211 30JUL26 90 P",
+            "1211",
+            "30JUL26",
+            90.0,
+            "P",
+            "SELL",
+            "O",
+            40,
+            77_200.0,
+            -218.0,
+            0.0,
+            Some("2026-04-09, 01:47:36"),
+        );
+        insert_record(
+            &db,
+            "excel-close",
+            &account_id,
+            "1211 30JUL26 90 P",
+            "1211",
+            "30JUL26",
+            90.0,
+            "P",
+            "BUY",
+            "C;Ep",
+            40,
+            0.0,
+            0.0,
+            0.0,
+            Some("46233"),
+        );
+
+        let report = fixed_review(&db, &account_id, None);
+        assert_eq!(report.summary.completed_campaigns, 1);
+        assert_eq!(report.summary.active_campaigns, 0);
+        assert_eq!(report.data_quality.missing_trade_dates, 0);
+        assert_eq!(report.data_quality.unmatched_records, 0);
+        assert_eq!(
+            report.underlyings[0].campaigns[0].ended_at.as_deref(),
+            Some("2026-07-30")
+        );
+    }
+
+    #[test]
+    fn production_shaped_3690_records_produce_six_completed_campaigns() {
+        let (db, account_id) = db_with_account();
+        let fixtures = [
+            (
+                "28AUG25",
+                120.0,
+                "O",
+                "2025-05-16, 03:59:57",
+                67_500.0,
+                -195.0,
+                &[("2025/8/28", 20)][..],
+            ),
+            (
+                "30DEC25",
+                110.0,
+                "O",
+                "2025-06-01, 23:36:44",
+                85_800.0,
+                -231.6,
+                &[("2025/12/30", 20)][..],
+            ),
+            (
+                "30MAR26",
+                110.0,
+                "O",
+                "2025-06-09, 03:04:05",
+                71_000.0,
+                -202.0,
+                &[("2026/3/13", 20)][..],
+            ),
+            (
+                "29JUN26",
+                112.5,
+                "O",
+                "2025-06-17, 03:38:24",
+                108_200.0,
+                -276.4,
+                &[("2026/3/5", 19), ("2026/6/8", 1)][..],
+            ),
+            (
+                "29JUN26",
+                95.0,
+                "O",
+                "2025-07-29, 01:00:00",
+                55_000.0,
+                -170.0,
+                &[("2026/6/18", 2), ("2026/6/23", 10), ("2026/6/29", 8)][..],
+            ),
+            (
+                "30MAR26",
+                95.0,
+                "O",
+                "2025-08-20, 23:07:39",
+                41_200.0,
+                -142.4,
+                &[("2026/3/30", 20)][..],
+            ),
+        ];
+        for (index, (expiry, strike, open_code, opened, gross, commission, closes)) in
+            fixtures.into_iter().enumerate()
+        {
+            let symbol = format!("3690 {expiry} {strike} P");
+            insert_record(
+                &db,
+                &format!("3690-open-{index}"),
+                &account_id,
+                &symbol,
+                "3690",
+                expiry,
+                strike,
+                "P",
+                "SELL",
+                open_code,
+                -20,
+                gross,
+                commission,
+                0.0,
+                Some(opened),
+            );
+            for (close_index, (ended, quantity)) in closes.iter().enumerate() {
+                insert_record(
+                    &db,
+                    &format!("3690-close-{index}-{close_index}"),
+                    &account_id,
+                    &symbol,
+                    "3690",
+                    expiry,
+                    strike,
+                    "P",
+                    "BUY",
+                    "A;C",
+                    *quantity,
+                    0.0,
+                    0.0,
+                    0.0,
+                    Some(ended),
+                );
+            }
+        }
+
+        let underlying = &fixed_review(&db, &account_id, None).underlyings[0];
+        assert_eq!(underlying.completed_campaigns, 6);
+        assert_eq!(underlying.active_campaigns, 0);
+        assert_eq!(underlying.campaigns.len(), 6);
+        assert!((underlying.net_premium_pnl - 427_482.60).abs() < 1e-9);
+    }
+
+    #[test]
+    fn production_shaped_857_records_keep_thirteen_completed_and_two_active() {
+        let (db, account_id) = db_with_account();
+        let opens = [
+            (
+                "30OCT23",
+                6.0,
+                "C",
+                "O",
+                -200,
+                52_000.0,
+                -204.0,
+                "2023-09-06, 22:47:47",
+            ),
+            (
+                "28FEB24",
+                5.5,
+                "C",
+                "O",
+                -40,
+                11_200.0,
+                -62.4,
+                "2024-01-10, 02:25:55",
+            ),
+            (
+                "29APR24",
+                6.0,
+                "C",
+                "O",
+                -40,
+                20_000.0,
+                -80.0,
+                "2024-01-26, 01:05:35",
+            ),
+            (
+                "27JUN24",
+                6.0,
+                "C",
+                "O;P",
+                -40,
+                26_400.0,
+                -92.8,
+                "2024-01-26, 01:20:53",
+            ),
+            (
+                "27MAR24",
+                6.0,
+                "C",
+                "O;P",
+                -40,
+                16_000.0,
+                -72.0,
+                "2024-01-26, 01:55:07",
+            ),
+            (
+                "27SEP24",
+                7.5,
+                "C",
+                "O;P",
+                -40,
+                18_400.0,
+                -76.8,
+                "2024-03-28, 03:12:31",
+            ),
+            (
+                "28MAR25",
+                5.25,
+                "P",
+                "O",
+                -40,
+                13_600.0,
+                -67.2,
+                "2024-11-26, 21:36:22",
+            ),
+            (
+                "27JUN25",
+                5.25,
+                "P",
+                "O",
+                -40,
+                27_200.0,
+                -94.4,
+                "2024-11-29, 02:00:26",
+            ),
+            (
+                "29SEP25",
+                5.0,
+                "P",
+                "O",
+                -40,
+                31_200.0,
+                -102.4,
+                "2024-12-02, 01:52:42",
+            ),
+            (
+                "30DEC25",
+                7.0,
+                "C",
+                "O;P",
+                -40,
+                27_200.0,
+                -94.4,
+                "2024-12-23, 21:30:33",
+            ),
+            (
+                "30DEC25",
+                5.0,
+                "P",
+                "O",
+                -40,
+                20_800.0,
+                -81.6,
+                "2025-01-22, 02:55:14",
+            ),
+            (
+                "30MAR26",
+                8.0,
+                "C",
+                "O",
+                -40,
+                28_800.0,
+                -97.6,
+                "2025-07-28, 23:55:41",
+            ),
+            (
+                "29JUN26",
+                6.25,
+                "P",
+                "O",
+                -40,
+                18_400.0,
+                -76.8,
+                "2025-09-12, 02:11:47",
+            ),
+            (
+                "29SEP26",
+                5.75,
+                "P",
+                "O",
+                -50,
+                21_000.0,
+                -92.0,
+                "2025-10-12, 21:54:51",
+            ),
+            (
+                "30MAR27",
+                10.5,
+                "C",
+                "O",
+                -20,
+                24_400.0,
+                -68.8,
+                "2026-07-13, 22:42:56",
+            ),
+        ];
+        for (index, (expiry, strike, option_type, code, quantity, gross, commission, opened)) in
+            opens.into_iter().enumerate()
+        {
+            insert_record(
+                &db,
+                &format!("857-open-{index}"),
+                &account_id,
+                &format!("857 {expiry} {strike} {option_type}"),
+                "857",
+                expiry,
+                strike,
+                option_type,
+                "SELL",
+                code,
+                quantity,
+                gross,
+                commission,
+                0.0,
+                Some(opened),
+            );
+        }
+
+        let closes = [
+            (0, 100, -14_000.0, -78.0, "C", "2023-09-13, 01:08:34"),
+            (0, 100, 0.0, 0.0, "C;Ep", "2023/10/30"),
+            (1, 40, 0.0, 0.0, "A;C", "2024/2/28"),
+            (2, 40, 0.0, 0.0, "A;C", "2024/4/29"),
+            (3, 40, 0.0, 0.0, "A;C", "2024/6/17"),
+            (4, 40, 0.0, 0.0, "A;C", "2024/3/27"),
+            (5, 40, 0.0, 0.0, "C;Ep", "2024/9/27"),
+            (6, 40, 0.0, 0.0, "C;Ep", "2025/3/28"),
+            (7, 40, 0.0, 0.0, "C;Ep", "2025/6/27"),
+            (8, 40, 0.0, 0.0, "C;Ep", "2025/9/29"),
+            (9, 40, 0.0, 0.0, "A;C", "2025/9/8"),
+            (10, 40, 0.0, 0.0, "C;Ep", "2025/12/30"),
+            (11, 40, 0.0, 0.0, "A;C", "2026/3/30"),
+            (12, 40, 0.0, 0.0, "C;Ep", "2026/6/29"),
+        ];
+        for (close_index, (open_index, quantity, amount, commission, code, ended)) in
+            closes.into_iter().enumerate()
+        {
+            let (expiry, strike, option_type, _, _, _, _, _) = opens[open_index];
+            insert_record(
+                &db,
+                &format!("857-close-{close_index}"),
+                &account_id,
+                &format!("857 {expiry} {strike} {option_type}"),
+                "857",
+                expiry,
+                strike,
+                option_type,
+                "BUY",
+                code,
+                quantity,
+                amount,
+                commission,
+                0.0,
+                Some(ended),
+            );
+        }
+
+        insert_record(
+            &db,
+            "other-active-open",
+            &account_id,
+            "OTHER 31DEC27 1 P",
+            "OTHER",
+            "31DEC27",
+            1.0,
+            "P",
+            "SELL",
+            "O",
+            -1,
+            13_294_970.0,
+            -43_682.14,
+            0.0,
+            Some("2026-08-01"),
+        );
+
+        let report = fixed_review(&db, &account_id, None);
+        let underlying = report
+            .underlyings
+            .iter()
+            .find(|item| item.underlying == "857")
+            .expect("857 review");
+        assert_eq!(underlying.completed_campaigns, 13);
+        assert_eq!(underlying.active_campaigns, 2);
+        assert_eq!(underlying.campaigns.len(), 15);
+        assert!((underlying.gross_premium - 356_600.0).abs() < 1e-9);
+        assert!((underlying.net_premium_pnl - 341_158.80).abs() < 1e-9);
+        assert!((underlying.completed_gross_premium - 311_200.0).abs() < 1e-9);
+        assert!((underlying.completed_net_premium_pnl - 295_919.60).abs() < 1e-9);
+        assert!((underlying.retention_rate.unwrap() - 295_919.60 / 311_200.0).abs() < 1e-9);
+        assert!((report.summary.gross_premium - 13_651_570.0).abs() < 1e-9);
+        assert!((report.summary.net_premium_pnl - 13_592_446.66).abs() < 1e-9);
     }
 
     #[test]

@@ -614,8 +614,14 @@ export interface OptionReviewReport {
 export interface OptionReviewSummary {
   completed_campaigns: number;
   active_campaigns: number;
+  /** Opening premium across completed and active Campaigns. */
   gross_premium: number;
+  /** Cash net across completed and active Campaigns. */
   net_premium_pnl: number;
+  /** Completed-only denominator used by retention_rate. */
+  completed_gross_premium: number;
+  /** Completed-only numerator used by retention/yield/worst metrics. */
+  completed_net_premium_pnl: number;
   retention_rate: number | null;
   annualized_yield_on_notional: number | null;
   worst_campaign: OptionWorstCampaign | null;
@@ -634,8 +640,14 @@ export interface OptionUnderlyingReview {
   underlying: string;
   completed_campaigns: number;
   active_campaigns: number;
+  /** Opening premium across completed and active Campaigns. */
   gross_premium: number;
+  /** Cash net across completed and active Campaigns. */
   net_premium_pnl: number;
+  /** Completed-only denominator used by retention_rate. */
+  completed_gross_premium: number;
+  /** Completed-only numerator used by retention/yield/worst metrics. */
+  completed_net_premium_pnl: number;
   retention_rate: number | null;
   annualized_yield_on_notional: number | null;
   worst_campaign_pnl: number | null;

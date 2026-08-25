@@ -357,7 +357,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "get_option_review",
-                "description": "确定性期权历史复盘：按账户和可选个股返回已完成Campaign、净权利金、留存率、担保名义资本年化收益率、最差Campaign及数据质量。用于评价CSP/Covered Call哪些做得好、哪些需要改进；不要用于当前到期风险。",
+                "description": "确定性期权历史复盘：按账户和可选个股返回Campaign；gross_premium/net_premium_pnl是含进行中Campaign的累计现金口径，completed_gross_premium/completed_net_premium_pnl及留存率、担保名义资本年化收益率、最差Campaign是已完成口径。用于评价CSP/Covered Call哪些做得好、哪些需要改进；不包含未平仓市值盈亏，也不要用于当前到期风险。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1249,6 +1249,8 @@ mod tests {
                 active_campaigns: 0,
                 gross_premium: 300.0,
                 net_premium_pnl: 240.0,
+                completed_gross_premium: 300.0,
+                completed_net_premium_pnl: 240.0,
                 retention_rate: Some(0.8),
                 annualized_yield_on_notional: Some(0.12),
                 worst_campaign: None,
@@ -1260,6 +1262,8 @@ mod tests {
                     active_campaigns: 0,
                     gross_premium: 200.0,
                     net_premium_pnl: 180.0,
+                    completed_gross_premium: 200.0,
+                    completed_net_premium_pnl: 180.0,
                     retention_rate: Some(0.9),
                     annualized_yield_on_notional: Some(0.15),
                     worst_campaign_pnl: Some(180.0),
@@ -1272,6 +1276,8 @@ mod tests {
                     active_campaigns: 0,
                     gross_premium: 100.0,
                     net_premium_pnl: 60.0,
+                    completed_gross_premium: 100.0,
+                    completed_net_premium_pnl: 60.0,
                     retention_rate: Some(0.6),
                     annualized_yield_on_notional: Some(0.09),
                     worst_campaign_pnl: Some(60.0),

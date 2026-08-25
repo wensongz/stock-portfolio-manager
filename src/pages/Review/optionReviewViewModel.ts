@@ -5,6 +5,7 @@ import type {
 } from "../../types";
 
 export const OPTION_REVIEW_ANNUALIZED_YIELD_LABEL = "年化收益率（担保名义资本口径）";
+export const OPTION_REVIEW_NET_PREMIUM_LABEL = "累计净权利金（含进行中）";
 
 interface OptionReviewPromptInput {
   accountId: string;
@@ -41,6 +42,12 @@ export function selectDefaultUnderlying(report: OptionReviewReport | null) {
 
 export function formatReviewPercent(value: number | null) {
   return value == null ? "—" : `${(value * 100).toFixed(1)}%`;
+}
+
+export function shouldShowNetPremium(
+  summary: Pick<OptionReviewReport["summary"], "completed_campaigns" | "active_campaigns">,
+) {
+  return summary.completed_campaigns + summary.active_campaigns > 0;
 }
 
 export function getOptionReviewEmptyDescription(

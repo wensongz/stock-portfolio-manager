@@ -31,7 +31,7 @@ import { ReasoningBlock } from "../../components/ai/ReasoningBlock";
 import { ToolCallList } from "../../components/ai/ToolCallCard";
 import { MarkdownRenderer } from "../../components/ai/MarkdownRenderer";
 import type { AiModelInfo, ChatMessageWithMeta, ChatSession, ChatUsage, Skill } from "../../types";
-import { readAiPrefill } from "./prefill";
+import { readAiPrefill, resolveAiPrefillSessionId } from "./prefill";
 
 const { Title, Text } = Typography;
 const { TextArea } = Input;
@@ -127,7 +127,6 @@ const TOOL_LABELS: Record<string, string> = {
 export default function AiAssistantPage() {
   const navigate = useNavigate();
   const location = useLocation();
-  const [initialPrompt] = useState(() => readAiPrefill(location.state));
   const {
     sessions,
     currentSessionId,
@@ -136,6 +135,10 @@ export default function AiAssistantPage() {
     renameSession,
     setCurrentSession,
   } = useChatSessionStore();
+  const [initialPrompt] = useState(() => readAiPrefill(location.state));
+  const [initialSessionId] = useState(() =>
+    resolveAiPrefillSessionId(initialPrompt, currentSessionId),
+  );
   const { init } = useChatStore();
   // Subscribe to the streaming session id so the sidebar can highlight which
   // session is actively generating (foreground or background). Selector form
@@ -148,8 +151,9 @@ export default function AiAssistantPage() {
 
   useEffect(() => {
     if (!initialPrompt) return;
+    setCurrentSession(initialSessionId);
     navigate(location.pathname, { replace: true, state: null });
-  }, [initialPrompt, location.pathname, navigate]);
+  }, [initialPrompt, initialSessionId, location.pathname, navigate, setCurrentSession]);
 
   // One-time bootstrap: bind streaming listeners, load AI config, load the
   // session list. We deliberately leave currentSessionId null so the page

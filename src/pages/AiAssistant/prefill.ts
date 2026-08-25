@@ -5,3 +5,10 @@ export function readAiPrefill(state: unknown): string | null {
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
 }
+
+export function resolveAiPrefillSessionId(
+  prefillPrompt: string | null,
+  currentSessionId: string | null,
+): string | null {
+  return prefillPrompt ? null : currentSessionId;
+}

@@ -45,7 +45,7 @@
 - `src-tauri/src/lib.rs`：注册 `get_option_review` Tauri命令。
 - `src-tauri/src/services/ai_tools.rs`：定义、分发和执行 `get_option_review` AI工具。
 - `src-tauri/src/skills/options-review.md`：改为使用确定性复盘数据。
-- `src-tauri/src/services/skill_service.rs`：内置Skill版本从4升到5。
+- `src-tauri/src/services/skill_service.rs`：内置Skill版本从4逐步升级，最终版本为6。
 - `docs/ai-tools.md`：记录新工具和用途。
 - `src/types/index.ts`：加入复盘报告类型。
 - `src/pages/Review/index.tsx`：变为页签容器。
@@ -535,7 +535,7 @@ async fn tool_option_review(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 - Campaign是系统推定，不能描述成用户明确制定的策略链。
 ```
 
-把 `BUILTIN_SKILLS_VERSION` 从4改为5，让未被用户编辑的内置Skill在启动时更新。
+把 `BUILTIN_SKILLS_VERSION` 从4升级到最终值6，让未被用户编辑的内置Skill在启动时更新；当前实现版本明确为6。
 
 - [x] **Step 6: 更新AI工具文档并运行目标测试**
 

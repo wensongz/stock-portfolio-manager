@@ -465,7 +465,7 @@ fn pair_cycles_fifo(
     let mut opens: Vec<OpenLot> = Vec::new();
     let mut cycles = Vec::new();
     let mut unmatched_close_ids = HashSet::new();
-    for record in valid {
+    'record_loop: for record in valid {
         if is_open(&record) {
             opens.push(OpenLot {
                 original_quantity: record.quantity,
@@ -495,7 +495,15 @@ fn pair_cycles_fifo(
                 remaining_quantity,
                 SplitRatio { from: 1, to: 1 },
             ) else {
-                continue;
+                unmatched_close_ids.insert(record.id.clone());
+                continue 'record_loop;
+            };
+            let (Some(next_open_remaining), Some(next_close_remaining)) = (
+                open.remaining_quantity.checked_sub(matched_open),
+                remaining_quantity.checked_sub(matched_close),
+            ) else {
+                unmatched_close_ids.insert(record.id.clone());
+                continue 'record_loop;
             };
             cycles.push(cycle_from_match(
                 open,
@@ -505,13 +513,8 @@ fn pair_cycles_fifo(
                 share_lots,
                 today,
             ));
-            open.remaining_quantity = open
-                .remaining_quantity
-                .checked_sub(matched_open)
-                .expect("matched open quantity does not exceed remaining quantity");
-            remaining_quantity = remaining_quantity
-                .checked_sub(matched_close)
-                .expect("matched close quantity does not exceed remaining quantity");
+            open.remaining_quantity = next_open_remaining;
+            remaining_quantity = next_close_remaining;
         }
 
         if remaining_quantity.is_positive() {
@@ -532,7 +535,14 @@ fn pair_cycles_fifo(
                     matched_quantities(open.remaining_quantity, remaining_quantity, ratio)
                 else {
                     unmatched_close_ids.insert(record.id.clone());
-                    continue;
+                    continue 'record_loop;
+                };
+                let (Some(next_open_remaining), Some(next_close_remaining)) = (
+                    open.remaining_quantity.checked_sub(matched_open),
+                    remaining_quantity.checked_sub(matched_close),
+                ) else {
+                    unmatched_close_ids.insert(record.id.clone());
+                    continue 'record_loop;
                 };
                 cycles.push(cycle_from_match(
                     open,
@@ -542,13 +552,8 @@ fn pair_cycles_fifo(
                     share_lots,
                     today,
                 ));
-                open.remaining_quantity = open
-                    .remaining_quantity
-                    .checked_sub(matched_open)
-                    .expect("matched open quantity does not exceed remaining quantity");
-                remaining_quantity = remaining_quantity
-                    .checked_sub(matched_close)
-                    .expect("matched close quantity does not exceed remaining quantity");
+                open.remaining_quantity = next_open_remaining;
+                remaining_quantity = next_close_remaining;
             }
         }
 
@@ -1721,6 +1726,105 @@ mod tests {
         assert!((active.gross_premium - 100.0).abs() < 1e-9);
         assert!((active.close_cost - 0.0).abs() < 1e-9);
         assert!((active.fees - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn split_remainder_overflow_is_unmatched_and_leaves_open_state_atomic() {
+        let (db, account_id) = db_with_account();
+        let first_denominator = 1_000_003_i64;
+        let second_factor = 1_000_033_i64;
+        let second_denominator = first_denominator * second_factor;
+        let third_denominator = 1_000_000_000_000_000_003_i64;
+        let fourth_denominator = 2_000_000_000_000_000_033_i64;
+        let open_strike = 1_000_000_000_000_000_000_f64;
+        let split_closes = [
+            (
+                "2026-01-02",
+                first_denominator - 1,
+                first_denominator,
+                "2026-01-03",
+                10.0,
+            ),
+            (
+                "2026-01-04",
+                second_factor - 1,
+                second_denominator,
+                "2026-01-05",
+                20.0,
+            ),
+            ("2026-01-06", 1, third_denominator, "2026-01-07", 30.0),
+            ("2026-01-08", 1, fourth_denominator, "2026-01-09", 40.0),
+        ];
+
+        insert_record(
+            &db,
+            "overflow-open",
+            &account_id,
+            "OVERFLOW OPEN C",
+            "OVERFLOW",
+            "31DEC26",
+            open_strike,
+            "C",
+            "SELL",
+            "O",
+            1,
+            100.0,
+            0.0,
+            0.0,
+            Some("2026-01-01"),
+        );
+        for (index, (split_date, ratio_from, ratio_to, close_date, amount)) in
+            split_closes.into_iter().enumerate()
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO stock_splits
+                 (stock_code, split_date, ratio_from, ratio_to, created_at)
+                 VALUES ('OVERFLOW', ?1, ?2, ?3, ?1)",
+                rusqlite::params![split_date, ratio_from, ratio_to],
+            )
+            .unwrap();
+            drop(conn);
+            insert_record(
+                &db,
+                &format!("overflow-close-{index}"),
+                &account_id,
+                &format!("OVERFLOW CLOSE {index} C"),
+                "OVERFLOW",
+                "31DEC26",
+                open_strike * ratio_from as f64 / ratio_to as f64,
+                "C",
+                "BUY",
+                "C;P",
+                1,
+                amount,
+                0.0,
+                0.0,
+                Some(close_date),
+            );
+        }
+
+        let (_, records, share_lots, splits) = load_inputs(&db, &account_id).unwrap();
+        let (cycles, quality) = pair_cycles_fifo(records, &share_lots, &splits, today());
+
+        assert_eq!(quality.unmatched_records, 1);
+        assert_eq!(cycles.len(), 4);
+        assert_eq!(
+            cycles
+                .iter()
+                .filter(|cycle| cycle.status == "closed")
+                .count(),
+            3
+        );
+        assert_eq!(
+            cycles
+                .iter()
+                .filter(|cycle| cycle.status == "active")
+                .count(),
+            1
+        );
+        assert!((cycles.iter().map(|cycle| cycle.close_cost).sum::<f64>() - 60.0).abs() < 1e-9);
+        assert!((cycles.iter().map(|cycle| cycle.gross_premium).sum::<f64>() - 100.0).abs() < 1e-9);
     }
 
     #[test]

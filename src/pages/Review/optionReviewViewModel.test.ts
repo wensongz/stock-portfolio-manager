@@ -4,11 +4,44 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   OPTION_REVIEW_ANNUALIZED_YIELD_LABEL,
+  buildOptionReviewPrompt,
   formatReviewPercent,
   getOptionReviewEmptyDescription,
   selectDefaultUnderlying,
   sortUnderlyingReviews,
 } from "./optionReviewViewModel.ts";
+
+test("recent option review prompt carries executable tool arguments", () => {
+  const prompt = buildOptionReviewPrompt({
+    accountId: "acct-options-123",
+    accountName: "Options Account",
+    symbol: "AAPL",
+    periodDays: 365,
+  });
+
+  assert.match(prompt, /Options Account/);
+  assert.match(prompt, /"accountId":"acct-options-123"/);
+  assert.match(prompt, /"symbol":"AAPL"/);
+  assert.match(prompt, /"periodDays":365/);
+  assert.match(prompt, /确定性期权复盘数据/);
+  assert.match(prompt, /样本限制/);
+});
+
+test("all-history option review prompt requests explicit allHistory semantics", () => {
+  const prompt = buildOptionReviewPrompt({
+    accountId: "acct-options-123",
+    accountName: "Options Account",
+    symbol: "MSFT",
+    periodDays: null,
+  });
+
+  assert.match(prompt, /"accountId":"acct-options-123"/);
+  assert.match(prompt, /"symbol":"MSFT"/);
+  assert.match(prompt, /"allHistory":true/);
+  assert.doesNotMatch(prompt, /"periodDays"/);
+  assert.match(prompt, /确定性期权复盘数据/);
+  assert.match(prompt, /样本限制/);
+});
 
 test("annualized yield label states the secured-notional basis", () => {
   assert.equal(

@@ -86,7 +86,7 @@ pub fn skills_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// whose on-disk version is older than this — but ONLY if the user hasn't
 /// edited it (the `.builtin/{stem}` marker still exists). User-edited skills
 /// (marker removed by `save_skill`) are never auto-overwritten.
-const BUILTIN_SKILLS_VERSION: u32 = 5;
+const BUILTIN_SKILLS_VERSION: u32 = 6;
 
 /// Materialise built-in skills into the user directory on first launch, and
 /// auto-update them when [`BUILTIN_SKILLS_VERSION`] bumps.
@@ -720,6 +720,9 @@ mod tests {
             .content
             .contains("当前持仓、到期风险、ITM/OTM、被行权准备"));
         assert!(parsed.content.contains("未平仓"));
+        assert!(parsed.content.contains("accountId"));
+        assert!(parsed.content.contains("periodDays"));
+        assert!(parsed.content.contains("allHistory"));
         assert!(parsed.content.contains("做得好的"));
         assert!(parsed.content.contains("值得改进"));
 

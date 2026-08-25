@@ -29,7 +29,93 @@ struct RawOptionRecord {
 struct OpenLot {
     record: RawOptionRecord,
     original_quantity: i64,
-    remaining_quantity: i64,
+    remaining_quantity: ContractQuantity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContractQuantity {
+    numerator: i128,
+    denominator: i128,
+}
+
+impl ContractQuantity {
+    fn new(numerator: i128, denominator: i128) -> Option<Self> {
+        if numerator < 0 || denominator <= 0 {
+            return None;
+        }
+        if numerator == 0 {
+            return Some(Self {
+                numerator: 0,
+                denominator: 1,
+            });
+        }
+        let divisor = greatest_common_divisor(numerator, denominator);
+        Some(Self {
+            numerator: numerator / divisor,
+            denominator: denominator / divisor,
+        })
+    }
+
+    fn from_i64(value: i64) -> Self {
+        Self::new(i128::from(value), 1).expect("positive option record quantity")
+    }
+
+    fn is_positive(self) -> bool {
+        self.numerator > 0
+    }
+
+    fn checked_min(self, other: Self) -> Option<Self> {
+        let left = self.numerator.checked_mul(other.denominator)?;
+        let right = other.numerator.checked_mul(self.denominator)?;
+        Some(if left <= right { self } else { other })
+    }
+
+    fn checked_sub(self, other: Self) -> Option<Self> {
+        let divisor = greatest_common_divisor(self.denominator, other.denominator);
+        let self_scale = other.denominator / divisor;
+        let other_scale = self.denominator / divisor;
+        let numerator = self
+            .numerator
+            .checked_mul(self_scale)?
+            .checked_sub(other.numerator.checked_mul(other_scale)?)?;
+        let denominator = self.denominator.checked_mul(self_scale)?;
+        Self::new(numerator, denominator)
+    }
+
+    fn checked_mul_ratio(self, numerator: i64, denominator: i64) -> Option<Self> {
+        if numerator <= 0 || denominator <= 0 {
+            return None;
+        }
+        let mut left_numerator = self.numerator;
+        let mut left_denominator = self.denominator;
+        let mut right_numerator = i128::from(numerator);
+        let mut right_denominator = i128::from(denominator);
+
+        let first_divisor = greatest_common_divisor(left_numerator, right_denominator);
+        left_numerator /= first_divisor;
+        right_denominator /= first_divisor;
+        let second_divisor = greatest_common_divisor(right_numerator, left_denominator);
+        right_numerator /= second_divisor;
+        left_denominator /= second_divisor;
+
+        Self::new(
+            left_numerator.checked_mul(right_numerator)?,
+            left_denominator.checked_mul(right_denominator)?,
+        )
+    }
+
+    fn as_f64(self) -> f64 {
+        self.numerator as f64 / self.denominator as f64
+    }
+}
+
+fn greatest_common_divisor(mut left: i128, mut right: i128) -> i128 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +144,12 @@ struct SplitInput {
     split_date: NaiveDate,
     ratio_from: i64,
     ratio_to: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SplitRatio {
+    from: i64,
+    to: i64,
 }
 
 pub fn get_option_review(
@@ -249,46 +341,67 @@ fn close_status(code: &str) -> &'static str {
     }
 }
 
-fn split_matches(open: &OpenLot, close: &RawOptionRecord, splits: &[SplitInput]) -> bool {
+fn split_ratio(
+    open: &OpenLot,
+    close: &RawOptionRecord,
+    splits: &[SplitInput],
+) -> Option<SplitRatio> {
     if open.record.underlying != close.underlying
         || open.record.expiry_date != close.expiry_date
         || open.record.option_type != close.option_type
     {
-        return false;
+        return None;
     }
     let Some(expiry) = parse_expiry_date(&close.expiry_date) else {
-        return false;
+        return None;
     };
     let (Some(opened_at), Some(closed_at)) = (open.record.trade_date, close.trade_date) else {
-        return false;
+        return None;
     };
-    splits.iter().any(|split| {
+    splits.iter().find_map(|split| {
         if split.stock_code != open.record.underlying
             || split.split_date <= opened_at
             || split.split_date > closed_at
             || split.split_date > expiry
-            || split.ratio_from == 0
-            || split.ratio_to == 0
+            || split.ratio_from <= 0
+            || split.ratio_to <= 0
         {
-            return false;
+            return None;
         }
         let ratio = split.ratio_to as f64 / split.ratio_from as f64;
         let expected_strike = open.record.strike_price / ratio;
-        expected_strike > 0.0
-            && (close.strike_price - expected_strike).abs() / expected_strike <= 0.02
+        (expected_strike > 0.0
+            && (close.strike_price - expected_strike).abs() / expected_strike <= 0.02)
+            .then_some(SplitRatio {
+                from: split.ratio_from,
+                to: split.ratio_to,
+            })
     })
+}
+
+fn matched_quantities(
+    open_remaining: ContractQuantity,
+    close_remaining: ContractQuantity,
+    ratio: SplitRatio,
+) -> Option<(ContractQuantity, ContractQuantity)> {
+    let close_in_open_contracts = close_remaining.checked_mul_ratio(ratio.from, ratio.to)?;
+    let matched_open = open_remaining.checked_min(close_in_open_contracts)?;
+    let matched_close = matched_open.checked_mul_ratio(ratio.to, ratio.from)?;
+    Some((matched_open, matched_close))
 }
 
 fn cycle_from_match(
     open: &OpenLot,
     close: Option<&RawOptionRecord>,
-    matched: i64,
+    matched_open: ContractQuantity,
+    matched_close: ContractQuantity,
     share_lots: &HashMap<String, i64>,
     today: NaiveDate,
 ) -> OptionCycle {
-    let open_fraction = matched as f64 / open.original_quantity as f64;
+    let matched_open = matched_open.as_f64();
+    let open_fraction = matched_open / open.original_quantity as f64;
     let close_fraction = close
-        .map(|record| matched as f64 / record.quantity as f64)
+        .map(|record| matched_close.as_f64() / record.quantity as f64)
         .unwrap_or(0.0);
     let opened_at = open.record.trade_date.expect("validated open trade date");
     let ended_at = close.and_then(|record| record.trade_date);
@@ -299,7 +412,7 @@ fn cycle_from_match(
         .copied()
         .unwrap_or(100)
         .abs() as f64;
-    let secured_notional = matched as f64 * shares_per_contract * open.record.strike_price.abs();
+    let secured_notional = matched_open * shares_per_contract * open.record.strike_price.abs();
     let close_cost = close
         .map(|record| record.amount * close_fraction)
         .unwrap_or(0.0);
@@ -356,72 +469,103 @@ fn pair_cycles_fifo(
         if is_open(&record) {
             opens.push(OpenLot {
                 original_quantity: record.quantity,
-                remaining_quantity: record.quantity,
+                remaining_quantity: ContractQuantity::from_i64(record.quantity),
                 record,
             });
             continue;
         }
 
-        let mut remaining_quantity = record.quantity;
+        let mut remaining_quantity = ContractQuantity::from_i64(record.quantity);
         let exact_indices: Vec<_> = opens
             .iter()
             .enumerate()
             .filter(|(_, open)| {
-                open.remaining_quantity > 0 && open.record.option_symbol == record.option_symbol
+                open.remaining_quantity.is_positive()
+                    && open.record.option_symbol == record.option_symbol
             })
             .map(|(index, _)| index)
             .collect();
         for index in exact_indices {
-            if remaining_quantity == 0 {
+            if !remaining_quantity.is_positive() {
                 break;
             }
             let open = &mut opens[index];
-            let matched = open.remaining_quantity.min(remaining_quantity);
+            let Some((matched_open, matched_close)) = matched_quantities(
+                open.remaining_quantity,
+                remaining_quantity,
+                SplitRatio { from: 1, to: 1 },
+            ) else {
+                continue;
+            };
             cycles.push(cycle_from_match(
                 open,
                 Some(&record),
-                matched,
+                matched_open,
+                matched_close,
                 share_lots,
                 today,
             ));
-            open.remaining_quantity -= matched;
-            remaining_quantity -= matched;
+            open.remaining_quantity = open
+                .remaining_quantity
+                .checked_sub(matched_open)
+                .expect("matched open quantity does not exceed remaining quantity");
+            remaining_quantity = remaining_quantity
+                .checked_sub(matched_close)
+                .expect("matched close quantity does not exceed remaining quantity");
         }
 
-        if remaining_quantity > 0 {
+        if remaining_quantity.is_positive() {
             let candidates: Vec<_> = opens
                 .iter()
                 .enumerate()
-                .filter(|(_, open)| {
-                    open.remaining_quantity > 0 && split_matches(open, &record, splits)
+                .filter_map(|(index, open)| {
+                    (open.remaining_quantity.is_positive())
+                        .then(|| split_ratio(open, &record, splits))
+                        .flatten()
+                        .map(|ratio| (index, ratio))
                 })
-                .map(|(index, _)| index)
                 .collect();
             if candidates.len() == 1 {
-                let open = &mut opens[candidates[0]];
-                let matched = open.remaining_quantity.min(remaining_quantity);
+                let (index, ratio) = candidates[0];
+                let open = &mut opens[index];
+                let Some((matched_open, matched_close)) =
+                    matched_quantities(open.remaining_quantity, remaining_quantity, ratio)
+                else {
+                    unmatched_close_ids.insert(record.id.clone());
+                    continue;
+                };
                 cycles.push(cycle_from_match(
                     open,
                     Some(&record),
-                    matched,
+                    matched_open,
+                    matched_close,
                     share_lots,
                     today,
                 ));
-                open.remaining_quantity -= matched;
-                remaining_quantity -= matched;
+                open.remaining_quantity = open
+                    .remaining_quantity
+                    .checked_sub(matched_open)
+                    .expect("matched open quantity does not exceed remaining quantity");
+                remaining_quantity = remaining_quantity
+                    .checked_sub(matched_close)
+                    .expect("matched close quantity does not exceed remaining quantity");
             }
         }
 
-        if remaining_quantity > 0 {
+        if remaining_quantity.is_positive() {
             unmatched_close_ids.insert(record.id);
         }
     }
 
-    for open in opens.iter().filter(|open| open.remaining_quantity > 0) {
+    for open in opens
+        .iter()
+        .filter(|open| open.remaining_quantity.is_positive())
+    {
         cycles.push(cycle_from_match(
             open,
             None,
             open.remaining_quantity,
+            ContractQuantity::from_i64(0),
             share_lots,
             today,
         ));
@@ -1380,7 +1524,7 @@ mod tests {
     }
 
     #[test]
-    fn split_adjusted_close_matches_existing_open() {
+    fn forward_split_close_conserves_both_record_allocations() {
         let (db, account_id) = db_with_account();
         {
             let conn = db.conn.lock().unwrap();
@@ -1406,7 +1550,7 @@ mod tests {
             1,
             250.0,
             1.0,
-            0.0,
+            0.2,
             Some("2023-05-01"),
         );
         insert_record(
@@ -1420,18 +1564,163 @@ mod tests {
             "C",
             "BUY",
             "C;Ep",
-            1,
-            0.0,
-            0.5,
-            0.0,
+            2,
+            80.0,
+            0.8,
+            0.2,
             Some("2023-06-16"),
         );
 
         let report = fixed_review(&db, &account_id, None);
         assert_eq!(report.summary.completed_campaigns, 1);
+        assert_eq!(report.summary.active_campaigns, 0);
         assert_eq!(report.data_quality.unmatched_records, 0);
-        assert!((report.summary.gross_premium - 250.0).abs() < 1e-9);
-        assert!((report.summary.net_premium_pnl - 248.5).abs() < 1e-9);
+        let campaign = &report.underlyings[0].campaigns[0];
+        assert!((campaign.gross_premium - 250.0).abs() < 1e-9);
+        assert!((campaign.close_cost - 80.0).abs() < 1e-9);
+        assert!((campaign.fees - 2.2).abs() < 1e-9);
+        assert!((campaign.net_premium_pnl.unwrap() - 167.8).abs() < 1e-9);
+        assert!(
+            (campaign.net_premium_pnl.unwrap()
+                - (campaign.gross_premium - campaign.close_cost - campaign.fees))
+                .abs()
+                < 1e-9
+        );
+        assert!((campaign.retention_rate.unwrap() - 0.6712).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reverse_split_close_conserves_both_record_allocations() {
+        let (db, account_id) = db_with_account();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO stock_splits
+                 (stock_code, split_date, ratio_from, ratio_to, created_at)
+                 VALUES ('BRK B', '2026-06-01', 2, 1, '2026-06-01')",
+                [],
+            )
+            .unwrap();
+        }
+        insert_record(
+            &db,
+            "reverse-split-open",
+            &account_id,
+            "BRK B 31DEC26 165 C",
+            "BRK B",
+            "31DEC26",
+            165.0,
+            "C",
+            "SELL",
+            "O",
+            2,
+            400.0,
+            2.0,
+            0.4,
+            Some("2026-05-01"),
+        );
+        insert_record(
+            &db,
+            "reverse-split-close",
+            &account_id,
+            "BRK B 31DEC26 330 C",
+            "BRK B",
+            "31DEC26",
+            330.0,
+            "C",
+            "BUY",
+            "C;P",
+            1,
+            70.0,
+            0.5,
+            0.1,
+            Some("2026-06-16"),
+        );
+
+        let report = fixed_review(&db, &account_id, None);
+        assert_eq!(report.summary.completed_campaigns, 1);
+        assert_eq!(report.summary.active_campaigns, 0);
+        assert_eq!(report.data_quality.unmatched_records, 0);
+        let campaign = &report.underlyings[0].campaigns[0];
+        assert!((campaign.gross_premium - 400.0).abs() < 1e-9);
+        assert!((campaign.close_cost - 70.0).abs() < 1e-9);
+        assert!((campaign.fees - 3.0).abs() < 1e-9);
+        assert!((campaign.net_premium_pnl.unwrap() - 327.0).abs() < 1e-9);
+        assert!(
+            (campaign.net_premium_pnl.unwrap()
+                - (campaign.gross_premium - campaign.close_cost - campaign.fees))
+                .abs()
+                < 1e-9
+        );
+        assert!((campaign.retention_rate.unwrap() - 0.8175).abs() < 1e-9);
+    }
+
+    #[test]
+    fn partial_adjusted_close_keeps_unclosed_open_exposure_active() {
+        let (db, account_id) = db_with_account();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO stock_splits
+                 (stock_code, split_date, ratio_from, ratio_to, created_at)
+                 VALUES ('BRK B', '2026-06-01', 1, 2, '2026-06-01')",
+                [],
+            )
+            .unwrap();
+        }
+        insert_record(
+            &db,
+            "partial-split-open",
+            &account_id,
+            "BRK B 31DEC26 330 C",
+            "BRK B",
+            "31DEC26",
+            330.0,
+            "C",
+            "SELL",
+            "O",
+            1,
+            200.0,
+            2.0,
+            0.0,
+            Some("2026-05-01"),
+        );
+        insert_record(
+            &db,
+            "partial-split-close",
+            &account_id,
+            "BRK B 31DEC26 165 C",
+            "BRK B",
+            "31DEC26",
+            165.0,
+            "C",
+            "BUY",
+            "C;P",
+            1,
+            30.0,
+            0.5,
+            0.0,
+            Some("2026-06-16"),
+        );
+
+        let (_, records, share_lots, splits) = load_inputs(&db, &account_id).unwrap();
+        let (cycles, quality) = pair_cycles_fifo(records, &share_lots, &splits, today());
+        assert_eq!(quality.unmatched_records, 0);
+        assert_eq!(cycles.len(), 2);
+        let completed = cycles
+            .iter()
+            .find(|cycle| cycle.status == "closed")
+            .expect("completed adjusted portion");
+        let active = cycles
+            .iter()
+            .find(|cycle| cycle.status == "active")
+            .expect("remaining open exposure");
+        assert!((completed.gross_premium - 100.0).abs() < 1e-9);
+        assert!((completed.close_cost - 30.0).abs() < 1e-9);
+        assert!((completed.fees - 1.5).abs() < 1e-9);
+        assert!((active.gross_premium - 100.0).abs() < 1e-9);
+        assert!((active.close_cost - 0.0).abs() < 1e-9);
+        assert!((active.fees - 1.0).abs() < 1e-9);
     }
 
     #[test]

@@ -28,6 +28,7 @@ import type {
 } from "../../types";
 import {
   OPTION_REVIEW_ANNUALIZED_YIELD_LABEL,
+  buildOptionReviewPrompt,
   formatReviewPercent,
   getOptionReviewEmptyDescription,
   selectDefaultUnderlying,
@@ -124,10 +125,14 @@ export default function OptionReviewTab() {
   const handleAiReview = () => {
     if (!selectedUnderlying || !selectedAccount) return;
     setActiveSkillsForNextTurn(["options-review"]);
-    const period = periodDays == null ? "全部历史" : `最近 ${periodDays} 天`;
     navigate("/ai-assistant", {
       state: {
-        prefillPrompt: `请复盘账户 ${selectedAccount.name} 在${period}的 ${selectedUnderlying.underlying} 期权交易，分别说明做得好的、做得不好的和最值得改进的地方。请使用确定性期权复盘数据并说明样本限制。`,
+        prefillPrompt: buildOptionReviewPrompt({
+          accountId: selectedAccount.id,
+          accountName: selectedAccount.name,
+          symbol: selectedUnderlying.underlying,
+          periodDays,
+        }),
       },
     });
   };

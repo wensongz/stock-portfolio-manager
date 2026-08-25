@@ -6,6 +6,27 @@ import type {
 
 export const OPTION_REVIEW_ANNUALIZED_YIELD_LABEL = "年化收益率（担保名义资本口径）";
 
+interface OptionReviewPromptInput {
+  accountId: string;
+  accountName: string;
+  symbol: string;
+  periodDays: number | null;
+}
+
+export function buildOptionReviewPrompt({
+  accountId,
+  accountName,
+  symbol,
+  periodDays,
+}: OptionReviewPromptInput) {
+  const allHistory = periodDays == null;
+  const toolArguments = allHistory
+    ? { accountId, symbol, allHistory: true }
+    : { accountId, symbol, periodDays, allHistory: false };
+  const period = allHistory ? "全部历史" : `最近 ${periodDays} 天`;
+  return `请复盘账户 ${accountName}（accountId: ${accountId}）在${period}的 ${symbol} 期权交易。请调用 get_option_review，工具参数为 ${JSON.stringify(toolArguments)}。分别说明做得好的、做得不好的和最值得改进的地方；请使用确定性期权复盘数据并说明样本限制。`;
+}
+
 export function sortUnderlyingReviews(items: OptionUnderlyingReview[]) {
   return [...items].sort(
     (a, b) =>

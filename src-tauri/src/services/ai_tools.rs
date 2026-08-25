@@ -363,7 +363,12 @@ pub fn tool_definitions() -> Vec<Value> {
                     "properties": {
                         "accountId": { "type": "string", "description": "账户 ID" },
                         "symbol": { "type": "string", "description": "可选标的，例如 AAPL" },
-                        "periodDays": { "type": "integer", "minimum": 1, "maximum": 3650, "default": 365 }
+                        "periodDays": { "type": "integer", "minimum": 1, "maximum": 3650, "default": 365 },
+                        "allHistory": {
+                            "type": "boolean",
+                            "description": "为 true 时返回全部历史并覆盖 periodDays；省略或为 false 时使用 periodDays（默认 365）",
+                            "default": false
+                        }
                     },
                     "required": ["accountId"]
                 }
@@ -1191,17 +1196,28 @@ fn option_review_payload(
     serde_json::to_value(report).map_err(|error| error.to_string())
 }
 
+fn option_review_period_days(args: &Value) -> Option<i64> {
+    if args
+        .get("allHistory")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    Some(
+        args.get("periodDays")
+            .and_then(Value::as_i64)
+            .unwrap_or(365)
+            .clamp(1, 3650),
+    )
+}
+
 async fn tool_option_review(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let account_id = match args.get("accountId").and_then(Value::as_str) {
         Some(value) if !value.trim().is_empty() => value.trim(),
         _ => return ToolResult::err_json("缺少参数 accountId"),
     };
-    let period_days = Some(
-        args.get("periodDays")
-            .and_then(Value::as_i64)
-            .unwrap_or(365)
-            .clamp(1, 3650),
-    );
+    let period_days = option_review_period_days(args);
     let report = match option_review_service::get_option_review(ctx.db, account_id, period_days) {
         Ok(report) => report,
         Err(error) => return ToolResult::err_json(format!("期权复盘失败：{error}")),
@@ -1310,6 +1326,43 @@ mod tests {
             3650
         );
         assert!(tool["function"]["parameters"]["properties"]["symbol"].is_object());
+        assert_eq!(
+            tool["function"]["parameters"]["properties"]["allHistory"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            tool["function"]["parameters"]["properties"]["allHistory"]["default"],
+            false
+        );
+    }
+
+    #[test]
+    fn option_review_period_arguments_all_history_overrides_period_days() {
+        assert_eq!(
+            option_review_period_days(&json!({ "allHistory": true, "periodDays": 30 })),
+            None
+        );
+    }
+
+    #[test]
+    fn option_review_period_arguments_default_to_recent_year() {
+        assert_eq!(option_review_period_days(&json!({})), Some(365));
+        assert_eq!(
+            option_review_period_days(&json!({ "allHistory": false })),
+            Some(365)
+        );
+    }
+
+    #[test]
+    fn option_review_period_arguments_clamp_recent_range() {
+        assert_eq!(
+            option_review_period_days(&json!({ "periodDays": 0 })),
+            Some(1)
+        );
+        assert_eq!(
+            option_review_period_days(&json!({ "periodDays": 9999 })),
+            Some(3650)
+        );
     }
 
     #[test]

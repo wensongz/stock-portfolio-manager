@@ -86,7 +86,7 @@
 
 同一期权标识内按交易时间FIFO配对开仓和结束数量。部分平仓时，开仓金额、结束金额、佣金和费用均按匹配数量比例分摊。
 
-股票拆分后的跨标识结束记录沿用现有拆分匹配规则：同一标的、到期日和期权类型，并根据 `stock_splits` 调整执行价；无法安全匹配时不猜测，报告为数据质量问题。
+股票拆分后的跨标识结束记录沿用现有拆分匹配规则：同一标的、到期日和期权类型，并根据 `stock_splits` 调整执行价。匹配数量按适用的 `ratio_from:ratio_to` 换算为同一敞口单位，开仓与结束记录使用各自实际消耗的数量比例分摊金额和费用；无法安全匹配时不猜测，报告为数据质量问题。
 
 ### 单个期权周期
 
@@ -275,10 +275,10 @@ get_option_review(accountId, periodDays?) -> OptionReviewReport
 新增AI工具：
 
 ```text
-get_option_review(accountId, symbol?, periodDays?)
+get_option_review(accountId, symbol?, periodDays?, allHistory?)
 ```
 
-它复用 `option_review_service`，不在AI层重复计算。指定 `symbol` 时只返回对应个股及账户摘要；找不到时返回明确错误。
+它复用 `option_review_service`，不在AI层重复计算。`accountId` 必须使用账户ID而不是账户名称；最近周期用 `periodDays`（默认365，限制1到3650），全部历史显式传 `allHistory=true`，并覆盖 `periodDays`。指定 `symbol` 时只返回对应个股及账户摘要；找不到时返回明确错误。
 
 更新 `options-review` Skill：
 
@@ -350,7 +350,7 @@ Campaign表字段：
 2. 跳转 `/ai-assistant`，通过路由state预填：
 
 ```text
-请复盘账户 {accountName} 在最近 {period} 的 {symbol} 期权交易，分别说明做得好的、做得不好的和最值得改进的地方。请使用确定性期权复盘数据并说明样本限制。
+请复盘账户 {accountName}（accountId: {accountId}）在 {period} 的 {symbol} 期权交易。请调用 get_option_review，最近周期的工具参数为 {"accountId":"{accountId}","symbol":"{symbol}","periodDays":365,"allHistory":false}，全部历史则为 {"accountId":"{accountId}","symbol":"{symbol}","allHistory":true}。分别说明做得好的、做得不好的和最值得改进的地方；请使用确定性期权复盘数据并说明样本限制。
 ```
 
 3. AI助手只预填、不自动发送，用户可检查后发送。

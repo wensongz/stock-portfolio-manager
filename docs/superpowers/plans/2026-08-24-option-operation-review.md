@@ -68,7 +68,7 @@
 - Produces: `pub fn get_option_review(db: &Database, account_id: &str, period_days: Option<i64>) -> Result<OptionReviewReport, String>`。
 - Produces: `OptionReviewReport`、`OptionReviewSummary`、`OptionUnderlyingReview`、`OptionCampaign`、`OptionWorstCampaign`、`OptionReviewDataQuality`。
 
-- [ ] **Step 1: 创建模型文件和最小测试夹具，让服务测试先因模块缺失失败**
+- [x] **Step 1: 创建模型文件和最小测试夹具，让服务测试先因模块缺失失败**
 
 在 `src-tauri/src/services/option_review_service.rs` 写入测试模块，先引用尚未实现的 `get_option_review`：
 
@@ -139,13 +139,13 @@ mod tests {
 
 在 `models/mod.rs` 和 `services/mod.rs` 暂时只增加 `pub mod option_review;` / `pub mod option_review_service;`，保证测试能定位文件。
 
-- [ ] **Step 2: 运行单测确认失败**
+- [x] **Step 2: 运行单测确认失败**
 
 Run: `cd src-tauri && cargo test --lib option_review_service::tests::expired_put_keeps_premium_net_of_fees -- --nocapture`
 
 Expected: FAIL，错误包含 `cannot find function get_option_review` 或缺失复盘模型。
 
-- [ ] **Step 3: 实现序列化模型**
+- [x] **Step 3: 实现序列化模型**
 
 在 `src-tauri/src/models/option_review.rs` 定义：
 
@@ -228,7 +228,7 @@ pub struct OptionReviewDataQuality {
 
 在 `models/mod.rs` 加 `pub mod option_review;` 和 `pub use option_review::*;`。
 
-- [ ] **Step 4: 实现记录读取、日期解析、FIFO周期配对的最小路径**
+- [x] **Step 4: 实现记录读取、日期解析、FIFO周期配对的最小路径**
 
 服务内创建私有结构 `RawOptionRecord`、`OpenLot`、`OptionCycle`，并实现：
 
@@ -285,13 +285,15 @@ let fees = (open.commission.abs() + open.fee.abs()) * open_fraction
     + (close.commission.abs() + close.fee.abs()) * close_fraction;
 ```
 
+上面的一比一数量适用于相同期权标识。跨标识拆股匹配必须使用适用的 `ratio_from:ratio_to` 把双方数量换算为同一敞口单位，以有理数或整数敞口安全保存剩余数量，并分别用实际消耗的开仓数量和结束数量计算两端分摊比例；不得直接对未调整张数取 `min`。
+
 从DB读取后把 `quantity.abs()` 归一化为正数匹配数量；按 `traded_at`、同时间戳SELL优先于BUY、最后按 `id` 稳定排序，确保导入顺序不改变FIFO结果。部分匹配后的开仓余量必须用同样的比例分摊为active周期，不得丢弃。
 
 完全未匹配的开仓生成 `status = "active"` 周期。`unmatched_records` 统计“存在任何未匹配数量的结束记录数”，使用record ID去重，不把一条2张的记录计为2条。缺交易日期的记录增加 `missing_trade_dates` 并排除。拆股跨标识匹配只有在候选开仓唯一时才执行；出现多个同样可能的开仓时归入 `unmatched_records`，不猜测。
 
 测试一律给 `get_option_review_at` 的 `today` 参数传 `NaiveDate::from_ymd_opt(2026, 8, 24).unwrap()`，避免“最近365天”随实际日期漂移。`load_inputs` 对不存在的账户返回错误，对存在但没有期权记录的账户返回空报告。
 
-- [ ] **Step 5: 实现Campaign归组、聚合和事实标签**
+- [x] **Step 5: 实现Campaign归组、聚合和事实标签**
 
 归组连接函数必须严格表达规格：
 
@@ -321,7 +323,7 @@ let annualized = safe_ratio(net * 365.0, capital_days);
 
 标签函数返回稳定顺序：`净亏损`、`低留存`、`单次损失较大`、`高留存`、`样本不足`、`有进行中仓位`。只有满足定义时加入，避免互相矛盾的 `高留存` 与 `低留存` 同时出现。
 
-- [ ] **Step 6: 补齐失败测试覆盖关键口径**
+- [x] **Step 6: 补齐失败测试覆盖关键口径**
 
 在同一测试模块增加下表的具体fixture和断言；所有日期都通过 `get_option_review_at` 固定在2026-08-24，所有浮点值断言误差 `< 1e-9`。
 
@@ -336,19 +338,20 @@ let annualized = safe_ratio(net * 365.0, capital_days);
 | `active_campaign_is_excluded_from_summary` | 一个已结束Put与7天内的未结束Put | `summary.completed=0`、`summary.active=1`、Campaign三个比率/损益字段为 `None` |
 | `completed_period_filter_uses_end_date_but_keeps_active` | 已完成Campaign于2025-01-01结束，另一未结束Campaign于2025-01-01开始，`period_days=365` | 旧completed不返回，旧active仍返回 |
 | `missing_dates_and_unmatched_closes_are_reported` | 1条 `traded_at=NULL` 开仓 + 1条无对应开仓的BUY | `missing_trade_dates=1`、`unmatched_records=1`，两者不进入Campaign |
-| `split_adjusted_close_matches_existing_open` | 配置1:2拆股；`BRK B 16JUN23 330 C` SELL 1张与`BRK B 16JUN23 165 C` BUY 1张 | 1个已完成Campaign、`unmatched_records=0`、金额守恒 |
+| `forward_split_close_conserves_both_record_allocations` | 配置1:2拆股；`BRK B 16JUN23 330 C` SELL 1张与`BRK B 16JUN23 165 C` BUY 2张 | 1个已完成Campaign、`unmatched_records=0`，gross/close/fees/net完整守恒 |
+| `reverse_split_close_conserves_both_record_allocations` | 配置2:1反向拆股；`BRK B 31DEC26 165 C` SELL 2张与`BRK B 31DEC26 330 C` BUY 1张 | 1个已完成Campaign、`unmatched_records=0`，gross/close/fees/net完整守恒 |
 | `underlying_and_account_totals_equal_campaign_sums` | AAPL和MSFT各2个已完成Campaign | 账户gross/net与个股再与Campaign求和一致 |
 | `fact_flags_follow_threshold_boundaries` | 分别构造3个Campaign且留存率恰好70%、恰好40%；正收益中位数100、最差-300与-300.01 | 70%包含`高留存`，40%不包含`低留存`，-300不标记而-300.01标记`单次损失较大` |
 
 每个测试除Campaign数量外，至少断言一个金额/比率字段或数据质量字段，不允许只留空函数体。
 
-- [ ] **Step 7: 运行服务单测并修到全部通过**
+- [x] **Step 7: 运行服务单测并修到全部通过**
 
 Run: `cd src-tauri && cargo test --lib option_review_service::tests -- --nocapture`
 
 Expected: 所有 `option_review_service::tests` PASS。
 
-- [ ] **Step 8: 运行Rust格式化和全库单测**
+- [x] **Step 8: 运行Rust格式化和全库单测**
 
 Run: `cd src-tauri && cargo fmt --check`
 
@@ -358,7 +361,7 @@ Run: `cd src-tauri && cargo test --lib`
 
 Expected: 所有库测试PASS。
 
-- [ ] **Step 9: 提交核心计算服务**
+- [x] **Step 9: 提交核心计算服务**
 
 ```bash
 git add src-tauri/src/models/option_review.rs src-tauri/src/models/mod.rs src-tauri/src/services/option_review_service.rs src-tauri/src/services/mod.rs
@@ -383,9 +386,9 @@ git commit -m "feat: add deterministic option review analysis"
 **Interfaces:**
 - Consumes: Task 1 `option_review_service::get_option_review`。
 - Produces: Tauri命令 `get_option_review(account_id: String, period_days: Option<i64>)`。
-- Produces: AI函数工具 `get_option_review(accountId, symbol?, periodDays?)`。
+- Produces: AI函数工具 `get_option_review(accountId, symbol?, periodDays?, allHistory?)`；`allHistory=true` 明确表示全部历史并覆盖 `periodDays`。
 
-- [ ] **Step 1: 先写AI工具定义测试并确认失败**
+- [x] **Step 1: 先写AI工具定义测试并确认失败**
 
 在 `ai_tools.rs` 测试中把工具数量从20改为21，并增加：
 
@@ -399,6 +402,7 @@ fn option_review_tool_requires_account_and_supports_filters() {
     assert_eq!(tool["function"]["parameters"]["required"], json!(["accountId"]));
     assert_eq!(tool["function"]["parameters"]["properties"]["periodDays"]["maximum"], 3650);
     assert!(tool["function"]["parameters"]["properties"]["symbol"].is_object());
+    assert_eq!(tool["function"]["parameters"]["properties"]["allHistory"]["type"], "boolean");
 }
 ```
 
@@ -416,7 +420,7 @@ fn options_review_uses_deterministic_review_tool() {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cd src-tauri && cargo test --lib ai_tools::tests::option_review_tool_requires_account_and_supports_filters -- --nocapture`
 
@@ -424,7 +428,7 @@ Run: `cd src-tauri && cargo test --lib skill_service::tests::options_review_uses
 
 Expected: FAIL，工具定义不存在且Skill仍只引用 `get_option_positions`。
 
-- [ ] **Step 3: 增加Tauri命令并注册**
+- [x] **Step 3: 增加Tauri命令并注册**
 
 `src-tauri/src/commands/option_review.rs`：
 
@@ -450,7 +454,7 @@ pub fn get_option_review(
 
 在 `commands/mod.rs` 增加 `pub mod option_review;`，并在 `lib.rs` Options Management段注册 `commands::option_review::get_option_review`。
 
-- [ ] **Step 4: 定义并分发AI工具**
+- [x] **Step 4: 定义并分发AI工具**
 
 在 `tool_definitions()` 加：
 
@@ -465,7 +469,8 @@ json!({
             "properties": {
                 "accountId": { "type": "string", "description": "账户 ID" },
                 "symbol": { "type": "string", "description": "可选标的，例如 AAPL" },
-                "periodDays": { "type": "integer", "minimum": 1, "maximum": 3650, "default": 365 }
+                "periodDays": { "type": "integer", "minimum": 1, "maximum": 3650, "default": 365 },
+                "allHistory": { "type": "boolean", "description": "true时返回全部历史并覆盖periodDays", "default": false }
             },
             "required": ["accountId"]
         }
@@ -487,13 +492,17 @@ async fn tool_option_review(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         Some(value) if !value.trim().is_empty() => value.trim(),
         _ => return ToolResult::err_json("缺少参数 accountId"),
     };
-    let period_days = Some(
+    let period_days = if args.get("allHistory").and_then(Value::as_bool).unwrap_or(false) {
+        None
+    } else {
+        Some(
         args.get("periodDays")
             .and_then(Value::as_i64)
             .unwrap_or(365)
             .clamp(1, 3650),
-    );
-    let mut report = match option_review_service::get_option_review(ctx.db, account_id, period_days) {
+        )
+    };
+    let report = match option_review_service::get_option_review(ctx.db, account_id, period_days) {
         Ok(report) => report,
         Err(error) => return ToolResult::err_json(format!("期权复盘失败：{error}")),
     };
@@ -505,15 +514,15 @@ async fn tool_option_review(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 }
 ```
 
-将symbol过滤抽成纯函数 `option_review_payload(mut report: OptionReviewReport, symbol: Option<&str>) -> Result<Value, String>`。空symbol视为未过滤；非空symbol忽略大小写匹配，无结果返回“账户中没有 {symbol} 的期权复盘数据”。过滤后保留原账户summary，并在序列化JSON根对象中追加 `scope_note: "summary为账户级；underlyings已按个股过滤"`；不得把账户summary误称为个股summary。AI工具省略 `periodDays` 时传 `Some(365)`，与Schema的默认值一致。
+将周期解析抽成纯函数并测试：`allHistory=true` 返回 `None` 且覆盖任何 `periodDays`；否则 `periodDays` 省略时返回 `Some(365)`，传入时限制在1到3650。将symbol过滤抽成纯函数 `option_review_payload(mut report: OptionReviewReport, symbol: Option<&str>) -> Result<Value, String>`。空symbol视为未过滤；非空symbol忽略大小写匹配，无结果返回“账户中没有 {symbol} 的期权复盘数据”。过滤后保留原账户summary，并在序列化JSON根对象中追加 `scope_note: "summary为账户级；underlyings已按个股过滤"`；不得把账户summary误称为个股summary。
 
-- [ ] **Step 5: 重写Skill并升级内置版本**
+- [x] **Step 5: 重写Skill并升级内置版本**
 
 `options-review.md`的核心步骤改为：
 
 ```markdown
 ## 分析步骤
-1. 确认账户和可选标的，调用 `get_option_review`。
+1. 确认账户ID和可选标的；最近周期用 `periodDays`，全部历史用 `allHistory=true`，调用 `get_option_review`。
 2. 先说明样本量、已完成/进行中Campaign和数据质量。
 3. 只引用工具返回的净权利金、留存率、担保名义资本年化收益率和最差Campaign。
 4. 分成「✅ 做得好的」「⚠️ 做得不好的」「🔧 值得改进」三段。
@@ -528,12 +537,12 @@ async fn tool_option_review(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 
 把 `BUILTIN_SKILLS_VERSION` 从4改为5，让未被用户编辑的内置Skill在启动时更新。
 
-- [ ] **Step 6: 更新AI工具文档并运行目标测试**
+- [x] **Step 6: 更新AI工具文档并运行目标测试**
 
 在 `docs/ai-tools.md` 的期权工具区同时列出：
 
 - `get_option_positions`：当前持仓和到期风险。
-- `get_option_review`：历史Campaign和确定性复盘指标。
+- `get_option_review`：历史Campaign和确定性复盘指标；必传 `accountId`，全部历史显式传 `allHistory=true`。
 
 在 `ai_tools.rs` 用手工构造的AAPL/MSFT报告fixture为 `option_review_payload` 增加两个纯函数测试：
 
@@ -558,7 +567,7 @@ Run: `cd src-tauri && cargo test --lib ai_tools::tests skill_service::tests -- -
 
 Expected: 新工具定义、唯一性、Skill解析和内容测试全部PASS；工具总数为21。
 
-- [ ] **Step 7: 运行Rust全库验证并提交**
+- [x] **Step 7: 运行Rust全库验证并提交**
 
 Run: `cd src-tauri && cargo fmt --check`
 
@@ -586,7 +595,7 @@ git commit -m "feat: expose option review to app and AI"
 - Produces: `useOptionReviewStore`，字段 `report/loading/error` 和方法 `fetchOptionReview(accountId, periodDays)`、`clearOptionReview()`。
 - Produces: `selectDefaultUnderlying(report)`、`sortUnderlyingReviews(items)`、`formatReviewPercent(value)`。
 
-- [ ] **Step 1: 先写视图模型失败测试**
+- [x] **Step 1: 先写视图模型失败测试**
 
 `optionReviewViewModel.test.ts`：
 
@@ -632,13 +641,13 @@ test("percentage formatter preserves negative values and missing state", () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `node --test src/pages/Review/optionReviewViewModel.test.ts`
 
 Expected: FAIL，模块或导出函数不存在。
 
-- [ ] **Step 3: 增加与Rust一致的TypeScript类型**
+- [x] **Step 3: 增加与Rust一致的TypeScript类型**
 
 在 `src/types/index.ts` 增加：
 
@@ -711,7 +720,7 @@ export interface OptionReviewDataQuality {
 }
 ```
 
-- [ ] **Step 4: 实现视图模型纯函数**
+- [x] **Step 4: 实现视图模型纯函数**
 
 `optionReviewViewModel.ts`：
 
@@ -734,7 +743,7 @@ export function formatReviewPercent(value: number | null) {
 }
 ```
 
-- [ ] **Step 5: 实现Zustand Store**
+- [x] **Step 5: 实现Zustand Store**
 
 `optionReviewStore.ts`：
 
@@ -779,7 +788,7 @@ export const useOptionReviewStore = create<OptionReviewState>((set) => ({
 
 在 `create` 之前定义 `let latestOptionReviewRequest = 0;`。这个请求序号保证用户快速切换账户/周期时，较早请求的慢响应不会覆盖新报告。
 
-- [ ] **Step 6: 运行前端纯函数测试与类型检查**
+- [x] **Step 6: 运行前端纯函数测试与类型检查**
 
 Run: `node --test src/pages/Review/optionReviewViewModel.test.ts`
 
@@ -789,7 +798,7 @@ Run: `npx tsc --noEmit`
 
 Expected: exit 0。
 
-- [ ] **Step 7: 提交前端数据层**
+- [x] **Step 7: 提交前端数据层**
 
 ```bash
 git add src/types/index.ts src/stores/optionReviewStore.ts src/pages/Review/optionReviewViewModel.ts src/pages/Review/optionReviewViewModel.test.ts
@@ -810,7 +819,7 @@ git commit -m "feat: add option review frontend data model"
 - Consumes: 现有 `useReviewStore`、`useAccountStore`、`usePnlColor`。
 - Produces: `StockReviewTab` 和 `OptionReviewTab` React组件。
 
-- [ ] **Step 1: 提取股票复盘组件并建立构建基线**
+- [x] **Step 1: 提取股票复盘组件并建立构建基线**
 
 先把现有 `src/pages/Review/index.tsx` 的完整内容复制到 `StockReviewTab.tsx`，然后做且只做三个机械变更：把 `ReviewPage` 重命名为 `StockReviewTab`；删除返回值中包含“历史操作复盘”的整个 `Title` 元素；删除因此不再使用的 `HistoryOutlined` 和 `Title` 引用。其余状态、effect、`DecisionQualityTag`、`HoldingTimeline`和JSX逐行保持。
 
@@ -837,7 +846,7 @@ Run: `npm run build`
 
 Expected: 构建通过，证明纯提取没有改变现有行为。
 
-- [ ] **Step 2: 创建期权复盘界面骨架并连接Store**
+- [x] **Step 2: 创建期权复盘界面骨架并连接Store**
 
 `OptionReviewTab`需要：
 
@@ -900,7 +909,7 @@ export default function OptionReviewTab() {
 
 账户ID失效时使用与期权管理页相同的校验effect：账户加载完成后清空不存在的localStorage值。
 
-- [ ] **Step 3: 实现四张指标卡与数据质量提示**
+- [x] **Step 3: 实现四张指标卡与数据质量提示**
 
 使用Ant Design `Row/Col/Card/Statistic/Alert`，每张卡用 `<Col xs={24} sm={12} xl={6}>` 保证响应式。指标卡必须满足：
 
@@ -914,7 +923,7 @@ export default function OptionReviewTab() {
 
 数据质量描述通过纯函数拼接，不在JSX里嵌套多层三元表达式。
 
-- [ ] **Step 4: 实现个股汇总表**
+- [x] **Step 4: 实现个股汇总表**
 
 使用 `sortUnderlyingReviews(report.underlyings)`，并设置 `scroll={{ x: 980 }}`。列定义：
 
@@ -932,7 +941,7 @@ const underlyingColumns: ColumnsType<OptionUnderlyingReview> = [
 
 表格行点击设置 `selectedSymbol`；选中行使用 `rowClassName` 加轻量主题背景。事实标签颜色只区分注意项、正向事实和中性项，文本始终可见。个股只有进行中Campaign时，该行的净权利金、留存率、年化收益率和最差Campaign都显示 `—`，不把内部聚合用的0显示为已实现绩效。
 
-- [ ] **Step 5: 实现选中个股Campaign表**
+- [x] **Step 5: 实现选中个股Campaign表**
 
 从 `report.underlyings.find(item => item.underlying === selectedSymbol)` 取详情，按 `started_at` 降序。列：期间、策略路径、状态、毛权利金、买回成本、费用、净权利金、留存率、年化收益率。
 
@@ -944,7 +953,7 @@ const underlyingColumns: ColumnsType<OptionUnderlyingReview> = [
 
 标题右侧预留 `AI复盘这只股票` 按钮，Task 5再连接行为；当前按钮可用 `disabled` 并带Tooltip「AI入口将在下一任务接入」。
 
-- [ ] **Step 6: 在Review页面加入两个页签**
+- [x] **Step 6: 在Review页面加入两个页签**
 
 `Review/index.tsx`最终结构：
 
@@ -967,7 +976,7 @@ export default function ReviewPage() {
 
 不要在第一版增加「复盘总览」空页签。
 
-- [ ] **Step 7: 构建与手动响应式验证**
+- [x] **Step 7: 构建与手动响应式验证**
 
 Run: `npm run build`
 
@@ -983,7 +992,7 @@ Run: `npm run tauri dev`
 - 宽表格使用Ant Design自身横向滚动，页面不整体横向溢出。
 - 切换账户、周期、个股不会出现旧数据残留。
 
-- [ ] **Step 8: 提交复盘界面**
+- [x] **Step 8: 提交复盘界面**
 
 ```bash
 git add src/pages/Review/index.tsx src/pages/Review/StockReviewTab.tsx src/pages/Review/OptionReviewTab.tsx
@@ -1006,7 +1015,7 @@ git commit -m "feat: add option operation review tab"
 - Produces: 路由state `{ prefillPrompt: string }`。
 - Produces: `readAiPrefill(state: unknown): string | null`。
 
-- [ ] **Step 1: 写一次性预填解析失败测试**
+- [x] **Step 1: 写一次性预填解析失败测试**
 
 `prefill.test.ts`：
 
@@ -1026,13 +1035,13 @@ test("rejects missing, blank, and non-string prompts", () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `node --test src/pages/AiAssistant/prefill.test.ts`
 
 Expected: FAIL，模块不存在。
 
-- [ ] **Step 3: 实现预填解析并接入AI助手**
+- [x] **Step 3: 实现预填解析并接入AI助手**
 
 `prefill.ts`：
 
@@ -1071,7 +1080,7 @@ useEffect(() => {
 
 清除路由state只阻止刷新重复注入，不能清除已写入composer的input。
 
-- [ ] **Step 4: 连接期权页AI按钮**
+- [x] **Step 4: 连接期权页AI按钮**
 
 在 `OptionReviewTab`：
 
@@ -1087,9 +1096,12 @@ const handleAiReview = () => {
   if (!selectedUnderlying || !selectedAccount) return;
   setActiveSkillsForNextTurn(["options-review"]);
   const period = periodDays == null ? "全部历史" : `最近 ${periodDays} 天`;
+  const toolArguments = periodDays == null
+    ? { accountId: selectedAccount.id, symbol: selectedUnderlying.underlying, allHistory: true }
+    : { accountId: selectedAccount.id, symbol: selectedUnderlying.underlying, periodDays, allHistory: false };
   navigate("/ai-assistant", {
     state: {
-      prefillPrompt: `请复盘账户 ${selectedAccount.name} 在${period}的 ${selectedUnderlying.underlying} 期权交易，分别说明做得好的、做得不好的和最值得改进的地方。请使用确定性期权复盘数据并说明样本限制。`,
+      prefillPrompt: `请复盘账户 ${selectedAccount.name}（accountId: ${selectedAccount.id}）在${period}的 ${selectedUnderlying.underlying} 期权交易。请调用 get_option_review，工具参数为 ${JSON.stringify(toolArguments)}。分别说明做得好的、做得不好的和最值得改进的地方。请使用确定性期权复盘数据并说明样本限制。`,
     },
   });
 };
@@ -1103,7 +1115,7 @@ const handleAiReview = () => {
 get_option_review: "期权操作复盘",
 ```
 
-- [ ] **Step 5: 运行测试和构建**
+- [x] **Step 5: 运行测试和构建**
 
 Run: `node --test src/pages/AiAssistant/prefill.test.ts src/pages/Review/optionReviewViewModel.test.ts`
 
@@ -1115,6 +1127,8 @@ Expected: 构建通过。
 
 - [ ] **Step 6: 手动验证AI入口只预填一次**
 
+> 环境限制：受浏览器安全限制，本轮未取得 composer、Skill待激活、刷新后不重复注入及不自动发送的端到端手工证据，因此此项保持未完成。
+
 从期权复盘页选中AAPL并点击按钮，确认：
 
 - 跳到AI助手欢迎页。
@@ -1123,7 +1137,7 @@ Expected: 构建通过。
 - 没有自动发送或自动创建会话。
 - 刷新AI页面不再次覆盖用户后来输入的内容。
 
-- [ ] **Step 7: 提交AI入口**
+- [x] **Step 7: 提交AI入口**
 
 ```bash
 git add src/pages/AiAssistant/index.tsx src/pages/AiAssistant/prefill.ts src/pages/AiAssistant/prefill.test.ts src/components/ai/ToolCallCard.tsx src/pages/Review/OptionReviewTab.tsx

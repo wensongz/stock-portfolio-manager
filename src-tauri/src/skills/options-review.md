@@ -11,12 +11,13 @@ enabled: true
 对期权历史执行进行确定性复盘，评价 CSP 和 Covered Call 的已完成Campaign。
 
 ## 工具路由
-- 历史执行复盘使用 `get_option_review`。
+- 历史执行复盘使用 `get_option_review`，必须传账户 `accountId`，不要用账户名称代替ID。
+- 最近周期传 `periodDays`（默认365，范围1到3650）；全部历史传 `allHistory: true`，它会覆盖 `periodDays`。
 - 当前持仓、到期风险、ITM/OTM、被行权准备使用 `get_option_positions`；需要现价时再调用 `get_stock_quote`。
 - 不将当前未平仓浮盈亏或风险敞口混入已完成Campaign指标。
 
 ## 分析步骤
-1. 确认账户和可选标的，调用 `get_option_review`。
+1. 确认账户ID和可选标的，按最近周期或全部历史的参数规则调用 `get_option_review`。
 2. 先说明样本量、已完成/进行中Campaign和数据质量。
 3. 只引用工具返回的净权利金、留存率、担保名义资本年化收益率和最差Campaign。
 4. 分成「✅ 做得好的」「⚠️ 做得不好的」「🔧 值得改进」三段。

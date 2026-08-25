@@ -4,6 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   formatReviewPercent,
+  getOptionReviewEmptyDescription,
   selectDefaultUnderlying,
   sortUnderlyingReviews,
 } from "./optionReviewViewModel.ts";
@@ -38,4 +39,23 @@ test("default selection uses the largest absolute net premium", () => {
 test("percentage formatter preserves negative values and missing state", () => {
   assert.equal(formatReviewPercent(-0.31), "-31.0%");
   assert.equal(formatReviewPercent(null), "—");
+});
+
+test("empty review with excluded records directs to the quality notice", () => {
+  for (const quality of [
+    { unmatched_records: 2, missing_trade_dates: 0 },
+    { unmatched_records: 0, missing_trade_dates: 3 },
+  ]) {
+    assert.equal(
+      getOptionReviewEmptyDescription(quality),
+      "当前暂无可分析的Campaign，请查看上方数据质量说明",
+    );
+  }
+});
+
+test("empty review without excluded records directs to CSV import", () => {
+  assert.equal(
+    getOptionReviewEmptyDescription({ unmatched_records: 0, missing_trade_dates: 0 }),
+    "该账户暂无可复盘的期权记录，请去期权管理导入CSV",
+  );
 });

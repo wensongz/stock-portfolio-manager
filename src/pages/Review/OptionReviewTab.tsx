@@ -27,6 +27,7 @@ import type {
 } from "../../types";
 import {
   formatReviewPercent,
+  getOptionReviewEmptyDescription,
   selectDefaultUnderlying,
   sortUnderlyingReviews,
 } from "./optionReviewViewModel";
@@ -254,6 +255,14 @@ export default function OptionReviewTab() {
 
   const hasCompletedCampaigns = (report?.summary.completed_campaigns ?? 0) > 0;
   const worstCampaign = report?.summary.worst_campaign ?? null;
+  const dataQualityNotice = report ? (
+    <Alert
+      type="info"
+      showIcon
+      title="数据质量说明"
+      description={describeDataQuality(report.data_quality)}
+    />
+  ) : null;
 
   return (
     <div className="space-y-4" style={{ minWidth: 0 }}>
@@ -291,7 +300,10 @@ export default function OptionReviewTab() {
       ) : null}
       {accountId && loading ? <Spin /> : null}
       {accountId && !loading && report && report.underlyings.length === 0 ? (
-        <Empty description="该账户暂无可复盘的期权记录，请去期权管理导入CSV" />
+        <>
+          {dataQualityNotice}
+          <Empty description={getOptionReviewEmptyDescription(report.data_quality)} />
+        </>
       ) : null}
 
       {accountId && !loading && report && report.underlyings.length > 0 ? (
@@ -384,12 +396,7 @@ export default function OptionReviewTab() {
             </Col>
           </Row>
 
-          <Alert
-            type="info"
-            showIcon
-            title="数据质量说明"
-            description={describeDataQuality(report.data_quality)}
-          />
+          {dataQualityNotice}
 
           <Card title="个股汇总" style={{ overflow: "hidden" }}>
             <Table<OptionUnderlyingReview>

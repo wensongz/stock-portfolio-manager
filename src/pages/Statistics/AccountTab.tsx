@@ -1,6 +1,7 @@
 import { useEffect } from "react";
-import { Row, Col, Card, Statistic, Spin, Empty, Select } from "antd";
+import { Row, Col, Card, Spin, Empty, Select } from "antd";
 import PieChart from "../../components/charts/PieChart";
+import StatCard from "../../components/charts/StatCard";
 import HoldingsTable from "../Dashboard/HoldingsTable";
 import { useStatisticsStore } from "../../stores/dashboardStore";
 import { useAccountStore } from "../../stores/accountStore";
@@ -66,24 +67,18 @@ export default function AccountTab({ selectedAccountId, onAccountChange }: Props
         <>
           <Row gutter={[16, 16]} className="mb-4">
             <Col xs={24} sm={8}>
-              <Card>
-                <Statistic title={`账户总市值 (${currencyCode})`} value={stats.total_market_value.toFixed(2)} prefix={currencySymbol} />
-              </Card>
+              <StatCard title={`账户总市值 (${currencyCode})`} value={stats.total_market_value.toFixed(2)} prefix={currencySymbol} />
             </Col>
             <Col xs={24} sm={8}>
-              <Card>
-                <Statistic title={`账户总成本 (${currencyCode})`} value={stats.total_cost.toFixed(2)} prefix={currencySymbol} />
-              </Card>
+              <StatCard title={`账户总成本 (${currencyCode})`} value={stats.total_cost.toFixed(2)} prefix={currencySymbol} />
             </Col>
             <Col xs={24} sm={8}>
-              <Card>
-                <Statistic
-                  title={`账户总盈亏 (${currencyCode})`}
-                  value={stats.total_pnl.toFixed(2)}
-                  styles={{ content: {  color: pnlColor(stats.total_pnl)  } }}
-                  suffix={`(${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl_percent.toFixed(2)}%)`}
-                />
-              </Card>
+              <StatCard
+                title={`账户总盈亏 (${currencyCode})`}
+                value={stats.total_pnl.toFixed(2)}
+                valueStyle={{ color: pnlColor(stats.total_pnl) }}
+                suffix={`(${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl_percent.toFixed(2)}%)`}
+              />
             </Col>
           </Row>
 

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Row, Col, Card, Statistic, Spin, Empty, Select, Tag, Table, Typography, Button } from "antd";
+import { Row, Col, Card, Spin, Empty, Select, Tag, Table, Typography, Button } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import PieChart from "../../components/charts/PieChart";
+import StatCard from "../../components/charts/StatCard";
 import { useStatisticsStore } from "../../stores/dashboardStore";
 import { useCategoryStore } from "../../stores/categoryStore";
 import type { CategoryStatistics, HoldingDetail } from "../../types";
@@ -169,24 +170,18 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
         <>
           <Row gutter={[16, 16]} className="mb-4">
             <Col xs={24} sm={8}>
-              <Card>
-                <Statistic title={`类别总市值 (${baseCurrency})`} value={stats.total_market_value.toFixed(2)} prefix={symbol} />
-              </Card>
+              <StatCard title={`类别总市值 (${baseCurrency})`} value={stats.total_market_value.toFixed(2)} prefix={symbol} />
             </Col>
             <Col xs={24} sm={8}>
-              <Card>
-                <Statistic title={`类别总成本 (${baseCurrency})`} value={stats.total_cost.toFixed(2)} prefix={symbol} />
-              </Card>
+              <StatCard title={`类别总成本 (${baseCurrency})`} value={stats.total_cost.toFixed(2)} prefix={symbol} />
             </Col>
             <Col xs={24} sm={8}>
-              <Card>
-                <Statistic
-                  title={`类别总盈亏 (${baseCurrency})`}
-                  value={stats.total_pnl.toFixed(2)}
-                  styles={{ content: {  color: pnlColor(stats.total_pnl)  } }}
-                  suffix={`(${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl_percent.toFixed(2)}%)`}
-                />
-              </Card>
+              <StatCard
+                title={`类别总盈亏 (${baseCurrency})`}
+                value={stats.total_pnl.toFixed(2)}
+                valueStyle={{ color: pnlColor(stats.total_pnl) }}
+                suffix={`(${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl_percent.toFixed(2)}%)`}
+              />
             </Col>
           </Row>
 

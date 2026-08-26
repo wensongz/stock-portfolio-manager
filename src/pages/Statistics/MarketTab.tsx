@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState, useCallback } from "react";
-import { Row, Col, Card, Statistic, Spin, Empty, Select, Table, Tag, Typography, Button } from "antd";
+import { Row, Col, Card, Spin, Empty, Select, Table, Tag, Typography, Button } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import PieChart from "../../components/charts/PieChart";
+import StatCard from "../../components/charts/StatCard";
 import { useStatisticsStore } from "../../stores/dashboardStore";
 import type { MarketStatistics } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
@@ -443,24 +444,18 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
         <>
           <Row gutter={[16, 16]}>
             <Col xs={24} sm={8}>
-              <Card>
-                <Statistic title={`市场总市值 (${currencyCode})`} value={stats.total_market_value.toFixed(2)} prefix={currencySymbol} />
-              </Card>
+              <StatCard title={`市场总市值 (${currencyCode})`} value={stats.total_market_value.toFixed(2)} prefix={currencySymbol} />
             </Col>
             <Col xs={24} sm={8}>
-              <Card>
-                <Statistic title={`市场总成本 (${currencyCode})`} value={stats.total_cost.toFixed(2)} prefix={currencySymbol} />
-              </Card>
+              <StatCard title={`市场总成本 (${currencyCode})`} value={stats.total_cost.toFixed(2)} prefix={currencySymbol} />
             </Col>
             <Col xs={24} sm={8}>
-              <Card>
-                <Statistic
-                  title={`市场总盈亏 (${currencyCode})`}
-                  value={stats.total_pnl.toFixed(2)}
-                  styles={{ content: {  color: pnlColor(stats.total_pnl)  } }}
-                  suffix={`(${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl_percent.toFixed(2)}%)`}
-                />
-              </Card>
+              <StatCard
+                title={`市场总盈亏 (${currencyCode})`}
+                value={stats.total_pnl.toFixed(2)}
+                valueStyle={{ color: pnlColor(stats.total_pnl) }}
+                suffix={`(${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl_percent.toFixed(2)}%)`}
+              />
             </Col>
           </Row>
 

@@ -1,8 +1,9 @@
 import { useMemo, useState, useCallback } from "react";
-import { Row, Col, Card, Statistic, Spin, Empty, Table, Tag, Typography, Button } from "antd";
+import { Row, Col, Card, Spin, Empty, Table, Tag, Typography, Button } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import PieChart from "../../components/charts/PieChart";
 import BarChart from "../../components/charts/BarChart";
+import StatCard from "../../components/charts/StatCard";
 import type { StatisticsOverview } from "../../types";
 import type { Currency } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
@@ -486,32 +487,26 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
       {/* Summary stats */}
       <Row gutter={[16, 16]} className="mb-4">
         <Col xs={24} sm={8}>
-          <Card>
-            <Statistic
-              title={`总市值 (${baseCurrency})`}
-              value={overview.total_market_value.toFixed(2)}
-              prefix={currency}
-            />
-          </Card>
+          <StatCard
+            title={`总市值 (${baseCurrency})`}
+            value={overview.total_market_value.toFixed(2)}
+            prefix={currency}
+          />
         </Col>
         <Col xs={24} sm={8}>
-          <Card>
-            <Statistic
-              title={`总成本 (${baseCurrency})`}
-              value={overview.total_cost.toFixed(2)}
-              prefix={currency}
-            />
-          </Card>
+          <StatCard
+            title={`总成本 (${baseCurrency})`}
+            value={overview.total_cost.toFixed(2)}
+            prefix={currency}
+          />
         </Col>
         <Col xs={24} sm={8}>
-          <Card>
-            <Statistic
-              title={`总盈亏 (${baseCurrency})`}
-              value={overview.total_pnl.toFixed(2)}
-              styles={{ content: {  color: pnlColor(overview.total_pnl)  } }}
-              suffix={`(${totalPnlPos ? "+" : ""}${overview.total_pnl_percent.toFixed(2)}%)`}
-            />
-          </Card>
+          <StatCard
+            title={`总盈亏 (${baseCurrency})`}
+            value={overview.total_pnl.toFixed(2)}
+            valueStyle={{ color: pnlColor(overview.total_pnl) }}
+            suffix={`(${totalPnlPos ? "+" : ""}${overview.total_pnl_percent.toFixed(2)}%)`}
+          />
         </Col>
       </Row>
 

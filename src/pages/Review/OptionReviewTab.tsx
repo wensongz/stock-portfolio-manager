@@ -9,13 +9,13 @@ import {
   Select,
   Space,
   Spin,
-  Statistic,
   Table,
   Tag,
   Typography,
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useNavigate } from "react-router-dom";
+import StatCard from "../../components/charts/StatCard";
 import { usePnlColor } from "../../hooks/usePnlColor";
 import { useAccountStore } from "../../stores/accountStore";
 import { useChatStore } from "../../stores/chatStore";
@@ -354,64 +354,52 @@ export default function OptionReviewTab() {
         <>
           <Row gutter={[16, 16]}>
             <Col xs={24} sm={12} xl={8}>
-              <Card>
-                <Statistic
-                  title={OPTION_REVIEW_NET_PREMIUM_LABEL}
-                  value={
-                    hasNetPremium
-                      ? formatCurrency(report.summary.net_premium_pnl, report.currency)
-                      : "—"
-                  }
-                  styles={{
-                    content: {
-                      color: hasNetPremium
-                        ? pnlColorDark(report.summary.net_premium_pnl)
-                        : undefined,
-                    },
-                  }}
-                />
-              </Card>
+              <StatCard
+                title={OPTION_REVIEW_NET_PREMIUM_LABEL}
+                value={
+                  hasNetPremium
+                    ? formatCurrency(report.summary.net_premium_pnl, report.currency)
+                    : "—"
+                }
+                valueStyle={{
+                  color: hasNetPremium
+                    ? pnlColorDark(report.summary.net_premium_pnl)
+                    : undefined,
+                }}
+              />
             </Col>
             <Col xs={24} sm={12} xl={8}>
-              <Card>
-                <Statistic
-                  title="留存率"
-                  value={
-                    hasCompletedCampaigns
-                      ? formatReviewPercent(report.summary.retention_rate)
-                      : "—"
-                  }
-                  styles={{
-                    content: {
-                      color:
-                        hasCompletedCampaigns && report.summary.retention_rate != null
-                          ? pnlColorDark(report.summary.retention_rate)
-                          : undefined,
-                    },
-                  }}
-                />
-              </Card>
+              <StatCard
+                title="留存率"
+                value={
+                  hasCompletedCampaigns
+                    ? formatReviewPercent(report.summary.retention_rate)
+                    : "—"
+                }
+                valueStyle={{
+                  color:
+                    hasCompletedCampaigns && report.summary.retention_rate != null
+                      ? pnlColorDark(report.summary.retention_rate)
+                      : undefined,
+                }}
+              />
             </Col>
             <Col xs={24} sm={12} xl={8}>
-              <Card>
-                <Statistic
-                  title={OPTION_REVIEW_ANNUALIZED_YIELD_LABEL}
-                  value={
-                    hasCompletedCampaigns
-                      ? formatReviewPercent(report.summary.annualized_yield_on_notional)
-                      : "—"
-                  }
-                  styles={{
-                    content: {
-                      color:
-                        hasCompletedCampaigns &&
-                        report.summary.annualized_yield_on_notional != null
-                          ? pnlColorDark(report.summary.annualized_yield_on_notional)
-                          : undefined,
-                    },
-                  }}
-                />
-              </Card>
+              <StatCard
+                title={OPTION_REVIEW_ANNUALIZED_YIELD_LABEL}
+                value={
+                  hasCompletedCampaigns
+                    ? formatReviewPercent(report.summary.annualized_yield_on_notional)
+                    : "—"
+                }
+                valueStyle={{
+                  color:
+                    hasCompletedCampaigns &&
+                    report.summary.annualized_yield_on_notional != null
+                      ? pnlColorDark(report.summary.annualized_yield_on_notional)
+                      : undefined,
+                }}
+              />
             </Col>
           </Row>
 

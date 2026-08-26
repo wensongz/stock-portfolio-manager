@@ -687,9 +687,9 @@ export default function HoldingsPage() {
   const actionColumn = {
     title: "操作",
     key: "action",
-    width: 160,
+    width: 150,
     render: (_: unknown, record: HoldingWithQuote) => (
-      <Space>
+      <Space size={2}>
         <Button type="link" size="small" onClick={() => handleShowDetail(record)}>
           明细
         </Button>

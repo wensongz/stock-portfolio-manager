@@ -215,14 +215,14 @@ export default function OptionReviewTab() {
     {
       title: "期权标识",
       dataIndex: "option_symbol",
-      width: 175,
+      width: 150,
       fixed: "left",
     },
     {
       title: "合约数",
       dataIndex: "contracts",
       align: "right",
-      width: 80,
+      width: 60,
     },
     {
       title: "状态",
@@ -242,28 +242,28 @@ export default function OptionReviewTab() {
       title: "买回成本",
       dataIndex: "close_cost",
       align: "right",
-      width: 100,
+      width: 90,
       render: (value: number) => formatCurrency(value, currency),
     },
     {
       title: "费用",
       dataIndex: "fees",
       align: "right",
-      width: 100,
+      width: 90,
       render: (value: number) => formatCurrency(value, currency),
     },
     {
       title: "净权利金（含进行中）",
       dataIndex: "net_premium_pnl",
       align: "right",
-      width: 140,
+      width: 120,
       render: (value: number | null) => (value == null ? "—" : renderPnl(value)),
     },
     {
       title: "年化收益率",
       dataIndex: "annualized_yield_on_notional",
       align: "right",
-      width: 90,
+      width: 80,
       render: (value: number | null, campaign) =>
         campaign.status === "active" ? "—" : renderPercent(value),
     },
@@ -439,7 +439,7 @@ export default function OptionReviewTab() {
                 dataSource={selectedCampaigns}
                 pagination={false}
                 size="small"
-                scroll={{ x: 1060 }}
+                scroll={{ x: "max-content" }}
               />
             </Card>
           ) : null}

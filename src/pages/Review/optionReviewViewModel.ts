@@ -6,6 +6,42 @@ import type {
 
 export const OPTION_REVIEW_ANNUALIZED_YIELD_LABEL = "年化收益率（担保名义资本口径）";
 export const OPTION_REVIEW_NET_PREMIUM_LABEL = "累计净权利金（含进行中）";
+export const OPTION_REVIEW_PERIOD_STORAGE_KEY = "review_option_period_days";
+export const DEFAULT_OPTION_REVIEW_PERIOD_DAYS = 365;
+const OPTION_REVIEW_PERIOD_DAYS = [365, 730] as const;
+
+function isOptionReviewPeriodDays(value: number): value is (typeof OPTION_REVIEW_PERIOD_DAYS)[number] {
+  return OPTION_REVIEW_PERIOD_DAYS.includes(
+    value as (typeof OPTION_REVIEW_PERIOD_DAYS)[number],
+  );
+}
+
+interface OptionReviewPeriodStorage {
+  getItem: (key: string) => string | null;
+  setItem: (key: string, value: string) => void;
+}
+
+export function loadOptionReviewPeriodDays(
+  storage: Pick<OptionReviewPeriodStorage, "getItem">,
+): number | null {
+  const value = storage.getItem(OPTION_REVIEW_PERIOD_STORAGE_KEY);
+  if (value === "all") return null;
+  const periodDays = Number(value);
+  if (isOptionReviewPeriodDays(periodDays)) return periodDays;
+  return DEFAULT_OPTION_REVIEW_PERIOD_DAYS;
+}
+
+export function saveOptionReviewPeriodDays(
+  storage: Pick<OptionReviewPeriodStorage, "setItem">,
+  periodDays: number | null,
+): void {
+  if (periodDays == null || isOptionReviewPeriodDays(periodDays)) {
+    storage.setItem(
+      OPTION_REVIEW_PERIOD_STORAGE_KEY,
+      periodDays == null ? "all" : String(periodDays),
+    );
+  }
+}
 
 interface OptionReviewPromptInput {
   accountId: string;

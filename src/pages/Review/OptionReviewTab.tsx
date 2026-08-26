@@ -32,6 +32,8 @@ import {
   buildOptionReviewPrompt,
   formatReviewPercent,
   getOptionReviewEmptyDescription,
+  loadOptionReviewPeriodDays,
+  saveOptionReviewPeriodDays,
   selectDefaultUnderlying,
   shouldShowNetPremium,
   sortUnderlyingReviews,
@@ -79,7 +81,9 @@ export default function OptionReviewTab() {
   const [accountId, setAccountId] = useState(
     () => localStorage.getItem("review_option_account_id") ?? "",
   );
-  const [periodDays, setPeriodDays] = useState<number | null>(365);
+  const [periodDays, setPeriodDays] = useState<number | null>(() =>
+    loadOptionReviewPeriodDays(localStorage),
+  );
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const [accountsReady, setAccountsReady] = useState(false);
   const { pnlColorDark, pnlTag } = usePnlColor();
@@ -311,9 +315,14 @@ export default function OptionReviewTab() {
         <Select
           aria-label="期权复盘周期"
           value={periodDays == null ? "all" : String(periodDays)}
-          onChange={(value) => setPeriodDays(value === "all" ? null : Number(value))}
+          onChange={(value) => {
+            const nextPeriodDays = value === "all" ? null : Number(value);
+            saveOptionReviewPeriodDays(localStorage, nextPeriodDays);
+            setPeriodDays(nextPeriodDays);
+          }}
           options={[
             { value: "365", label: "最近365天" },
+            { value: "730", label: "最近730天" },
             { value: "all", label: "全部历史" },
           ]}
           style={{ minWidth: 140 }}

@@ -53,6 +53,8 @@ const LOCAL_STORAGE_KEYS = [
   "statistics_selected_market",
   "holdings_table_page_size",
   "options_selected_account_id",
+  "review_option_period_days",
+  "review_active_tab",
 ] as const;
 
 export default function GeneralSettings() {

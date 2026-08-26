@@ -7,10 +7,46 @@ import {
   buildOptionReviewPrompt,
   formatReviewPercent,
   getOptionReviewEmptyDescription,
+  loadOptionReviewPeriodDays,
+  saveOptionReviewPeriodDays,
   selectDefaultUnderlying,
   shouldShowNetPremium,
   sortUnderlyingReviews,
 } from "./optionReviewViewModel.ts";
+
+function memoryStorage(initial: Record<string, string> = {}) {
+  const values = new Map(Object.entries(initial));
+  return {
+    getItem(key: string) {
+      return values.get(key) ?? null;
+    },
+    setItem(key: string, value: string) {
+      values.set(key, value);
+    },
+  };
+}
+
+test("option review period remembers the latest valid selection", () => {
+  const storage = memoryStorage();
+
+  saveOptionReviewPeriodDays(storage, null);
+  assert.equal(loadOptionReviewPeriodDays(storage), null);
+
+  saveOptionReviewPeriodDays(storage, 365);
+  assert.equal(loadOptionReviewPeriodDays(storage), 365);
+
+  saveOptionReviewPeriodDays(storage, 730);
+  assert.equal(loadOptionReviewPeriodDays(storage), 730);
+});
+
+test("option review period falls back to 365 days for missing or invalid data", () => {
+  for (const value of [undefined, "", "0", "30", "lots"]) {
+    const storage = memoryStorage(
+      value === undefined ? {} : { review_option_period_days: value },
+    );
+    assert.equal(loadOptionReviewPeriodDays(storage), 365);
+  }
+});
 
 test("recent option review prompt carries executable tool arguments", () => {
   const prompt = buildOptionReviewPrompt({

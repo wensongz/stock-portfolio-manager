@@ -32,6 +32,10 @@ import { ToolCallList } from "../../components/ai/ToolCallCard";
 import { MarkdownRenderer } from "../../components/ai/MarkdownRenderer";
 import type { AiModelInfo, ChatMessageWithMeta, ChatSession, ChatUsage, Skill } from "../../types";
 import { readAiPrefill, resolveAiPrefillSessionId } from "./prefill";
+import {
+  loadAiSidebarCollapsed,
+  saveAiSidebarCollapsed,
+} from "./sidebarPreference";
 
 const { Title, Text } = Typography;
 const { TextArea } = Input;
@@ -244,7 +248,14 @@ function SessionSidebar({
   // Collapsed by default — users expand it on demand to browse/manage
   // chats. The collapsed rail still shows per-chat icons (with the active
   // one highlighted) so switching is one click away.
-  const [collapsed, setCollapsed] = useState(true);
+  const [collapsed, setCollapsed] = useState(() =>
+    loadAiSidebarCollapsed(localStorage),
+  );
+
+  const updateCollapsed = (nextCollapsed: boolean) => {
+    saveAiSidebarCollapsed(localStorage, nextCollapsed);
+    setCollapsed(nextCollapsed);
+  };
 
   if (collapsed) {
     // Collapsed rail: a thin icon column. New-chat + toggle on top, chat
@@ -265,7 +276,7 @@ function SessionSidebar({
             type="text"
             shape="circle"
             icon={<MenuUnfoldOutlined />}
-            onClick={() => setCollapsed(false)}
+            onClick={() => updateCollapsed(false)}
           />
         </Tooltip>
         <div className="w-full h-px my-1" style={{ backgroundColor: "var(--color-border)" }} />
@@ -320,7 +331,7 @@ function SessionSidebar({
           <Button
             type="text"
             icon={<MenuFoldOutlined />}
-            onClick={() => setCollapsed(true)}
+            onClick={() => updateCollapsed(true)}
           />
         </Tooltip>
       </div>

@@ -1,4 +1,5 @@
 import type {
+  OptionCampaign,
   OptionReviewDataQuality,
   OptionReviewReport,
   OptionUnderlyingReview,
@@ -69,6 +70,13 @@ export function sortUnderlyingReviews(items: OptionUnderlyingReview[]) {
     (a, b) =>
       Math.abs(b.net_premium_pnl) - Math.abs(a.net_premium_pnl) ||
       a.underlying.localeCompare(b.underlying),
+  );
+}
+
+export function sortOptionCampaigns(items: OptionCampaign[]) {
+  return [...items].sort(
+    (left, right) =>
+      right.expiry_date.localeCompare(left.expiry_date) || left.id.localeCompare(right.id),
   );
 }
 

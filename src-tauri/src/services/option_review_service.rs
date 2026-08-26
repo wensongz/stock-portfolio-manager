@@ -16,6 +16,7 @@ struct RawOptionRecord {
     option_type: String,
     action: String,
     code: String,
+    raw_quantity: i64,
     quantity: i64,
     amount: f64,
     commission: f64,
@@ -101,6 +102,7 @@ struct OptionCycle {
     open_record_id: String,
     underlying: String,
     option_symbol: String,
+    expiry_date: String,
     contracts: i64,
     option_type: String,
     opened_at: NaiveDate,
@@ -203,6 +205,7 @@ fn load_inputs(db: &Database, account_id: &str) -> Result<LoadedInputs, String> 
                 option_type: row.get(5)?,
                 action: row.get(6)?,
                 code: row.get(7)?,
+                raw_quantity: row.get(8)?,
                 quantity: row.get::<_, i64>(8)?.abs(),
                 amount: row.get(9)?,
                 commission: row.get(10)?,
@@ -388,7 +391,10 @@ fn cycle_from_match(
         open_record_id: open.record.id.clone(),
         underlying: open.record.underlying.clone(),
         option_symbol: open.record.option_symbol.clone(),
-        contracts: open.original_quantity,
+        expiry_date: parse_expiry_date(&open.record.expiry_date)
+            .map(|date| date.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| open.record.expiry_date.clone()),
+        contracts: open.record.raw_quantity,
         option_type: open.record.option_type.clone(),
         opened_at,
         ended_at,
@@ -593,6 +599,7 @@ fn campaign_from_cycles(
         id: format!("option-review:{account_id}:{underlying}:{open_record_id}"),
         underlying: underlying.to_string(),
         option_symbol: cycles[0].option_symbol.clone(),
+        expiry_date: cycles[0].expiry_date.clone(),
         contracts: cycles[0].contracts,
         started_at: started_at.format("%Y-%m-%d").to_string(),
         ended_at: ended_at.map(|date| date.format("%Y-%m-%d").to_string()),
@@ -1435,6 +1442,34 @@ mod tests {
             report.underlyings[0].campaigns[0].ended_at.as_deref(),
             Some("2026-07-30")
         );
+    }
+
+    #[test]
+    fn campaign_exposes_open_record_expiry_and_signed_quantity() {
+        let (db, account_id) = db_with_account();
+        insert_record(
+            &db,
+            "signed-open",
+            &account_id,
+            "1211 30SEP26 90 P",
+            "1211",
+            "30SEP26",
+            90.0,
+            "P",
+            "SELL",
+            "O",
+            -40,
+            77_200.0,
+            -218.0,
+            0.0,
+            Some("2026-04-09, 01:47:36"),
+        );
+
+        let report = fixed_review(&db, &account_id, None);
+        let campaign = &report.underlyings[0].campaigns[0];
+
+        assert_eq!(campaign.expiry_date, "2026-09-30");
+        assert_eq!(campaign.contracts, -40);
     }
 
     #[test]
@@ -2395,6 +2430,7 @@ mod tests {
             id: id.to_string(),
             underlying: "TEST".to_string(),
             option_symbol: "TEST 31DEC26 100 P".to_string(),
+            expiry_date: "2026-12-31".to_string(),
             contracts: 1,
             started_at: "2026-01-01".to_string(),
             ended_at: Some("2026-01-02".to_string()),

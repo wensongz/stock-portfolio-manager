@@ -36,6 +36,7 @@ import {
   saveOptionReviewPeriodDays,
   selectDefaultUnderlying,
   shouldShowNetPremium,
+  sortOptionCampaigns,
   sortUnderlyingReviews,
 } from "./optionReviewViewModel";
 
@@ -119,11 +120,7 @@ export default function OptionReviewTab() {
     [report, selectedSymbol],
   );
   const selectedCampaigns = useMemo(
-    () =>
-      [...(selectedUnderlying?.campaigns ?? [])].sort(
-        (left, right) =>
-          right.started_at.localeCompare(left.started_at) || left.id.localeCompare(right.id),
-      ),
+    () => sortOptionCampaigns(selectedUnderlying?.campaigns ?? []),
     [selectedUnderlying],
   );
 

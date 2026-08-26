@@ -11,6 +11,7 @@ import {
   saveOptionReviewPeriodDays,
   selectDefaultUnderlying,
   shouldShowNetPremium,
+  sortOptionCampaigns,
   sortUnderlyingReviews,
 } from "./optionReviewViewModel.ts";
 
@@ -112,6 +113,22 @@ test("underlyings sort by absolute net premium, then symbol", () => {
 test("default selection uses the largest absolute net premium", () => {
   const report = { underlyings: [underlying("MSFT", 500), underlying("AAPL", -200, ["净亏损"])] } as never;
   assert.equal(selectDefaultUnderlying(report), "MSFT");
+});
+
+test("campaigns sort by expiry descending, then id", () => {
+  const campaign = (id: string, expiryDate: string, startedAt: string) => ({
+    id,
+    expiry_date: expiryDate,
+    started_at: startedAt,
+  });
+
+  const sorted = sortOptionCampaigns([
+    campaign("later-id", "2026-09-30", "2026-08-01"),
+    campaign("earlier-expiry", "2026-08-28", "2026-08-20"),
+    campaign("earlier-id", "2026-09-30", "2026-08-15"),
+  ] as never);
+
+  assert.deepEqual(sorted.map((row) => row.id), ["earlier-id", "later-id", "earlier-expiry"]);
 });
 
 test("percentage formatter preserves negative values and missing state", () => {

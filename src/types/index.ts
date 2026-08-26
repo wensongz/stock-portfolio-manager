@@ -659,6 +659,7 @@ export interface OptionCampaign {
   id: string;
   underlying: string;
   option_symbol: string;
+  expiry_date: string;
   contracts: number;
   started_at: string;
   ended_at: string | null;

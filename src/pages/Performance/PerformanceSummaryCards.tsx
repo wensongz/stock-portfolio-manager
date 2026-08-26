@@ -53,7 +53,7 @@ export default function PerformanceSummaryCards({ summary, loading, currency = "
   const sharpe = summary?.sharpe_ratio ?? null;
   return (
     <Row gutter={[16, 16]}>
-      <Col xs={12} sm={8} md={6} lg={4}>
+      <Col xs={12} sm={8} md={6} lg={5}>
         <Card loading={loading} size="small">
           <Statistic
             title="总盈亏"
@@ -105,7 +105,7 @@ export default function PerformanceSummaryCards({ summary, loading, currency = "
           />
         </Card>
       </Col>
-      <Col xs={12} sm={8} md={6} lg={4}>
+      <Col xs={12} sm={8} md={6} lg={3}>
         <Card loading={loading} size="small">
           <Statistic
             title={

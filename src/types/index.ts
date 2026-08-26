@@ -658,6 +658,8 @@ export interface OptionUnderlyingReview {
 export interface OptionCampaign {
   id: string;
   underlying: string;
+  option_symbol: string;
+  contracts: number;
   started_at: string;
   ended_at: string | null;
   status: "completed" | "active";

@@ -62,6 +62,8 @@ pub struct OptionUnderlyingReview {
 pub struct OptionCampaign {
     pub id: String,
     pub underlying: String,
+    pub option_symbol: String,
+    pub contracts: i64,
     pub started_at: String,
     pub ended_at: Option<String>,
     pub status: String,

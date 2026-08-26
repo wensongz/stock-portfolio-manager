@@ -100,6 +100,8 @@ fn greatest_common_divisor(mut left: i128, mut right: i128) -> i128 {
 struct OptionCycle {
     open_record_id: String,
     underlying: String,
+    option_symbol: String,
+    contracts: i64,
     option_type: String,
     opened_at: NaiveDate,
     ended_at: Option<NaiveDate>,
@@ -385,6 +387,8 @@ fn cycle_from_match(
     OptionCycle {
         open_record_id: open.record.id.clone(),
         underlying: open.record.underlying.clone(),
+        option_symbol: open.record.option_symbol.clone(),
+        contracts: open.original_quantity,
         option_type: open.record.option_type.clone(),
         opened_at,
         ended_at,
@@ -588,6 +592,8 @@ fn campaign_from_cycles(
     OptionCampaign {
         id: format!("option-review:{account_id}:{underlying}:{open_record_id}"),
         underlying: underlying.to_string(),
+        option_symbol: cycles[0].option_symbol.clone(),
+        contracts: cycles[0].contracts,
         started_at: started_at.format("%Y-%m-%d").to_string(),
         ended_at: ended_at.map(|date| date.format("%Y-%m-%d").to_string()),
         status: if active { "active" } else { "completed" }.to_string(),
@@ -1008,7 +1014,7 @@ mod tests {
             "P",
             "SELL",
             "O",
-            1,
+            3,
             200.0,
             1.0,
             0.2,
@@ -1025,7 +1031,7 @@ mod tests {
             "P",
             "BUY",
             "C;Ep",
-            1,
+            3,
             0.0,
             0.5,
             0.1,
@@ -1040,6 +1046,9 @@ mod tests {
             report.underlyings[0].campaigns[0].strategy_path,
             vec!["CSP"]
         );
+        let campaign_json = serde_json::to_value(&report.underlyings[0].campaigns[0]).unwrap();
+        assert_eq!(campaign_json["option_symbol"], "AAPL 20FEB26 100 P");
+        assert_eq!(campaign_json["contracts"], 3);
     }
 
     #[test]
@@ -2385,6 +2394,8 @@ mod tests {
         OptionCampaign {
             id: id.to_string(),
             underlying: "TEST".to_string(),
+            option_symbol: "TEST 31DEC26 100 P".to_string(),
+            contracts: 1,
             started_at: "2026-01-01".to_string(),
             ended_at: Some("2026-01-02".to_string()),
             status: "completed".to_string(),

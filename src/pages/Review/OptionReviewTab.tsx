@@ -66,10 +66,6 @@ function describeDataQuality(dataQuality: OptionReviewDataQuality) {
   return descriptions.join("；");
 }
 
-function formatCampaignPeriod(campaign: OptionCampaign) {
-  return `${campaign.started_at} 至 ${campaign.ended_at ?? "今"}`;
-}
-
 export default function OptionReviewTab() {
   const navigate = useNavigate();
   const { accounts, loading: accountsLoading, fetchAccounts } = useAccountStore();
@@ -159,10 +155,10 @@ export default function OptionReviewTab() {
     );
 
   const underlyingColumns: ColumnsType<OptionUnderlyingReview> = [
-    { title: "标的", dataIndex: "underlying", width: 100 },
+    { title: "标的", dataIndex: "underlying", width: 90 },
     {
       title: "Campaign",
-      width: 180,
+      width: 160,
       render: (_: unknown, row: OptionUnderlyingReview) =>
         `${row.completed_campaigns} 完成 / ${row.active_campaigns} 进行中`,
     },
@@ -170,14 +166,14 @@ export default function OptionReviewTab() {
       title: OPTION_REVIEW_NET_PREMIUM_LABEL,
       dataIndex: "net_premium_pnl",
       align: "right",
-      width: 140,
+      width: 160,
       render: (value: number) => renderPnl(value),
     },
     {
       title: "留存率",
       dataIndex: "retention_rate",
       align: "right",
-      width: 100,
+      width: 80,
       render: (value: number | null, row) =>
         row.completed_campaigns > 0 ? renderPercent(value) : "—",
     },
@@ -185,7 +181,7 @@ export default function OptionReviewTab() {
       title: OPTION_REVIEW_ANNUALIZED_YIELD_LABEL,
       dataIndex: "annualized_yield_on_notional",
       align: "right",
-      width: 120,
+      width: 140,
       render: (value: number | null, row) =>
         row.completed_campaigns > 0 ? renderPercent(value) : "—",
     },
@@ -220,20 +216,20 @@ export default function OptionReviewTab() {
 
   const campaignColumns: ColumnsType<OptionCampaign> = [
     {
-      title: "期间",
-      width: 210,
-      render: (_: unknown, campaign) => formatCampaignPeriod(campaign),
+      title: "期权标识",
+      dataIndex: "option_symbol",
+      width: 175,
     },
     {
-      title: "策略路径",
-      dataIndex: "strategy_path",
-      width: 190,
-      render: (path: string[]) => path.join(" → ") || "—",
+      title: "合约数",
+      dataIndex: "contracts",
+      align: "right",
+      width: 80,
     },
     {
       title: "状态",
       dataIndex: "status",
-      width: 90,
+      width: 60,
       render: (status: OptionCampaign["status"]) =>
         status === "active" ? <Tag color="orange">进行中</Tag> : <Tag>已完成</Tag>,
     },
@@ -241,21 +237,21 @@ export default function OptionReviewTab() {
       title: "毛权利金",
       dataIndex: "gross_premium",
       align: "right",
-      width: 140,
+      width: 100,
       render: (value: number) => formatCurrency(value, currency),
     },
     {
       title: "买回成本",
       dataIndex: "close_cost",
       align: "right",
-      width: 140,
+      width: 100,
       render: (value: number) => formatCurrency(value, currency),
     },
     {
       title: "费用",
       dataIndex: "fees",
       align: "right",
-      width: 120,
+      width: 100,
       render: (value: number) => formatCurrency(value, currency),
     },
     {
@@ -269,7 +265,7 @@ export default function OptionReviewTab() {
       title: "留存率",
       dataIndex: "retention_rate",
       align: "right",
-      width: 100,
+      width: 80,
       render: (value: number | null, campaign) =>
         campaign.status === "active" ? "—" : renderPercent(value),
     },
@@ -277,7 +273,7 @@ export default function OptionReviewTab() {
       title: OPTION_REVIEW_ANNUALIZED_YIELD_LABEL,
       dataIndex: "annualized_yield_on_notional",
       align: "right",
-      width: 120,
+      width: 150,
       render: (value: number | null, campaign) =>
         campaign.status === "active" ? "—" : renderPercent(value),
     },
@@ -285,7 +281,6 @@ export default function OptionReviewTab() {
 
   const hasCompletedCampaigns = (report?.summary.completed_campaigns ?? 0) > 0;
   const hasNetPremium = report ? shouldShowNetPremium(report.summary) : false;
-  const worstCampaign = report?.summary.worst_campaign ?? null;
   const dataQualityNotice = report ? (
     <Alert
       type="info"
@@ -345,7 +340,7 @@ export default function OptionReviewTab() {
       {accountId && !loading && report && report.underlyings.length > 0 ? (
         <>
           <Row gutter={[16, 16]}>
-            <Col xs={24} sm={12} xl={6}>
+            <Col xs={24} sm={12} xl={8}>
               <Card>
                 <Statistic
                   title={OPTION_REVIEW_NET_PREMIUM_LABEL}
@@ -364,7 +359,7 @@ export default function OptionReviewTab() {
                 />
               </Card>
             </Col>
-            <Col xs={24} sm={12} xl={6}>
+            <Col xs={24} sm={12} xl={8}>
               <Card>
                 <Statistic
                   title="留存率"
@@ -384,7 +379,7 @@ export default function OptionReviewTab() {
                 />
               </Card>
             </Col>
-            <Col xs={24} sm={12} xl={6}>
+            <Col xs={24} sm={12} xl={8}>
               <Card>
                 <Statistic
                   title={OPTION_REVIEW_ANNUALIZED_YIELD_LABEL}
@@ -403,31 +398,6 @@ export default function OptionReviewTab() {
                     },
                   }}
                 />
-              </Card>
-            </Col>
-            <Col xs={24} sm={12} xl={6}>
-              <Card>
-                <Statistic
-                  title="最差Campaign"
-                  value={
-                    hasCompletedCampaigns && worstCampaign
-                      ? formatCurrency(worstCampaign.net_premium_pnl, report.currency)
-                      : "—"
-                  }
-                  styles={{
-                    content: {
-                      color:
-                        hasCompletedCampaigns && worstCampaign
-                          ? pnlColorDark(worstCampaign.net_premium_pnl)
-                          : undefined,
-                    },
-                  }}
-                />
-                {hasCompletedCampaigns && worstCampaign ? (
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    {worstCampaign.underlying} · {worstCampaign.started_at} 至 {worstCampaign.ended_at}
-                  </Text>
-                ) : null}
               </Card>
             </Col>
           </Row>
@@ -464,7 +434,7 @@ export default function OptionReviewTab() {
                 columns={campaignColumns}
                 dataSource={selectedCampaigns}
                 pagination={false}
-                scroll={{ x: 1250 }}
+                scroll={{ x: 1060 }}
               />
             </Card>
           ) : null}

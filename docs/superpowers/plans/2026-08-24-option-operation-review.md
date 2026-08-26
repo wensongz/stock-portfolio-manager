@@ -287,11 +287,11 @@ let fees = (open.commission.abs() + open.fee.abs()) * open_fraction
     + (close.commission.abs() + close.fee.abs()) * close_fraction;
 ```
 
-上面的一比一数量适用于相同期权标识。跨标识拆股匹配必须使用适用的 `ratio_from:ratio_to` 把双方数量换算为同一敞口单位，以有理数或整数敞口安全保存剩余数量，并分别用实际消耗的开仓数量和结束数量计算两端分摊比例；不得直接对未调整张数取 `min`。
+上面的一比一张数配对同时适用于相同期权标识和拆股调整后的跨标识匹配。跨标识时使用适用的 `ratio_from:ratio_to` 只校验调整后执行价，与期权管理保持一致，不按拆股比例缩放期权合约张数；双方按实际消耗张数分别计算金额和费用的分摊比例。
 
 从DB读取后把 `quantity.abs()` 归一化为正数匹配数量；按 `traded_at`、同时间戳SELL优先于BUY、最后按 `id` 稳定排序，确保导入顺序不改变FIFO结果。部分匹配后的开仓余量必须用同样的比例分摊为active周期，不得丢弃。
 
-完全未匹配的开仓生成 `status = "active"` 周期。`unmatched_records` 统计“存在任何未匹配数量的结束记录数”，使用record ID去重，不把一条2张的记录计为2条。缺交易日期的记录增加 `missing_trade_dates` 并排除。拆股跨标识匹配只有在候选开仓唯一时才执行；出现多个同样可能的开仓时归入 `unmatched_records`，不猜测。
+完全未匹配的开仓生成 `status = "active"` 周期。`unmatched_records` 统计“存在任何未匹配数量的结束记录数”，使用record ID去重，不把一条2张的记录计为2条。缺交易日期的记录增加 `missing_trade_dates` 并排除。拆股跨标识匹配按开仓时间FIFO遍历所有有效候选，因此一个结束记录可以依次关闭多个开仓Campaign；遍历后仍有剩余张数才归入 `unmatched_records`。
 
 测试一律给 `get_option_review_at` 的 `today` 参数传 `NaiveDate::from_ymd_opt(2026, 8, 24).unwrap()`，避免“最近365天”随实际日期漂移。`load_inputs` 对不存在的账户返回错误，对存在但没有期权记录的账户返回空报告。
 
@@ -340,8 +340,9 @@ let annualized = safe_ratio(net * 365.0, capital_days);
 | `active_campaign_is_excluded_from_summary` | 一个已结束Put与7天内的未结束Put | `summary.completed=0`、`summary.active=1`、Campaign三个比率/损益字段为 `None` |
 | `completed_period_filter_uses_end_date_but_keeps_active` | 已完成Campaign于2025-01-01结束，另一未结束Campaign于2025-01-01开始，`period_days=365` | 旧completed不返回，旧active仍返回 |
 | `missing_dates_and_unmatched_closes_are_reported` | 1条 `traded_at=NULL` 开仓 + 1条无对应开仓的BUY | `missing_trade_dates=1`、`unmatched_records=1`，两者不进入Campaign |
-| `forward_split_close_conserves_both_record_allocations` | 配置1:2拆股；`BRK B 16JUN23 330 C` SELL 1张与`BRK B 16JUN23 165 C` BUY 2张 | 1个已完成Campaign、`unmatched_records=0`，gross/close/fees/net完整守恒 |
-| `reverse_split_close_conserves_both_record_allocations` | 配置2:1反向拆股；`BRK B 31DEC26 165 C` SELL 2张与`BRK B 31DEC26 330 C` BUY 1张 | 1个已完成Campaign、`unmatched_records=0`，gross/close/fees/net完整守恒 |
+| `forward_split_close_conserves_both_record_allocations` | 配置1:2拆股；`BRK B 16JUN23 330 C` SELL 1张与`BRK B 16JUN23 165 C` BUY 1张 | 1个已完成Campaign、`unmatched_records=0`，gross/close/fees/net完整守恒 |
+| `reverse_split_close_conserves_both_record_allocations` | 配置2:1反向拆股；`BRK B 31DEC26 165 C` SELL 1张与`BRK B 31DEC26 330 C` BUY 1张 | 1个已完成Campaign、`unmatched_records=0`，gross/close/fees/net完整守恒 |
+| `split_adjusted_close_matches_multiple_open_campaigns_fifo_without_scaling_contracts` | 配置1211 1:3拆股；两个拆股前开仓合计12张与拆股后平仓12张 | 2个已完成Campaign、`unmatched_records=0`，金额与费用按张数守恒 |
 | `underlying_and_account_totals_equal_campaign_sums` | AAPL和MSFT各2个已完成Campaign | 账户gross/net与个股再与Campaign求和一致 |
 | `fact_flags_follow_threshold_boundaries` | 分别构造3个Campaign且留存率恰好70%、恰好40%；正收益中位数100、最差-300与-300.01 | 70%包含`高留存`，40%不包含`低留存`，-300不标记而-300.01标记`单次损失较大` |
 

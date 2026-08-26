@@ -82,28 +82,6 @@ impl ContractQuantity {
         Self::new(numerator, denominator)
     }
 
-    fn checked_mul_ratio(self, numerator: i64, denominator: i64) -> Option<Self> {
-        if numerator <= 0 || denominator <= 0 {
-            return None;
-        }
-        let mut left_numerator = self.numerator;
-        let mut left_denominator = self.denominator;
-        let mut right_numerator = i128::from(numerator);
-        let mut right_denominator = i128::from(denominator);
-
-        let first_divisor = greatest_common_divisor(left_numerator, right_denominator);
-        left_numerator /= first_divisor;
-        right_denominator /= first_divisor;
-        let second_divisor = greatest_common_divisor(right_numerator, left_denominator);
-        right_numerator /= second_divisor;
-        left_denominator /= second_divisor;
-
-        Self::new(
-            left_numerator.checked_mul(right_numerator)?,
-            left_denominator.checked_mul(right_denominator)?,
-        )
-    }
-
     fn as_f64(self) -> f64 {
         self.numerator as f64 / self.denominator as f64
     }
@@ -139,12 +117,6 @@ struct SplitInput {
     split_date: NaiveDate,
     ratio_from: i64,
     ratio_to: i64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SplitRatio {
-    from: i64,
-    to: i64,
 }
 
 pub fn get_option_review(
@@ -342,24 +314,20 @@ fn close_status(code: &str) -> &'static str {
     }
 }
 
-fn split_ratio(
-    open: &OpenLot,
-    close: &RawOptionRecord,
-    splits: &[SplitInput],
-) -> Option<SplitRatio> {
+fn has_split_match(open: &OpenLot, close: &RawOptionRecord, splits: &[SplitInput]) -> bool {
     if open.record.underlying != close.underlying
         || open.record.expiry_date != close.expiry_date
         || open.record.option_type != close.option_type
     {
-        return None;
+        return false;
     }
     let Some(expiry) = parse_expiry_date(&close.expiry_date) else {
-        return None;
+        return false;
     };
     let (Some(opened_at), Some(closed_at)) = (open.record.trade_date, close.trade_date) else {
-        return None;
+        return false;
     };
-    splits.iter().find_map(|split| {
+    splits.iter().any(|split| {
         if split.stock_code != open.record.underlying
             || split.split_date <= opened_at
             || split.split_date > closed_at
@@ -367,28 +335,21 @@ fn split_ratio(
             || split.ratio_from <= 0
             || split.ratio_to <= 0
         {
-            return None;
+            return false;
         }
         let ratio = split.ratio_to as f64 / split.ratio_from as f64;
         let expected_strike = open.record.strike_price / ratio;
-        (expected_strike > 0.0
-            && (close.strike_price - expected_strike).abs() / expected_strike <= 0.02)
-            .then_some(SplitRatio {
-                from: split.ratio_from,
-                to: split.ratio_to,
-            })
+        expected_strike > 0.0
+            && (close.strike_price - expected_strike).abs() / expected_strike <= 0.02
     })
 }
 
 fn matched_quantities(
     open_remaining: ContractQuantity,
     close_remaining: ContractQuantity,
-    ratio: SplitRatio,
 ) -> Option<(ContractQuantity, ContractQuantity)> {
-    let close_in_open_contracts = close_remaining.checked_mul_ratio(ratio.from, ratio.to)?;
-    let matched_open = open_remaining.checked_min(close_in_open_contracts)?;
-    let matched_close = matched_open.checked_mul_ratio(ratio.to, ratio.from)?;
-    Some((matched_open, matched_close))
+    let matched = open_remaining.checked_min(close_remaining)?;
+    Some((matched, matched))
 }
 
 fn cycle_from_match(
@@ -492,11 +453,9 @@ fn pair_cycles_fifo(
                 break;
             }
             let open = &mut opens[index];
-            let Some((matched_open, matched_close)) = matched_quantities(
-                open.remaining_quantity,
-                remaining_quantity,
-                SplitRatio { from: 1, to: 1 },
-            ) else {
+            let Some((matched_open, matched_close)) =
+                matched_quantities(open.remaining_quantity, remaining_quantity)
+            else {
                 unmatched_close_ids.insert(record.id.clone());
                 continue 'record_loop;
             };
@@ -523,18 +482,18 @@ fn pair_cycles_fifo(
             let candidates: Vec<_> = opens
                 .iter()
                 .enumerate()
-                .filter_map(|(index, open)| {
-                    (open.remaining_quantity.is_positive())
-                        .then(|| split_ratio(open, &record, splits))
-                        .flatten()
-                        .map(|ratio| (index, ratio))
+                .filter(|(_, open)| {
+                    open.remaining_quantity.is_positive() && has_split_match(open, &record, splits)
                 })
+                .map(|(index, _)| index)
                 .collect();
-            if candidates.len() == 1 {
-                let (index, ratio) = candidates[0];
+            for index in candidates {
+                if !remaining_quantity.is_positive() {
+                    break;
+                }
                 let open = &mut opens[index];
                 let Some((matched_open, matched_close)) =
-                    matched_quantities(open.remaining_quantity, remaining_quantity, ratio)
+                    matched_quantities(open.remaining_quantity, remaining_quantity)
                 else {
                     unmatched_close_ids.insert(record.id.clone());
                     continue 'record_loop;
@@ -2002,6 +1961,108 @@ mod tests {
     }
 
     #[test]
+    fn split_adjusted_close_matches_multiple_open_campaigns_fifo_without_scaling_contracts() {
+        let (db, account_id) = db_with_account();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO stock_splits
+                 (stock_code, split_date, ratio_from, ratio_to, created_at)
+                 VALUES ('1211', '2025-06-10', 1, 3, '2025-06-10')",
+                [],
+            )
+            .unwrap();
+        }
+        insert_record(
+            &db,
+            "byd-open-8",
+            &account_id,
+            "1211 27JUN25 250 P",
+            "1211",
+            "27JUN25",
+            250.0,
+            "P",
+            "SELL",
+            "O",
+            8,
+            800.0,
+            8.0,
+            0.8,
+            Some("2024-10-14"),
+        );
+        insert_record(
+            &db,
+            "byd-open-4",
+            &account_id,
+            "1211 27JUN25 250 P",
+            "1211",
+            "27JUN25",
+            250.0,
+            "P",
+            "SELL",
+            "O",
+            4,
+            400.0,
+            4.0,
+            0.4,
+            Some("2025-01-02"),
+        );
+        insert_record(
+            &db,
+            "byd-close-12",
+            &account_id,
+            "1211 27JUN25 83.33 P",
+            "1211",
+            "27JUN25",
+            83.33,
+            "P",
+            "BUY",
+            "C;Ep",
+            12,
+            120.0,
+            12.0,
+            1.2,
+            Some("2025-06-27"),
+        );
+
+        let report = fixed_review(&db, &account_id, None);
+
+        assert_eq!(report.data_quality.unmatched_records, 0);
+        assert_eq!(report.summary.completed_campaigns, 2);
+        assert_eq!(report.summary.active_campaigns, 0);
+        let campaigns = &report.underlyings[0].campaigns;
+        assert_eq!(campaigns.len(), 2);
+        assert!(
+            (campaigns
+                .iter()
+                .map(|campaign| campaign.gross_premium)
+                .sum::<f64>()
+                - 1200.0)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (campaigns
+                .iter()
+                .map(|campaign| campaign.close_cost)
+                .sum::<f64>()
+                - 120.0)
+                .abs()
+                < 1e-9
+        );
+        assert!((campaigns.iter().map(|campaign| campaign.fees).sum::<f64>() - 26.4).abs() < 1e-9);
+        assert!(
+            (campaigns
+                .iter()
+                .map(|campaign| campaign.net_premium_pnl.unwrap())
+                .sum::<f64>()
+                - 1053.6)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
     fn forward_split_close_conserves_both_record_allocations() {
         let (db, account_id) = db_with_account();
         {
@@ -2042,7 +2103,7 @@ mod tests {
             "C",
             "BUY",
             "C;Ep",
-            2,
+            1,
             80.0,
             0.8,
             0.2,
@@ -2091,7 +2152,7 @@ mod tests {
             "C",
             "SELL",
             "O",
-            2,
+            1,
             400.0,
             2.0,
             0.4,
@@ -2157,7 +2218,7 @@ mod tests {
             "C",
             "SELL",
             "O",
-            1,
+            2,
             200.0,
             2.0,
             0.0,
@@ -2199,105 +2260,6 @@ mod tests {
         assert!((active.gross_premium - 100.0).abs() < 1e-9);
         assert!((active.close_cost - 0.0).abs() < 1e-9);
         assert!((active.fees - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn split_remainder_overflow_is_unmatched_and_leaves_open_state_atomic() {
-        let (db, account_id) = db_with_account();
-        let first_denominator = 1_000_003_i64;
-        let second_factor = 1_000_033_i64;
-        let second_denominator = first_denominator * second_factor;
-        let third_denominator = 1_000_000_000_000_000_003_i64;
-        let fourth_denominator = 2_000_000_000_000_000_033_i64;
-        let open_strike = 1_000_000_000_000_000_000_f64;
-        let split_closes = [
-            (
-                "2026-01-02",
-                first_denominator - 1,
-                first_denominator,
-                "2026-01-03",
-                10.0,
-            ),
-            (
-                "2026-01-04",
-                second_factor - 1,
-                second_denominator,
-                "2026-01-05",
-                20.0,
-            ),
-            ("2026-01-06", 1, third_denominator, "2026-01-07", 30.0),
-            ("2026-01-08", 1, fourth_denominator, "2026-01-09", 40.0),
-        ];
-
-        insert_record(
-            &db,
-            "overflow-open",
-            &account_id,
-            "OVERFLOW OPEN C",
-            "OVERFLOW",
-            "31DEC26",
-            open_strike,
-            "C",
-            "SELL",
-            "O",
-            1,
-            100.0,
-            0.0,
-            0.0,
-            Some("2026-01-01"),
-        );
-        for (index, (split_date, ratio_from, ratio_to, close_date, amount)) in
-            split_closes.into_iter().enumerate()
-        {
-            let conn = db.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO stock_splits
-                 (stock_code, split_date, ratio_from, ratio_to, created_at)
-                 VALUES ('OVERFLOW', ?1, ?2, ?3, ?1)",
-                rusqlite::params![split_date, ratio_from, ratio_to],
-            )
-            .unwrap();
-            drop(conn);
-            insert_record(
-                &db,
-                &format!("overflow-close-{index}"),
-                &account_id,
-                &format!("OVERFLOW CLOSE {index} C"),
-                "OVERFLOW",
-                "31DEC26",
-                open_strike * ratio_from as f64 / ratio_to as f64,
-                "C",
-                "BUY",
-                "C;P",
-                1,
-                amount,
-                0.0,
-                0.0,
-                Some(close_date),
-            );
-        }
-
-        let (_, records, share_lots, splits) = load_inputs(&db, &account_id).unwrap();
-        let (cycles, quality) = pair_cycles_fifo(records, &share_lots, &splits, today());
-
-        assert_eq!(quality.unmatched_records, 1);
-        assert_eq!(cycles.len(), 4);
-        assert_eq!(
-            cycles
-                .iter()
-                .filter(|cycle| cycle.status == "closed")
-                .count(),
-            3
-        );
-        assert_eq!(
-            cycles
-                .iter()
-                .filter(|cycle| cycle.status == "active")
-                .count(),
-            1
-        );
-        assert!((cycles.iter().map(|cycle| cycle.close_cost).sum::<f64>() - 60.0).abs() < 1e-9);
-        assert!((cycles.iter().map(|cycle| cycle.gross_premium).sum::<f64>() - 100.0).abs() < 1e-9);
     }
 
     #[test]

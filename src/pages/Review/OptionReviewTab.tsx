@@ -175,10 +175,10 @@ export default function OptionReviewTab() {
         row.completed_campaigns > 0 ? renderPercent(value) : "—",
     },
     {
-      title: OPTION_REVIEW_ANNUALIZED_YIELD_LABEL,
+      title: "年化收益率",
       dataIndex: "annualized_yield_on_notional",
       align: "right",
-      width: 140,
+      width: 90,
       render: (value: number | null, row) =>
         row.completed_campaigns > 0 ? renderPercent(value) : "—",
     },
@@ -216,6 +216,7 @@ export default function OptionReviewTab() {
       title: "期权标识",
       dataIndex: "option_symbol",
       width: 175,
+      fixed: "left",
     },
     {
       title: "合约数",
@@ -259,18 +260,18 @@ export default function OptionReviewTab() {
       render: (value: number | null) => (value == null ? "—" : renderPnl(value)),
     },
     {
-      title: "留存率",
-      dataIndex: "retention_rate",
+      title: "年化收益率",
+      dataIndex: "annualized_yield_on_notional",
       align: "right",
-      width: 80,
+      width: 90,
       render: (value: number | null, campaign) =>
         campaign.status === "active" ? "—" : renderPercent(value),
     },
     {
-      title: OPTION_REVIEW_ANNUALIZED_YIELD_LABEL,
-      dataIndex: "annualized_yield_on_notional",
+      title: "留存率",
+      dataIndex: "retention_rate",
       align: "right",
-      width: 150,
+      width: 80,
       render: (value: number | null, campaign) =>
         campaign.status === "active" ? "—" : renderPercent(value),
     },
@@ -280,10 +281,15 @@ export default function OptionReviewTab() {
   const hasNetPremium = report ? shouldShowNetPremium(report.summary) : false;
   const dataQualityNotice = report ? (
     <Alert
+      className="option-review-quality-notice"
       type="info"
       showIcon
-      title="数据质量说明"
-      description={describeDataQuality(report.data_quality)}
+      title={
+        <span>
+          <strong>数据质量说明：</strong>
+          {describeDataQuality(report.data_quality)}
+        </span>
+      }
     />
   ) : null;
 
@@ -292,6 +298,16 @@ export default function OptionReviewTab() {
       <style>{`
         .option-review-selected-row > td {
           background: color-mix(in srgb, var(--color-info) 12%, transparent) !important;
+        }
+        .option-review-compact-table th,
+        .option-review-compact-table td {
+          white-space: nowrap;
+        }
+        .option-review-compact-table .ant-space {
+          flex-wrap: nowrap !important;
+        }
+        .option-review-quality-notice {
+          padding: 6px 12px;
         }
       `}</style>
       <Space wrap>
@@ -401,12 +417,14 @@ export default function OptionReviewTab() {
 
           {dataQualityNotice}
 
-          <Card title="个股汇总" style={{ overflow: "hidden" }}>
+          <Card title="个股期权汇总" style={{ overflow: "hidden" }}>
             <Table<OptionUnderlyingReview>
+              className="option-review-compact-table"
               rowKey="underlying"
               columns={underlyingColumns}
               dataSource={sortedUnderlyings}
               pagination={false}
+              size="small"
               scroll={{ x: 980 }}
               rowClassName={(row) =>
                 row.underlying === selectedSymbol ? "option-review-selected-row" : ""
@@ -427,10 +445,12 @@ export default function OptionReviewTab() {
               style={{ overflow: "hidden" }}
             >
               <Table<OptionCampaign>
+                className="option-review-compact-table"
                 rowKey="id"
                 columns={campaignColumns}
                 dataSource={selectedCampaigns}
                 pagination={false}
+                size="small"
                 scroll={{ x: 1060 }}
               />
             </Card>

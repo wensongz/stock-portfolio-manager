@@ -1,255 +1,247 @@
 # Stock Portfolio Manager
 
-A desktop application for managing personal stock portfolios across US, CN (A-shares), and HK markets. 
-It can run on MacOS, Windows and Linux.
+**简体中文** | [English](README_EN.md)
 
-Built with **Tauri 2.0** + **React 19** + **TypeScript** + **Rust** + **SQLite**.
+一个面向个人投资者与小型投资机构的本地优先桌面投资组合管理工具，统一管理美股、A 股和港股的多账户持仓、交易、绩效与投资复盘。
 
-## ✨ Features
+支持平台：**macOS / Windows / Linux**
 
-### Phase 1 — 基础框架 & 数据管理
-- 📊 Multi-account portfolio management across US / CN / HK markets
-- 🗂️ Investment category management (4 system presets + custom)
-- 📈 Holdings management (add/edit/delete positions)
-- 💱 Transaction recording (BUY/SELL with automatic avg cost calculation)
-- 🖥️ Dashboard overview
+项目基于 **Tauri 2 + React 19 + TypeScript + Rust + SQLite**。组合数据、配置和 AI 会话默认保存在本机；行情、汇率及已配置的 AI 服务需要联网访问。当前采用单机数据模式，适合独立投资者，以及暂不需要复杂成员权限或云端协作的小型投资团队。
 
-### Phase 2 — 实时数据集成
-- 📡 Real-time stock quotes (Yahoo Finance for US/HK, Tencent Finance for CN A-shares)
-- 💱 Real-time exchange rates (USD/CNY/HKD) with caching
-- 📸 Daily portfolio snapshot auto-collection (market value, cost, P&L)
-- ⏱️ Configurable refresh intervals
+## ✨ 功能概览
 
-### Phase 3 — 仓位统计与可视化
-- 📊 Dashboard with summary cards (total value, cost, P&L, daily change)
-- 🥧 Pie charts — asset allocation by market / category / account
-- 📊 Bar charts — P&L comparison across holdings
-- 📈 Line charts — portfolio value trend over time
-- 🔍 Multi-dimensional statistics: overall / by market / by account / by category
+### 账户、持仓与交易
 
-### Phase 4 — Performance Analysis（绩效分析）
-- 📐 TWR (Time-Weighted Return) & annualized return calculation
-- 📈 Return curve with customizable time range (1W / 1M / 3M / 6M / YTD / 1Y / ALL)
-- 🏦 Benchmark comparison (S&P 500, NASDAQ, CSI 300, Hang Seng Index)
-- 📉 Maximum drawdown analysis with drawdown area chart
-- 🧩 Return attribution (by market / category / holding — waterfall & treemap charts)
-- 📅 Monthly returns heatmap table
-- 🏆 Top/Bottom 10 holding performance ranking
-- ⚠️ Risk metrics: volatility, Sharpe ratio, Calmar ratio
+- 美股、A 股、港股多市场、多证券账户管理
+- 4 个系统投资类别（现金类、分红股、成长股、套利）及自定义类别
+- 持仓新增、编辑、删除、筛选和实时盈亏展示
+- 支持 `BUY` / `SELL` / `OPEN` / `PAY` 交易，自动维护持仓数量与平均成本
+- 支持现金存入、提取及余额校验，可按市场设置卖出/分红是否调整持仓成本
+- 持仓和交易列表会记住账户筛选、分页大小等界面偏好
 
-### Phase 5 — 季度分析与持仓思考
-- 📸 Quarterly snapshot (auto/manual creation)
-- 🔄 Quarter-over-quarter comparison (value, cost, P&L, holding changes)
-- 📝 Per-holding investment notes (buy/sell/hold reasoning per quarter)
-- 📋 Quarterly overall summary (Markdown editor)
-- 📈 Multi-quarter trend charts (stacked area, bar, line)
+### 行情、仪表盘与统计分析
 
-### Phase 6 — 增强功能 & 优化
-- 📥📤 Data import/export (CSV/Excel) with validation & preview
-- 📄 Quarterly report export (Markdown / PDF)
-- 🔔 Price alerts & notifications (price threshold, change %, P&L triggers)
-- 🔍 Historical decision review & tracking (per-stock timeline, decision quality stats)
-- 🤖 AI-powered investment analysis (OpenAI integration, portfolio analysis, risk assessment)
-- ⚡ AI assistant skills (Markdown skill files with auto/manual activation — see [docs/skills.md](docs/skills.md))
+- 可按市场选择雪球、东方财富或 Yahoo Finance 行情源，并提供缓存与失败回退
+- 启动后后台刷新持仓行情，保留最近一次行情及刷新时间
+- USD / CNY / HKD 实时汇率、持久化缓存与本位币换算
+- 仪表盘展示总市值、成本、累计盈亏、当日盈亏和持仓明细
+- 按市场、账户、投资类别查看资产分布、盈亏和个股明细
+- 支持红涨绿跌 / 绿涨红跌以及浅色 / 深色 / 跟随系统主题
 
-## Tech Stack
+### 绩效与季度分析
 
-| Layer | Technology |
-|-------|-----------|
-| Desktop Framework | Tauri 2.0 |
-| Frontend | React 19 + TypeScript + Vite |
-| Styling | TailwindCSS + Ant Design |
-| Charts | ECharts (echarts-for-react) |
-| State Management | Zustand |
-| Backend | Rust (Tauri Core) |
-| Database | SQLite (rusqlite) |
-| HTTP Client | reqwest |
-| Async Runtime | tokio |
-| Date Handling | chrono (Rust) / dayjs (Frontend) |
+- 时间加权收益率（TWR）、累计/年化收益、波动率、夏普比率和 Calmar 比率
+- 自定义时间范围的收益曲线，并与 S&P 500、NASDAQ、沪深 300、上证指数、恒生指数对比
+- 最大回撤、收益归因、月度收益、持仓 Top/Bottom 排名
+- 自动补齐缺失的历史持仓快照，支持每日组合与持仓快照
+- 季度快照创建/刷新、季度对比、多季度趋势及季度交易回顾
+- 持仓投资笔记、季度总结和历史笔记时间线
 
-## Project Structure
+### 分红、期权与操作复盘
 
-```
+- 按年份、市场、账户和标的汇总 `PAY` 类型的分红/利息记录
+- 期权 CSV 导入/导出、持仓与已到期合约统计、Sell Put / Sell Call 模拟
+- 支持中英文字段名、期权合约状态校验、拆股比例与每张合约股数配置
+- 股票操作复盘：按季度快照查看历史决策并标记决策质量
+- 期权操作复盘：按 Campaign 匹配开平仓，分析权利金、留存率、担保名义资本口径年化收益率、最差 Campaign 和数据质量
+- 可将确定性的期权复盘结果一键交给 AI 助手继续分析
+
+### 导入、提醒与数据安全
+
+- 通用 CSV 导入/导出，以及 Interactive Brokers、Moomoo、Firstrade、同花顺等格式的持仓/交易导入
+- A 股交易截图 OCR 导入，导入前可预览与校验
+- 价格、涨跌幅和持仓盈亏阈值提醒规则及触发状态管理
+- SQLite 手动备份；可在应用启动时按数据库变更和时间间隔自动备份
+- 设置页提供恢复出厂设置，可清空数据库与本地界面偏好
+
+### AI 助手（实验性）
+
+- 流式对话、多会话管理、会话持久化、自动标题和 token 用量展示
+- 支持 OpenAI、Anthropic Claude、Ollama、OpenRouter、Kimi、GLM、MiMo 和 DeepSeek
+- 可选择是否注入当前组合快照，并通过内置工具查询行情、持仓、交易、绩效、分红和期权数据
+- 展示推理内容与工具调用卡片，支持 Markdown、GFM 表格和代码高亮
+- Markdown 技能支持关键词自动激活、`/` 手动激活、创建、编辑、克隆、导入/导出和恢复内置版本
+
+AI 功能需要在 **设置 → AI 配置** 中选择提供商和模型；除本地 Ollama 外，通常还需要自行提供 API Key。详见 [AI 助手工具](docs/ai-tools.md) 与 [AI 助手技能](docs/skills.md)。
+
+## 技术栈
+
+| 层 | 技术 |
+| --- | --- |
+| 桌面框架 | Tauri 2 |
+| 前端 | React 19 + TypeScript 7 + Vite 8 |
+| UI 与样式 | Ant Design 6 + Tailwind CSS 4 |
+| 图表 | ECharts 6 + echarts-for-react |
+| 状态管理 | Zustand 5 |
+| 后端 | Rust 1.97.1（Tauri Core） |
+| 数据库 | SQLite + rusqlite |
+| 网络与异步 | reqwest + tokio |
+| 日期处理 | chrono（Rust）+ dayjs（前端） |
+
+## 项目结构
+
+```text
 stock-portfolio-manager/
-├── src-tauri/                        # Rust backend (Tauri Core)
-│   ├── src/
-│   │   ├── main.rs                   # Entry point
-│   │   ├── lib.rs                    # App setup + command registration
-│   │   ├── db/                       # Database init & migrations
-│   │   ├── models/                   # Data models
-│   │   ├── commands/                 # Tauri IPC commands
-│   │   ├── services/                 # Business logic services
-│   │   │   ├── quote_service.rs      # Real-time stock quotes
-│   │   │   ├── exchange_rate_service.rs  # Exchange rates
-│   │   │   ├── snapshot_service.rs   # Daily & quarterly snapshots
-│   │   │   ├── performance_service.rs    # Performance analysis
-│   │   │   └── ai_service.rs         # AI analysis
-│   │   └── utils/
-│   └── Cargo.toml
-├── src/                              # React frontend
+├── src/                              # React 前端
 │   ├── pages/
-│   │   ├── Dashboard/                # Overview dashboard
-│   │   ├── Accounts/                 # Account management
-│   │   ├── Holdings/                 # Holdings management
-│   │   ├── Transactions/             # Transaction records
-│   │   ├── Categories/               # Category management
-│   │   ├── Statistics/               # Multi-dimensional statistics
-│   │   ├── Performance/              # Performance analysis
-│   │   ├── Quarterly/                # Quarterly analysis & notes
-│   │   ├── Review/                   # Historical decision review
-│   │   ├── Alerts/                   # Price alerts
-│   │   ├── Import/                   # Data import
-│   │   ├── AI/                       # AI analysis
-│   │   └── Settings/                 # App settings
-│   ├── components/
-│   │   ├── charts/                   # Reusable chart components (Pie, Bar, Line, etc.)
-│   │   └── layout/                   # Layout components
-│   ├── hooks/                        # Custom React hooks
-│   ├── stores/                       # Zustand state stores
-│   ├── types/                        # TypeScript type definitions
-│   ├── utils/                        # Utility functions
-│   └── styles/                       # Global CSS
+│   │   ├── Dashboard/                # 仪表盘
+│   │   ├── Statistics/               # 多维统计
+│   │   ├── Performance/              # 绩效分析
+│   │   ├── Quarterly/                # 季度快照、对比与笔记
+│   │   ├── Accounts/                 # 证券账户
+│   │   ├── Holdings/                 # 持仓管理与券商 CSV 导入
+│   │   ├── Transactions/             # 交易、现金流、CSV/OCR 导入
+│   │   ├── Dividends/                # 分红分析
+│   │   ├── Options/                  # 期权管理与统计
+│   │   ├── Review/                   # 股票与期权操作复盘
+│   │   ├── Import/                   # 通用导入导出
+│   │   ├── Alerts/                   # 价格提醒
+│   │   ├── AiAssistant/              # AI 对话助手
+│   │   └── Settings/                 # 通用、类别、备份、期权与 AI 设置
+│   ├── components/                   # 图表、布局和 AI 展示组件
+│   ├── hooks/                        # 主题、盈亏配色、分页等 Hooks
+│   ├── stores/                       # Zustand stores
+│   ├── types/                        # TypeScript 类型
+│   └── styles/                       # 全局样式与主题变量
+├── src-tauri/                        # Rust / Tauri 后端
+│   ├── src/
+│   │   ├── commands/                 # 前端可调用的 Tauri commands
+│   │   ├── db/                       # SQLite 初始化、迁移与测试
+│   │   ├── models/                   # 后端数据模型
+│   │   ├── services/                 # 行情、绩效、AI、复盘等业务逻辑
+│   │   ├── skills/                   # 内置 AI 技能 Markdown
+│   │   ├── lib.rs                    # 应用初始化与 command 注册
+│   │   └── main.rs                   # 桌面应用入口
+│   ├── capabilities/                 # Tauri 权限配置
+│   ├── Cargo.toml
+│   └── tauri.conf.json
 ├── docs/
-│   └── PRD.md                        # Product Requirements Document (v3.0)
+│   ├── RELEASE-NOTES.md              # 发布说明
+│   ├── ai-tools.md                   # AI 工具说明
+│   ├── skills.md                     # AI 技能格式与使用说明
+│   └── PRD.md                        # 产品需求文档
+├── tools/                            # 数据修复/规范化辅助工具
 ├── package.json
-├── vite.config.ts
-├── tailwind.config.js
-└── tsconfig.json
+├── bun.lock
+├── rust-toolchain.toml
+└── vite.config.ts
 ```
 
-## Getting Started
+## 开始开发
 
-### Prerequisites
+### 环境要求
 
-- [Node.js](https://nodejs.org/) >= 26
-- [Rust](https://rustup.rs/) 1.97.1 (pinned via `rust-toolchain.toml`)
-- Tauri system dependencies ([guide](https://tauri.app/v2/guides/getting-started/prerequisites))
+- [Bun](https://bun.sh/)（项目和 CI 的前端包管理/构建工具）
+- [Node.js](https://nodejs.org/) >= 26（`package.json` 的引擎要求，并用于运行前端测试）
+- [Rust](https://rustup.rs/) 1.97.1（由 `rust-toolchain.toml` 固定）
+- 对应平台的 [Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/)
 
-### Development
+### 安装与启动
 
 ```bash
-# Install frontend dependencies
-npm install
+# 安装前端依赖
+bun install
 
-# Run in development mode (starts both Vite dev server and Tauri)
-npm run tauri dev
+# 启动 Vite 开发服务和 Tauri 桌面应用
+bun run tauri dev
 ```
 
-### Build & Package
+### 测试与检查
 
 ```bash
-# Build for production (generates platform-specific installers)
-npm run tauri build
+# 前端单元测试（Node 26 原生 TypeScript 支持）
+node --test
+
+# TypeScript 检查和前端生产构建
+bun run build
+
+# Rust 后端测试
+cd src-tauri && cargo test --lib
 ```
 
-Build output is located in `src-tauri/target/release/bundle/`:
-
-| Platform | Output | Path |
-|----------|--------|------|
-| macOS | `.dmg` installer | `bundle/dmg/stock-portfolio-manager_<version>_<arch>.dmg` |
-| macOS | `.app` bundle | `bundle/macos/stock-portfolio-manager.app` |
-| Windows | `.msi` installer | `bundle/msi/` |
-| Linux | `.deb` / `.AppImage` | `bundle/deb/` / `bundle/appimage/` |
-
-#### Generating .dmg (macOS)
-
-On a Mac, simply run:
+## 构建与发布
 
 ```bash
-npm run tauri build
+# 构建当前平台的安装包
+bun run tauri build
 ```
 
-The `.dmg` file will be at:
-- Apple Silicon: `src-tauri/target/release/bundle/dmg/stock-portfolio-manager_0.1.0_aarch64.dmg`
-- Intel Mac: `src-tauri/target/release/bundle/dmg/stock-portfolio-manager_0.1.0_x64.dmg`
+未显式指定 target 时，构建产物位于 `src-tauri/target/release/bundle/`。指定 target 时，产物位于 `src-tauri/target/<target>/release/bundle/`。
 
-To build for a specific architecture:
+| 平台 | 主要产物 |
+| --- | --- |
+| macOS | `.dmg`、`.app` |
+| Windows | `.msi`、`.exe` |
+| Linux | `.deb`、`.AppImage` |
+
+macOS 可按架构构建：
 
 ```bash
-# Apple Silicon (M1/M2/M3)
-npm run tauri build -- --target aarch64-apple-darwin
+# Apple Silicon
+bun run tauri build -- --target aarch64-apple-darwin
 
 # Intel
-npm run tauri build -- --target x86_64-apple-darwin
+bun run tauri build -- --target x86_64-apple-darwin
 ```
 
-#### Automated Builds (CI/CD)
+### GitHub Actions
 
-Push a version tag to trigger the GitHub Actions workflow that builds installers for all platforms:
+推送 `v*` 标签或在 Actions 页面手动触发 `.github/workflows/build.yml`，CI 会使用 Bun 和 Rust 1.97.1 构建 macOS（Apple Silicon / Intel）、Windows 和 Linux 安装包，并创建包含构建产物的 draft release。
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
-The workflow produces `.dmg` (macOS), `.msi` (Windows), and `.deb`/`.AppImage` (Linux) as draft release assets. You can also trigger it manually from the **Actions** tab.
+## 数据存储
 
-### Tests
+主数据库位于 Tauri 的应用数据目录：`{app_data_dir}/portfolio.db`。当前应用标识为 `com.portfolio.manager`，macOS 上的默认路径为：
 
-```bash
-# Run Rust backend tests
-cd src-tauri && cargo test
-
-# Type-check frontend
-npx tsc --noEmit
+```text
+~/Library/Application Support/com.portfolio.manager/portfolio.db
 ```
 
-## Database
+主要数据表：
 
-SQLite database is stored in the system app data directory:
-- macOS: `~/Library/Application Support/com.portfolio.manager/portfolio.db`
+| 表 | 用途 |
+| --- | --- |
+| `accounts`、`categories`、`holdings`、`transactions` | 账户、类别、持仓和交易 |
+| `daily_portfolio_values`、`daily_holding_snapshots` | 每日组合与持仓快照 |
+| `quarterly_snapshots`、`quarterly_holding_snapshots` | 季度快照、笔记与决策质量 |
+| `benchmark_daily_prices` | 绩效基准历史行情缓存 |
+| `price_alerts` | 价格/涨跌幅/盈亏提醒规则 |
+| `quote_provider_config` | 各市场行情源、雪球 Cookie 与成本调整设置 |
+| `ai_config`、`chat_sessions`、`chat_messages` | AI 配置、会话、消息、推理和工具调用记录 |
+| `cached_quotes`、`cached_exchange_rates`、`cached_quote_refresh_time` | 行情、汇率及刷新时间缓存 |
+| `option_records`、`stock_splits`、`option_share_lots` | 期权记录、拆股与合约股数配置 |
 
-### Tables
+AI 技能不存储在 SQLite 中，而是保存在 `{app_data_dir}/skills/` 下的 Markdown 文件中。备份设置保存在 `{app_data_dir}/backup_config.json`。
 
-| Table | Description |
-|-------|-------------|
-| **accounts** | Securities accounts (US/CN/HK markets) |
-| **categories** | Investment categories (4 system presets + custom) |
-| **holdings** | Current positions |
-| **transactions** | Buy/sell transaction records |
-| **daily_portfolio_values** | Daily portfolio net value snapshots |
-| **daily_holding_snapshots** | Daily per-holding snapshots (close price, market value) |
-| **quarterly_snapshots** | Quarterly portfolio snapshots with notes |
-| **quarterly_holding_snapshots** | Quarterly per-holding snapshots with investment notes |
-| **benchmark_daily_prices** | Cached benchmark index historical prices |
-| **price_alerts** | Price alert rules and trigger history |
-| **ai_config** | AI service configuration |
+## 数据源与配置
 
-> 💡 AI assistant **skills** are not stored in the database — they live as Markdown files in the `{app_data_dir}/skills/` directory. See [docs/skills.md](docs/skills.md) for the file format.
+| 数据 | 来源 | 说明 |
+| --- | --- | --- |
+| 美股 / 港股行情 | 雪球、东方财富、Yahoo Finance | 可按市场选择；雪球失败时依次回退到东方财富、Yahoo Finance |
+| A 股行情 | 雪球、东方财富 | 可按市场选择；雪球失败时回退到东方财富 |
+| USD / CNY / HKD 汇率 | ExchangeRate-API（`open.er-api.com`） | 内存与 SQLite 双层缓存，网络失败时可使用旧缓存 |
+| 绩效基准指数 | Yahoo Finance | S&P 500、NASDAQ、沪深 300、上证指数、恒生指数 |
+| AI 模型 | 用户配置的 AI 提供商 | API Key 仅保存在本地 SQLite；请求直接发往所选服务 |
 
-### System Categories
+雪球是默认行情源，需要有效的 `xq_a_token` 和 `u`。可在 **设置 → 通用设置 → 雪球 Cookie 设置** 中通过以下任一方式配置：
 
-| Icon | Name | Color |
-|------|------|-------|
-| 💵 | 现金类 | `#22C55E` |
-| 💰 | 分红股 | `#3B82F6` |
-| 🚀 | 成长股 | `#F97316` |
-| 🔄 | 套利 | `#8B5CF6` |
+1. 一键打开雪球登录窗口，登录后自动抓取 Cookie（推荐）。
+2. 粘贴浏览器请求中的完整 `Cookie` 字符串，由应用解析。
+3. 手动填写 `xq_a_token` 和 `u`。
 
-## Data Sources
+Cookie 过期后重新执行任一配置方式即可；未配置或请求失败时，应用会按上述行情源规则回退并显示提示。
 
-| Data | Source | Markets |
-|------|--------|---------|
-| US Stock Quotes | Xueqiu API, Yahoo Finance API | 🇺🇸 US |
-| HK Stock Quotes | Xueqiu API, Yahoo Finance API | 🇭🇰 HK |
-| CN A-Share Quotes | Xueqiu API, EastMoney API | 🇨🇳 CN |
-| Exchange Rates | ExchangeRate-API | USD/CNY/HKD |
-| Benchmark Indices | Yahoo Finance API | S&P 500, NASDAQ, CSI 300, HSI |
+## 相关文档
 
-The Xueqiu API requires a session cookie (`xq_a_token`) and a user id (`u`) to
-return quotes and historical candles. There are three ways to configure them in
-**Settings → 雪球 Cookie 设置**:
-
-1. **One-click login (recommended)** — click 「一键登录雪球」to open the Xueqiu
-   site in an embedded window, finish login there, then click 「我已登录，抓取
-   Cookie」. The app reads the cookies (including HttpOnly ones) directly from
-   the embedded webview, so no manual copy-paste is needed.
-2. **Paste a full cookie string** — copy the whole `Cookie:` header from your
-   browser's DevTools and the app will parse out `xq_a_token` and `u` for you.
-3. **Manual entry (advanced)** — paste the two values separately.
-
-Cookies expire periodically; just repeat option 1 to refresh them.
+- [发布说明](docs/RELEASE-NOTES.md)
+- [AI 助手工具](docs/ai-tools.md)
+- [AI 助手技能](docs/skills.md)
+- [产品需求文档](docs/PRD.md)
 
 ## License
 
-It is released under the GPL-3.0 license. Use it at your own risk.
+本项目基于 [GPL-3.0](LICENSE) 许可证发布。投资分析功能仅供参考，不构成投资建议；使用者需自行承担投资决策与数据安全责任。

@@ -29,6 +29,7 @@ import ImportFromIbCsvModal from "./ImportFromIbCsvModal";
 import ImportFromMoomooCsvModal from "./ImportFromMoomooCsvModal";
 import ImportFromThsCsvModal from "./ImportFromThsCsvModal";
 import ImportFromFirstradeCsvModal from "./ImportFromFirstradeCsvModal";
+import { useTablePageSize } from "../../hooks/tablePageSize";
 
 const { Title, Text } = Typography;
 
@@ -71,6 +72,7 @@ export default function TransactionsPage() {
   const { transactions, loading, fetchTransactions, createTransaction, updateTransaction, deleteTransaction } =
     useTransactionStore();
   const { accounts, fetchAccounts } = useAccountStore();
+  const { pageSize, onShowSizeChange } = useTablePageSize();
   const [modalOpen, setModalOpen] = useState(false);
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
   const [form] = Form.useForm();
@@ -534,7 +536,7 @@ export default function TransactionsPage() {
         columns={columns}
         rowKey="id"
         loading={loading}
-        pagination={{ pageSize: 20 }}
+        pagination={{ pageSize, showSizeChanger: true, onShowSizeChange }}
         scroll={{ x: "max-content" }}
         onChange={(_pagination, filters) => {
           const stockFilters = filters["stock"];

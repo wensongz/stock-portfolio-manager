@@ -406,7 +406,7 @@ export default function TransactionsPage() {
       title: "操作",
       key: "action",
       render: (_: unknown, record: Transaction) => (
-        <Space>
+        <Space size={2}>
           <Button
             type="link"
             size="small"

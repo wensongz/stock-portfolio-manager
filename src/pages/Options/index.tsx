@@ -6,7 +6,6 @@ import {
   Tabs,
   Table,
   Tag,
-  Statistic,
   Row,
   Col,
   InputNumber,
@@ -29,6 +28,7 @@ import {
 } from "@ant-design/icons";
 import { useAccountStore } from "../../stores/accountStore";
 import { useOptionStore } from "../../stores/optionStore";
+import StatCard from "../../components/charts/StatCard";
 import { useOptionReviewStore } from "../../stores/optionReviewStore";
 import type {
   OptionContract,
@@ -671,50 +671,38 @@ export default function OptionsPage() {
   // Render active tab content with simulation
   const renderActiveTab = () => (
     <div>
-      <Row gutter={16} style={{ marginBottom: 24 }}>
-        <Col span={6}>
-          <Card>
-            <Statistic
-              title="累计权利金"
-              value={activePremiumStats.total}
-              prefix="$"
-              precision={0}
-              styles={{ content: {  color: "var(--color-success)"  } }}
-            />
-          </Card>
+      <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
+        <Col xs={24} sm={12} lg={6}>
+          <StatCard
+            title="累计权利金"
+            value={activePremiumStats.total.toFixed(0)}
+            prefix="$"
+            valueStyle={{ color: "var(--color-success)" }}
+          />
         </Col>
-        <Col span={6}>
-          <Card>
-            <Statistic
-              title="最近90天权利金"
-              value={activePremiumStats.last90}
-              prefix="$"
-              precision={0}
-              styles={{ content: {  color: "var(--color-success)"  } }}
-            />
-          </Card>
+        <Col xs={24} sm={12} lg={6}>
+          <StatCard
+            title="最近90天权利金"
+            value={activePremiumStats.last90.toFixed(0)}
+            prefix="$"
+            valueStyle={{ color: "var(--color-success)" }}
+          />
         </Col>
-        <Col span={6}>
-          <Card>
-            <Statistic
-              title="最近60天权利金"
-              value={activePremiumStats.last60}
-              prefix="$"
-              precision={0}
-              styles={{ content: {  color: "var(--color-success)"  } }}
-            />
-          </Card>
+        <Col xs={24} sm={12} lg={6}>
+          <StatCard
+            title="最近60天权利金"
+            value={activePremiumStats.last60.toFixed(0)}
+            prefix="$"
+            valueStyle={{ color: "var(--color-success)" }}
+          />
         </Col>
-        <Col span={6}>
-          <Card>
-            <Statistic
-              title="最近30天权利金"
-              value={activePremiumStats.last30}
-              prefix="$"
-              precision={0}
-              styles={{ content: {  color: "var(--color-success)"  } }}
-            />
-          </Card>
+        <Col xs={24} sm={12} lg={6}>
+          <StatCard
+            title="最近30天权利金"
+            value={activePremiumStats.last30.toFixed(0)}
+            prefix="$"
+            valueStyle={{ color: "var(--color-success)" }}
+          />
         </Col>
       </Row>
 
@@ -941,52 +929,38 @@ export default function OptionsPage() {
         }
       `}</style>
 
-      <Row gutter={16} style={{ marginBottom: 24 }}>
-        <Col span={5}>
-          <Card>
-            <Statistic
-              title="累计权利金"
-              value={expiredTotalPremium}
-              prefix="$"
-              precision={0}
-              styles={{ content: { color: "var(--color-success)" } }}
-            />
-          </Card>
+      <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
+        <Col xs={24} sm={12} lg={5}>
+          <StatCard
+            title="累计权利金"
+            value={expiredTotalPremium.toFixed(0)}
+            prefix="$"
+            valueStyle={{ color: "var(--color-success)" }}
+          />
         </Col>
-        <Col span={5}>
-          <Card>
-            <Statistic
-              title="总合约数（记录）"
-              value={expiredStats.total_contracts}
-            />
-          </Card>
+        <Col xs={24} sm={12} lg={5}>
+          <StatCard title="总合约数（记录）" value={expiredStats.total_contracts} />
         </Col>
-        <Col span={5}>
-          <Card>
-            <Statistic
-              title="被执行合约"
-              value={expiredStats.assigned_contracts}
-              styles={{ content: { color: "var(--color-error)" } }}
-            />
-          </Card>
+        <Col xs={24} sm={12} lg={5}>
+          <StatCard
+            title="被执行合约"
+            value={expiredStats.assigned_contracts}
+            valueStyle={{ color: "var(--color-error)" }}
+          />
         </Col>
-        <Col span={5}>
-          <Card>
-            <Statistic
-              title="到期作废合约"
-              value={expiredStats.expired_contracts}
-              styles={{ content: { color: "var(--color-success)" } }}
-            />
-          </Card>
+        <Col xs={24} sm={12} lg={5}>
+          <StatCard
+            title="到期作废合约"
+            value={expiredStats.expired_contracts}
+            valueStyle={{ color: "var(--color-success)" }}
+          />
         </Col>
-        <Col span={4}>
-          <Card>
-            <Statistic
-              title="执行比例"
-              value={(expiredStats.assignment_ratio * 100).toFixed(1)}
-              suffix="%"
-            />
-          </Card>
+        <Col xs={24} sm={12} lg={4}>
+          <StatCard
+            title="执行比例"
+            value={(expiredStats.assignment_ratio * 100).toFixed(1)}
+            suffix="%"
+          />
         </Col>
       </Row>
 

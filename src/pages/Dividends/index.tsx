@@ -6,11 +6,11 @@ import {
   Row,
   Select,
   Spin,
-  Statistic,
   Table,
   Typography,
   message,
 } from "antd";
+import StatCard from "../../components/charts/StatCard";
 import { invoke } from "@tauri-apps/api/core";
 import { GiftOutlined } from "@ant-design/icons";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
@@ -153,24 +153,20 @@ export default function DividendsPage() {
           {/* Annual summary cards */}
           <Row gutter={[16, 16]}>
             <Col xs={24} sm={12} lg={6}>
-              <Card>
-                <Statistic
-                  title={`${year}年分红总计 (${baseName})`}
-                  value={grandTotalBase.toFixed(2)}
-                  prefix={baseSymbol}
-                />
-              </Card>
+              <StatCard
+                title={`${year}年分红总计 (${baseName})`}
+                value={grandTotalBase.toFixed(2)}
+                prefix={baseSymbol}
+              />
             </Col>
             {analysis.markets.map((m) => (
               <Col xs={24} sm={12} lg={6} key={m.market}>
-                <Card>
-                  <Statistic
-                    title={`${marketCurrency[m.market]?.label ?? m.market} 分红`}
-                    value={m.total.toFixed(2)}
-                    prefix={marketCurrency[m.market]?.symbol ?? ""}
-                    suffix={`≈ ${fmt(convertMarketTotal(m), baseSymbol)}`}
-                  />
-                </Card>
+                <StatCard
+                  title={`${marketCurrency[m.market]?.label ?? m.market} 分红`}
+                  value={m.total.toFixed(2)}
+                  prefix={marketCurrency[m.market]?.symbol ?? ""}
+                  suffix={`≈ ${fmt(convertMarketTotal(m), baseSymbol)}`}
+                />
               </Col>
             ))}
           </Row>

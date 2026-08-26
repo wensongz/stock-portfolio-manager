@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   Card,
   Select,
@@ -29,10 +29,23 @@ import {
 } from "@ant-design/icons";
 import { useAccountStore } from "../../stores/accountStore";
 import { useOptionStore } from "../../stores/optionStore";
+import { useOptionReviewStore } from "../../stores/optionReviewStore";
 import type {
   OptionContract,
   StockPriceInput,
 } from "../../types";
+import type { ColumnsType } from "antd/es/table";
+import {
+  buildExpiredOptionStats,
+  buildExpiredUnderlyingSummaries,
+  getOptionContractRowKey,
+  isAllHistoryOptionReview,
+  isAllHistoryOptionReviewRequest,
+  resolveCurrentOptionAccount,
+  resolveExpiredUnderlyingSelection,
+  selectAccountOptionContracts,
+} from "./expiredOptionsViewModel";
+import type { ExpiredUnderlyingSummary } from "./expiredOptionsViewModel";
 
 const { Title, Text } = Typography;
 
@@ -47,23 +60,35 @@ export default function OptionsPage() {
   const { accounts, fetchAccounts } = useAccountStore();
   const {
     contracts,
-    expiredStats,
     putSimulations,
     callSimulations,
     fetchContracts,
-    fetchExpiredStats,
     importOptionsCsv,
     simulateSellPut,
     simulateSellCall,
     deleteOptionRecords,
     clearSimulations,
   } = useOptionStore();
+  const {
+    report: optionReviewReport,
+    loading: optionReviewLoading,
+    error: optionReviewError,
+    requestedAccountId: optionReviewRequestedAccountId,
+    requestedPeriodDays: optionReviewRequestedPeriodDays,
+    fetchOptionReview,
+    clearOptionReview,
+  } = useOptionReviewStore();
 
   const [selectedAccountId, setSelectedAccountId] = useState<string>(() => {
     return localStorage.getItem("options_selected_account_id") || "";
   });
+  const selectedAccountIdRef = useRef(selectedAccountId);
+  const expiredUnderlyingSelectedByUserRef = useRef(false);
   const [stockPrices, setStockPrices] = useState<Record<string, number>>({});
   const [activeTab, setActiveTab] = useState<string>("active");
+  const [selectedExpiredUnderlying, setSelectedExpiredUnderlying] = useState<
+    string | null
+  >(null);
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [confirmName, setConfirmName] = useState("");
 
@@ -94,6 +119,7 @@ export default function OptionsPage() {
 
   // Persist selected account
   useEffect(() => {
+    selectedAccountIdRef.current = selectedAccountId;
     if (selectedAccountId) {
       localStorage.setItem("options_selected_account_id", selectedAccountId);
     }
@@ -103,29 +129,48 @@ export default function OptionsPage() {
   useEffect(() => {
     if (selectedAccountId) {
       fetchContracts(selectedAccountId);
-      fetchExpiredStats(selectedAccountId);
+      fetchOptionReview(selectedAccountId, null);
+    } else {
+      clearOptionReview();
     }
     clearSimulations();
     setStockPrices({});
-  }, [selectedAccountId, fetchContracts, fetchExpiredStats, clearSimulations]);
+    expiredUnderlyingSelectedByUserRef.current = false;
+    setSelectedExpiredUnderlying(null);
+  }, [
+    selectedAccountId,
+    fetchContracts,
+    fetchOptionReview,
+    clearOptionReview,
+    clearSimulations,
+  ]);
+
+  const selectedAccountContracts = useMemo(
+    () => selectAccountOptionContracts(contracts, selectedAccountId),
+    [contracts, selectedAccountId],
+  );
 
   // Calculate latest trade time from all contracts
   const latestTradeTime = useMemo(() => {
-    const times = contracts
+    const times = selectedAccountContracts
       .map((c) => c.traded_at)
       .filter((t): t is string => !!t);
     if (times.length === 0) return null;
     return times.sort().reverse()[0];
-  }, [contracts]);
+  }, [selectedAccountContracts]);
 
   // Get active and expired contracts
   const activeContracts = useMemo(
-    () => contracts.filter((c) => c.status === "active"),
-    [contracts]
+    () => selectedAccountContracts.filter((c) => c.status === "active"),
+    [selectedAccountContracts]
   );
   const expiredContracts = useMemo(
-    () => contracts.filter((c) => c.status !== "active"),
-    [contracts]
+    () => selectedAccountContracts.filter((c) => c.status !== "active"),
+    [selectedAccountContracts]
+  );
+  const expiredStats = useMemo(
+    () => buildExpiredOptionStats(expiredContracts),
+    [expiredContracts],
   );
 
   // Group contracts by option_symbol for expandable display
@@ -205,9 +250,55 @@ export default function OptionsPage() {
     () => groupContracts(activeContracts),
     [activeContracts, groupContracts]
   );
-  const groupedExpiredContracts = useMemo(
-    () => groupContracts(expiredContracts),
-    [expiredContracts, groupContracts]
+
+  const expiredReviewReady = isAllHistoryOptionReview(
+    optionReviewReport,
+    selectedAccountId,
+  );
+  const expiredReviewRequestMatches = isAllHistoryOptionReviewRequest(
+    optionReviewRequestedAccountId,
+    optionReviewRequestedPeriodDays,
+    selectedAccountId,
+  );
+
+  const expiredSummaryRows = useMemo(
+    () =>
+      buildExpiredUnderlyingSummaries(
+        expiredContracts,
+        expiredReviewReady && optionReviewReport
+          ? optionReviewReport.underlyings
+          : [],
+      ),
+    [expiredContracts, expiredReviewReady, optionReviewReport],
+  );
+
+  useEffect(() => {
+    if (!expiredReviewRequestMatches) return;
+    if (optionReviewLoading) return;
+    if (!expiredReviewReady && !optionReviewError) return;
+    setSelectedExpiredUnderlying((current) =>
+      resolveExpiredUnderlyingSelection(
+        expiredSummaryRows,
+        current,
+        expiredUnderlyingSelectedByUserRef.current,
+      ),
+    );
+  }, [
+    expiredSummaryRows,
+    optionReviewError,
+    optionReviewLoading,
+    expiredReviewRequestMatches,
+    expiredReviewReady,
+  ]);
+
+  const selectedExpiredContracts = useMemo(
+    () =>
+      groupContracts(
+        expiredContracts.filter(
+          (contract) => contract.underlying === selectedExpiredUnderlying,
+        ),
+      ),
+    [expiredContracts, groupContracts, selectedExpiredUnderlying],
   );
 
   // Get unique underlyings from active contracts for price inputs
@@ -260,12 +351,16 @@ export default function OptionsPage() {
     }
 
     return { total, last30, last60, last90 };
-  }, [activeContracts, contracts]);
+  }, [activeContracts]);
 
-  // Compute total premium for expired contracts
-  const expiredTotalPremium = useMemo(() => {
-    return expiredContracts.reduce((sum, c) => sum + Math.abs(c.open_amount), 0);
-  }, [expiredContracts]);
+  const expiredTotalPremium = useMemo(
+    () =>
+      expiredContracts.reduce(
+        (total, contract) => total + Math.abs(contract.open_amount),
+        0,
+      ),
+    [expiredContracts],
+  );
 
   // Compute premium grouped by underlying stock for active contracts
   const activePremiumByStock = useMemo(() => {
@@ -277,17 +372,6 @@ export default function OptionsPage() {
       .map(([underlying, premium]) => ({ underlying, premium }))
       .sort((a, b) => b.premium - a.premium);
   }, [activeContracts]);
-
-  // Compute premium grouped by underlying stock for expired contracts
-  const expiredPremiumByStock = useMemo(() => {
-    const map: Record<string, number> = {};
-    for (const c of expiredContracts) {
-      map[c.underlying] = (map[c.underlying] || 0) + Math.abs(c.open_amount);
-    }
-    return Object.entries(map)
-      .map(([underlying, premium]) => ({ underlying, premium }))
-      .sort((a, b) => b.premium - a.premium);
-  }, [expiredContracts]);
 
   // Handle CSV import
   const handleImport = useCallback(
@@ -309,15 +393,22 @@ export default function OptionsPage() {
             `导入成功：${result.imported} 条记录，跳过 ${result.skipped} 条`
           );
         }
-        // Refresh data
-        fetchContracts(selectedAccountId);
-        fetchExpiredStats(selectedAccountId);
+        const refreshAccountId = resolveCurrentOptionAccount(
+          selectedAccountId,
+          selectedAccountIdRef.current,
+        );
+        if (refreshAccountId) {
+          expiredUnderlyingSelectedByUserRef.current = false;
+          setSelectedExpiredUnderlying(null);
+          fetchContracts(refreshAccountId);
+          fetchOptionReview(refreshAccountId, null);
+        }
       } catch (err) {
         message.error(`导入失败: ${err}`);
       }
       return false; // Prevent default upload
     },
-    [selectedAccountId, importOptionsCsv, fetchContracts, fetchExpiredStats]
+    [selectedAccountId, importOptionsCsv, fetchContracts, fetchOptionReview]
   );
 
   // Handle stock price change and trigger simulation
@@ -363,13 +454,29 @@ export default function OptionsPage() {
     }
     try {
       await deleteOptionRecords(selectedAccountId);
+      if (
+        resolveCurrentOptionAccount(
+          selectedAccountId,
+          selectedAccountIdRef.current,
+        )
+      ) {
+        clearOptionReview();
+        expiredUnderlyingSelectedByUserRef.current = false;
+        setSelectedExpiredUnderlying(null);
+      }
       message.success("已清除所有期权记录");
       setDeleteModalOpen(false);
       setConfirmName("");
     } catch (err) {
       message.error(`删除失败: ${err}`);
     }
-  }, [selectedAccountId, deleteOptionRecords, confirmName, selectedAccountName]);
+  }, [
+    selectedAccountId,
+    deleteOptionRecords,
+    clearOptionReview,
+    confirmName,
+    selectedAccountName,
+  ]);
 
   const openDeleteModal = useCallback(() => {
     setConfirmName("");
@@ -469,6 +576,95 @@ export default function OptionsPage() {
         if (v === "closed") return <Tag color="blue">已平仓</Tag>;
         return <Tag>未知</Tag>;
       },
+    },
+  ];
+
+  const expiredCurrency = expiredReviewReady
+    ? optionReviewReport!.currency
+    : selectedAccountCurrency || "USD";
+  const formatExpiredCurrency = (value: number) =>
+    new Intl.NumberFormat("zh-CN", {
+      style: "currency",
+      currency: expiredCurrency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(value);
+
+  const expiredSummaryColumns: ColumnsType<ExpiredUnderlyingSummary> = [
+    {
+      title: "标的",
+      dataIndex: "underlying",
+      key: "underlying",
+      fixed: "left",
+      width: 80,
+      render: (value: string) => <Tag color="blue">{value}</Tag>,
+    },
+    {
+      title: "累计净权利金",
+      dataIndex: "netPremium",
+      key: "netPremium",
+      align: "right",
+      width: 120,
+      render: (value: number | null) =>
+        expiredReviewReady && value != null ? (
+          <Text type={value < 0 ? "danger" : "success"}>
+            {formatExpiredCurrency(value)}
+          </Text>
+        ) : (
+          "—"
+        ),
+    },
+    {
+      title: "总合约数",
+      dataIndex: "totalRecords",
+      key: "totalRecords",
+      align: "right",
+      width: 90,
+    },
+    {
+      title: "被执行合约",
+      dataIndex: "assignedRecords",
+      key: "assignedRecords",
+      align: "right",
+      width: 90,
+    },
+    {
+      title: "到期作废合约",
+      dataIndex: "expiredRecords",
+      key: "expiredRecords",
+      align: "right",
+      width: 90,
+    },
+    {
+      title: "执行比例",
+      dataIndex: "assignmentRatio",
+      key: "assignmentRatio",
+      align: "right",
+      width: 90,
+      render: (value: number) => `${(value * 100).toFixed(1)}%`,
+    },
+    {
+      title: "Put / Call",
+      key: "optionMix",
+      align: "right",
+      width: 110,
+      render: (_: unknown, row) => `${row.putQuantity} / ${row.callQuantity}`,
+    },
+    {
+      title: "平均净权利金/记录",
+      dataIndex: "averageNetPremiumPerRecord",
+      key: "averageNetPremiumPerRecord",
+      align: "right",
+      width: 120,
+      render: (value: number | null) =>
+        expiredReviewReady && value != null ? formatExpiredCurrency(value) : "—",
+    },
+    {
+      title: "最近完成日",
+      dataIndex: "latestCompletedAt",
+      key: "latestCompletedAt",
+      width: 110,
+      render: (value: string | null) => value?.substring(0, 10) ?? "—",
     },
   ];
 
@@ -732,96 +928,135 @@ export default function OptionsPage() {
     </div>
   );
 
-  // Render expired tab content with stats
+  // Render expired tab content with underlying summary and selected details
   const renderExpiredTab = () => (
     <div>
-      {expiredStats && (
-        <Row gutter={16} style={{ marginBottom: 24 }}>
-          <Col span={5}>
-            <Card>
-              <Statistic
-                title="累计权利金"
-                value={expiredTotalPremium}
-                prefix="$"
-                precision={0}
-                styles={{ content: {  color: "var(--color-success)"  } }}
-              />
-            </Card>
-          </Col>
-          <Col span={5}>
-            <Card>
-              <Statistic title="总合约数" value={expiredStats.total_contracts} />
-            </Card>
-          </Col>
-          <Col span={5}>
-            <Card>
-              <Statistic
-                title="被执行合约"
-                value={expiredStats.assigned_contracts}
-                styles={{ content: {  color: "var(--color-error)"  } }}
-              />
-            </Card>
-          </Col>
-          <Col span={5}>
-            <Card>
-              <Statistic
-                title="到期作废合约"
-                value={expiredStats.expired_contracts}
-                styles={{ content: {  color: "var(--color-success)"  } }}
-              />
-            </Card>
-          </Col>
-          <Col span={4}>
-            <Card>
-              <Statistic
-                title="执行比例"
-                value={(expiredStats.assignment_ratio * 100).toFixed(1)}
-                suffix="%"
-              />
-            </Card>
-          </Col>
-        </Row>
-      )}
+      <style>{`
+        .expired-option-selected-row > td {
+          background: color-mix(in srgb, var(--color-info) 12%, transparent) !important;
+        }
+        .expired-option-table th,
+        .expired-option-table td {
+          white-space: nowrap;
+        }
+      `}</style>
 
-      <Table
-        dataSource={groupedExpiredContracts}
-        columns={expiredColumns}
-        rowKey={(record: any) => record.key || record.id}
-        size="small"
-        pagination={false}
-        expandable={{
-          childrenColumnName: "children",
-          expandIcon: ({ expanded, onExpand, record }) =>
-            record.children ? (
-              expanded ? (
-                <MinusOutlined onClick={(e) => onExpand(record, e)} style={{ cursor: "pointer", marginRight: 8 }} />
-              ) : (
-                <PlusOutlined onClick={(e) => onExpand(record, e)} style={{ cursor: "pointer", marginRight: 8 }} />
-              )
-            ) : (
-              <span style={{ marginRight: 8, width: 14, display: "inline-block" }} />
-            ),
-        }}
-      />
+      <Row gutter={16} style={{ marginBottom: 24 }}>
+        <Col span={5}>
+          <Card>
+            <Statistic
+              title="累计权利金"
+              value={expiredTotalPremium}
+              prefix="$"
+              precision={0}
+              styles={{ content: { color: "var(--color-success)" } }}
+            />
+          </Card>
+        </Col>
+        <Col span={5}>
+          <Card>
+            <Statistic
+              title="总合约数（记录）"
+              value={expiredStats.total_contracts}
+            />
+          </Card>
+        </Col>
+        <Col span={5}>
+          <Card>
+            <Statistic
+              title="被执行合约"
+              value={expiredStats.assigned_contracts}
+              styles={{ content: { color: "var(--color-error)" } }}
+            />
+          </Card>
+        </Col>
+        <Col span={5}>
+          <Card>
+            <Statistic
+              title="到期作废合约"
+              value={expiredStats.expired_contracts}
+              styles={{ content: { color: "var(--color-success)" } }}
+            />
+          </Card>
+        </Col>
+        <Col span={4}>
+          <Card>
+            <Statistic
+              title="执行比例"
+              value={(expiredStats.assignment_ratio * 100).toFixed(1)}
+              suffix="%"
+            />
+          </Card>
+        </Col>
+      </Row>
 
-      {expiredPremiumByStock.length > 0 && (
-        <Card title="按股票权利金统计" size="small" style={{ marginTop: 24 }}>
-          <Row gutter={[12, 12]}>
-            {expiredPremiumByStock.map((item) => (
-              <Col key={item.underlying} flex="20%">
-                <Card size="small" styles={{ body: { padding: "10px 16px" } }}>
-                  <Space>
-                    <Text strong>{item.underlying}</Text>
-                    <Text strong style={{ color: "var(--color-success)" }}>
-                      ${item.premium.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
-                    </Text>
-                  </Space>
-                </Card>
-              </Col>
-            ))}
-          </Row>
+      {expiredReviewRequestMatches && optionReviewError ? (
+        <Alert
+          type="warning"
+          showIcon
+          title="净权利金数据加载失败"
+          description={optionReviewError}
+          style={{ marginBottom: 16 }}
+        />
+      ) : null}
+
+      <Card title="个股期权汇总" style={{ overflow: "hidden", marginBottom: 16 }}>
+        <Table<ExpiredUnderlyingSummary>
+          className="expired-option-table"
+          dataSource={expiredSummaryRows}
+          columns={expiredSummaryColumns}
+          rowKey="underlying"
+          size="small"
+          pagination={false}
+          loading={expiredReviewRequestMatches && optionReviewLoading}
+          scroll={{ x: "max-content" }}
+          rowClassName={(row) =>
+            row.underlying === selectedExpiredUnderlying
+              ? "expired-option-selected-row"
+              : ""
+          }
+          onRow={(row) => ({
+            onClick: () => {
+              expiredUnderlyingSelectedByUserRef.current = true;
+              setSelectedExpiredUnderlying(row.underlying);
+            },
+            style: { cursor: "pointer" },
+          })}
+        />
+      </Card>
+
+      {selectedExpiredUnderlying ? (
+        <Card title={`${selectedExpiredUnderlying} 已完成期权记录`}>
+          <Table
+            dataSource={selectedExpiredContracts}
+            columns={expiredColumns}
+            rowKey={getOptionContractRowKey}
+            size="small"
+            pagination={false}
+            expandable={{
+              childrenColumnName: "children",
+              expandIcon: ({ expanded, onExpand, record }) =>
+                record.children ? (
+                  expanded ? (
+                    <MinusOutlined
+                      onClick={(event) => onExpand(record, event)}
+                      style={{ cursor: "pointer", marginRight: 8 }}
+                    />
+                  ) : (
+                    <PlusOutlined
+                      onClick={(event) => onExpand(record, event)}
+                      style={{ cursor: "pointer", marginRight: 8 }}
+                    />
+                  )
+                ) : (
+                  <span
+                    style={{ marginRight: 8, width: 14, display: "inline-block" }}
+                  />
+                ),
+            }}
+          />
         </Card>
-      )}
+      ) : null}
     </div>
   );
 
@@ -843,7 +1078,10 @@ export default function OptionsPage() {
             placeholder="选择证券账户"
             style={{ width: 200 }}
             value={selectedAccountId || undefined}
-            onChange={setSelectedAccountId}
+            onChange={(accountId) => {
+              selectedAccountIdRef.current = accountId;
+              setSelectedAccountId(accountId);
+            }}
             options={accounts.map((a) => ({
               label: a.name,
               value: a.id,
@@ -862,7 +1100,7 @@ export default function OptionsPage() {
           <Button
             icon={<DeleteOutlined />}
             danger
-            disabled={!selectedAccountId || contracts.length === 0}
+            disabled={!selectedAccountId || selectedAccountContracts.length === 0}
             onClick={openDeleteModal}
           >
             清除记录

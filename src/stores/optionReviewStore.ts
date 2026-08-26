@@ -6,6 +6,8 @@ interface OptionReviewState {
   report: OptionReviewReport | null;
   loading: boolean;
   error: string | null;
+  requestedAccountId: string | null;
+  requestedPeriodDays: number | null;
   fetchOptionReview: (accountId: string, periodDays: number | null) => Promise<void>;
   clearOptionReview: () => void;
 }
@@ -16,9 +18,17 @@ export const useOptionReviewStore = create<OptionReviewState>((set) => ({
   report: null,
   loading: false,
   error: null,
+  requestedAccountId: null,
+  requestedPeriodDays: null,
   fetchOptionReview: async (accountId, periodDays) => {
     const requestId = ++latestOptionReviewRequest;
-    set({ report: null, loading: true, error: null });
+    set({
+      report: null,
+      loading: true,
+      error: null,
+      requestedAccountId: accountId,
+      requestedPeriodDays: periodDays,
+    });
     try {
       const report = await invoke<OptionReviewReport>("get_option_review", {
         accountId,
@@ -33,6 +43,12 @@ export const useOptionReviewStore = create<OptionReviewState>((set) => ({
   },
   clearOptionReview: () => {
     latestOptionReviewRequest += 1;
-    set({ report: null, error: null, loading: false });
+    set({
+      report: null,
+      error: null,
+      loading: false,
+      requestedAccountId: null,
+      requestedPeriodDays: null,
+    });
   },
 }));

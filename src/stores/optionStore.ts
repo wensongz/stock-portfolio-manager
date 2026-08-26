@@ -26,6 +26,8 @@ interface OptionState {
   clearSimulations: () => void;
 }
 
+let latestContractsRequest = 0;
+
 export const useOptionStore = create<OptionState>((set) => ({
   contracts: [],
   expiredStats: null,
@@ -35,14 +37,19 @@ export const useOptionStore = create<OptionState>((set) => ({
   error: null,
 
   fetchContracts: async (accountId: string) => {
+    const requestId = ++latestContractsRequest;
     set({ loading: true, error: null });
     try {
       const contracts = await invoke<OptionContract[]>("get_option_contracts", {
         accountId,
       });
-      set({ contracts, loading: false });
+      if (requestId === latestContractsRequest) {
+        set({ contracts, loading: false });
+      }
     } catch (err) {
-      set({ error: String(err), loading: false });
+      if (requestId === latestContractsRequest) {
+        set({ error: String(err), loading: false });
+      }
     }
   },
 
@@ -90,8 +97,11 @@ export const useOptionStore = create<OptionState>((set) => ({
   },
 
   deleteOptionRecords: async (accountId: string) => {
+    const requestId = ++latestContractsRequest;
     await invoke("delete_option_records", { accountId });
-    set({ contracts: [], expiredStats: null, putSimulations: [], callSimulations: [] });
+    if (requestId === latestContractsRequest) {
+      set({ contracts: [], expiredStats: null, putSimulations: [], callSimulations: [] });
+    }
   },
 
   clearSimulations: () => {

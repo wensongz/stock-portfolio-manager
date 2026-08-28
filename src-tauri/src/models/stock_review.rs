@@ -186,13 +186,45 @@ pub struct StockActionReview {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StockCampaignSummary {
     pub campaign_id: String,
+    pub account_ids: Vec<String>,
+    pub action_ids: Vec<String>,
+    pub fragments: Vec<AccountCampaignFragment>,
+    pub campaign_status: StockCampaignStatus,
+    pub availability: MetricAvailability,
+    pub symbol: String,
+    pub market: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub contribution: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StockCampaignStatus {
+    Active,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StockCampaignTransferFact {
+    pub transaction_id: String,
+    pub action_id: Option<String>,
+    pub traded_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AccountCampaignFragment {
+    pub fragment_id: String,
+    pub logical_campaign_id: String,
     pub account_id: String,
     pub symbol: String,
     pub market: String,
     pub started_at: String,
     pub ended_at: Option<String>,
-    pub status: MetricStatus,
-    pub contribution: Option<f64>,
+    pub status: StockCampaignStatus,
+    pub action_ids: Vec<String>,
+    pub transfer_in: Option<StockCampaignTransferFact>,
+    pub transfer_out: Option<StockCampaignTransferFact>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

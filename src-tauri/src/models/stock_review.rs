@@ -322,10 +322,10 @@ pub struct StockCampaignDetail {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CampaignPnl {
-    pub buy_outlays_base: f64,
-    pub sell_proceeds_base: f64,
-    pub dividends_base: f64,
-    pub trading_fees_base: f64,
+    pub buy_outlays_base: Option<f64>,
+    pub sell_proceeds_base: Option<f64>,
+    pub dividends_base: Option<f64>,
+    pub trading_fees_base: Option<f64>,
     pub remaining_shares: f64,
     pub remaining_market_value_base: Option<f64>,
     pub total_pnl_base: Option<f64>,
@@ -346,7 +346,9 @@ pub enum CampaignCashFlowKind {
 pub struct CampaignTimelineItem {
     pub date: NaiveDate,
     pub kind: CampaignCashFlowKind,
-    pub amount_base: f64,
+    pub amount_base: Option<f64>,
+    pub amount_local: f64,
+    pub currency: String,
     pub shares: f64,
     pub account_id: String,
     pub action_id: Option<String>,

@@ -32,6 +32,22 @@ pub enum MarketReturnMode {
     PriceOnly,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarketCalendar {
+    pub sessions: Vec<NaiveDate>,
+    pub complete_start: Option<NaiveDate>,
+    pub complete_through: Option<NaiveDate>,
+    pub availability: MetricAvailability,
+}
+
+impl MarketCalendar {
+    pub fn covers(&self, start: NaiveDate, end: NaiveDate) -> bool {
+        self.availability.status == MetricStatus::Available
+            && self.complete_start.is_some_and(|date| date <= start)
+            && self.complete_through.is_some_and(|date| date >= end)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MarketDataCoverage {
     pub required_sessions: usize,
@@ -313,11 +329,58 @@ pub fn load_market_sessions(
     market: &str,
     start: NaiveDate,
     end: NaiveDate,
-) -> Result<Vec<NaiveDate>, String> {
+) -> Result<MarketCalendar, String> {
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let coverage = conn
+        .query_row(
+            "SELECT complete_start, complete_through, encodes_closed_dates
+         FROM stock_market_calendar_coverage WHERE market = ?1",
+            params![market],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .ok();
+    let Some((complete_start, complete_through, encodes_closed_dates)) = coverage else {
+        return Ok(MarketCalendar {
+            sessions: Vec::new(),
+            complete_start: None,
+            complete_through: None,
+            availability: MetricAvailability {
+                status: MetricStatus::Unavailable,
+                note: Some(
+                    "Explicit market-calendar coverage metadata is unavailable.".to_string(),
+                ),
+            },
+        });
+    };
+    let complete_start = NaiveDate::parse_from_str(&complete_start, "%Y-%m-%d")
+        .map_err(|error| format!("Invalid calendar coverage start: {error}"))?;
+    let complete_through = NaiveDate::parse_from_str(&complete_through, "%Y-%m-%d")
+        .map_err(|error| format!("Invalid calendar coverage end: {error}"))?;
+    if encodes_closed_dates != 1 || complete_start > complete_through {
+        return Ok(MarketCalendar {
+            sessions: Vec::new(),
+            complete_start: Some(complete_start),
+            complete_through: Some(complete_through),
+            availability: MetricAvailability {
+                status: MetricStatus::Unavailable,
+                note: Some(
+                    "Calendar coverage does not explicitly encode both open and closed dates."
+                        .to_string(),
+                ),
+            },
+        });
+    }
+    let range_start = start.max(complete_start);
+    let range_end = end.min(complete_through);
     let mut statement = conn
         .prepare(
-            "SELECT date FROM stock_market_sessions
+            "SELECT date, is_session FROM stock_market_sessions
              WHERE market = ?1 AND date BETWEEN ?2 AND ?3
              ORDER BY date ASC",
         )
@@ -326,19 +389,53 @@ pub fn load_market_sessions(
         .query_map(
             params![
                 market,
-                start.format("%Y-%m-%d").to_string(),
-                end.format("%Y-%m-%d").to_string()
+                range_start.format("%Y-%m-%d").to_string(),
+                range_end.format("%Y-%m-%d").to_string()
             ],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )
         .map_err(|error| error.to_string())?
         .map(|row| {
-            let date = row.map_err(|error| error.to_string())?;
+            let (date, is_session) = row.map_err(|error| error.to_string())?;
             NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .map(|date| (date, is_session))
                 .map_err(|error| format!("Invalid cached market-session date '{date}': {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(sessions)
+    let expected_days = if range_start <= range_end {
+        (range_end - range_start).num_days() as usize + 1
+    } else {
+        0
+    };
+    let complete_rows = sessions.len() == expected_days
+        && sessions.iter().enumerate().all(|(offset, (date, flag))| {
+            *date == range_start + Duration::days(offset as i64) && matches!(*flag, 0 | 1)
+        });
+    if !complete_rows {
+        return Ok(MarketCalendar {
+            sessions: Vec::new(),
+            complete_start: Some(complete_start),
+            complete_through: Some(complete_through),
+            availability: MetricAvailability {
+                status: MetricStatus::Unavailable,
+                note: Some(
+                    "Calendar coverage metadata claims a range with missing day rows.".to_string(),
+                ),
+            },
+        });
+    }
+    Ok(MarketCalendar {
+        sessions: sessions
+            .into_iter()
+            .filter_map(|(date, is_session)| (is_session == 1).then_some(date))
+            .collect(),
+        complete_start: Some(complete_start),
+        complete_through: Some(complete_through),
+        availability: MetricAvailability {
+            status: MetricStatus::Available,
+            note: None,
+        },
+    })
 }
 
 pub fn default_benchmark_symbol(market: &str) -> Option<&'static str> {

@@ -31,12 +31,26 @@ mod tests {
 
         let table_count: i32 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('stock_daily_prices', 'stock_review_annotations', 'stock_review_overrides')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('stock_daily_prices', 'stock_market_sessions', 'stock_market_calendar_coverage', 'stock_review_annotations', 'stock_review_overrides')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(table_count, 3);
+        assert_eq!(table_count, 5);
+
+        conn.execute(
+            "INSERT INTO stock_market_calendar_coverage
+                (market, source, complete_start, complete_through, revision, encodes_closed_dates, updated_at)
+             VALUES ('US', 'fixture', '2024-01-01', '2024-12-31', 'fixture-v1', 1, '2024-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stock_market_sessions (market, date, is_session, source, updated_at)
+             VALUES ('US', '2024-01-01', 0, 'fixture', '2024-01-01')",
+            [],
+        )
+        .unwrap();
 
         conn.execute(
             "INSERT INTO stock_daily_prices (symbol, market, date, close, source, updated_at)
@@ -190,6 +204,8 @@ mod tests {
 
         for table in [
             "stock_daily_prices",
+            "stock_market_sessions",
+            "stock_market_calendar_coverage",
             "stock_review_annotations",
             "stock_review_overrides",
         ] {

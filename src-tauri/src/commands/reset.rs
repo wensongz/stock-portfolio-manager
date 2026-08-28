@@ -24,6 +24,7 @@ pub(crate) fn clear_stock_review_data(tx: &Transaction<'_>) -> SqlResult<()> {
     for table in [
         "stock_daily_prices",
         "stock_market_sessions",
+        "stock_market_calendar_coverage",
         "stock_review_annotations",
         "stock_review_overrides",
     ] {

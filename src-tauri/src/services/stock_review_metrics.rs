@@ -1243,26 +1243,23 @@ pub struct CampaignDetailInput {
 pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDetail {
     let mut timeline = input.cash_flows.clone();
     timeline.sort_by_key(|flow| flow.date);
-    let buy_outlays = timeline
-        .iter()
-        .filter(|flow| flow.kind == CampaignCashFlowKind::Buy)
-        .map(|flow| flow.amount_base)
-        .sum::<f64>();
-    let sell_proceeds = timeline
-        .iter()
-        .filter(|flow| flow.kind == CampaignCashFlowKind::Sell)
-        .map(|flow| flow.amount_base)
-        .sum::<f64>();
-    let dividends = timeline
-        .iter()
-        .filter(|flow| flow.kind == CampaignCashFlowKind::Dividend)
-        .map(|flow| flow.amount_base)
-        .sum::<f64>();
-    let fees = timeline
-        .iter()
-        .filter(|flow| flow.kind == CampaignCashFlowKind::Fee)
-        .map(|flow| flow.amount_base)
-        .sum::<f64>();
+    let base_flows_complete = timeline.iter().all(|flow| {
+        flow.amount_base
+            .is_some_and(|amount| amount.is_finite() && amount >= 0.0)
+    });
+    let sum_kind = |kind: CampaignCashFlowKind| {
+        base_flows_complete.then(|| {
+            timeline
+                .iter()
+                .filter(|flow| flow.kind == kind)
+                .filter_map(|flow| flow.amount_base)
+                .sum::<f64>()
+        })
+    };
+    let buy_outlays = sum_kind(CampaignCashFlowKind::Buy);
+    let sell_proceeds = sum_kind(CampaignCashFlowKind::Sell);
+    let dividends = sum_kind(CampaignCashFlowKind::Dividend);
+    let fees = sum_kind(CampaignCashFlowKind::Fee);
     let bought_shares = timeline
         .iter()
         .filter(|flow| flow.kind == CampaignCashFlowKind::Buy)
@@ -1276,13 +1273,12 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
     let remaining_shares = bought_shares - sold_shares;
     let mut net_invested = 0.0;
     let mut max_invested: f64 = 0.0;
-    for flow in &timeline {
+    for flow in timeline.iter().filter(|_| base_flows_complete) {
+        let amount_base = flow.amount_base.unwrap();
         match flow.kind {
-            CampaignCashFlowKind::Buy | CampaignCashFlowKind::Fee => {
-                net_invested += flow.amount_base
-            }
+            CampaignCashFlowKind::Buy | CampaignCashFlowKind::Fee => net_invested += amount_base,
             CampaignCashFlowKind::Sell | CampaignCashFlowKind::Dividend => {
-                net_invested -= flow.amount_base
+                net_invested -= amount_base
             }
         }
         max_invested = max_invested.max(net_invested);
@@ -1302,7 +1298,13 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
         Some(0.0)
     };
     let total_pnl = remaining_market_value
-        .map(|remaining| sell_proceeds + dividends + remaining - buy_outlays - fees);
+        .zip(sell_proceeds)
+        .zip(dividends)
+        .zip(buy_outlays)
+        .zip(fees)
+        .map(|((((remaining, sells), dividends), buys), fees)| {
+            sells + dividends + remaining - buys - fees
+        });
     let pnl = CampaignPnl {
         buy_outlays_base: buy_outlays,
         sell_proceeds_base: sell_proceeds,
@@ -1343,12 +1345,14 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
             start.close.is_finite() && start.close > 0.0 && end.close.is_finite()
         })
         .map(|(start, end)| end.close / start.close - 1.0);
-    let pnl_status =
-        if total_pnl.is_none() || input.summary.availability.status == MetricStatus::Unavailable {
-            MetricStatus::Unavailable
-        } else {
-            input.summary.availability.status.clone()
-        };
+    let pnl_status = if !base_flows_complete
+        || total_pnl.is_none()
+        || input.summary.availability.status == MetricStatus::Unavailable
+    {
+        MetricStatus::Unavailable
+    } else {
+        input.summary.availability.status.clone()
+    };
     let excursion_status = if max_invested.is_none()
         || !excursions.expected_sessions_valid
         || (input.daily_prices.is_empty() && mae_base.is_none() && mfe_base.is_none())
@@ -1566,17 +1570,21 @@ fn campaign_excursions(
         };
         while applied < flows.len() && flows[applied].date <= price.date {
             let flow = &flows[applied];
+            let Some(amount_base) = flow.amount_base else {
+                path_valid = false;
+                break;
+            };
             match flow.kind {
                 CampaignCashFlowKind::Buy => {
-                    cash -= flow.amount_base;
+                    cash -= amount_base;
                     shares += flow.shares;
                 }
                 CampaignCashFlowKind::Sell => {
-                    cash += flow.amount_base;
+                    cash += amount_base;
                     shares -= flow.shares;
                 }
-                CampaignCashFlowKind::Dividend => cash += flow.amount_base,
-                CampaignCashFlowKind::Fee => cash -= flow.amount_base,
+                CampaignCashFlowKind::Dividend => cash += amount_base,
+                CampaignCashFlowKind::Fee => cash -= amount_base,
             }
             applied += 1;
         }
@@ -2465,7 +2473,9 @@ mod tests {
         CampaignCashFlow {
             date: date(day),
             kind,
-            amount_base: amount,
+            amount_base: Some(amount),
+            amount_local: amount,
+            currency: "BASE".to_string(),
             shares,
             account_id: "acct".to_string(),
             action_id: None,
@@ -2521,10 +2531,10 @@ mod tests {
             )],
             annotations: vec![],
         });
-        assert_eq!(detail.pnl.buy_outlays_base, 100.0);
-        assert_eq!(detail.pnl.sell_proceeds_base, 130.0);
-        assert_eq!(detail.pnl.dividends_base, 5.0);
-        assert_eq!(detail.pnl.trading_fees_base, 2.0);
+        assert_eq!(detail.pnl.buy_outlays_base, Some(100.0));
+        assert_eq!(detail.pnl.sell_proceeds_base, Some(130.0));
+        assert_eq!(detail.pnl.dividends_base, Some(5.0));
+        assert_eq!(detail.pnl.trading_fees_base, Some(2.0));
         assert_eq!(detail.pnl.total_pnl_base, Some(33.0));
         assert_eq!(detail.pnl.max_invested_capital_base, Some(102.0));
         assert_eq!(detail.mae_base, Some(-22.0));

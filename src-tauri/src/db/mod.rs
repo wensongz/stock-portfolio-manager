@@ -541,9 +541,20 @@ impl Database {
             CREATE TABLE IF NOT EXISTS stock_market_sessions (
               market TEXT NOT NULL CHECK(market IN ('US','CN','HK')),
               date TEXT NOT NULL,
+              is_session INTEGER NOT NULL DEFAULT 1 CHECK(is_session IN (0,1)),
               source TEXT NOT NULL,
               updated_at TEXT NOT NULL,
               PRIMARY KEY (market, date)
+            );
+
+            CREATE TABLE IF NOT EXISTS stock_market_calendar_coverage (
+              market TEXT PRIMARY KEY CHECK(market IN ('US','CN','HK')),
+              source TEXT NOT NULL,
+              complete_start TEXT NOT NULL,
+              complete_through TEXT NOT NULL,
+              revision TEXT NOT NULL,
+              encodes_closed_dates INTEGER NOT NULL DEFAULT 0 CHECK(encodes_closed_dates IN (0,1)),
+              updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS stock_review_annotations (
@@ -570,6 +581,10 @@ impl Database {
             );
         ",
         )?;
+
+        let _ = conn.execute_batch(
+            "ALTER TABLE stock_market_sessions ADD COLUMN is_session INTEGER NOT NULL DEFAULT 1 CHECK(is_session IN (0,1));",
+        );
 
         // Existing installations created before durable override reference
         // snapshots need the column before corrections can be safely replayed.

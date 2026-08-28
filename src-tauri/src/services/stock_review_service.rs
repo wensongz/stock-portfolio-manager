@@ -407,7 +407,9 @@ fn build_stock_review_artifacts(
                 annotations: input
                     .annotations
                     .iter()
-                    .filter(|annotation| annotation_applies_to_campaign(annotation, campaign))
+                    .filter(|annotation| {
+                        annotation_applies_to_campaign(annotation, campaign, &campaigns)
+                    })
                     .cloned()
                     .collect(),
             });
@@ -622,6 +624,7 @@ fn action_date(action: &StockActionReview) -> Option<NaiveDate> {
 fn annotation_applies_to_campaign(
     annotation: &StockReviewAnnotation,
     campaign: &StockCampaignSummary,
+    all_campaigns: &[StockCampaignSummary],
 ) -> bool {
     if annotation
         .account_id
@@ -634,11 +637,71 @@ fn annotation_applies_to_campaign(
         "campaign" => annotation.scope_key == campaign.campaign_id,
         "action" => campaign.action_ids.contains(&annotation.scope_key),
         "stock" => {
-            stock_symbols_equal(&annotation.scope_key, &campaign.symbol)
+            let symbol_matches = stock_symbols_equal(&annotation.scope_key, &campaign.symbol)
                 && annotation
                     .symbol
                     .as_ref()
-                    .is_none_or(|symbol| stock_symbols_equal(symbol, &campaign.symbol))
+                    .is_none_or(|symbol| stock_symbols_equal(symbol, &campaign.symbol));
+            if !symbol_matches {
+                return false;
+            }
+
+            let value = serde_json::from_str::<serde_json::Value>(&annotation.value_json).ok();
+            let explicit_date = value.as_ref().and_then(|value| {
+                value
+                    .get("effective_date")
+                    .or_else(|| value.get("snapshot_date"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+            });
+            let explicit_start = value
+                .as_ref()
+                .and_then(|value| value.get("effective_start"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+            let explicit_end = value
+                .as_ref()
+                .and_then(|value| value.get("effective_end"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+            let campaign_start = campaign
+                .started_at
+                .get(..10)
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+            let campaign_end = campaign
+                .ended_at
+                .as_deref()
+                .and_then(|date| date.get(..10))
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+                .unwrap_or(NaiveDate::MAX);
+
+            if let (Some(effective), Some(start)) = (explicit_date, campaign_start) {
+                return effective >= start && effective <= campaign_end;
+            }
+            if explicit_start.is_some() || explicit_end.is_some() {
+                let Some(start) = campaign_start else {
+                    return false;
+                };
+                let annotation_start = explicit_start.unwrap_or(NaiveDate::MIN);
+                let annotation_end = explicit_end.unwrap_or(NaiveDate::MAX);
+                return annotation_start <= campaign_end && annotation_end >= start;
+            }
+
+            // An undated stock annotation is campaign-specific only when there
+            // is exactly one unambiguous account/symbol lifetime. Otherwise it
+            // remains visible at report/stock scope instead of leaking into
+            // every same-symbol cycle.
+            all_campaigns
+                .iter()
+                .filter(|candidate| {
+                    stock_symbols_equal(&candidate.symbol, &campaign.symbol)
+                        && annotation
+                            .account_id
+                            .as_ref()
+                            .is_none_or(|account_id| candidate.account_ids.contains(account_id))
+                })
+                .count()
+                == 1
         }
         _ => false,
     }
@@ -773,6 +836,7 @@ pub async fn confirm_stock_review_override(
     let mut prepared_candidate = stock_review_persistence::prepare_override_candidate(db, input)?;
     let input = prepared_candidate.input.clone();
     validate_override_query_scope(db, &query, &input)?;
+    stock_review_persistence::scope_candidate_to_query(db, &mut prepared_candidate, &query)?;
     let candidate_record = StockReviewOverride {
         id: input.id.clone(),
         override_type: input.override_type.clone(),
@@ -781,9 +845,13 @@ pub async fn confirm_stock_review_override(
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
     };
-    let cached =
-        prepare_cached_stock_review_input_with_candidate(db, query, Some(candidate_record)).await?;
-    stock_review_persistence::refresh_candidate_source_revision(db, &mut prepared_candidate)?;
+    let cached = prepare_cached_stock_review_input_with_candidate(
+        db,
+        query,
+        Some(candidate_record),
+        Some(&mut prepared_candidate),
+    )
+    .await?;
     let candidate_report = build_stock_review_report_from_cached_data(&cached)?;
     if candidate_report.data_quality.issues.iter().any(|issue| {
         matches!(
@@ -804,21 +872,50 @@ async fn prepare_cached_stock_review_input(
     db: &Database,
     query: StockReviewQuery,
 ) -> Result<CachedStockReviewInput, String> {
-    prepare_cached_stock_review_input_with_candidate(db, query, None).await
+    prepare_cached_stock_review_input_with_candidate(db, query, None, None).await
 }
 
 async fn prepare_cached_stock_review_input_with_candidate(
     db: &Database,
     query: StockReviewQuery,
     candidate: Option<StockReviewOverride>,
+    candidate_revision: Option<&mut stock_review_persistence::ValidatedOverrideCandidate>,
 ) -> Result<CachedStockReviewInput, String> {
+    prepare_cached_stock_review_input_with_candidate_and_cache_hook(
+        db,
+        query,
+        candidate,
+        candidate_revision,
+        |_| Ok(()),
+    )
+    .await
+}
+
+async fn prepare_cached_stock_review_input_with_candidate_and_cache_hook<F>(
+    db: &Database,
+    query: StockReviewQuery,
+    candidate: Option<StockReviewOverride>,
+    mut candidate_revision: Option<&mut stock_review_persistence::ValidatedOverrideCandidate>,
+    after_cache_fill: F,
+) -> Result<CachedStockReviewInput, String>
+where
+    F: FnOnce(&Database) -> Result<(), String>,
+{
     validate_query(&query)?;
     validate_account_exists(db, query.account_id.as_deref())?;
     let mut override_list = stock_review_persistence::list_overrides(db)?;
     if let Some(candidate) = candidate {
+        let candidate_id = candidate.id.clone();
         override_list
             .overrides
-            .retain(|record| record.id != candidate.id);
+            .retain(|record| record.id != candidate_id);
+        override_list
+            .stale_overrides
+            .retain(|record| record.id != candidate_id);
+        let stale_message_prefix = format!("Override {candidate_id} ");
+        override_list.issues.retain(|issue| {
+            issue.code != "stale_override" || !issue.message.starts_with(&stale_message_prefix)
+        });
         override_list.overrides.push(candidate);
     }
     let transactions = load_all_transactions_for_review(db)?;
@@ -872,13 +969,17 @@ async fn prepare_cached_stock_review_input_with_candidate(
         .map(|(_, market)| market.clone())
         .collect::<BTreeSet<_>>();
     let today = Utc::now().date_naive();
-    let mut market_sessions_by_market = BTreeMap::new();
+    let mut market_calendars_by_market = BTreeMap::new();
     for market in &local_markets {
-        market_sessions_by_market.insert(
+        market_calendars_by_market.insert(
             market.clone(),
             load_market_sessions(db, market, price_start, today)?,
         );
     }
+    let market_sessions_by_market = market_calendars_by_market
+        .iter()
+        .map(|(market, calendar)| (market.clone(), calendar.sessions.clone()))
+        .collect::<BTreeMap<_, _>>();
     let evaluation_end = action_build
         .actions
         .iter()
@@ -955,7 +1056,14 @@ async fn prepare_cached_stock_review_input_with_candidate(
         );
     }
 
-    let (baseline, actual_values, mut actual_availability) = load_actual_values(db, &query)?;
+    after_cache_fill(db)?;
+
+    if let Some(candidate) = candidate_revision.as_deref_mut() {
+        stock_review_persistence::pin_candidate_source_revision_after_cache_fill(db, candidate)?;
+    }
+
+    let (baseline, actual_values, mut actual_availability, actual_nav_complete) =
+        load_actual_values(db, &query)?;
     let actual_origin_date = baseline
         .as_ref()
         .map(|point| point.date)
@@ -974,7 +1082,7 @@ async fn prepare_cached_stock_review_input_with_candidate(
     }
     let shadow_external_flows =
         external_flow_events(corrected_transactions, actual_origin_date, query.end_date);
-    let recorded_splits = load_recorded_splits(db, query.end_date)?;
+    let recorded_splits = load_recorded_splits(db, today)?;
     let opening_positions = opening_positions(
         db,
         &query,
@@ -998,6 +1106,15 @@ async fn prepare_cached_stock_review_input_with_candidate(
             affected_date: None,
         });
     }
+    if (query.account_id.is_some() || query.market.is_some()) && !actual_values.is_empty() {
+        preparation_issues.push(StockReviewIssue {
+            code: "filtered_nav_cash_unavailable".to_string(),
+            severity: StockReviewIssueSeverity::Error,
+            message: "Filtered holding snapshots contain stock value but no authoritative account/market cash total; average NAV, turnover, and fee drag are unavailable.".to_string(),
+            affected_symbol: None,
+            affected_date: None,
+        });
+    }
     if !opening_cash_complete {
         preparation_issues.push(StockReviewIssue {
             code: "opening_cash_incomplete".to_string(),
@@ -1007,8 +1124,8 @@ async fn prepare_cached_stock_review_input_with_candidate(
             affected_date: Some(actual_origin_date),
         });
     }
-    for (market, sessions) in &market_sessions_by_market {
-        preparation_issues.push(if sessions.is_empty() {
+    for (market, calendar) in &market_calendars_by_market {
+        preparation_issues.push(if calendar.availability.status == MetricStatus::Unavailable {
             StockReviewIssue {
                 code: "market_calendar_unavailable".to_string(),
                 severity: StockReviewIssueSeverity::Error,
@@ -1044,6 +1161,12 @@ async fn prepare_cached_stock_review_input_with_candidate(
                 .actions
                 .iter()
                 .filter_map(action_date)
+                .filter(|date| *date <= query.end_date),
+        )
+        .chain(
+            corrected_transactions
+                .iter()
+                .filter_map(|corrected| transaction_date(&corrected.transaction))
                 .filter(|date| *date <= query.end_date),
         )
         .chain(
@@ -1162,6 +1285,13 @@ async fn prepare_cached_stock_review_input_with_candidate(
             let stock = prices_by_security.get(&(action.symbol.clone(), action.market.clone()))?;
             let benchmark = local_benchmark_points_by_market.get(&action.market)?;
             let sessions = market_sessions_by_market.get(&action.market)?;
+            let calendar = market_calendars_by_market.get(&action.market)?;
+            let target_120 = nth_market_session_after(sessions, date, 120);
+            let calendar_covers_window = calendar.complete_start.is_some_and(|start| start <= date)
+                && (target_120.is_some()
+                    || calendar
+                        .complete_through
+                        .is_some_and(|through| through >= today));
             let fx = exact_fx_on(
                 market_currency(&action.market),
                 &query.base_currency,
@@ -1190,7 +1320,9 @@ async fn prepare_cached_stock_review_input_with_candidate(
                         close: point.close,
                     })
                     .collect(),
-                availability: if sessions.is_empty() {
+                availability: if !calendar_covers_window
+                    || calendar.availability.status == MetricStatus::Unavailable
+                {
                     MetricAvailability {
                         status: MetricStatus::Unavailable,
                         note: Some(
@@ -1223,26 +1355,32 @@ async fn prepare_cached_stock_review_input_with_candidate(
                 .min(query.end_date);
             let benchmark = local_benchmark_points_by_market.get(market)?;
             let sessions = market_sessions_by_market.get(market)?;
+            let calendar = market_calendars_by_market.get(market)?;
+            let calendar_covers_campaign = calendar.covers(campaign_start, campaign_end);
             let currency = market_currency(market);
-            let expected_session_dates = sessions
-                .iter()
-                .filter(|date| **date >= campaign_start && **date <= campaign_end)
-                .copied()
-                .collect::<Vec<_>>();
+            let expected_session_dates = if calendar_covers_campaign {
+                sessions
+                    .iter()
+                    .filter(|date| **date >= campaign_start && **date <= campaign_end)
+                    .copied()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             let mut campaign_issues = Vec::new();
             campaign_issues.push(StockReviewIssue {
-                code: if sessions.is_empty() {
+                code: if !calendar_covers_campaign {
                     "campaign_calendar_unavailable"
                 } else {
                     "campaign_calendar_authority"
                 }
                 .to_string(),
-                severity: if sessions.is_empty() {
+                severity: if !calendar_covers_campaign {
                     StockReviewIssueSeverity::Error
                 } else {
                     StockReviewIssueSeverity::Info
                 },
-                message: if sessions.is_empty() {
+                message: if !calendar_covers_campaign {
                     "No authoritative exchange-session calendar covers this Campaign."
                         .to_string()
                 } else {
@@ -1280,20 +1418,33 @@ async fn prepare_cached_stock_review_input_with_candidate(
             let as_of_point = expected_session_dates
                 .last()
                 .and_then(|date| stock.iter().find(|point| point.date == *date));
+            let cash_flows = campaign_cash_flows(
+                corrected_transactions,
+                symbol,
+                market,
+                &campaign.account_ids,
+                campaign_start,
+                campaign_end,
+                &query,
+                &fx_points,
+            );
+            if let Some(flow) = cash_flows.iter().find(|flow| flow.amount_base.is_none()) {
+                campaign_issues.push(StockReviewIssue {
+                    code: "campaign_fx_unavailable".to_string(),
+                    severity: StockReviewIssueSeverity::Error,
+                    message: format!(
+                        "Campaign P&L and excursion metrics are unavailable because {} on {} lacks exact daily FX.",
+                        flow.currency, flow.date
+                    ),
+                    affected_symbol: Some(symbol.clone()),
+                    affected_date: Some(flow.date),
+                });
+            }
             Some(CachedCampaignData {
                 campaign_id: campaign.campaign_id.clone(),
                 account_id: query.account_id.clone(),
                 symbol: symbol.clone(),
-                cash_flows: campaign_cash_flows(
-                    corrected_transactions,
-                    symbol,
-                    market,
-                    &campaign.account_ids,
-                    campaign_start,
-                    campaign_end,
-                    &query,
-                    &fx_points,
-                ),
+                cash_flows,
                 daily_prices: stock
                     .iter()
                     .filter(|point| point.date >= campaign_start && point.date <= campaign_end)
@@ -1360,7 +1511,7 @@ async fn prepare_cached_stock_review_input_with_candidate(
     } else {
         BenchmarkSelection::AutomaticMixed
     };
-    let average_nav = if actual_values.is_empty() {
+    let average_nav = if actual_values.is_empty() || !actual_nav_complete {
         None
     } else {
         Some(
@@ -1400,7 +1551,17 @@ async fn prepare_cached_stock_review_input_with_candidate(
         average_nav,
         actual_origin_date,
     )?;
-    let risk_input = load_risk_input(db, &query, &action_build.actions, average_nav, &fx_points)?;
+    let (risk_input, action_fx_complete) =
+        load_risk_input(db, &query, &action_build.actions, average_nav, &fx_points)?;
+    if !action_fx_complete {
+        preparation_issues.push(StockReviewIssue {
+            code: "action_fx_unavailable".to_string(),
+            severity: StockReviewIssueSeverity::Error,
+            message: "Turnover and fee drag are unavailable because at least one scoped stock action lacks exact action-date FX.".to_string(),
+            affected_symbol: None,
+            affected_date: None,
+        });
+    }
     let annotations = load_display_context(db, &query)?;
     let market_data_coverage = aggregate_market_coverage(&prices_by_security, &valuation_dates);
     let exchange_rate_coverage = fx_coverage_for_openings(
@@ -1412,7 +1573,7 @@ async fn prepare_cached_stock_review_input_with_candidate(
     );
     let actual_ending = actual_values.last().map(|point| point.value_base);
 
-    Ok(CachedStockReviewInput {
+    let cached = CachedStockReviewInput {
         query: query.clone(),
         transactions,
         overrides: override_list.overrides,
@@ -1452,7 +1613,11 @@ async fn prepare_cached_stock_review_input_with_candidate(
                 .map(str::to_string)
         }),
         generated_at: Utc::now().to_rfc3339(),
-    })
+    };
+    if let Some(candidate) = candidate_revision.as_deref() {
+        stock_review_persistence::verify_candidate_source_revision(db, candidate)?;
+    }
+    Ok(cached)
 }
 
 fn validate_account_exists(db: &Database, account_id: Option<&str>) -> Result<(), String> {
@@ -1619,6 +1784,7 @@ fn load_actual_values(
         Option<PortfolioValuePoint>,
         Vec<PortfolioValuePoint>,
         MetricAvailability,
+        bool,
     ),
     String,
 > {
@@ -1654,7 +1820,7 @@ fn load_actual_values(
                  WHERE date BETWEEN ?1 AND ?2 ORDER BY date ASC",
             )
             .map_err(|error| error.to_string())?;
-        let values = statement
+        let rows = statement
             .query_map(
                 params![
                     query.start_date.format("%Y-%m-%d").to_string(),
@@ -1670,18 +1836,22 @@ fn load_actual_values(
             )
             .map_err(|error| error.to_string())?
             .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+        let values = rows
+            .iter()
             .filter_map(|(date, value, rates_json)| {
                 NaiveDate::parse_from_str(&date, "%Y-%m-%d")
                     .ok()
                     .zip(convert_snapshot_value(
-                        value,
-                        &rates_json,
+                        *value,
+                        rates_json,
                         &query.base_currency,
                     ))
                     .map(|(date, value_base)| PortfolioValuePoint { date, value_base })
             })
             .collect::<Vec<_>>();
-        let availability = if baseline.is_some() && !values.is_empty() {
+        let nav_complete = baseline.is_some() && !values.is_empty() && values.len() == rows.len();
+        let availability = if nav_complete {
             MetricAvailability {
                 status: MetricStatus::Available,
                 note: None,
@@ -1694,7 +1864,7 @@ fn load_actual_values(
                 ),
             }
         };
-        return Ok((baseline, values, availability));
+        return Ok((baseline, values, availability, nav_complete));
     }
     // Filtered daily snapshots do not contain account cash. Preserve their
     // stock value path for context, but do not claim an authoritative TWR.
@@ -1761,12 +1931,16 @@ fn load_actual_values(
         };
     }
     let conversion_incomplete = daily_values.values().any(Option::is_none);
-    let values = daily_values
-        .into_iter()
-        .filter_map(|(date, value_base)| {
-            value_base.map(|value_base| PortfolioValuePoint { date, value_base })
-        })
-        .collect();
+    let values = if conversion_incomplete {
+        Vec::new()
+    } else {
+        daily_values
+            .into_iter()
+            .filter_map(|(date, value_base)| {
+                value_base.map(|value_base| PortfolioValuePoint { date, value_base })
+            })
+            .collect()
+    };
     Ok((
         None,
         values,
@@ -1778,6 +1952,7 @@ fn load_actual_values(
                 "Filtered snapshots lack an authoritative daily cash ledger; actual TWR is unavailable.".to_string()
             }),
         },
+        false,
     ))
 }
 
@@ -1872,11 +2047,25 @@ fn opening_positions(
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    positions.extend(legacy_positions.into_iter().filter(|position| {
-        !ledger_keys.contains(&(
+    positions.extend(legacy_positions.into_iter().filter_map(|mut position| {
+        if ledger_keys.contains(&(
             position.account_id.clone(),
             normalized_stock_symbol(&position.symbol).unwrap_or_default(),
-        ))
+        )) {
+            return None;
+        }
+        let post_origin_factor = recorded_splits
+            .iter()
+            .filter(|split| {
+                stock_symbols_equal(&split.symbol, &position.symbol) && split.date > origin
+            })
+            .map(|split| split.ratio)
+            .product::<f64>();
+        if !post_origin_factor.is_finite() || post_origin_factor <= 0.0 {
+            return None;
+        }
+        position.quantity /= post_origin_factor;
+        Some(position)
     }));
     Ok(positions)
 }
@@ -2495,16 +2684,15 @@ fn campaign_cash_flows(
         let Some(date) = transaction_date(transaction) else {
             continue;
         };
-        let Some(fx) = exact_fx_on(&transaction.currency, &query.base_currency, fx_points, date)
-        else {
-            continue;
-        };
+        let fx = exact_fx_on(&transaction.currency, &query.base_currency, fx_points, date);
         let action_id = corrected.action_id.clone();
         match transaction.transaction_type.as_str() {
             "BUY" => flows.push(CampaignTimelineItem {
                 date,
                 kind: CampaignCashFlowKind::Buy,
-                amount_base: transaction.total_amount * fx,
+                amount_base: fx.map(|fx| transaction.total_amount * fx),
+                amount_local: transaction.total_amount,
+                currency: transaction.currency.clone(),
                 shares: transaction.shares,
                 account_id: transaction.account_id.clone(),
                 action_id: action_id.clone(),
@@ -2512,7 +2700,9 @@ fn campaign_cash_flows(
             "SELL" => flows.push(CampaignTimelineItem {
                 date,
                 kind: CampaignCashFlowKind::Sell,
-                amount_base: transaction.total_amount * fx,
+                amount_base: fx.map(|fx| transaction.total_amount * fx),
+                amount_local: transaction.total_amount,
+                currency: transaction.currency.clone(),
                 shares: transaction.shares,
                 account_id: transaction.account_id.clone(),
                 action_id: action_id.clone(),
@@ -2520,7 +2710,9 @@ fn campaign_cash_flows(
             "PAY" => flows.push(CampaignTimelineItem {
                 date,
                 kind: CampaignCashFlowKind::Dividend,
-                amount_base: transaction.total_amount * fx,
+                amount_base: fx.map(|fx| transaction.total_amount * fx),
+                amount_local: transaction.total_amount,
+                currency: transaction.currency.clone(),
                 shares: 0.0,
                 account_id: transaction.account_id.clone(),
                 action_id: None,
@@ -2533,7 +2725,9 @@ fn campaign_cash_flows(
             flows.push(CampaignTimelineItem {
                 date,
                 kind: CampaignCashFlowKind::Fee,
-                amount_base: transaction.commission * fx,
+                amount_base: fx.map(|fx| transaction.commission * fx),
+                amount_local: transaction.commission,
+                currency: transaction.currency.clone(),
                 shares: 0.0,
                 account_id: transaction.account_id.clone(),
                 action_id,
@@ -2953,7 +3147,7 @@ fn load_risk_input(
     actions: &[StockActionReview],
     average_nav: Option<f64>,
     fx_points: &[ShadowFxPoint],
-) -> Result<RiskStructureInput, String> {
+) -> Result<(RiskStructureInput, bool), String> {
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
     let mut statement = conn
         .prepare(
@@ -3055,6 +3249,7 @@ fn load_risk_input(
         .collect();
     let mut total_fees = 0.0;
     let mut changes = Vec::new();
+    let mut action_fx_complete = true;
     for action in actions.iter().filter(|action| {
         action_date(action).is_some_and(|date| date >= query.start_date && date <= query.end_date)
             && !action.fact_labels.iter().any(|label| label == "transfer")
@@ -3070,14 +3265,19 @@ fn load_risk_input(
             if let Some(notional) = action.gross_amount {
                 changes.push(StockChangeBase::trade(notional * fx));
             }
+        } else {
+            action_fx_complete = false;
         }
     }
-    Ok(RiskStructureInput {
-        snapshots,
-        stock_changes: changes,
-        total_stock_trading_fees_base: Some(total_fees),
-        average_portfolio_nav_base: average_nav,
-    })
+    Ok((
+        RiskStructureInput {
+            snapshots,
+            stock_changes: changes,
+            total_stock_trading_fees_base: action_fx_complete.then_some(total_fees),
+            average_portfolio_nav_base: action_fx_complete.then_some(average_nav).flatten(),
+        },
+        action_fx_complete,
+    ))
 }
 
 fn load_display_context(
@@ -3366,24 +3566,47 @@ mod tests {
     }
 
     fn install_market_sessions(db: &Database, market: &str, dates: &[NaiveDate]) {
+        let Some(first) = dates.iter().min().copied() else {
+            return;
+        };
+        let last = dates.iter().max().copied().unwrap();
+        let open_dates = dates.iter().copied().collect::<BTreeSet<_>>();
         let conn = db.conn.lock().unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS stock_market_sessions (
                 market TEXT NOT NULL,
                 date TEXT NOT NULL,
+                is_session INTEGER NOT NULL DEFAULT 1,
                 source TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (market, date)
+            );
+            CREATE TABLE IF NOT EXISTS stock_market_calendar_coverage (
+                market TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                complete_start TEXT NOT NULL,
+                complete_through TEXT NOT NULL,
+                revision TEXT NOT NULL,
+                encodes_closed_dates INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
             );",
         )
         .unwrap();
-        for date in dates {
+        conn.execute(
+            "INSERT OR REPLACE INTO stock_market_calendar_coverage
+                (market, source, complete_start, complete_through, revision, encodes_closed_dates, updated_at)
+             VALUES (?1, 'fixture_exchange_calendar', ?2, ?3, 'fixture-v1', 1, '2024-01-01T00:00:00Z')",
+            params![market, first.format("%Y-%m-%d").to_string(), last.format("%Y-%m-%d").to_string()],
+        ).unwrap();
+        let mut date = first;
+        while date <= last {
             conn.execute(
-                "INSERT OR REPLACE INTO stock_market_sessions (market, date, source, updated_at)
-                 VALUES (?1, ?2, 'fixture_exchange_calendar', '2024-01-01T00:00:00Z')",
-                params![market, date.format("%Y-%m-%d").to_string()],
+                "INSERT OR REPLACE INTO stock_market_sessions (market, date, is_session, source, updated_at)
+                 VALUES (?1, ?2, ?3, 'fixture_exchange_calendar', '2024-01-01T00:00:00Z')",
+                params![market, date.format("%Y-%m-%d").to_string(), i64::from(open_dates.contains(&date))],
             )
             .unwrap();
+            date += Duration::days(1);
         }
     }
 
@@ -3619,7 +3842,9 @@ mod tests {
                 cash_flows: vec![CampaignTimelineItem {
                     date: day("2024-01-01"),
                     kind: CampaignCashFlowKind::Buy,
-                    amount_base: 100.0,
+                    amount_base: Some(100.0),
+                    amount_local: 100.0,
+                    currency: "USD".to_string(),
                     shares: 1.0,
                     account_id: "acct".to_string(),
                     action_id: Some(action_id.to_string()),
@@ -3801,7 +4026,9 @@ mod tests {
             .push(CampaignTimelineItem {
                 date: day("2024-01-01"),
                 kind: CampaignCashFlowKind::Sell,
-                amount_base: 100.0,
+                amount_base: Some(100.0),
+                amount_local: 100.0,
+                currency: "USD".to_string(),
                 shares: 1.0,
                 account_id: "acct".to_string(),
                 action_id: Some(action_id.to_string()),
@@ -4676,10 +4903,11 @@ mod tests {
             .actual_values
             .iter()
             .all(|point| (point.value_base - 200.0).abs() < 1e-12));
-        assert_eq!(
-            prepared.attribution_input.average_portfolio_nav,
-            Some(200.0)
-        );
+        assert_eq!(prepared.attribution_input.average_portfolio_nav, None);
+        assert!(prepared
+            .preparation_issues
+            .iter()
+            .any(|issue| issue.code == "filtered_nav_cash_unavailable"));
         assert!(prepared.shadow_input.fx_points.iter().any(|point| {
             point.currency == "CNY"
                 && point.date == day("2024-01-10")
@@ -5380,12 +5608,15 @@ mod tests {
         insert_portfolio_value(&db, "2023-12-31", 1_000.0, 7.0);
         insert_portfolio_value(&db, "2024-01-01", 1_000.0, 7.0);
         insert_portfolio_value(&db, "2024-01-03", 1_002.0, 7.0);
-        let sessions = calendar_dates(day("2024-01-02"), 121);
+        // Calendar authority must include the action date as well as all
+        // post-action observation sessions.
+        let sessions = calendar_dates(day("2024-01-01"), 122);
         install_market_sessions(&db, "US", &sessions);
         let mut stock_points = vec![(day("2024-01-01"), 100.0)];
         stock_points.extend(
             sessions
                 .iter()
+                .filter(|date| **date > day("2024-01-01"))
                 .enumerate()
                 .map(|(index, date)| (*date, 101.0 + index as f64)),
         );
@@ -5444,8 +5675,8 @@ mod tests {
             "USD",
             "2024-01-01T09:30:00Z",
         );
-        let sessions = calendar_dates(day("2024-01-02"), 121);
-        let target_60 = sessions[59];
+        let sessions = calendar_dates(day("2024-01-01"), 122);
+        let target_60 = sessions[60];
         install_market_sessions(&db, "US", &sessions);
         for date in ["2023-12-31", "2024-01-01", "2024-05-01"] {
             insert_portfolio_value(&db, date, 1_000.0, 7.0);
@@ -5567,7 +5798,7 @@ mod tests {
         for date in ["2023-12-31", "2024-01-01", "2024-05-01"] {
             insert_portfolio_value(&db, date, 1_000.0, 7.0);
         }
-        let sessions = calendar_dates(day("2024-01-02"), 121);
+        let sessions = calendar_dates(day("2024-01-01"), 122);
         install_market_sessions(&db, "US", &sessions);
         let mut aapl = vec![(day("2024-01-01"), 100.0)];
         aapl.extend(sessions.iter().map(|date| (*date, 110.0)));
@@ -5944,6 +6175,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn candidate_async_cache_preparation_rejects_in_scope_user_mutation() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "US");
+        insert_holding(&db, "holding", "acct", "AAPL", "US", "USD", 1.0);
+        insert_live_transaction(
+            &db,
+            "buy",
+            "acct",
+            "AAPL",
+            "US",
+            "BUY",
+            1.0,
+            100.0,
+            100.0,
+            0.0,
+            "USD",
+            "2024-01-02T09:30:00Z",
+        );
+        for date in ["2024-01-01", "2024-01-02", "2024-01-03"] {
+            insert_portfolio_value(&db, date, 1_000.0, 7.0);
+        }
+        let cache_start = day("2023-12-20");
+        seed_stock_cache_bounds(
+            &db,
+            "AAPL",
+            "US",
+            cache_start,
+            &[(day("2024-01-01"), 100.0), (day("2024-01-03"), 100.0)],
+        );
+        seed_default_benchmarks(&db, cache_start);
+
+        let query = live_query("2024-01-02", "2024-01-03", Some("US"));
+        let mut prepared_candidate = stock_review_persistence::prepare_override_candidate(
+            &db,
+            StockReviewOverrideInput {
+                id: "race".to_string(),
+                override_type: "non_trade".to_string(),
+                transaction_ids_json: r#"["buy"]"#.to_string(),
+                value_json: "{}".to_string(),
+            },
+        )
+        .unwrap();
+        stock_review_persistence::scope_candidate_to_query(&db, &mut prepared_candidate, &query)
+            .unwrap();
+        let canonical = prepared_candidate.input.clone();
+        let candidate_record = StockReviewOverride {
+            id: canonical.id,
+            override_type: canonical.override_type,
+            transaction_ids_json: canonical.transaction_ids_json,
+            value_json: canonical.value_json,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let result = prepare_cached_stock_review_input_with_candidate_and_cache_hook(
+            &db,
+            query,
+            Some(candidate_record),
+            Some(&mut prepared_candidate),
+            |db| {
+                db.conn
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .execute("UPDATE holdings SET shares = 2 WHERE id = 'holding'", [])
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            },
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("changed during cache preparation"),
+            "unexpected preparation error: {error}"
+        );
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM stock_review_overrides", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn override_preview_rejects_a_reference_outside_exact_query_scope() {
         let db = Database::new(":memory:").unwrap();
         insert_account(&db, "a", "US");
@@ -6223,10 +6540,536 @@ mod tests {
         query.base_currency = "CNY".to_string();
         query.market = None;
         query.end_date = day("2024-01-01");
-        let (baseline, values, availability) = load_actual_values(&db, &query).unwrap();
+        let (baseline, values, availability, nav_complete) =
+            load_actual_values(&db, &query).unwrap();
+        assert!(nav_complete);
         assert_eq!(availability.status, MetricStatus::Available);
         assert_eq!(baseline.unwrap().value_base, 7_000.0);
         assert_eq!(values[0].value_base, 7_700.0);
+    }
+
+    #[tokio::test]
+    async fn filtered_nav_never_averages_the_surviving_fx_subset() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "CN");
+        insert_holding(&db, "cn", "acct", "600000", "CN", "CNY", 1.0);
+        insert_holding_snapshot(&db, "2024-01-10", "acct", "600000", "CN", 1.0, 700.0, 700.0);
+        insert_holding_snapshot(&db, "2024-01-11", "acct", "600000", "CN", 1.0, 700.0, 700.0);
+        insert_portfolio_value(&db, "2024-01-10", 100.0, 7.0);
+        let cache_start = day("2023-12-01");
+        seed_stock_cache_bounds(
+            &db,
+            "600000",
+            "CN",
+            cache_start,
+            &[(day("2024-01-10"), 700.0), (day("2024-01-11"), 700.0)],
+        );
+        seed_default_benchmarks(&db, cache_start);
+        let mut query = live_query("2024-01-10", "2024-01-11", None);
+        query.account_id = Some("acct".to_string());
+
+        let prepared = prepare_cached_stock_review_input(&db, query).await.unwrap();
+        assert!(prepared.result_quality_input.actual_values.is_empty());
+        assert_eq!(prepared.attribution_input.average_portfolio_nav, None);
+        assert!(prepared
+            .preparation_issues
+            .iter()
+            .any(|issue| issue.code == "snapshot_fx_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn filtered_stock_snapshots_without_authoritative_cash_disable_nav_ratios() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "US");
+        insert_holding(&db, "stock", "acct", "AAPL", "US", "USD", 1.0);
+        for date in ["2024-01-10", "2024-01-11"] {
+            insert_holding_snapshot(&db, date, "acct", "AAPL", "US", 1.0, 100.0, 100.0);
+            insert_portfolio_value(&db, date, 100.0, 7.0);
+        }
+        let cache_start = day("2023-12-01");
+        seed_stock_cache_bounds(
+            &db,
+            "AAPL",
+            "US",
+            cache_start,
+            &[(day("2024-01-10"), 100.0), (day("2024-01-11"), 100.0)],
+        );
+        seed_default_benchmarks(&db, cache_start);
+        let mut query = live_query("2024-01-10", "2024-01-11", None);
+        query.account_id = Some("acct".to_string());
+
+        let prepared = prepare_cached_stock_review_input(&db, query).await.unwrap();
+        assert_eq!(prepared.attribution_input.average_portfolio_nav, None);
+        let report = build_stock_review_report_from_cached_data(&prepared).unwrap();
+        assert_eq!(report.summary.risk_structure.one_way_turnover, None);
+        assert_eq!(report.summary.risk_structure.fee_drag, None);
+        assert!(report
+            .data_quality
+            .issues
+            .iter()
+            .any(|issue| issue.code == "filtered_nav_cash_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn missing_action_date_fx_disables_turnover_and_fee_drag() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "CN");
+        insert_live_transaction(
+            &db,
+            "cash",
+            "acct",
+            "$CASH-CNY",
+            "CN",
+            "BUY",
+            1000.0,
+            1.0,
+            1000.0,
+            0.0,
+            "CNY",
+            "2024-01-01T08:00:00Z",
+        );
+        insert_live_transaction(
+            &db,
+            "buy",
+            "acct",
+            "600000",
+            "CN",
+            "BUY",
+            1.0,
+            700.0,
+            700.0,
+            7.0,
+            "CNY",
+            "2024-01-10T09:30:00Z",
+        );
+        insert_portfolio_value(&db, "2024-01-09", 142.857142857, 7.0);
+        insert_portfolio_value(&db, "2024-01-11", 142.857142857, 7.0);
+        let cache_start = day("2023-12-01");
+        seed_stock_cache_bounds(
+            &db,
+            "600000",
+            "CN",
+            cache_start,
+            &[(day("2024-01-10"), 700.0), (day("2024-01-11"), 700.0)],
+        );
+        seed_default_benchmarks(&db, cache_start);
+
+        let prepared =
+            prepare_cached_stock_review_input(&db, live_query("2024-01-10", "2024-01-11", None))
+                .await
+                .unwrap();
+        let report = build_stock_review_report_from_cached_data(&prepared).unwrap();
+        assert_eq!(report.summary.risk_structure.one_way_turnover, None);
+        assert_eq!(report.summary.risk_structure.fee_drag, None);
+        assert!(report
+            .data_quality
+            .issues
+            .iter()
+            .any(|issue| issue.code == "action_fx_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn campaign_retains_non_base_flows_when_exact_fx_is_missing() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "CN");
+        insert_live_transaction(
+            &db,
+            "cash",
+            "acct",
+            "$CASH-CNY",
+            "CN",
+            "BUY",
+            1000.0,
+            1.0,
+            1000.0,
+            0.0,
+            "CNY",
+            "2024-01-01T08:00:00Z",
+        );
+        insert_live_transaction(
+            &db,
+            "buy",
+            "acct",
+            "600000",
+            "CN",
+            "BUY",
+            1.0,
+            700.0,
+            700.0,
+            7.0,
+            "CNY",
+            "2024-01-10T09:30:00Z",
+        );
+        insert_live_transaction(
+            &db,
+            "pay",
+            "acct",
+            "600000",
+            "CN",
+            "PAY",
+            1.0,
+            10.0,
+            10.0,
+            0.0,
+            "CNY",
+            "2024-01-11T09:30:00Z",
+        );
+        insert_portfolio_value(&db, "2024-01-09", 142.857142857, 7.0);
+        insert_portfolio_value(&db, "2024-01-12", 144.285714286, 7.0);
+        let cache_start = day("2023-12-01");
+        seed_stock_cache_bounds(
+            &db,
+            "600000",
+            "CN",
+            cache_start,
+            &[
+                (day("2024-01-10"), 700.0),
+                (day("2024-01-11"), 700.0),
+                (day("2024-01-12"), 700.0),
+            ],
+        );
+        seed_default_benchmarks(&db, cache_start);
+
+        let prepared =
+            prepare_cached_stock_review_input(&db, live_query("2024-01-10", "2024-01-12", None))
+                .await
+                .unwrap();
+        assert_eq!(prepared.campaign_data[0].cash_flows.len(), 3);
+        let mut artifacts = build_stock_review_artifacts(&prepared).unwrap();
+        let detail = artifacts.campaign_details.remove(0);
+        assert_eq!(detail.pnl_availability.status, MetricStatus::Unavailable);
+        assert!(detail
+            .issues
+            .iter()
+            .any(|issue| issue.code == "campaign_fx_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn legacy_current_holding_is_reversed_for_post_origin_split_then_replayed_once() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "US");
+        insert_holding(&db, "legacy", "acct", "AAPL", "US", "USD", 20.0);
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO stock_splits (stock_code, split_date, ratio_from, ratio_to, created_at) VALUES ('AAPL', '2024-01-10', 1, 2, '2024-01-10')",
+            [],
+        ).unwrap();
+        for (date, value) in [
+            ("2024-01-09", 1000.0),
+            ("2024-01-10", 1000.0),
+            ("2024-01-11", 1000.0),
+        ] {
+            insert_portfolio_value(&db, date, value, 7.0);
+        }
+        let cache_start = day("2023-12-01");
+        seed_stock_cache_bounds(
+            &db,
+            "AAPL",
+            "US",
+            cache_start,
+            &[
+                (day("2024-01-09"), 100.0),
+                (day("2024-01-10"), 50.0),
+                (day("2024-01-11"), 50.0),
+            ],
+        );
+        seed_default_benchmarks(&db, cache_start);
+
+        let prepared =
+            prepare_cached_stock_review_input(&db, live_query("2024-01-10", "2024-01-11", None))
+                .await
+                .unwrap();
+        assert_eq!(prepared.shadow_input.opening_positions[0].quantity, 10.0);
+        assert_eq!(prepared.shadow_input.split_events.len(), 1);
+        let shadow = build_shadow_series(&prepared.shadow_input);
+        assert_eq!(shadow.ending_value, Some(1000.0));
+    }
+
+    #[tokio::test]
+    async fn nonempty_session_rows_without_coverage_metadata_are_not_authority() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "US");
+        insert_live_transaction(
+            &db,
+            "cash",
+            "acct",
+            "$CASH-USD",
+            "US",
+            "BUY",
+            1000.0,
+            1.0,
+            1000.0,
+            0.0,
+            "USD",
+            "2024-01-01T08:00:00Z",
+        );
+        insert_live_transaction(
+            &db,
+            "buy",
+            "acct",
+            "AAPL",
+            "US",
+            "BUY",
+            1.0,
+            100.0,
+            100.0,
+            0.0,
+            "USD",
+            "2024-01-02T09:30:00Z",
+        );
+        insert_portfolio_value(&db, "2024-01-01", 1000.0, 7.0);
+        insert_portfolio_value(&db, "2024-01-03", 1000.0, 7.0);
+        let cache_start = day("2023-12-01");
+        seed_stock_cache_bounds(
+            &db,
+            "AAPL",
+            "US",
+            cache_start,
+            &[(day("2024-01-02"), 100.0), (day("2024-01-03"), 100.0)],
+        );
+        seed_benchmark_cache(&db, "^GSPC", cache_start, None, 100.0);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO stock_market_sessions (market, date, is_session, source, updated_at)
+             VALUES ('US', '2024-01-02', 1, 'unproven', '2024-01-02')",
+                [],
+            )
+            .unwrap();
+
+        let prepared = prepare_cached_stock_review_input(
+            &db,
+            live_query("2024-01-02", "2024-01-03", Some("US")),
+        )
+        .await
+        .unwrap();
+        assert!(prepared.forward_actions[0].market_session_dates.is_empty());
+        assert_eq!(
+            prepared.forward_actions[0].availability.status,
+            MetricStatus::Unavailable
+        );
+        assert!(prepared
+            .preparation_issues
+            .iter()
+            .any(|issue| issue.code == "market_calendar_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn declared_calendar_with_missing_interior_day_is_invalid() {
+        let db = Database::new(":memory:").unwrap();
+        install_market_sessions(&db, "US", &calendar_dates(day("2024-01-01"), 5));
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM stock_market_sessions WHERE market = 'US' AND date = '2024-01-03'",
+                [],
+            )
+            .unwrap();
+        let calendar =
+            load_market_sessions(&db, "US", day("2024-01-01"), day("2024-01-05")).unwrap();
+        assert_eq!(calendar.availability.status, MetricStatus::Unavailable);
+        assert!(calendar.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn campaign_terminal_is_unavailable_when_calendar_coverage_stops_before_cutoff() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "US");
+        insert_live_transaction(
+            &db,
+            "cash",
+            "acct",
+            "$CASH-USD",
+            "US",
+            "BUY",
+            1000.0,
+            1.0,
+            1000.0,
+            0.0,
+            "USD",
+            "2024-01-01T08:00:00Z",
+        );
+        insert_live_transaction(
+            &db,
+            "buy",
+            "acct",
+            "AAPL",
+            "US",
+            "BUY",
+            1.0,
+            100.0,
+            100.0,
+            0.0,
+            "USD",
+            "2024-01-09T09:30:00Z",
+        );
+        insert_portfolio_value(&db, "2024-01-08", 1000.0, 7.0);
+        insert_portfolio_value(&db, "2024-01-11", 1000.0, 7.0);
+        let cache_start = day("2023-12-01");
+        seed_stock_cache_bounds(
+            &db,
+            "AAPL",
+            "US",
+            cache_start,
+            &[
+                (day("2024-01-09"), 100.0),
+                (day("2024-01-10"), 110.0),
+                (day("2024-01-11"), 120.0),
+            ],
+        );
+        seed_benchmark_cache(&db, "^GSPC", cache_start, None, 100.0);
+        install_market_sessions(&db, "US", &calendar_dates(day("2024-01-01"), 10));
+
+        let prepared = prepare_cached_stock_review_input(
+            &db,
+            live_query("2024-01-09", "2024-01-11", Some("US")),
+        )
+        .await
+        .unwrap();
+        let mut artifacts = build_stock_review_artifacts(&prepared).unwrap();
+        let detail = artifacts.campaign_details.remove(0);
+        assert_eq!(detail.pnl_availability.status, MetricStatus::Unavailable);
+        assert!(detail
+            .issues
+            .iter()
+            .any(|issue| issue.code == "campaign_calendar_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn same_id_candidate_replaces_stale_preview_state_and_matches_saved_report() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "US");
+        insert_live_transaction(
+            &db,
+            "cash",
+            "acct",
+            "$CASH-USD",
+            "US",
+            "BUY",
+            1000.0,
+            1.0,
+            1000.0,
+            0.0,
+            "USD",
+            "2024-01-01T08:00:00Z",
+        );
+        insert_live_transaction(
+            &db,
+            "buy",
+            "acct",
+            "AAPL",
+            "US",
+            "BUY",
+            1.0,
+            100.0,
+            100.0,
+            0.0,
+            "USD",
+            "2024-01-10T09:30:00Z",
+        );
+        for date in ["2024-01-09", "2024-01-10", "2024-01-11"] {
+            insert_portfolio_value(&db, date, 1000.0, 7.0);
+        }
+        let cache_start = day("2023-12-01");
+        seed_stock_cache_bounds(
+            &db,
+            "AAPL",
+            "US",
+            cache_start,
+            &[(day("2024-01-10"), 100.0), (day("2024-01-11"), 100.0)],
+        );
+        seed_default_benchmarks(&db, cache_start);
+        let input = StockReviewOverrideInput {
+            id: "same-id".to_string(),
+            override_type: "non_trade".to_string(),
+            transaction_ids_json: r#"["buy"]"#.to_string(),
+            value_json: "{}".to_string(),
+        };
+        stock_review_persistence::save_override(&db, input.clone()).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE transactions SET price = 101 WHERE id = 'buy'", [])
+            .unwrap();
+        assert_eq!(
+            stock_review_persistence::list_overrides(&db)
+                .unwrap()
+                .stale_overrides
+                .len(),
+            1
+        );
+
+        let query = live_query("2024-01-10", "2024-01-11", None);
+        let candidate = confirm_stock_review_override(&db, query.clone(), input)
+            .await
+            .unwrap();
+        assert!(!candidate
+            .data_quality
+            .issues
+            .iter()
+            .any(|issue| issue.code == "stale_override"));
+        let saved = get_stock_review_report(&db, query).await.unwrap();
+        assert_eq!(candidate.summary, saved.summary);
+        assert_eq!(candidate.actions, saved.actions);
+        assert_eq!(candidate.campaigns, saved.campaigns);
+        assert_eq!(candidate.data_quality.issues, saved.data_quality.issues);
+    }
+
+    #[test]
+    fn stock_annotations_require_explicit_effective_time_when_multiple_cycles_match() {
+        let campaign = |id: &str, start: &str, end: &str| StockCampaignSummary {
+            campaign_id: id.to_string(),
+            account_ids: vec!["acct".to_string()],
+            action_ids: vec![],
+            fragments: vec![],
+            campaign_status: StockCampaignStatus::Completed,
+            availability: available(),
+            symbol: "AAPL".to_string(),
+            market: "US".to_string(),
+            started_at: format!("{start}T09:30:00Z"),
+            ended_at: Some(format!("{end}T16:00:00Z")),
+            contribution: None,
+        };
+        let campaigns = vec![
+            campaign("first", "2024-01-01", "2024-01-10"),
+            campaign("second", "2024-02-01", "2024-02-10"),
+        ];
+        let annotation = |id: &str, value_json: &str| StockReviewAnnotation {
+            id: id.to_string(),
+            scope_type: "stock".to_string(),
+            scope_key: "AAPL".to_string(),
+            account_id: Some("acct".to_string()),
+            symbol: Some("AAPL".to_string()),
+            annotation_type: "thesis".to_string(),
+            value_json: value_json.to_string(),
+            source: "user".to_string(),
+            created_at: "2026-08-28T00:00:00Z".to_string(),
+            updated_at: "2026-08-28T00:00:00Z".to_string(),
+        };
+        let undated = annotation("undated", r#"{"note":"report-level"}"#);
+        assert!(!annotation_applies_to_campaign(
+            &undated,
+            &campaigns[0],
+            &campaigns
+        ));
+        assert!(!annotation_applies_to_campaign(
+            &undated,
+            &campaigns[1],
+            &campaigns
+        ));
+
+        let dated = annotation("dated", r#"{"effective_date":"2024-02-05"}"#);
+        assert!(!annotation_applies_to_campaign(
+            &dated,
+            &campaigns[0],
+            &campaigns
+        ));
+        assert!(annotation_applies_to_campaign(
+            &dated,
+            &campaigns[1],
+            &campaigns
+        ));
     }
 
     #[test]

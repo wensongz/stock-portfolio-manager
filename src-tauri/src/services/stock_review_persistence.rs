@@ -3,7 +3,7 @@
 use crate::db::Database;
 use crate::models::stock_review::{
     StockReviewAnnotation, StockReviewAnnotationInput, StockReviewIssue, StockReviewIssueSeverity,
-    StockReviewOverride, StockReviewOverrideInput,
+    StockReviewOverride, StockReviewOverrideInput, StockReviewQuery,
 };
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -50,7 +50,22 @@ pub struct ValidatedOverrideCandidate {
     pub input: StockReviewOverrideInput,
     active_override_revision: String,
     reference_fingerprint_json: String,
-    review_source_revision: String,
+    source_scope: ReviewSourceScope,
+    preparation_user_revision: String,
+    review_source_revision: ReviewSourceRevision,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReviewSourceScope {
+    account_id: Option<String>,
+    market: Option<String>,
+    end_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReviewSourceRevision {
+    user: String,
+    cache: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -216,24 +231,74 @@ pub fn prepare_override_candidate(
         .iter()
         .map(TransactionReferenceFingerprint::from_transaction)
         .collect::<Vec<_>>();
+    let account_id = references
+        .first()
+        .map(|transaction| transaction.account_id.clone())
+        .filter(|account_id| {
+            references
+                .iter()
+                .all(|transaction| transaction.account_id == *account_id)
+        });
+    let source_scope = ReviewSourceScope {
+        account_id,
+        market: None,
+        end_date: None,
+    };
+    let preparation_user_revision = user_source_revision(&conn, &source_scope)?;
     Ok(ValidatedOverrideCandidate {
         input,
         active_override_revision: active_override_revision(&conn)?,
         reference_fingerprint_json: serde_json::to_string(&fingerprints)
             .map_err(|error| error.to_string())?,
-        review_source_revision: review_source_revision(&conn)?,
+        review_source_revision: review_source_revision(&conn, &source_scope)?,
+        preparation_user_revision,
+        source_scope,
     })
 }
 
-/// Refresh only after the asynchronous cache preparation owned by this
-/// candidate has completed. The active override revision deliberately remains
-/// the original one so a concurrent confirmation is still detected.
-pub fn refresh_candidate_source_revision(
+pub fn scope_candidate_to_query(
+    db: &Database,
+    candidate: &mut ValidatedOverrideCandidate,
+    query: &StockReviewQuery,
+) -> Result<(), String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    candidate.source_scope = ReviewSourceScope {
+        account_id: query.account_id.clone(),
+        market: query.market.clone(),
+        end_date: Some(query.end_date.format("%Y-%m-%d").to_string()),
+    };
+    candidate.preparation_user_revision = user_source_revision(&conn, &candidate.source_scope)?;
+    candidate.review_source_revision = review_source_revision(&conn, &candidate.source_scope)?;
+    Ok(())
+}
+
+pub fn pin_candidate_source_revision_after_cache_fill(
     db: &Database,
     candidate: &mut ValidatedOverrideCandidate,
 ) -> Result<(), String> {
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
-    candidate.review_source_revision = review_source_revision(&conn)?;
+    let current_user = user_source_revision(&conn, &candidate.source_scope)?;
+    if current_user != candidate.preparation_user_revision {
+        return Err(
+            "A user-owned report source changed during cache preparation; rebuild before confirming."
+                .to_string(),
+        );
+    }
+    candidate.review_source_revision = review_source_revision(&conn, &candidate.source_scope)?;
+    Ok(())
+}
+
+pub fn verify_candidate_source_revision(
+    db: &Database,
+    candidate: &ValidatedOverrideCandidate,
+) -> Result<(), String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    if review_source_revision(&conn, &candidate.source_scope)? != candidate.review_source_revision {
+        return Err(
+            "A report source changed while candidate inputs were materialized; rebuild before confirming."
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -250,7 +315,9 @@ pub fn save_override_candidate(
                 .to_string(),
         );
     }
-    if review_source_revision(&transaction)? != candidate.review_source_revision {
+    if review_source_revision(&transaction, &candidate.source_scope)?
+        != candidate.review_source_revision
+    {
         return Err(
             "A report source changed while the candidate report was being built; rebuild before confirming."
                 .to_string(),
@@ -331,21 +398,39 @@ fn active_override_revision(conn: &Connection) -> Result<String, String> {
     serde_json::to_string(&rows).map_err(|error| error.to_string())
 }
 
-fn review_source_revision(conn: &Connection) -> Result<String, String> {
-    const TABLES: &[&str] = &[
-        "transactions",
-        "holdings",
-        "daily_portfolio_values",
-        "daily_holding_snapshots",
-        "benchmark_daily_prices",
-        "stock_daily_prices",
-        "stock_market_sessions",
-        "stock_splits",
-        "stock_review_annotations",
-        "cached_exchange_rates",
+fn review_source_revision(
+    conn: &Connection,
+    scope: &ReviewSourceScope,
+) -> Result<ReviewSourceRevision, String> {
+    Ok(ReviewSourceRevision {
+        user: user_source_revision(conn, scope)?,
+        cache: cache_source_revision(conn, scope)?,
+    })
+}
+
+fn user_source_revision(conn: &Connection, scope: &ReviewSourceScope) -> Result<String, String> {
+    let tables = [
+        (
+            "transactions",
+            scoped_where(scope, true, true, Some("traded_at")),
+        ),
+        ("holdings", scoped_where(scope, true, true, None)),
+        (
+            "daily_holding_snapshots",
+            scoped_where(scope, true, true, Some("date")),
+        ),
+        (
+            "daily_portfolio_values",
+            scoped_where(scope, false, false, Some("date")),
+        ),
+        (
+            "stock_splits",
+            scoped_where(scope, false, false, Some("split_date")),
+        ),
+        ("stock_review_annotations", scoped_annotation_where(scope)),
     ];
-    let mut revision = Vec::<(&str, Vec<Vec<String>>)>::new();
-    for table in TABLES {
+    let mut revision = Vec::<(String, Vec<Vec<String>>)>::new();
+    for (table, where_clause) in tables {
         let mut columns_statement = conn
             .prepare(&format!("PRAGMA table_info({table})"))
             .map_err(|error| error.to_string())?;
@@ -354,20 +439,146 @@ fn review_source_revision(conn: &Connection) -> Result<String, String> {
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
-        let sql = format!("SELECT {} FROM {table} ORDER BY rowid", columns.join(", "));
+        let sql = format!(
+            "SELECT {} FROM {table} {where_clause} ORDER BY rowid",
+            columns.join(", ")
+        );
         let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map([], |row| {
-                (0..columns.len())
-                    .map(|index| row.get_ref(index).map(|value| format!("{value:?}")))
-                    .collect::<Result<Vec<_>, _>>()
-            })
+            .query_map(
+                params![scope.account_id, scope.market, scope.end_date],
+                |row| {
+                    (0..columns.len())
+                        .map(|index| row.get_ref(index).map(|value| format!("{value:?}")))
+                        .collect::<Result<Vec<_>, _>>()
+                },
+            )
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
-        revision.push((table, rows));
+        revision.push((table.to_string(), rows));
+    }
+    revision.push((
+        "quarterly_context".to_string(),
+        quarterly_context_revision(conn, scope)?,
+    ));
+    serde_json::to_string(&revision).map_err(|error| error.to_string())
+}
+
+fn cache_source_revision(conn: &Connection, scope: &ReviewSourceScope) -> Result<String, String> {
+    let tables = [
+        (
+            "benchmark_daily_prices",
+            scoped_where(scope, false, false, Some("date")),
+        ),
+        (
+            "stock_daily_prices",
+            scoped_where(scope, false, true, Some("date")),
+        ),
+        (
+            "stock_market_sessions",
+            scoped_where(scope, false, true, Some("date")),
+        ),
+        (
+            "stock_market_calendar_coverage",
+            scoped_where(scope, false, true, Some("complete_through")),
+        ),
+        (
+            "cached_exchange_rates",
+            scoped_where(scope, false, false, None),
+        ),
+    ];
+    let mut revision = Vec::<(String, Vec<Vec<String>>)>::new();
+    for (table, where_clause) in tables {
+        let mut columns_statement = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|error| error.to_string())?;
+        let columns = columns_statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let sql = format!(
+            "SELECT {} FROM {table} {where_clause} ORDER BY rowid",
+            columns.join(", ")
+        );
+        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![scope.account_id, scope.market, scope.end_date],
+                |row| {
+                    (0..columns.len())
+                        .map(|index| row.get_ref(index).map(|value| format!("{value:?}")))
+                        .collect::<Result<Vec<_>, _>>()
+                },
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        revision.push((table.to_string(), rows));
     }
     serde_json::to_string(&revision).map_err(|error| error.to_string())
+}
+
+fn scoped_where(
+    _scope: &ReviewSourceScope,
+    has_account: bool,
+    has_market: bool,
+    date_column: Option<&str>,
+) -> String {
+    let account = if has_account {
+        "(?1 IS NULL OR account_id = ?1)".to_string()
+    } else {
+        "(?1 IS NULL OR ?1 IS NOT NULL)".to_string()
+    };
+    let market = if has_market {
+        "(?2 IS NULL OR market = ?2)".to_string()
+    } else {
+        "(?2 IS NULL OR ?2 IS NOT NULL)".to_string()
+    };
+    let date = date_column.map_or_else(
+        || "(?3 IS NULL OR ?3 IS NOT NULL)".to_string(),
+        |column| format!("(?3 IS NULL OR substr({column}, 1, 10) <= ?3)"),
+    );
+    format!("WHERE {account} AND {market} AND {date}")
+}
+
+fn scoped_annotation_where(scope: &ReviewSourceScope) -> String {
+    let _ = scope;
+    "WHERE (?1 IS NULL OR account_id IS NULL OR account_id = ?1)
+       AND (?2 IS NULL OR ?2 IS NOT NULL)
+       AND (?3 IS NULL OR ?3 IS NOT NULL)"
+        .to_string()
+}
+
+fn quarterly_context_revision(
+    conn: &Connection,
+    scope: &ReviewSourceScope,
+) -> Result<Vec<Vec<String>>, String> {
+    let where_clause = "WHERE (?1 IS NULL OR qh.account_id = ?1)
+                          AND (?2 IS NULL OR qh.market = ?2)
+                          AND (?3 IS NULL OR substr(qs.snapshot_date, 1, 10) <= ?3)";
+    let sql = format!(
+        "SELECT qs.id, qs.quarter, qs.snapshot_date, qs.overall_notes,
+                qh.id, qh.account_id, qh.symbol, qh.market, qh.notes, qh.decision_quality
+         FROM quarterly_snapshots qs
+         LEFT JOIN quarterly_holding_snapshots qh ON qh.quarterly_snapshot_id = qs.id
+         {where_clause} ORDER BY qs.snapshot_date, qs.id, qh.id"
+    );
+    let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(
+            params![scope.account_id, scope.market, scope.end_date],
+            |row| {
+                (0..10)
+                    .map(|index| row.get_ref(index).map(|value| format!("{value:?}")))
+                    .collect::<Result<Vec<_>, _>>()
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(rows)
 }
 
 pub fn list_overrides(db: &Database) -> Result<StockReviewOverrideList, String> {
@@ -1363,6 +1574,112 @@ mod tests {
 
         assert!(save_override_candidate(&db, candidate).is_err());
         assert_eq!(list_overrides(&db).unwrap().overrides.len(), 0);
+    }
+
+    #[test]
+    fn post_async_refresh_must_not_bless_an_in_scope_user_mutation() {
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        let mut candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["buy"], "{}"),
+        )
+        .unwrap();
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO holdings (id, account_id, symbol, name, market, shares, avg_cost, currency, created_at, updated_at)
+             VALUES ('concurrent', 'acct-a', 'MSFT', 'MSFT', 'US', 1, 100, 'USD', '2024-02-02', '2024-02-02')",
+            [],
+        ).unwrap();
+
+        assert!(
+            super::pin_candidate_source_revision_after_cache_fill(&db, &mut candidate).is_err()
+        );
+        assert!(save_override_candidate(&db, candidate).is_err());
+        assert!(list_overrides(&db).unwrap().overrides.is_empty());
+    }
+
+    #[test]
+    fn quarterly_context_mutation_invalidates_a_prepared_candidate() {
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        let candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["buy"], "{}"),
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO quarterly_snapshots (id, quarter, snapshot_date, created_at)
+             VALUES ('q1', '2024Q1', '2024-03-31', '2024-03-31')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO quarterly_holding_snapshots
+                (id, quarterly_snapshot_id, account_id, symbol, name, market, notes)
+             VALUES ('qh1', 'q1', 'acct-a', 'AAPL', 'AAPL', 'US', 'changed')",
+                [],
+            )
+            .unwrap();
+
+        assert!(save_override_candidate(&db, candidate).is_err());
+        assert!(list_overrides(&db).unwrap().overrides.is_empty());
+    }
+
+    #[test]
+    fn unrelated_account_mutation_does_not_invalidate_scoped_candidate() {
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy-a",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        let candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["buy-a"], "{}"),
+        )
+        .unwrap();
+        insert_transaction(
+            &db,
+            "buy-b",
+            "acct-b",
+            "MSFT",
+            "BUY",
+            1.0,
+            200.0,
+            "2024-02-02",
+        );
+
+        assert!(save_override_candidate(&db, candidate).is_ok());
+        assert_eq!(list_overrides(&db).unwrap().overrides.len(), 1);
     }
 
     #[test]

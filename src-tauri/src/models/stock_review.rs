@@ -142,6 +142,28 @@ pub struct RebalanceAttributionSummary {
     pub buy_value_add: Option<f64>,
     pub sell_value_add: Option<f64>,
     pub fees: Option<f64>,
+    pub action_contributions: Vec<RebalanceAttributionItem>,
+    pub contributors: Vec<RebalanceAttributionItem>,
+    pub detractors: Vec<RebalanceAttributionItem>,
+    pub dividend_contribution: Option<f64>,
+    pub fee_contribution: Option<f64>,
+    pub currency_contribution: Option<f64>,
+    pub cash_contribution: Option<f64>,
+    pub explained_value_difference: Option<f64>,
+    pub ending_value_difference: Option<f64>,
+    pub residual: Option<f64>,
+    pub residual_to_average_nav: Option<f64>,
+    pub percentage_basis_label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RebalanceAttributionItem {
+    pub market: String,
+    pub symbol: String,
+    pub action_type: String,
+    pub action_id: String,
+    pub amount: f64,
+    pub percentage_of_average_nav: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -238,9 +260,14 @@ pub struct StockCampaignDetail {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StockReviewDataQuality {
     pub availability: MetricAvailability,
+    pub actual_result_availability: MetricAvailability,
+    pub shadow_value_add_availability: MetricAvailability,
+    pub attribution_availability: MetricAvailability,
+    pub forward_effect_availability: MetricAvailability,
     pub issues: Vec<StockReviewIssue>,
     pub market_data_coverage: Option<f64>,
     pub exchange_rate_coverage: Option<f64>,
+    pub interval_drawdown_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

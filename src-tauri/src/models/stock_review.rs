@@ -3,6 +3,17 @@
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
+/// Canonical comparison key for stock symbols. Keep the original symbol for
+/// user-facing display; use this key only for identity/grouping decisions.
+pub fn normalized_stock_symbol(symbol: &str) -> Option<String> {
+    let symbol = symbol.trim();
+    (!symbol.is_empty()).then(|| symbol.to_ascii_uppercase())
+}
+
+pub fn stock_symbols_equal(left: &str, right: &str) -> bool {
+    normalized_stock_symbol(left) == normalized_stock_symbol(right)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricStatus {

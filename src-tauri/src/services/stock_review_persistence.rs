@@ -5,7 +5,7 @@ use crate::models::stock_review::{
     StockReviewAnnotation, StockReviewAnnotationInput, StockReviewIssue, StockReviewIssueSeverity,
     StockReviewOverride, StockReviewOverrideInput,
 };
-use chrono::Utc;
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -131,7 +131,7 @@ pub fn save_annotation(
     let input = normalize_annotation_input(input, context)?;
     let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
     let transaction = conn.transaction().map_err(|error| error.to_string())?;
-    let now = Utc::now().to_rfc3339();
+    let now = next_audit_timestamp(&transaction, "stock_review_annotations", &input.id)?;
     transaction
         .execute(
             "INSERT INTO stock_review_annotations
@@ -203,7 +203,7 @@ pub fn save_override(
         .iter()
         .map(TransactionReferenceFingerprint::from_transaction)
         .collect::<Vec<_>>();
-    let now = Utc::now().to_rfc3339();
+    let now = next_audit_timestamp(&transaction, "stock_review_overrides", &input.id)?;
     transaction
         .execute(
             "INSERT INTO stock_review_overrides
@@ -675,7 +675,46 @@ fn normalize_scope_type(value: &str) -> Result<String, String> {
 }
 
 fn normalize_symbol(value: &str) -> Result<String, String> {
-    Ok(normalize_identifier("symbol", value)?.to_ascii_uppercase())
+    crate::models::stock_review::normalized_stock_symbol(value)
+        .ok_or_else(|| "symbol must not be empty.".to_string())
+}
+
+fn next_audit_timestamp(conn: &Connection, table: &str, id: &str) -> Result<String, String> {
+    let sql = match table {
+        "stock_review_annotations" | "stock_review_overrides" => {
+            format!("SELECT created_at, updated_at FROM {table} WHERE id = ?1")
+        }
+        _ => return Err("Unsupported audit table.".to_string()),
+    };
+    let prior = conn
+        .query_row(&sql, params![id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()
+        .map_err(|error| error.to_string())?;
+    Ok(monotonic_audit_timestamp(Utc::now(), prior.as_ref())?
+        .to_rfc3339_opts(SecondsFormat::Nanos, true))
+}
+
+fn monotonic_audit_timestamp(
+    now: DateTime<Utc>,
+    prior: Option<&(String, String)>,
+) -> Result<DateTime<Utc>, String> {
+    let Some((created_at, updated_at)) = prior else {
+        return Ok(now);
+    };
+    let created_at = DateTime::parse_from_rfc3339(created_at)
+        .map_err(|error| format!("Invalid persisted created_at: {error}"))?
+        .with_timezone(&Utc);
+    let updated_at = DateTime::parse_from_rfc3339(updated_at)
+        .map_err(|error| format!("Invalid persisted updated_at: {error}"))?
+        .with_timezone(&Utc);
+    let latest = created_at.max(updated_at);
+    if now > latest {
+        Ok(now)
+    } else {
+        latest
+            .checked_add_signed(Duration::nanoseconds(1))
+            .ok_or_else(|| "Audit timestamp overflow.".to_string())
+    }
 }
 
 fn normalize_identifier(name: &str, value: &str) -> Result<String, String> {
@@ -745,8 +784,8 @@ fn format_override_validation_error(validation: &OverrideValidationResult) -> St
 #[cfg(test)]
 mod tests {
     use super::{
-        list_annotations, list_overrides, save_annotation, save_override, validate_override,
-        AnnotationSaveContext, StockReviewAnnotationFilter,
+        list_annotations, list_overrides, monotonic_audit_timestamp, save_annotation,
+        save_override, validate_override, AnnotationSaveContext, StockReviewAnnotationFilter,
     };
     use crate::db::Database;
     use crate::models::stock_review::{
@@ -882,6 +921,80 @@ mod tests {
             AnnotationSaveContext::UserInitiated,
         )
         .is_err());
+    }
+
+    #[test]
+    fn stable_id_upserts_advance_annotation_and_override_audit_times_without_sleeping() {
+        // Reusing a same-tick or regressed clock value would make an update
+        // indistinguishable from its prior persisted revision.
+        let db = database();
+        let annotation_first = save_annotation(
+            &db,
+            annotation_input("audit-annotation", r#"{"thesis":"first"}"#),
+            AnnotationSaveContext::UserInitiated,
+        )
+        .unwrap();
+        let annotation_second = save_annotation(
+            &db,
+            annotation_input("audit-annotation", r#"{"thesis":"second"}"#),
+            AnnotationSaveContext::UserInitiated,
+        )
+        .unwrap();
+        assert_eq!(annotation_second.created_at, annotation_first.created_at);
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&annotation_second.updated_at).unwrap()
+                > chrono::DateTime::parse_from_rfc3339(&annotation_first.updated_at).unwrap()
+        );
+
+        insert_transaction(
+            &db,
+            "audit-non-trade",
+            "acct-a",
+            "AAPL",
+            "OPEN",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        let override_first = save_override(
+            &db,
+            override_input("audit-override", "non_trade", &["audit-non-trade"], "{}"),
+        )
+        .unwrap();
+        let override_second = save_override(
+            &db,
+            override_input(
+                "audit-override",
+                "non_trade",
+                &["audit-non-trade"],
+                r#"{"note":"second"}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(override_second.created_at, override_first.created_at);
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&override_second.updated_at).unwrap()
+                > chrono::DateTime::parse_from_rfc3339(&override_first.updated_at).unwrap()
+        );
+    }
+
+    #[test]
+    fn audit_timestamp_advances_when_the_clock_is_equal_or_behind_the_saved_audit_time() {
+        // A wall-clock rollback must never make an idempotent update appear
+        // older than the correction/annotation revision it replaces.
+        let prior = (
+            "2024-02-01T00:00:00.000000010Z".to_string(),
+            "2024-02-01T00:00:00.000000010Z".to_string(),
+        );
+        let now = chrono::DateTime::parse_from_rfc3339("2024-02-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            monotonic_audit_timestamp(now, Some(&prior)).unwrap(),
+            chrono::DateTime::parse_from_rfc3339("2024-02-01T00:00:00.000000011Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        );
     }
 
     #[test]

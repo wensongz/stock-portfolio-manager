@@ -1,6 +1,6 @@
 use crate::models::stock_review::{
-    ForwardEffectWindow, MetricStatus, StockActionReview, StockReviewIssue,
-    StockReviewIssueSeverity, StockReviewOverride,
+    normalized_stock_symbol, stock_symbols_equal, ForwardEffectWindow, MetricStatus,
+    StockActionReview, StockReviewIssue, StockReviewIssueSeverity, StockReviewOverride,
 };
 use crate::models::Transaction;
 use crate::services::quote_service::is_cash_symbol;
@@ -93,7 +93,10 @@ pub fn build_stock_actions(
             continue;
         };
 
-        let key = (transaction.account_id.clone(), transaction.symbol.clone());
+        let key = (
+            transaction.account_id.clone(),
+            symbol_key(&transaction.symbol),
+        );
         let shares_before = *shares_by_position.get(&key).unwrap_or(&0.0);
         let delta = match transaction.transaction_type.as_str() {
             "BUY" | "OPEN" => transaction.shares,
@@ -188,19 +191,19 @@ pub fn build_stock_actions(
         if is_date_precision {
             date_only_reversals.insert((
                 transaction.account_id.clone(),
-                transaction.symbol.clone(),
+                symbol_key(&transaction.symbol),
                 trade_date,
             ));
         }
     }
     flush_action_fills(&mut fills, &mut actions);
 
-    for (account_id, symbol, date) in date_only_reversals {
+    for (account_id, normalized_symbol, date) in date_only_reversals {
         let relevant_events = position_events
             .iter()
             .filter(|event| {
                 event.account_id == account_id
-                    && event.symbol == symbol
+                    && symbol_key(&event.symbol) == normalized_symbol
                     && event.trade_date == date
                     && event.is_date_precision
                     && (event.transaction_type == "BUY" || event.transaction_type == "SELL")
@@ -221,7 +224,7 @@ pub fn build_stock_actions(
                 code: "same_day_order_uncertain".to_string(),
                 severity: StockReviewIssueSeverity::Warning,
                 message: "Same-day reversal has date-only precision; confirm transaction order before using derived metrics.".to_string(),
-                affected_symbol: Some(symbol),
+                affected_symbol: relevant_events.first().map(|event| event.symbol.clone()),
                 affected_date: Some(date),
             });
         }
@@ -279,7 +282,7 @@ fn compare_records(
     let left_date = trade_date(&left.transaction.traded_at);
     let right_date = trade_date(&right.transaction.traded_at);
     if left.transaction.account_id == right.transaction.account_id
-        && left.transaction.symbol == right.transaction.symbol
+        && stock_symbols_equal(&left.transaction.symbol, &right.transaction.symbol)
         && left_date == right_date
     {
         if let (Some(left_rank), Some(right_rank)) = (
@@ -308,7 +311,7 @@ fn same_action_group(
     is_transfer: bool,
 ) -> bool {
     previous.record.transaction.account_id == transaction.account_id
-        && previous.record.transaction.symbol == transaction.symbol
+        && stock_symbols_equal(&previous.record.transaction.symbol, &transaction.symbol)
         && previous.trade_date == trade_date
         && previous.side == side
         && previous.record.is_transfer == is_transfer
@@ -402,6 +405,10 @@ fn issue(
 
 fn parse_ids(json: &str) -> Vec<String> {
     serde_json::from_str(json).unwrap_or_default()
+}
+
+fn symbol_key(symbol: &str) -> String {
+    normalized_stock_symbol(symbol).unwrap_or_else(|| symbol.trim().to_string())
 }
 
 fn trade_date(traded_at: &str) -> Option<NaiveDate> {
@@ -661,6 +668,65 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == "same_day_order_uncertain"));
+    }
+
+    #[test]
+    fn mixed_case_same_day_order_replays_one_symbol_and_uses_confirmed_order() {
+        // Case-sensitive position keys or ordering checks would replay the
+        // SELL first and ignore the confirmed order for one economic symbol.
+        let transactions = vec![
+            transaction("open", "acct", "AAPL", "BUY", 10.0, 100.0, "2024-01-01"),
+            transaction("a-sell", "acct", "AAPL", "SELL", 15.0, 110.0, "2024-01-02"),
+            transaction("z-buy", "acct", "aapl", "BUY", 5.0, 105.0, "2024-01-02"),
+        ];
+        let overrides = vec![override_record(
+            "order",
+            "same_day_order",
+            &["a-sell", "z-buy"],
+            r#"["z-buy","a-sell"]"#,
+        )];
+
+        let result = build_stock_actions(&transactions, &overrides);
+
+        assert_eq!(
+            result
+                .actions
+                .iter()
+                .map(|action| action.action_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["open", "add", "close"]
+        );
+        assert!(!result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "negative_position"));
+        assert!(!result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "same_day_order_uncertain"));
+        assert_eq!(result.actions[1].symbol, "aapl");
+    }
+
+    #[test]
+    fn mixed_case_duplicate_and_non_trade_overrides_keep_id_based_exclusions_intact() {
+        // Symbol-key normalization must not broaden ID-scoped duplicate or
+        // non-trade exclusions to unrelated records that only share a symbol.
+        let transactions = vec![
+            transaction("duplicate", "acct", "aapl", "BUY", 1.0, 100.0, "2024-01-01"),
+            transaction("non-trade", "acct", "MsFt", "BUY", 1.0, 100.0, "2024-01-01"),
+            transaction("kept", "acct", "AAPL", "BUY", 2.0, 100.0, "2024-01-02"),
+        ];
+        let overrides = vec![
+            override_record("duplicate", "duplicate", &["duplicate"], "{}"),
+            override_record("non-trade", "non_trade", &["non-trade"], "{}"),
+        ];
+        let result = build_stock_actions(&transactions, &overrides);
+        assert_eq!(result.actions.len(), 1);
+        assert_eq!(result.actions[0].transaction_ids, vec!["kept"]);
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "source_ledger_conflict"));
     }
 
     #[test]

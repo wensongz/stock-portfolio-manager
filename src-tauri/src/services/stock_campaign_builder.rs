@@ -265,6 +265,59 @@ mod tests {
     }
 
     #[test]
+    fn mixed_case_confirmed_transfer_links_the_same_economic_symbol() {
+        // A persistence-accepted transfer must not be rejected downstream
+        // solely because source and destination retain their display casing.
+        let overrides = vec![override_record("move-case", &["a-out", "b-in"])];
+        let action_result = build_stock_actions(
+            &[
+                transaction(
+                    "a-open",
+                    "acct-A",
+                    "AAPL",
+                    "BUY",
+                    10.0,
+                    "2024-01-02T09:30:00Z",
+                ),
+                transaction(
+                    "a-out",
+                    "acct-A",
+                    "AAPL",
+                    "SELL",
+                    10.0,
+                    "2024-01-10T09:30:00Z",
+                ),
+                transaction(
+                    "b-in",
+                    "acct-B",
+                    "aapl",
+                    "BUY",
+                    10.0,
+                    "2024-01-10T10:30:00Z",
+                ),
+            ],
+            &overrides,
+        );
+        let result = build_stock_campaigns(
+            &action_result.position_events,
+            &action_result.actions,
+            &overrides,
+            NaiveDate::from_ymd_opt(2024, 1, 20).unwrap(),
+        );
+
+        assert_eq!(result.campaigns.len(), 1);
+        assert_eq!(
+            result.campaigns[0].campaign_id,
+            "campaign:transfer:move-case"
+        );
+        assert!(!result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "invalid_transfer_override"));
+        assert_eq!(result.fragments[1].symbol, "aapl");
+    }
+
+    #[test]
     fn preserves_ordinary_same_day_fill_when_suppressing_transfer_action() {
         // Grouping a transfer and ordinary buy into one action would suppress
         // the ordinary investment action and must make this fail.
@@ -540,9 +593,9 @@ mod tests {
     }
 }
 use crate::models::stock_review::{
-    AccountCampaignFragment, MetricAvailability, MetricStatus, StockActionReview,
-    StockCampaignStatus, StockCampaignSummary, StockCampaignTransferFact, StockReviewIssue,
-    StockReviewIssueSeverity, StockReviewOverride,
+    normalized_stock_symbol, stock_symbols_equal, AccountCampaignFragment, MetricAvailability,
+    MetricStatus, StockActionReview, StockCampaignStatus, StockCampaignSummary,
+    StockCampaignTransferFact, StockReviewIssue, StockReviewIssueSeverity, StockReviewOverride,
 };
 use crate::services::stock_action_builder::PositionEvent;
 use chrono::NaiveDate;
@@ -588,14 +641,15 @@ pub fn build_stock_campaigns(
     let mut events_by_position: BTreeMap<(String, String), Vec<&PositionEvent>> = BTreeMap::new();
     for event in &retained_events {
         events_by_position
-            .entry((event.account_id.clone(), event.symbol.clone()))
+            .entry((event.account_id.clone(), symbol_key(&event.symbol)))
             .or_default()
             .push(event);
     }
 
     let mut fragments = Vec::new();
     let mut issues = Vec::new();
-    for ((account_id, symbol), position_events) in events_by_position {
+    for ((account_id, _symbol_key), position_events) in events_by_position {
+        let symbol = &position_events[0].symbol;
         derive_position_fragments(
             &account_id,
             &symbol,
@@ -768,7 +822,7 @@ fn valid_transfer_links(
         if !source.is_transfer
             || !destination.is_transfer
             || source.account_id == destination.account_id
-            || source.symbol != destination.symbol
+            || !stock_symbols_equal(&source.symbol, &destination.symbol)
             || !approximately_equal(source.shares_delta.abs(), destination.shares_delta.abs())
             || source_fragment.is_none()
             || destination_fragment.is_none()
@@ -966,6 +1020,10 @@ fn invalid_transfer_issue(
 
 fn parse_ids(json: &str) -> Vec<String> {
     serde_json::from_str(json).unwrap_or_default()
+}
+
+fn symbol_key(symbol: &str) -> String {
+    normalized_stock_symbol(symbol).unwrap_or_else(|| symbol.trim().to_string())
 }
 
 fn fragment_id(account_id: &str, symbol: &str, opening_event_id: &str) -> String {

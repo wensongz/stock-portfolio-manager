@@ -746,6 +746,7 @@ fn digest_scoped_override_snapshots(
         ] {
             digest.write_frame(0x32, value.as_bytes());
         }
+        digest.write_frame(0x39, &[u8::from(snapshot.is_current)]);
         for (reference_index, (id, current)) in snapshot
             .reference_ids
             .iter()
@@ -1410,6 +1411,10 @@ fn validate_same_day_order(
     let same_position_day = transactions.iter().all(|transaction| {
         transaction.account_id == first.account_id
             && normalize_symbol(&transaction.symbol).ok() == normalize_symbol(&first.symbol).ok()
+            && transaction
+                .market
+                .trim()
+                .eq_ignore_ascii_case(first.market.trim())
             && trade_date(&transaction.traded_at) == Some(date)
             && matches!(
                 normalized_type(&transaction.transaction_type).as_str(),
@@ -1424,7 +1429,7 @@ fn validate_same_day_order(
             .any(|transaction| normalized_type(&transaction.transaction_type) == "SELL");
     let input_ids = parse_transaction_ids(&input.transaction_ids_json)?;
     let full_database_order_set =
-        same_day_reversal_ids(conn, &first.account_id, &first.symbol, date)?;
+        same_day_reversal_ids(conn, &first.account_id, &first.symbol, &first.market, date)?;
     if !same_position_day
         || !has_reversal
         || full_database_order_set.len() != input_ids.len()
@@ -1434,7 +1439,7 @@ fn validate_same_day_order(
     {
         issues.push(validation_issue(
             "invalid_same_day_order",
-            "Same-day order must contain the complete ordered BUY/SELL reversal set for one account, normalized symbol, and trade date.",
+            "Same-day order must contain the complete ordered BUY/SELL reversal set for one account, normalized symbol, normalized market, and trade date.",
         ));
     }
     Ok(())
@@ -1497,19 +1502,28 @@ fn same_day_reversal_ids(
     conn: &Connection,
     account_id: &str,
     symbol: &str,
+    market: &str,
     date: chrono::NaiveDate,
 ) -> Result<Vec<String>, String> {
     let mut statement = conn
         .prepare(
             "SELECT id FROM transactions
-             WHERE account_id = ?1 AND UPPER(TRIM(symbol)) = UPPER(TRIM(?2)) AND substr(traded_at, 1, 10) = ?3
+             WHERE account_id = ?1
+               AND UPPER(TRIM(symbol)) = UPPER(TRIM(?2))
+               AND UPPER(TRIM(market)) = UPPER(TRIM(?3))
+               AND substr(traded_at, 1, 10) = ?4
                AND transaction_type IN ('BUY', 'SELL')
              ORDER BY id ASC",
         )
         .map_err(|error| error.to_string())?;
     let ids = statement
         .query_map(
-            params![account_id, symbol, date.format("%Y-%m-%d").to_string()],
+            params![
+                account_id,
+                symbol,
+                market,
+                date.format("%Y-%m-%d").to_string()
+            ],
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?
@@ -3450,5 +3464,162 @@ mod tests {
             .unwrap();
 
         assert!(save_override_candidate(&db, candidate).is_err());
+    }
+
+    fn save_us_same_day_order(db: &Database) {
+        insert_transaction(
+            db,
+            "order-buy",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            2.0,
+            100.0,
+            "2024-02-01",
+        );
+        insert_transaction(
+            db,
+            "order-sell",
+            "acct-a",
+            "aapl",
+            "SELL",
+            2.0,
+            100.0,
+            "2024-02-01",
+        );
+        save_override(
+            db,
+            override_input(
+                "us-order",
+                "same_day_order",
+                &["order-buy", "order-sell"],
+                r#"["order-buy","order-sell"]"#,
+            ),
+        )
+        .unwrap();
+    }
+
+    fn prepared_us_candidate(db: &Database) -> super::ValidatedOverrideCandidate {
+        insert_transaction(
+            db,
+            "candidate-row",
+            "acct-a",
+            "MSFT",
+            "OPEN",
+            1.0,
+            200.0,
+            "2024-02-02",
+        );
+        let mut candidate = prepare_override_candidate(
+            db,
+            override_input("candidate", "non_trade", &["candidate-row"], "{}"),
+        )
+        .unwrap();
+        scope_candidate_to_query(db, &mut candidate, &scoped_query("acct-a")).unwrap();
+        candidate
+    }
+
+    #[test]
+    fn cross_market_same_day_reversals_do_not_stale_us_order_or_candidate() {
+        // Removing market from position identity makes an unrelated CN order
+        // silently flip a confirmed US ordering correction to stale.
+        let db = database();
+        save_us_same_day_order(&db);
+        let candidate = prepared_us_candidate(&db);
+        insert_transaction(
+            &db,
+            "cn-buy",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            50.0,
+            "2024-02-01",
+        );
+        insert_transaction(
+            &db,
+            "cn-sell",
+            "acct-a",
+            "AAPL",
+            "SELL",
+            1.0,
+            50.0,
+            "2024-02-01",
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE transactions SET market = 'CN', currency = 'CNY'
+                 WHERE id IN ('cn-buy', 'cn-sell')",
+                [],
+            )
+            .unwrap();
+
+        assert!(save_override_candidate(&db, candidate).is_ok());
+        let listed = list_overrides_for_query(
+            &db,
+            &scoped_query("acct-a"),
+            NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listed.overrides.len(), 2);
+        assert!(listed
+            .overrides
+            .iter()
+            .any(|record| record.id == "us-order"));
+        assert!(listed.stale_overrides.is_empty());
+    }
+
+    #[test]
+    fn same_market_extra_reversal_changes_override_revision_and_rejects_candidate() {
+        // The active override digest must frame derived validation/currentness;
+        // otherwise a complete-set change can flip active to stale invisibly.
+        let db = database();
+        save_us_same_day_order(&db);
+        let candidate = prepared_us_candidate(&db);
+        let query = scoped_query("acct-a");
+        let scope = CandidateRevisionScope {
+            report_start: query.start_date,
+            report_end: query.end_date,
+            price_start: query.start_date,
+            evaluation_end: query.end_date,
+            current_horizon: NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+            display_cutoff: query.end_date,
+            account_ids: vec!["acct-a".to_string()],
+            markets: vec!["US".to_string()],
+            ..CandidateRevisionScope::default()
+        };
+        let before = super::active_override_revision(&db.conn.lock().unwrap(), &scope).unwrap();
+        insert_transaction(
+            &db,
+            "extra-buy",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        insert_transaction(
+            &db,
+            "extra-sell",
+            "acct-a",
+            "AAPL",
+            "SELL",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+
+        let after = super::active_override_revision(&db.conn.lock().unwrap(), &scope).unwrap();
+        assert_ne!(before, after);
+        assert!(save_override_candidate(&db, candidate).is_err());
+        let listed =
+            list_overrides_for_query(&db, &query, NaiveDate::from_ymd_opt(2024, 3, 1).unwrap())
+                .unwrap();
+        assert!(listed.overrides.is_empty());
+        assert_eq!(listed.stale_overrides.len(), 1);
+        assert_eq!(listed.stale_overrides[0].id, "us-order");
     }
 }

@@ -2,8 +2,8 @@
 
 use crate::db::Database;
 use crate::models::stock_review::{
-    StockReviewAnnotation, StockReviewAnnotationInput, StockReviewIssue, StockReviewIssueSeverity,
-    StockReviewOverride, StockReviewOverrideInput, StockReviewQuery,
+    normalized_stock_symbol, StockReviewAnnotation, StockReviewAnnotationInput, StockReviewIssue,
+    StockReviewIssueSeverity, StockReviewOverride, StockReviewOverrideInput, StockReviewQuery,
 };
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
 use rusqlite::types::{Value as SqlValue, ValueRef};
@@ -13,6 +13,13 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 const EPSILON: f64 = 1e-9;
+const SCOPED_OVERRIDE_EXISTS: &str = "EXISTS (
+        SELECT 1 FROM json_each(o.transaction_ids_json) ids
+        JOIN transactions t ON t.id = ids.value
+        WHERE (json_array_length(?1) = 0 OR t.account_id IN (SELECT value FROM json_each(?1)))
+          AND (json_array_length(?2) = 0 OR t.market IN (SELECT value FROM json_each(?2)))
+          AND substr(t.traded_at, 1, 10) <= ?3
+    )";
 
 /// The caller's trust boundary for an annotation write. `ai_confirmed` is a
 /// provenance label, never standalone authority for an AI to write data.
@@ -28,6 +35,14 @@ pub struct StockReviewAnnotationFilter {
     pub scope_key: Option<String>,
     pub account_id: Option<String>,
     pub symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AnnotationEconomicDates {
+    pub effective_date: Option<NaiveDate>,
+    pub effective_start: Option<NaiveDate>,
+    pub effective_end: Option<NaiveDate>,
+    pub snapshot_date: Option<NaiveDate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -470,21 +485,18 @@ fn active_override_revision(
     let mut digest = StableDigest::new("stock-review-overrides-v2");
     let accounts = json_string_list(&scope.account_ids)?;
     let markets = json_string_list(&scope.markets)?;
+    let sql = format!(
+        "SELECT o.id, o.override_type, o.transaction_ids_json, o.value_json,
+                o.reference_fingerprint_json, o.updated_at
+         FROM stock_review_overrides o
+         WHERE {SCOPED_OVERRIDE_EXISTS}
+         ORDER BY o.id ASC"
+    );
     stream_query_digest(
         conn,
         &mut digest,
         "overrides",
-        "SELECT o.id, o.override_type, o.transaction_ids_json, o.value_json,
-                o.reference_fingerprint_json, o.updated_at
-         FROM stock_review_overrides o
-         WHERE EXISTS (
-             SELECT 1 FROM json_each(o.transaction_ids_json) ids
-             JOIN transactions t ON t.id = ids.value
-             WHERE (json_array_length(?1) = 0 OR t.account_id IN (SELECT value FROM json_each(?1)))
-               AND (json_array_length(?2) = 0 OR t.market IN (SELECT value FROM json_each(?2)))
-               AND substr(t.traded_at, 1, 10) <= ?3
-         )
-         ORDER BY o.id ASC",
+        &sql,
         vec![
             SqlValue::Text(accounts),
             SqlValue::Text(markets),
@@ -513,13 +525,12 @@ fn user_source_revision(
     digest_scope(&mut digest, scope)?;
     let accounts = json_string_list(&scope.account_ids)?;
     let markets = json_string_list(&scope.markets)?;
-    let symbols = json_string_list(
-        &scope
+    let symbols = json_string_list(&sorted_unique(
+        scope
             .securities
             .iter()
-            .map(|(symbol, _)| symbol.clone())
-            .collect::<Vec<_>>(),
-    )?;
+            .filter_map(|(symbol, _)| normalized_stock_symbol(symbol)),
+    ))?;
     let securities = serde_json::to_string(&scope.securities).map_err(|error| error.to_string())?;
     let common = || {
         vec![
@@ -571,8 +582,6 @@ fn user_source_revision(
         common(),
         8,
     )?;
-    let mut values = common();
-    values.push(SqlValue::Text(date_text(scope.report_end)));
     stream_query_digest(
         conn,
         &mut digest,
@@ -581,14 +590,14 @@ fn user_source_revision(
          FROM daily_holding_snapshots
          WHERE (json_array_length(?1) = 0 OR account_id IN (SELECT value FROM json_each(?1)))
            AND (json_array_length(?2) = 0 OR market IN (SELECT value FROM json_each(?2)))
-           AND (json_array_length(?3) = 0 OR EXISTS (
-               SELECT 1 FROM json_each(?3) security
-               WHERE symbol = json_extract(security.value, '$[0]')
-                 AND market = json_extract(security.value, '$[1]')
-           ))
-           AND date <= ?4
+           AND date BETWEEN ?3 AND ?4
          ORDER BY date, account_id, market, symbol",
-        values,
+        vec![
+            SqlValue::Text(accounts.clone()),
+            SqlValue::Text(markets.clone()),
+            SqlValue::Text(date_text(scope.report_start)),
+            SqlValue::Text(date_text(scope.report_end)),
+        ],
         8,
     )?;
     stream_query_digest(
@@ -605,7 +614,7 @@ fn user_source_revision(
         &mut digest,
         "splits",
         "SELECT id, stock_code, split_date, ratio_from, ratio_to, created_at FROM stock_splits
-         WHERE (json_array_length(?1) = 0 OR stock_code IN (SELECT value FROM json_each(?1)))
+         WHERE (json_array_length(?1) = 0 OR UPPER(TRIM(stock_code)) IN (SELECT value FROM json_each(?1)))
            AND split_date <= ?2
          ORDER BY split_date, id",
         vec![
@@ -621,14 +630,9 @@ fn user_source_revision(
         "SELECT id, scope_type, scope_key, account_id, symbol, annotation_type,
                 value_json, source, created_at, updated_at
          FROM stock_review_annotations
-         WHERE (json_array_length(?1) = 0 OR account_id IS NULL OR account_id IN (SELECT value FROM json_each(?1)))
-           AND COALESCE(json_extract(value_json, '$.effective_date'), ?2) <= ?2
-           AND COALESCE(json_extract(value_json, '$.effective_start'), ?2) <= ?2
+         WHERE (json_array_length(?1) = 0 OR account_id IN (SELECT value FROM json_each(?1)))
          ORDER BY updated_at, id",
-        vec![
-            SqlValue::Text(accounts.clone()),
-            SqlValue::Text(date_text(scope.display_cutoff)),
-        ],
+        vec![SqlValue::Text(accounts.clone())],
         10,
     )?;
     stream_query_digest(
@@ -745,26 +749,35 @@ struct StableDigest(u64);
 impl StableDigest {
     fn new(domain: &str) -> Self {
         let mut digest = Self(0xcbf29ce484222325);
-        digest.write_bytes(domain.as_bytes());
+        digest.write_frame(0x01, domain.as_bytes());
         digest
     }
 
-    fn write_bytes(&mut self, bytes: &[u8]) {
-        self.0 ^= bytes.len() as u64;
-        self.0 = self.0.wrapping_mul(0x100000001b3);
+    fn write_raw(&mut self, bytes: &[u8]) {
         for byte in bytes {
             self.0 ^= u64::from(*byte);
             self.0 = self.0.wrapping_mul(0x100000001b3);
         }
     }
 
-    fn write_value(&mut self, value: ValueRef<'_>) {
+    fn write_frame(&mut self, tag: u8, payload: &[u8]) {
+        self.write_raw(&[tag]);
+        self.write_raw(&(payload.len() as u64).to_le_bytes());
+        self.write_raw(payload);
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.write_frame(0x02, bytes);
+    }
+
+    fn write_value(&mut self, column_index: usize, value: ValueRef<'_>) {
+        self.write_frame(0x13, &(column_index as u64).to_le_bytes());
         match value {
-            ValueRef::Null => self.write_bytes(b"null"),
-            ValueRef::Integer(value) => self.write_bytes(&value.to_le_bytes()),
-            ValueRef::Real(value) => self.write_bytes(&value.to_bits().to_le_bytes()),
-            ValueRef::Text(value) => self.write_bytes(value),
-            ValueRef::Blob(value) => self.write_bytes(value),
+            ValueRef::Null => self.write_frame(0x20, &[]),
+            ValueRef::Integer(value) => self.write_frame(0x21, &value.to_le_bytes()),
+            ValueRef::Real(value) => self.write_frame(0x22, &value.to_bits().to_le_bytes()),
+            ValueRef::Text(value) => self.write_frame(0x23, value),
+            ValueRef::Blob(value) => self.write_frame(0x24, value),
         }
     }
 
@@ -781,16 +794,23 @@ fn stream_query_digest(
     values: Vec<SqlValue>,
     column_count: usize,
 ) -> Result<(), String> {
-    digest.write_bytes(label.as_bytes());
+    digest.write_frame(0x10, label.as_bytes());
     let mut statement = conn.prepare(sql).map_err(|error| error.to_string())?;
     let mut rows = statement
         .query(params_from_iter(values.iter()))
         .map_err(|error| error.to_string())?;
+    let mut row_index = 0_u64;
     while let Some(row) = rows.next().map_err(|error| error.to_string())? {
-        digest.write_bytes(b"row");
+        digest.write_frame(0x11, &row_index.to_le_bytes());
+        digest.write_frame(0x12, &(column_count as u64).to_le_bytes());
         for index in 0..column_count {
-            digest.write_value(row.get_ref(index).map_err(|error| error.to_string())?);
+            digest.write_value(
+                index,
+                row.get_ref(index).map_err(|error| error.to_string())?,
+            );
         }
+        digest.write_frame(0x14, &[]);
+        row_index += 1;
     }
     Ok(())
 }
@@ -835,17 +855,53 @@ fn sorted_unique<T: Ord>(values: impl Iterator<Item = T>) -> Vec<T> {
 
 pub fn list_overrides(db: &Database) -> Result<StockReviewOverrideList, String> {
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
-    let mut statement = conn
-        .prepare(
-            "SELECT id, override_type, transaction_ids_json, value_json, created_at, updated_at, reference_fingerprint_json
-             FROM stock_review_overrides ORDER BY created_at ASC, id ASC",
-        )
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map([], |row| Ok((map_override(row)?, row.get::<_, String>(6)?)))
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
+    list_overrides_from_connection(&conn, None)
+}
+
+pub fn list_overrides_for_query(
+    db: &Database,
+    query: &StockReviewQuery,
+    current_horizon: NaiveDate,
+) -> Result<StockReviewOverrideList, String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let accounts = json_string_list(&query.account_id.clone().into_iter().collect::<Vec<_>>())?;
+    let markets = json_string_list(&query.market.clone().into_iter().collect::<Vec<_>>())?;
+    list_overrides_from_connection(&conn, Some((accounts, markets, date_text(current_horizon))))
+}
+
+fn list_overrides_from_connection(
+    conn: &Connection,
+    scope: Option<(String, String, String)>,
+) -> Result<StockReviewOverrideList, String> {
+    let sql = match scope {
+        Some(_) => format!(
+            "SELECT o.id, o.override_type, o.transaction_ids_json, o.value_json,
+                    o.created_at, o.updated_at, o.reference_fingerprint_json
+             FROM stock_review_overrides o
+             WHERE {SCOPED_OVERRIDE_EXISTS}
+             ORDER BY o.created_at ASC, o.id ASC"
+        ),
+        None => "SELECT o.id, o.override_type, o.transaction_ids_json, o.value_json,
+                        o.created_at, o.updated_at, o.reference_fingerprint_json
+                 FROM stock_review_overrides o
+                 ORDER BY o.created_at ASC, o.id ASC"
+            .to_string(),
+    };
+    let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let rows = match scope {
+        Some((accounts, markets, horizon)) => statement
+            .query_map(params![accounts, markets, horizon], |row| {
+                Ok((map_override(row)?, row.get::<_, String>(6)?))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?,
+        None => statement
+            .query_map([], |row| Ok((map_override(row)?, row.get::<_, String>(6)?)))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?,
+    };
 
     let mut result = StockReviewOverrideList {
         overrides: Vec::new(),
@@ -919,6 +975,7 @@ fn normalize_annotation_input(
     if !value.is_object() {
         return Err("Annotation value_json must be a JSON object.".to_string());
     }
+    annotation_economic_dates(&input.value_json)?;
     let source = input.source.trim();
     match (source, context) {
         ("user", AnnotationSaveContext::UserInitiated)
@@ -945,6 +1002,46 @@ fn normalize_annotation_input(
         value_json: input.value_json,
         source: source.to_string(),
     })
+}
+
+pub(crate) fn annotation_economic_dates(
+    value_json: &str,
+) -> Result<AnnotationEconomicDates, String> {
+    let value: Value = serde_json::from_str(value_json)
+        .map_err(|error| format!("Annotation value_json must be valid JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Annotation value_json must be a JSON object.".to_string())?;
+    let parse_date = |key: &str| -> Result<Option<NaiveDate>, String> {
+        let Some(value) = object.get(key) else {
+            return Ok(None);
+        };
+        let text = value
+            .as_str()
+            .ok_or_else(|| format!("Annotation {key} must be a YYYY-MM-DD string."))?;
+        let date = NaiveDate::parse_from_str(text, "%Y-%m-%d")
+            .map_err(|_| format!("Annotation {key} must be a valid YYYY-MM-DD date."))?;
+        if date.format("%Y-%m-%d").to_string() != text {
+            return Err(format!(
+                "Annotation {key} must use exact YYYY-MM-DD formatting."
+            ));
+        }
+        Ok(Some(date))
+    };
+    let dates = AnnotationEconomicDates {
+        effective_date: parse_date("effective_date")?,
+        effective_start: parse_date("effective_start")?,
+        effective_end: parse_date("effective_end")?,
+        snapshot_date: parse_date("snapshot_date")?,
+    };
+    if dates
+        .effective_start
+        .zip(dates.effective_end)
+        .is_some_and(|(start, end)| start > end)
+    {
+        return Err("Annotation effective_start must be on or before effective_end.".to_string());
+    }
+    Ok(dates)
 }
 
 fn normalize_override_input(
@@ -1381,10 +1478,10 @@ fn format_override_validation_error(validation: &OverrideValidationResult) -> St
 #[cfg(test)]
 mod tests {
     use super::{
-        list_annotations, list_overrides, monotonic_audit_timestamp, prepare_override_candidate,
-        save_annotation, save_override, save_override_candidate, scope_candidate_to_query,
-        set_candidate_revision_scope, validate_override, AnnotationSaveContext,
-        CandidateRevisionScope, StockReviewAnnotationFilter,
+        list_annotations, list_overrides, list_overrides_for_query, monotonic_audit_timestamp,
+        prepare_override_candidate, save_annotation, save_override, save_override_candidate,
+        scope_candidate_to_query, set_candidate_revision_scope, validate_override,
+        AnnotationSaveContext, CandidateRevisionScope, StockReviewAnnotationFilter,
     };
     use crate::db::Database;
     use crate::models::stock_review::{
@@ -1392,7 +1489,7 @@ mod tests {
         StockReviewQuery,
     };
     use chrono::NaiveDate;
-    use rusqlite::params;
+    use rusqlite::{params, Connection};
 
     fn database() -> Database {
         let db = Database::new(":memory:").unwrap();
@@ -2044,6 +2141,254 @@ mod tests {
     }
 
     #[test]
+    fn historical_snapshot_symbol_outside_discovery_still_invalidates_candidate() {
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO daily_holding_snapshots
+                    (date, account_id, symbol, market, shares, avg_cost, close_price, market_value)
+                 VALUES ('2024-02-02', 'acct-a', 'MSFT', 'US', 1, 200, 200, 200)",
+                [],
+            )
+            .unwrap();
+        let mut candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["buy"], "{}"),
+        )
+        .unwrap();
+        set_candidate_revision_scope(
+            &mut candidate,
+            CandidateRevisionScope {
+                report_start: NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+                report_end: NaiveDate::from_ymd_opt(2024, 2, 2).unwrap(),
+                price_start: NaiveDate::from_ymd_opt(2024, 1, 20).unwrap(),
+                evaluation_end: NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+                current_horizon: NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+                display_cutoff: NaiveDate::from_ymd_opt(2024, 2, 2).unwrap(),
+                account_ids: vec!["acct-a".to_string()],
+                markets: vec!["US".to_string()],
+                securities: vec![("AAPL".to_string(), "US".to_string())],
+                benchmark_symbols: vec![],
+                currencies: vec!["USD".to_string()],
+            },
+        );
+        super::pin_candidate_source_revision_after_cache_fill(&db, &mut candidate).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE daily_holding_snapshots SET market_value = 250
+                 WHERE account_id = 'acct-a' AND symbol = 'MSFT'",
+                [],
+            )
+            .unwrap();
+
+        assert!(save_override_candidate(&db, candidate).is_err());
+        assert!(list_overrides(&db).unwrap().overrides.is_empty());
+    }
+
+    #[test]
+    fn normalized_split_symbol_mutation_invalidates_candidate() {
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO stock_splits
+                    (stock_code, split_date, ratio_from, ratio_to, created_at)
+                 VALUES (' aapl ', '2024-02-02', 1, 2, '2024-02-02')",
+                [],
+            )
+            .unwrap();
+        let mut candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["buy"], "{}"),
+        )
+        .unwrap();
+        set_candidate_revision_scope(
+            &mut candidate,
+            CandidateRevisionScope {
+                report_start: NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+                report_end: NaiveDate::from_ymd_opt(2024, 2, 2).unwrap(),
+                price_start: NaiveDate::from_ymd_opt(2024, 1, 20).unwrap(),
+                evaluation_end: NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+                current_horizon: NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+                display_cutoff: NaiveDate::from_ymd_opt(2024, 2, 2).unwrap(),
+                account_ids: vec!["acct-a".to_string()],
+                markets: vec!["US".to_string()],
+                securities: vec![("AAPL".to_string(), "US".to_string())],
+                benchmark_symbols: vec![],
+                currencies: vec!["USD".to_string()],
+            },
+        );
+        super::pin_candidate_source_revision_after_cache_fill(&db, &mut candidate).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE stock_splits SET ratio_to = 3 WHERE stock_code = ' aapl '",
+                [],
+            )
+            .unwrap();
+
+        assert!(save_override_candidate(&db, candidate).is_err());
+        assert!(list_overrides(&db).unwrap().overrides.is_empty());
+    }
+
+    #[test]
+    fn annotation_rejects_invalid_economic_dates_without_writing() {
+        let db = database();
+        let invalid_values = [
+            r#"{"effective_date":"2024-02-30"}"#,
+            r#"{"effective_start":"2024-2-01"}"#,
+            r#"{"effective_end":42}"#,
+            r#"{"snapshot_date":"not-a-date"}"#,
+            r#"{"effective_start":"2024-03-01","effective_end":"2024-02-01"}"#,
+        ];
+        for (index, value_json) in invalid_values.into_iter().enumerate() {
+            let mut input = annotation_input(&format!("invalid-date-{index}"), value_json);
+            input.value_json = value_json.to_string();
+            assert!(
+                save_annotation(&db, input, AnnotationSaveContext::UserInitiated).is_err(),
+                "invalid annotation date fixture {index} was accepted"
+            );
+        }
+        let count = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM stock_review_annotations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn future_annotation_mutation_is_part_of_candidate_revision() {
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO stock_review_annotations
+                    (id, scope_type, scope_key, account_id, symbol, annotation_type,
+                     value_json, source, created_at, updated_at)
+                 VALUES ('future', 'stock', 'AAPL', 'acct-a', 'AAPL', 'thesis',
+                         '{\"effective_date\":\"2024-03-01\",\"note\":\"first\"}',
+                         'user', '2024-02-01', '2024-02-01')",
+                [],
+            )
+            .unwrap();
+        let mut candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["buy"], "{}"),
+        )
+        .unwrap();
+        set_candidate_revision_scope(
+            &mut candidate,
+            CandidateRevisionScope {
+                report_start: NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+                report_end: NaiveDate::from_ymd_opt(2024, 2, 2).unwrap(),
+                price_start: NaiveDate::from_ymd_opt(2024, 1, 20).unwrap(),
+                evaluation_end: NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+                current_horizon: NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+                display_cutoff: NaiveDate::from_ymd_opt(2024, 2, 2).unwrap(),
+                account_ids: vec!["acct-a".to_string()],
+                markets: vec!["US".to_string()],
+                securities: vec![("AAPL".to_string(), "US".to_string())],
+                benchmark_symbols: vec![],
+                currencies: vec!["USD".to_string()],
+            },
+        );
+        super::pin_candidate_source_revision_after_cache_fill(&db, &mut candidate).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE stock_review_annotations
+                 SET value_json = '{\"effective_date\":\"2024-03-01\",\"note\":\"changed\"}'
+                 WHERE id = 'future'",
+                [],
+            )
+            .unwrap();
+
+        assert!(save_override_candidate(&db, candidate).is_err());
+    }
+
+    fn query_digest(sql: &str, column_count: usize) -> String {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut digest = super::StableDigest::new("structural-test");
+        super::stream_query_digest(&conn, &mut digest, "fixture", sql, vec![], column_count)
+            .unwrap();
+        digest.finish()
+    }
+
+    #[test]
+    fn digest_distinguishes_null_from_text_null() {
+        assert_ne!(
+            query_digest("SELECT NULL", 1),
+            query_digest("SELECT 'null'", 1)
+        );
+    }
+
+    #[test]
+    fn digest_distinguishes_text_from_blob_with_the_same_bytes() {
+        assert_ne!(
+            query_digest("SELECT 'same'", 1),
+            query_digest("SELECT CAST('same' AS BLOB)", 1)
+        );
+    }
+
+    #[test]
+    fn digest_distinguishes_integer_from_real() {
+        assert_ne!(
+            query_digest("SELECT 1", 1),
+            query_digest("SELECT CAST(1 AS REAL)", 1)
+        );
+    }
+
+    #[test]
+    fn digest_distinguishes_multi_column_boundaries() {
+        assert_ne!(
+            query_digest("SELECT 'ab', 'c'", 2),
+            query_digest("SELECT 'a', 'bc'", 2)
+        );
+    }
+
+    #[test]
     fn candidate_revisions_are_compact_streaming_digests() {
         let db = database();
         insert_transaction(
@@ -2409,5 +2754,66 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == "stale_override"));
+    }
+
+    #[test]
+    fn scoped_override_list_excludes_unrelated_stale_rows_and_issues() {
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy-a",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        insert_transaction(
+            &db,
+            "buy-b",
+            "acct-b",
+            "MSFT",
+            "BUY",
+            1.0,
+            200.0,
+            "2024-02-01",
+        );
+        save_override(
+            &db,
+            override_input("stale-a", "non_trade", &["buy-a"], "{}"),
+        )
+        .unwrap();
+        save_override(
+            &db,
+            override_input("stale-b", "non_trade", &["buy-b"], "{}"),
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE transactions SET price = price + 1, total_amount = total_amount + 1",
+                [],
+            )
+            .unwrap();
+        let query = StockReviewQuery {
+            start_date: NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            end_date: NaiveDate::from_ymd_opt(2024, 2, 2).unwrap(),
+            account_id: Some("acct-a".to_string()),
+            market: Some("US".to_string()),
+            benchmark_symbol: None,
+            base_currency: "USD".to_string(),
+        };
+
+        let result =
+            list_overrides_for_query(&db, &query, NaiveDate::from_ymd_opt(2024, 3, 1).unwrap())
+                .unwrap();
+        assert!(result.overrides.is_empty());
+        assert_eq!(result.stale_overrides.len(), 1);
+        assert_eq!(result.stale_overrides[0].id, "stale-a");
+        assert_eq!(result.issues.len(), 1);
+        assert_eq!(result.issues[0].code, "stale_override");
+        assert!(result.issues[0].message.contains("stale-a"));
     }
 }

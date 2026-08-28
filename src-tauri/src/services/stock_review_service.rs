@@ -655,24 +655,14 @@ fn annotation_applies_to_campaign(
                 return false;
             }
 
-            let value = serde_json::from_str::<serde_json::Value>(&annotation.value_json).ok();
-            let explicit_date = value.as_ref().and_then(|value| {
-                value
-                    .get("effective_date")
-                    .or_else(|| value.get("snapshot_date"))
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
-            });
-            let explicit_start = value
-                .as_ref()
-                .and_then(|value| value.get("effective_start"))
-                .and_then(serde_json::Value::as_str)
-                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
-            let explicit_end = value
-                .as_ref()
-                .and_then(|value| value.get("effective_end"))
-                .and_then(serde_json::Value::as_str)
-                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+            let Ok(dates) =
+                stock_review_persistence::annotation_economic_dates(&annotation.value_json)
+            else {
+                return false;
+            };
+            let explicit_date = dates.effective_date.or(dates.snapshot_date);
+            let explicit_start = dates.effective_start;
+            let explicit_end = dates.effective_end;
             let campaign_start = campaign
                 .started_at
                 .get(..10)
@@ -721,20 +711,17 @@ fn annotation_applies_to_campaign(
 }
 
 fn annotation_visible_as_of(annotation: &StockReviewAnnotation, report_as_of: NaiveDate) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&annotation.value_json) else {
+    let Ok(dates) = stock_review_persistence::annotation_economic_dates(&annotation.value_json)
+    else {
         return false;
     };
-    let effective_date = value
-        .get("effective_date")
-        .or_else(|| value.get("snapshot_date"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
-    let effective_start = value
-        .get("effective_start")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
-    effective_date.is_none_or(|date| date <= report_as_of)
-        && effective_start.is_none_or(|date| date <= report_as_of)
+    dates
+        .effective_date
+        .or(dates.snapshot_date)
+        .is_none_or(|date| date <= report_as_of)
+        && dates
+            .effective_start
+            .is_none_or(|date| date <= report_as_of)
 }
 
 fn transaction_date(transaction: &Transaction) -> Option<NaiveDate> {
@@ -935,7 +922,7 @@ where
     validate_account_exists(db, query.account_id.as_deref())?;
     let today = Utc::now().date_naive();
     let candidate_record = candidate.clone();
-    let mut override_list = stock_review_persistence::list_overrides(db)?;
+    let mut override_list = stock_review_persistence::list_overrides_for_query(db, &query, today)?;
     if let Some(candidate) = candidate.clone() {
         let candidate_id = candidate.id.clone();
         override_list
@@ -1173,7 +1160,7 @@ where
     // Every mutable source used by the candidate is loaded again after the
     // async cache phase has finished and the exact dependency scope is pinned.
     // The final digest check below rejects any mutation during these reads.
-    let mut override_list = stock_review_persistence::list_overrides(db)?;
+    let mut override_list = stock_review_persistence::list_overrides_for_query(db, &query, today)?;
     if let Some(candidate) = candidate_record {
         let candidate_id = candidate.id.clone();
         override_list
@@ -7465,6 +7452,90 @@ mod tests {
         assert_eq!(candidate.data_quality.issues, saved.data_quality.issues);
     }
 
+    #[tokio::test]
+    async fn report_scopes_stale_override_rows_and_issues_to_the_query() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct-a", "US");
+        insert_account(&db, "acct-b", "US");
+        insert_live_transaction(
+            &db,
+            "cash-a",
+            "acct-a",
+            "$CASH-USD",
+            "US",
+            "BUY",
+            1_000.0,
+            1.0,
+            1_000.0,
+            0.0,
+            "USD",
+            "2024-01-01T08:00:00Z",
+        );
+        for (id, account, symbol, price) in [
+            ("buy-a", "acct-a", "AAPL", 100.0),
+            ("buy-b", "acct-b", "MSFT", 200.0),
+        ] {
+            insert_live_transaction(
+                &db,
+                id,
+                account,
+                symbol,
+                "US",
+                "BUY",
+                1.0,
+                price,
+                price,
+                0.0,
+                "USD",
+                "2024-01-10T09:30:00Z",
+            );
+            stock_review_persistence::save_override(
+                &db,
+                StockReviewOverrideInput {
+                    id: format!("stale-{account}"),
+                    override_type: "non_trade".to_string(),
+                    transaction_ids_json: serde_json::json!([id]).to_string(),
+                    value_json: "{}".to_string(),
+                },
+            )
+            .unwrap();
+        }
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE transactions
+                 SET price = price + 1, total_amount = total_amount + 1
+                 WHERE id IN ('buy-a', 'buy-b')",
+                [],
+            )
+            .unwrap();
+        for date in ["2024-01-09", "2024-01-10", "2024-01-11"] {
+            insert_portfolio_value(&db, date, 1_000.0, 7.0);
+        }
+        let cache_start = day("2023-12-01");
+        seed_stock_cache_bounds(
+            &db,
+            "AAPL",
+            "US",
+            cache_start,
+            &[(day("2024-01-10"), 101.0), (day("2024-01-11"), 101.0)],
+        );
+        seed_default_benchmarks(&db, cache_start);
+        let mut query = live_query("2024-01-10", "2024-01-11", Some("US"));
+        query.account_id = Some("acct-a".to_string());
+
+        let prepared = prepare_cached_stock_review_input(&db, query).await.unwrap();
+        let stale = prepared
+            .persisted_override_issues
+            .iter()
+            .filter(|issue| issue.code == "stale_override")
+            .collect::<Vec<_>>();
+        assert_eq!(stale.len(), 1);
+        assert!(stale[0].message.contains("stale-acct-a"));
+        assert!(!stale[0].message.contains("stale-acct-b"));
+    }
+
     #[test]
     fn stock_annotations_require_explicit_effective_time_when_multiple_cycles_match() {
         let campaign = |id: &str, start: &str, end: &str| StockCampaignSummary {
@@ -7596,6 +7667,25 @@ mod tests {
             std::slice::from_ref(&campaign),
             day("2024-01-31"),
         ));
+    }
+
+    #[test]
+    fn malformed_legacy_annotation_date_is_not_treated_as_undated_display_context() {
+        let annotation = StockReviewAnnotation {
+            id: "legacy-malformed".to_string(),
+            scope_type: "stock".to_string(),
+            scope_key: "AAPL".to_string(),
+            account_id: Some("acct".to_string()),
+            symbol: Some("AAPL".to_string()),
+            annotation_type: "thesis".to_string(),
+            value_json: r#"{"effective_date":"2024-02-30","note":"invalid legacy row"}"#
+                .to_string(),
+            source: "user".to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        assert!(!annotation_visible_as_of(&annotation, day("2024-03-01")));
     }
 
     #[test]

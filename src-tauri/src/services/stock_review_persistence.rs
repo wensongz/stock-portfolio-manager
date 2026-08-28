@@ -564,7 +564,7 @@ fn same_day_reversal_ids(
     let mut statement = conn
         .prepare(
             "SELECT id FROM transactions
-             WHERE account_id = ?1 AND UPPER(symbol) = UPPER(?2) AND substr(traded_at, 1, 10) = ?3
+             WHERE account_id = ?1 AND UPPER(TRIM(symbol)) = UPPER(TRIM(?2)) AND substr(traded_at, 1, 10) = ?3
                AND transaction_type IN ('BUY', 'SELL')
              ORDER BY id ASC",
         )
@@ -1194,6 +1194,43 @@ mod tests {
         )
         .unwrap();
         assert!(validation.is_valid, "{:?}", validation.issues);
+    }
+
+    #[test]
+    fn same_day_order_accepts_trimmed_case_equivalent_symbols_from_the_source_ledger() {
+        // The SQL completeness lookup must use the same trim/case identity as
+        // validation, otherwise a valid confirmed reversal cannot be saved.
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            2.0,
+            100.0,
+            "2024-02-03",
+        );
+        insert_transaction(
+            &db,
+            "sell",
+            "acct-a",
+            " aapl ",
+            "SELL",
+            2.0,
+            100.0,
+            "2024-02-03",
+        );
+        let input = override_input(
+            "trimmed-order",
+            "same_day_order",
+            &["sell", "buy"],
+            r#"["buy","sell"]"#,
+        );
+
+        assert!(validate_override(&db, &input).unwrap().is_valid);
+        let saved = save_override(&db, input).unwrap();
+        assert_eq!(saved.id, "trimmed-order");
     }
 
     #[test]

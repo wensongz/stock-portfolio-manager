@@ -260,3 +260,107 @@ passed
 - Ruling: question selection occurs after semantic scope filtering but before any size cap; this keeps symbol/Campaign answers relevant without losing lower-ranked qualifying rows.
 - Ruling: collection omission metadata is part of successful result data, alongside Task 9 metric availability/statuses; it is never a tool error.
 - Remaining concern: the trusted host/UI approval event is deliberately not fabricated in this task. A future UI integration must construct the private exact-draft capability inside the trusted boundary rather than reintroducing text inference or a caller-supplied token.
+
+---
+
+## Fix round 2: migration, routing, and issue-order finalization (2026-08-29)
+
+Implementation commit: `8feb8ed07d354d0a6715ad23863148d3c0086526` (`fix: finalize stock review skill routing`). This section supersedes the earlier statement that the current built-in version is 8; the hardened built-in version is 9.
+
+### RED evidence
+
+The v8 migration, on-disk routing, stock negative-pressure matrix, and deterministic issue-cap tests were written before production changes.
+
+```text
+cargo test --lib services::skill_service::tests -- --nocapture
+```
+
+Exited 101 with three intended failures:
+
+- a v8-marked `options-review.md` remained the old broad-trigger file instead of upgrading;
+- the version-7 migration still wrote marker 8 instead of 9;
+- `这只股票历史表现怎么样` incorrectly activated `stock-review`.
+
+```text
+cargo test --lib services::ai_tools::tests::issue_caps_are_byte_stable_for_equivalent_permuted_inputs -- --exact --nocapture
+```
+
+Exited 101 because reversing an equivalent 32-issue array changed both selected ordering and which unselected issues survived the 20-item cap.
+
+### Version-9 migration and disk-loaded routing
+
+- `BUILTIN_SKILLS_VERSION` is 9 because `stock-review` and `options-review` changed after the v8 release.
+- The migration fixture starts with old v8-marked copies of both review Skills, runs the real exporter, and compares both resulting files byte-for-byte with the current embedded built-ins.
+- Both markers advance to 9. A marker-free custom Skill remains byte-identical and receives no built-in marker.
+- The activation assertions parse `trade-review.md`, `options-review.md`, and `stock-review.md` from the migrated temporary directory, then route those parsed on-disk Skills. They do not substitute embedded constants for the routed content.
+
+### Narrow stock semantics and pressure matrix
+
+Stock auto-activation now requires an explicit review intent plus one of:
+
+- stock-operation semantics;
+- rebalance semantics;
+- stock Campaign-review semantics;
+- the explicit stock-review-report phrase.
+
+Option-specific historical aliases remain available only when an option domain is present. Generic `历史表现` and `历史Campaign` no longer create a domain-neutral review intent.
+
+| User text | Stock-review result |
+| --- | --- |
+| `这只股票历史表现怎么样` | inactive |
+| `查询这只股票的风险` | inactive |
+| `导入股票交易记录` | inactive |
+| `查询股票行情` | inactive |
+| `股票操作复盘` | `stock-review` only |
+| `复盘股票调仓` | `stock-review` only |
+| `股票 Campaign 复盘` | `stock-review` only |
+| `一起复盘股票调仓和期权交易` | `options-review`, `stock-review` |
+
+The separate option cases continue to route option history/review aliases without activating stock review.
+
+### Deterministic issue cap
+
+Report and Campaign-detail issues now sort by:
+
+1. selected-question priority;
+2. trimmed issue code;
+3. shared trim/case-normalized symbol identity;
+4. affected date;
+5. recursively canonicalized `value`;
+6. recursively canonicalized `details`;
+7. recursively canonicalized remaining fields.
+
+Length-prefixed key components avoid concatenation ambiguity. The cap layer is self-sufficient even if an upstream producer supplies a HashSet-derived permutation. The regression reverses 32 equivalent issues and proves byte-identical retained report issues, Campaign-detail issues, and omission metadata.
+
+### GREEN verification
+
+```text
+cargo test --lib services::ai_tools::tests -- --nocapture
+21 passed; 0 failed
+
+cargo test --lib services::skill_service::tests -- --nocapture
+31 passed; 0 failed
+
+cargo test --lib services::stock_review_persistence::tests -- --nocapture
+39 passed; 0 failed
+
+cargo test --lib services::stock_review_service::tests -- --nocapture
+50 passed; 0 failed
+
+cargo test --lib
+536 passed; 0 failed; 8 ignored
+
+cargo check --lib
+passed with no warnings
+
+npm run build
+passed; repository's existing large-chunk warning only
+
+rustfmt --edition 2021 --check <two changed Rust files>
+passed
+
+git diff --check
+passed
+```
+
+No new interface concern was introduced. The prior trusted-host confirmation integration concern remains unchanged.

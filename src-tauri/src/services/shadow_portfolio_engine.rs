@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::models::performance::ReturnDataPoint;
+use crate::models::stock_review::{MetricAvailability, MetricStatus};
 use crate::services::performance_service::build_twr_return_series;
 use crate::services::stock_review_market_data::MarketReturnMode;
 use chrono::NaiveDate;
@@ -127,6 +128,7 @@ pub enum ShadowDataIssueKind {
     MissingAdjustedClose,
     InvalidInput,
     DegradedReturnMode,
+    TwrUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -172,6 +174,8 @@ pub struct ShadowValuationPoint {
 pub struct ShadowPortfolioResult {
     pub daily_valuations: Vec<ShadowValuationPoint>,
     pub twr_return_series: Vec<ReturnDataPoint>,
+    pub twr_availability: MetricAvailability,
+    pub twr_unavailable_from: Option<NaiveDate>,
     pub ending_value: Option<f64>,
     pub return_mode: MarketReturnMode,
     pub return_method: ShadowReturnMethod,
@@ -180,8 +184,16 @@ pub struct ShadowPortfolioResult {
     pub fx_coverage: Vec<FxCoverage>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AdjustedValuationBasis {
+    quantity: f64,
+    raw_close: f64,
+    adjusted_close: f64,
+}
+
 pub fn build_shadow_series(input: &ShadowPortfolioInput) -> ShadowPortfolioResult {
     let mut positions = input.opening_positions.clone();
+    let mut adjusted_bases = vec![None; positions.len()];
     let mut cash_balances = input.opening_cash.clone();
     let mut daily_valuations = Vec::with_capacity(input.valuation_dates.len());
     let mut external_flows = Vec::new();
@@ -347,7 +359,8 @@ pub fn build_shadow_series(input: &ShadowPortfolioInput) -> ShadowPortfolioResul
 
         let position_states = positions
             .iter()
-            .map(|position| {
+            .enumerate()
+            .map(|(position_index, position)| {
                 let price = input.price_points.iter().find(|price| {
                     price.date == *date
                         && price.symbol == position.symbol
@@ -355,7 +368,9 @@ pub fn build_shadow_series(input: &ShadowPortfolioInput) -> ShadowPortfolioResul
                         && price.currency == position.currency
                 });
                 let selected_price = price.and_then(|price| match input.return_method {
-                    ShadowReturnMethod::AdjustedClose => price.adjusted_close,
+                    ShadowReturnMethod::AdjustedClose => price
+                        .adjusted_close
+                        .filter(|adjusted| adjusted.is_finite() && *adjusted > 0.0),
                     ShadowReturnMethod::ExplicitDividends | ShadowReturnMethod::PriceOnly => {
                         Some(price.close)
                     }
@@ -388,6 +403,31 @@ pub fn build_shadow_series(input: &ShadowPortfolioInput) -> ShadowPortfolioResul
                     });
                 }
                 let fx_rate = day_fx.get(&position.currency).copied().flatten();
+                let value_in_currency = match input.return_method {
+                    ShadowReturnMethod::AdjustedClose => {
+                        price
+                            .zip(selected_price)
+                            .and_then(|(price, adjusted_close)| {
+                                if !price.close.is_finite() || price.close < 0.0 {
+                                    return None;
+                                }
+                                let basis = adjusted_bases[position_index].get_or_insert(
+                                    AdjustedValuationBasis {
+                                        quantity: position.quantity,
+                                        raw_close: price.close,
+                                        adjusted_close,
+                                    },
+                                );
+                                Some(
+                                    basis.quantity * basis.raw_close * adjusted_close
+                                        / basis.adjusted_close,
+                                )
+                            })
+                    }
+                    ShadowReturnMethod::ExplicitDividends | ShadowReturnMethod::PriceOnly => {
+                        selected_price.map(|price| price * position.quantity)
+                    }
+                };
                 ShadowPositionState {
                     account_id: position.account_id.clone(),
                     symbol: position.symbol.clone(),
@@ -395,9 +435,9 @@ pub fn build_shadow_series(input: &ShadowPortfolioInput) -> ShadowPortfolioResul
                     currency: position.currency.clone(),
                     quantity: position.quantity,
                     price: selected_price,
-                    value_in_base: selected_price
+                    value_in_base: value_in_currency
                         .zip(fx_rate)
-                        .map(|(price, rate)| price * position.quantity * rate),
+                        .map(|(value, rate)| value * rate),
                 }
             })
             .collect::<Vec<_>>();
@@ -434,12 +474,46 @@ pub fn build_shadow_series(input: &ShadowPortfolioInput) -> ShadowPortfolioResul
         });
     }
 
-    let daily_values = daily_valuations
+    let twr_unavailable_from = daily_valuations
         .iter()
-        .take_while(|point| point.total_value.is_some() && point.external_flow_in_base.is_some())
-        .filter_map(|point| point.total_value.map(|value| (point.date, value, 0.0)))
-        .collect::<Vec<_>>();
-    let twr_return_series = build_twr_return_series(&daily_values, None, &external_flows);
+        .find(|point| point.total_value.is_none() || point.external_flow_in_base.is_none())
+        .map(|point| point.date);
+    let (twr_return_series, twr_availability) = if let Some(date) = twr_unavailable_from {
+        issues.push(ShadowDataIssue {
+            kind: ShadowDataIssueKind::TwrUnavailable,
+            date: Some(date),
+            account_id: None,
+            symbol: None,
+            market: None,
+            currency: None,
+            message: format!(
+                "Shadow TWR is unavailable because valuation or external-flow conversion is incomplete from {}.",
+                date
+            ),
+        });
+        (
+            vec![],
+            MetricAvailability {
+                status: MetricStatus::Unavailable,
+                note: Some(format!(
+                    "Valuation or external-flow conversion is incomplete from {}.",
+                    date
+                )),
+            },
+        )
+    } else {
+        let daily_values = daily_valuations
+            .iter()
+            .filter_map(|point| point.total_value.map(|value| (point.date, value, 0.0)))
+            .collect::<Vec<_>>();
+        (
+            build_twr_return_series(&daily_values, None, &external_flows),
+            MetricAvailability {
+                status: MetricStatus::Available,
+                note: None,
+            },
+        )
+    };
     let ending_value = daily_valuations.last().and_then(|point| point.total_value);
     let fx_coverage = fx_coverage_by_currency
         .into_values()
@@ -455,6 +529,8 @@ pub fn build_shadow_series(input: &ShadowPortfolioInput) -> ShadowPortfolioResul
     ShadowPortfolioResult {
         daily_valuations,
         twr_return_series,
+        twr_availability,
+        twr_unavailable_from,
         ending_value,
         return_mode: match input.return_method {
             ShadowReturnMethod::PriceOnly => MarketReturnMode::PriceOnly,
@@ -506,6 +582,7 @@ fn add_cash(balances: &mut Vec<OpeningCashBalance>, account_id: &str, currency: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::stock_review::MetricStatus;
     use chrono::NaiveDate;
 
     fn day(value: &str) -> NaiveDate {
@@ -687,6 +764,60 @@ mod tests {
     }
 
     #[test]
+    fn adjusted_close_split_uses_one_corporate_action_basis() {
+        let input = ShadowPortfolioInput {
+            base_currency: "USD".to_string(),
+            return_method: ShadowReturnMethod::AdjustedClose,
+            opening_positions: vec![OpeningPosition {
+                account_id: "broker".to_string(),
+                symbol: "ACME".to_string(),
+                market: "US".to_string(),
+                currency: "USD".to_string(),
+                quantity: 10.0,
+            }],
+            opening_cash: vec![],
+            valuation_dates: vec![day("2024-01-01"), day("2024-01-02")],
+            price_points: vec![
+                ShadowPricePoint {
+                    date: day("2024-01-01"),
+                    symbol: "ACME".to_string(),
+                    market: "US".to_string(),
+                    currency: "USD".to_string(),
+                    close: 100.0,
+                    adjusted_close: Some(50.0),
+                },
+                ShadowPricePoint {
+                    date: day("2024-01-02"),
+                    symbol: "ACME".to_string(),
+                    market: "US".to_string(),
+                    currency: "USD".to_string(),
+                    close: 50.0,
+                    adjusted_close: Some(50.0),
+                },
+            ],
+            fx_points: vec![],
+            external_flows: vec![],
+            cash_income_events: vec![],
+            dividend_events: vec![],
+            split_events: vec![SplitEvent {
+                date: day("2024-01-02"),
+                account_id: "broker".to_string(),
+                symbol: "ACME".to_string(),
+                market: "US".to_string(),
+                ratio: 2.0,
+            }],
+        };
+
+        let result = build_shadow_series(&input);
+
+        assert_eq!(result.daily_valuations[0].total_value, Some(1_000.0));
+        assert_eq!(result.daily_valuations[1].positions[0].quantity, 20.0);
+        assert_eq!(result.daily_valuations[1].total_value, Some(1_000.0));
+        assert_eq!(result.twr_return_series[1].daily_return, 0.0);
+        assert_eq!(result.twr_return_series[1].cumulative_return, 0.0);
+    }
+
+    #[test]
     fn price_only_excludes_dividends_and_reports_degraded_return_mode() {
         let result = build_shadow_series(&dividend_input(ShadowReturnMethod::PriceOnly));
 
@@ -860,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn twr_does_not_bridge_an_unavailable_external_flow_day() {
+    fn missing_fx_after_a_valid_day_makes_twr_unavailable() {
         let input = ShadowPortfolioInput {
             base_currency: "USD".to_string(),
             return_method: ShadowReturnMethod::ExplicitDividends,
@@ -893,8 +1024,13 @@ mod tests {
 
         assert_eq!(result.daily_valuations[1].total_value, None);
         assert_eq!(result.daily_valuations[2].total_value, Some(1_500.0));
-        assert_eq!(result.twr_return_series.len(), 1);
-        assert_eq!(result.twr_return_series[0].portfolio_value, 1_000.0);
+        assert!(result.twr_return_series.is_empty());
+        assert_eq!(result.twr_availability.status, MetricStatus::Unavailable);
+        assert_eq!(result.twr_unavailable_from, Some(day("2024-01-02")));
+        assert!(result.issues.iter().any(|issue| {
+            issue.kind == ShadowDataIssueKind::TwrUnavailable
+                && issue.date == Some(day("2024-01-02"))
+        }));
     }
 
     #[test]
@@ -928,12 +1064,19 @@ mod tests {
         assert_eq!(result.daily_valuations[1].positions[0].price, None);
         assert_eq!(result.daily_valuations[1].total_value, None);
         assert_eq!(result.ending_value, None);
+        assert!(result.twr_return_series.is_empty());
+        assert_eq!(result.twr_availability.status, MetricStatus::Unavailable);
+        assert_eq!(result.twr_unavailable_from, Some(day("2024-01-02")));
         assert!(result.issues.iter().any(|issue| {
             issue.kind == ShadowDataIssueKind::MissingPrice
                 && issue.date == Some(day("2024-01-02"))
                 && issue.account_id.as_deref() == Some("broker")
                 && issue.market.as_deref() == Some("US")
                 && issue.symbol.as_deref() == Some("ACME")
+        }));
+        assert!(result.issues.iter().any(|issue| {
+            issue.kind == ShadowDataIssueKind::TwrUnavailable
+                && issue.date == Some(day("2024-01-02"))
         }));
     }
 }

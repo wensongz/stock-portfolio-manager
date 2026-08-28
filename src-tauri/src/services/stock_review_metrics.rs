@@ -64,6 +64,7 @@ pub enum BenchmarkSelection {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResultQualityInput {
+    pub actual_origin_date: NaiveDate,
     pub actual_values: Vec<PortfolioValuePoint>,
     pub baseline: Option<PortfolioValuePoint>,
     pub external_flows_base: Vec<ExternalFlowBase>,
@@ -100,12 +101,23 @@ pub struct ResultQualityOutput {
 }
 
 pub fn calculate_result_quality(input: &ResultQualityInput) -> ResultQualityOutput {
-    let actual_twr = validated_actual_twr(
-        &input.actual_values,
-        input.baseline.as_ref(),
-        &input.external_flows_base,
-        &input.actual_availability,
-    );
+    let actual_origin_matches_twr = input
+        .baseline
+        .as_ref()
+        .map(|point| point.date)
+        .or_else(|| input.actual_values.first().map(|point| point.date))
+        == Some(input.actual_origin_date);
+    let actual_twr = if actual_origin_matches_twr {
+        validated_actual_twr(
+            &input.actual_values,
+            input.baseline.as_ref(),
+            &input.external_flows_base,
+            &input.actual_availability,
+        )
+    } else {
+        Err("The explicit actual origin does not match the TWR origin.".to_string())
+    };
+    let actual_error = actual_twr.as_ref().err().cloned();
     let actual_twr_series = actual_twr.clone().unwrap_or_default();
     let actual_return = actual_twr_series
         .last()
@@ -131,13 +143,15 @@ pub fn calculate_result_quality(input: &ResultQualityInput) -> ResultQualityOutp
     let portfolio_return = actual_return;
     let benchmark_return = benchmark_usable.then_some(benchmark_return).flatten();
     let note = if !actual_usable {
-        Some(
-            "Actual TWR is unavailable because the value or cash-flow history is invalid."
-                .to_string(),
-        )
+        actual_error.or_else(|| {
+            Some(
+                "Actual TWR is unavailable because the value or cash-flow history is invalid."
+                    .to_string(),
+            )
+        })
     } else if !benchmark_usable {
         Some(
-            "Actual TWR is available; the selected fixed-weight benchmark is unavailable."
+            "Actual TWR is available; the selected fixed-weight benchmark lacks a valid, sorted, exact origin-to-end series."
                 .to_string(),
         )
     } else {
@@ -260,7 +274,7 @@ fn benchmark_returns_by_date(
         .actual_values
         .iter()
         .map(|point| point.date)
-        .chain(input.baseline.iter().map(|point| point.date))
+        .chain(std::iter::once(input.actual_origin_date))
         .collect::<BTreeSet<_>>();
     dates
         .into_iter()
@@ -270,7 +284,7 @@ fn benchmark_returns_by_date(
                     .benchmark_series
                     .iter()
                     .find(|series| &series.market == market)
-                    .and_then(|series| series_return_on(series, date)),
+                    .and_then(|series| series_return_on(series, input.actual_origin_date, date)),
                 BenchmarkSelection::AutomaticMixed => {
                     let mut total_return = 0.0;
                     let mut complete = !weights.is_empty();
@@ -282,7 +296,9 @@ fn benchmark_returns_by_date(
                             .benchmark_series
                             .iter()
                             .find(|series| series.market.trim().eq_ignore_ascii_case(market))
-                            .and_then(|series| series_return_on(series, date));
+                            .and_then(|series| {
+                                series_return_on(series, input.actual_origin_date, date)
+                            });
                         match value {
                             Some(value) => total_return += weight * value,
                             None => complete = false,
@@ -296,14 +312,30 @@ fn benchmark_returns_by_date(
         .collect()
 }
 
-fn series_return_on(series: &BenchmarkSeriesInput, date: NaiveDate) -> Option<f64> {
-    if series.availability.status == MetricStatus::Unavailable {
+fn series_return_on(
+    series: &BenchmarkSeriesInput,
+    origin_date: NaiveDate,
+    date: NaiveDate,
+) -> Option<f64> {
+    if series.availability.status == MetricStatus::Unavailable
+        || series.points.is_empty()
+        || series
+            .points
+            .iter()
+            .any(|point| !point.value.is_finite() || point.value <= 0.0)
+        || series
+            .points
+            .windows(2)
+            .any(|pair| pair[0].date >= pair[1].date)
+    {
         return None;
     }
-    let start = series.points.first()?;
+    let start = series
+        .points
+        .iter()
+        .find(|point| point.date == origin_date)?;
     let current = series.points.iter().find(|point| point.date == date)?;
-    (start.value.is_finite() && start.value > 0.0 && current.value.is_finite())
-        .then_some(current.value / start.value - 1.0)
+    Some(current.value / start.value - 1.0)
 }
 
 fn validated_actual_twr(
@@ -379,11 +411,7 @@ fn normalized_review_curve(
     if actual_twr_series.is_empty() {
         return Vec::new();
     }
-    let origin = input
-        .baseline
-        .as_ref()
-        .map(|point| point.date)
-        .unwrap_or(input.actual_values[0].date);
+    let origin = input.actual_origin_date;
     let shadow_origin = input
         .shadow_curve
         .iter()
@@ -544,14 +572,17 @@ fn drawdown_from_twr(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ComparableCurveInput {
+    pub mode: MarketReturnMode,
+    pub return_value: Option<f64>,
+    pub ending_value_base: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RebalanceValueAddInput {
     pub actual_recorded_twr: Option<f64>,
-    pub actual_comparable_total_return: Option<f64>,
-    pub actual_comparable_price_return: Option<f64>,
-    pub shadow_return: Option<f64>,
-    pub shadow_return_mode: MarketReturnMode,
-    pub actual_comparable_ending_value_base: Option<f64>,
-    pub shadow_comparable_ending_value_base: Option<f64>,
+    pub actual_comparable: ComparableCurveInput,
+    pub shadow_comparable: ComparableCurveInput,
     pub comparison_mode: MarketReturnMode,
     pub availability: MetricAvailability,
 }
@@ -565,17 +596,14 @@ pub struct RebalanceValueAddOutput {
 }
 
 pub fn calculate_rebalance_value_add(input: &RebalanceValueAddInput) -> RebalanceValueAddOutput {
-    let actual_comparable = match input.comparison_mode {
-        MarketReturnMode::TotalReturn => input.actual_comparable_total_return,
-        MarketReturnMode::PriceOnly => input.actual_comparable_price_return,
-    };
-    let modes_match = input.comparison_mode == input.shadow_return_mode;
+    let modes_match = input.actual_comparable.mode == input.comparison_mode
+        && input.shadow_comparable.mode == input.comparison_mode;
     let complete = modes_match
         && [
-            actual_comparable,
-            input.shadow_return,
-            input.actual_comparable_ending_value_base,
-            input.shadow_comparable_ending_value_base,
+            input.actual_comparable.return_value,
+            input.shadow_comparable.return_value,
+            input.actual_comparable.ending_value_base,
+            input.shadow_comparable.ending_value_base,
         ]
         .iter()
         .all(|value| value.is_some_and(f64::is_finite));
@@ -587,13 +615,18 @@ pub fn calculate_rebalance_value_add(input: &RebalanceValueAddInput) -> Rebalanc
         input.availability.status.clone()
     };
     let precise = status != MetricStatus::Unavailable;
-    let actual_return = precise.then_some(actual_comparable).flatten();
-    let shadow_return = precise.then_some(input.shadow_return).flatten();
+    let actual_return = precise
+        .then_some(input.actual_comparable.return_value)
+        .flatten();
+    let shadow_return = precise
+        .then_some(input.shadow_comparable.return_value)
+        .flatten();
     let ending_difference = precise
         .then(|| {
             input
-                .actual_comparable_ending_value_base
-                .zip(input.shadow_comparable_ending_value_base)
+                .actual_comparable
+                .ending_value_base
+                .zip(input.shadow_comparable.ending_value_base)
                 .map(|(actual, shadow)| actual - shadow)
         })
         .flatten();
@@ -1198,6 +1231,7 @@ pub struct CampaignDetailInput {
     pub summary: StockCampaignSummary,
     pub cash_flows: Vec<CampaignCashFlow>,
     pub daily_prices: Vec<CampaignPricePoint>,
+    pub expected_session_dates: Vec<NaiveDate>,
     pub benchmark_prices: Vec<LocalPricePoint>,
     pub current_price_local: Option<f64>,
     pub current_fx_to_base: Option<f64>,
@@ -1285,7 +1319,11 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
         }
         .to_string(),
     };
-    let excursions = campaign_excursions(&timeline, &input.daily_prices);
+    let excursions = campaign_excursions(
+        &timeline,
+        &input.daily_prices,
+        &input.expected_session_dates,
+    );
     let mae_base = excursions.mae_base;
     let mfe_base = excursions.mfe_base;
     let mae_percent = mae_base
@@ -1312,6 +1350,7 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
             input.summary.availability.status.clone()
         };
     let excursion_status = if max_invested.is_none()
+        || !excursions.expected_sessions_valid
         || (input.daily_prices.is_empty() && mae_base.is_none() && mfe_base.is_none())
     {
         MetricStatus::Unavailable
@@ -1325,12 +1364,18 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
     } else {
         MetricStatus::Available
     };
-    let holding_period_drawdown = if excursions.path_valid && excursions.close_complete {
+    let holding_period_drawdown = if excursions.path_valid
+        && excursions.session_coverage_complete
+        && excursions.close_complete
+    {
         campaign_drawdown(&excursions.close_path, max_invested)
     } else {
         None
     };
-    let drawdown_status = if max_invested.is_none() || input.daily_prices.is_empty() {
+    let drawdown_status = if max_invested.is_none()
+        || !excursions.expected_sessions_valid
+        || input.daily_prices.is_empty()
+    {
         MetricStatus::Unavailable
     } else if holding_period_drawdown.is_some() {
         MetricStatus::Available
@@ -1429,6 +1474,7 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
         excursion_availability: availability(
             excursion_status.clone(),
             (!excursions.path_valid
+                || !excursions.session_coverage_complete
                 || !excursions.intraday_complete
                 || !excursions.close_complete)
                 .then(|| {
@@ -1483,11 +1529,14 @@ struct CampaignExcursionEvaluation {
     intraday_complete: bool,
     close_complete: bool,
     path_valid: bool,
+    expected_sessions_valid: bool,
+    session_coverage_complete: bool,
 }
 
 fn campaign_excursions(
     flows: &[CampaignCashFlow],
     prices: &[CampaignPricePoint],
+    expected_session_dates: &[NaiveDate],
 ) -> CampaignExcursionEvaluation {
     let mut cash = 0.0;
     let mut shares = 0.0;
@@ -1495,12 +1544,25 @@ fn campaign_excursions(
     let mut adverse: Option<f64> = None;
     let mut favorable: Option<f64> = None;
     let mut close_path = Vec::new();
-    let mut intraday_complete = !prices.is_empty();
-    let mut close_complete = !prices.is_empty();
-    let mut path_valid = true;
-    let mut ordered_prices = prices.to_vec();
-    ordered_prices.sort_by_key(|point| point.date);
-    for price in &ordered_prices {
+    let expected_sessions_valid = !expected_session_dates.is_empty()
+        && expected_session_dates
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]);
+    let mut prices_by_date = BTreeMap::new();
+    let unique_prices = prices
+        .iter()
+        .all(|price| prices_by_date.insert(price.date, price).is_none());
+    let mut intraday_complete = expected_sessions_valid;
+    let mut close_complete = expected_sessions_valid;
+    let mut session_coverage_complete = expected_sessions_valid;
+    let mut path_valid = expected_sessions_valid && unique_prices;
+    for session_date in expected_session_dates {
+        let Some(price) = prices_by_date.get(session_date).copied() else {
+            session_coverage_complete = false;
+            intraday_complete = false;
+            close_complete = false;
+            continue;
+        };
         while applied < flows.len() && flows[applied].date <= price.date {
             let flow = &flows[applied];
             match flow.kind {
@@ -1571,7 +1633,7 @@ fn campaign_excursions(
             None => close_complete = false,
         }
     }
-    if !path_valid {
+    if !path_valid || !session_coverage_complete {
         adverse = None;
         favorable = None;
         close_path.clear();
@@ -1585,6 +1647,8 @@ fn campaign_excursions(
         intraday_complete,
         close_complete,
         path_valid,
+        expected_sessions_valid,
+        session_coverage_complete,
     }
 }
 
@@ -1691,6 +1755,7 @@ mod tests {
 
     fn result_input(selection: BenchmarkSelection) -> ResultQualityInput {
         ResultQualityInput {
+            actual_origin_date: date(1),
             actual_values: vec![
                 PortfolioValuePoint {
                     date: date(1),
@@ -1821,6 +1886,66 @@ mod tests {
             .note
             .as_deref()
             .is_some_and(|note| note.contains("benchmark")));
+    }
+
+    #[test]
+    fn benchmark_return_is_aligned_to_the_explicit_actual_origin() {
+        let mut input = result_input(BenchmarkSelection::SingleMarket("US".to_string()));
+        input.actual_origin_date = date(2);
+        input.actual_values[0].date = date(2);
+        input.actual_values[1].date = date(3);
+        input.benchmark_series[0].points = vec![
+            BenchmarkPoint {
+                date: date(1),
+                value: 50.0,
+            },
+            BenchmarkPoint {
+                date: date(2),
+                value: 100.0,
+            },
+            BenchmarkPoint {
+                date: date(3),
+                value: 110.0,
+            },
+        ];
+        let result = calculate_result_quality(&input);
+        assert_eq!(result.metric.availability.status, MetricStatus::Available);
+        assert!((result.metric.benchmark_return.unwrap() - 0.10).abs() < 1e-12);
+        assert!((result.metric.excess_return.unwrap() - 0.90).abs() < 1e-12);
+        assert_eq!(result.normalized_curve[0].date, date(2));
+        assert_eq!(result.normalized_curve[0].benchmark_index, Some(100.0));
+    }
+
+    #[test]
+    fn missing_or_ambiguous_benchmark_origin_preserves_only_actual_twr() {
+        let mut later_start = result_input(BenchmarkSelection::SingleMarket("US".to_string()));
+        later_start.benchmark_series[0].points = vec![BenchmarkPoint {
+            date: date(2),
+            value: 110.0,
+        }];
+
+        let mut duplicate = result_input(BenchmarkSelection::SingleMarket("US".to_string()));
+        duplicate.benchmark_series[0].points.insert(
+            1,
+            BenchmarkPoint {
+                date: date(1),
+                value: 100.0,
+            },
+        );
+
+        let mut unsorted = result_input(BenchmarkSelection::SingleMarket("US".to_string()));
+        unsorted.benchmark_series[0].points.reverse();
+
+        let mut nonfinite = result_input(BenchmarkSelection::SingleMarket("US".to_string()));
+        nonfinite.benchmark_series[0].points[0].value = f64::NAN;
+
+        for input in [later_start, duplicate, unsorted, nonfinite] {
+            let result = calculate_result_quality(&input);
+            assert_eq!(result.metric.availability.status, MetricStatus::Degraded);
+            assert_eq!(result.metric.portfolio_return, Some(1.0));
+            assert_eq!(result.metric.benchmark_return, None);
+            assert_eq!(result.metric.excess_return, None);
+        }
     }
 
     #[test]
@@ -1967,12 +2092,16 @@ mod tests {
     fn price_only_value_add_compares_compatible_curves_without_replacing_actual_twr() {
         let result = calculate_rebalance_value_add(&RebalanceValueAddInput {
             actual_recorded_twr: Some(0.12),
-            actual_comparable_total_return: Some(0.12),
-            actual_comparable_price_return: Some(0.08),
-            shadow_return: Some(0.05),
-            shadow_return_mode: MarketReturnMode::PriceOnly,
-            actual_comparable_ending_value_base: Some(1_080.0),
-            shadow_comparable_ending_value_base: Some(1_050.0),
+            actual_comparable: ComparableCurveInput {
+                mode: MarketReturnMode::PriceOnly,
+                return_value: Some(0.08),
+                ending_value_base: Some(1_080.0),
+            },
+            shadow_comparable: ComparableCurveInput {
+                mode: MarketReturnMode::PriceOnly,
+                return_value: Some(0.05),
+                ending_value_base: Some(1_050.0),
+            },
             comparison_mode: MarketReturnMode::PriceOnly,
             availability: available(),
         });
@@ -1985,15 +2114,19 @@ mod tests {
     }
 
     #[test]
-    fn rebalance_value_add_rejects_mismatched_shadow_return_mode() {
+    fn rebalance_value_add_rejects_mismatched_comparable_return_and_ending_value_mode() {
         let result = calculate_rebalance_value_add(&RebalanceValueAddInput {
             actual_recorded_twr: Some(0.12),
-            actual_comparable_total_return: Some(0.12),
-            actual_comparable_price_return: Some(0.08),
-            shadow_return: Some(0.05),
-            shadow_return_mode: MarketReturnMode::TotalReturn,
-            actual_comparable_ending_value_base: Some(1_080.0),
-            shadow_comparable_ending_value_base: Some(1_050.0),
+            actual_comparable: ComparableCurveInput {
+                mode: MarketReturnMode::PriceOnly,
+                return_value: Some(0.08),
+                ending_value_base: Some(1_080.0),
+            },
+            shadow_comparable: ComparableCurveInput {
+                mode: MarketReturnMode::TotalReturn,
+                return_value: Some(0.05),
+                ending_value_base: Some(1_050.0),
+            },
             comparison_mode: MarketReturnMode::PriceOnly,
             availability: available(),
         });
@@ -2377,6 +2510,7 @@ mod tests {
                 CampaignPricePoint::complete(date(2), 9.0, 14.0, 11.0),
                 CampaignPricePoint::complete(date(3), 12.0, 13.0, 13.0),
             ],
+            expected_session_dates: vec![date(1), date(2), date(3)],
             benchmark_prices: sessions(3, 1, 100.0, 110.0),
             current_price_local: None,
             current_fx_to_base: None,
@@ -2423,6 +2557,7 @@ mod tests {
                 flow(2, CampaignCashFlowKind::Sell, 48.0, 4.0),
             ],
             daily_prices: vec![CampaignPricePoint::complete(date(1), 9.0, 11.0, 10.0)],
+            expected_session_dates: vec![date(1)],
             benchmark_prices: sessions(2, 1, 100.0, 105.0),
             current_price_local: Some(15.0),
             current_fx_to_base: Some(1.0),
@@ -2445,6 +2580,7 @@ mod tests {
                 flow(2, CampaignCashFlowKind::Sell, 120.0, 10.0),
             ],
             daily_prices: vec![],
+            expected_session_dates: vec![date(1), date(2)],
             benchmark_prices: vec![],
             current_price_local: None,
             current_fx_to_base: None,
@@ -2476,6 +2612,7 @@ mod tests {
                 close: Some(10.0),
                 fx_to_base: Some(1.0),
             }],
+            expected_session_dates: vec![date(1)],
             benchmark_prices: vec![],
             current_price_local: Some(10.0),
             current_fx_to_base: Some(1.0),
@@ -2505,6 +2642,7 @@ mod tests {
             summary: campaign_summary(StockCampaignStatus::Active),
             cash_flows: vec![flow(1, CampaignCashFlowKind::Buy, 100.0, 10.0)],
             daily_prices: vec![CampaignPricePoint::complete(date(1), 9.0, 11.0, 10.0)],
+            expected_session_dates: vec![date(1)],
             benchmark_prices: vec![],
             current_price_local: None,
             current_fx_to_base: None,
@@ -2531,6 +2669,7 @@ mod tests {
                 close: Some(10.0),
                 fx_to_base: Some(2.0),
             }],
+            expected_session_dates: vec![date(1)],
             benchmark_prices: vec![],
             current_price_local: Some(12.0),
             current_fx_to_base: Some(2.0),
@@ -2550,6 +2689,7 @@ mod tests {
             summary: campaign_summary(StockCampaignStatus::Active),
             cash_flows: vec![flow(1, CampaignCashFlowKind::Buy, 100.0, 10.0)],
             daily_prices: vec![CampaignPricePoint::complete(date(1), 12.0, 8.0, 10.0)],
+            expected_session_dates: vec![date(1)],
             benchmark_prices: vec![],
             current_price_local: Some(10.0),
             current_fx_to_base: Some(1.0),
@@ -2584,6 +2724,7 @@ mod tests {
                 },
                 CampaignPricePoint::complete(date(3), 9.0, 11.0, 10.0),
             ],
+            expected_session_dates: vec![date(1), date(2), date(3)],
             benchmark_prices: vec![],
             current_price_local: Some(10.0),
             current_fx_to_base: Some(1.0),
@@ -2599,6 +2740,60 @@ mod tests {
         assert_eq!(
             missing_close.drawdown_availability.status,
             MetricStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn campaign_expected_sessions_detect_whole_missing_rows_but_ignore_non_trading_days() {
+        let missing_session = calculate_campaign_detail(&CampaignDetailInput {
+            summary: campaign_summary(StockCampaignStatus::Active),
+            cash_flows: vec![flow(1, CampaignCashFlowKind::Buy, 100.0, 10.0)],
+            daily_prices: vec![
+                CampaignPricePoint::complete(date(1), 9.0, 11.0, 10.0),
+                CampaignPricePoint::complete(date(4), 9.0, 11.0, 10.0),
+            ],
+            expected_session_dates: vec![date(1), date(2), date(4)],
+            benchmark_prices: vec![],
+            current_price_local: Some(10.0),
+            current_fx_to_base: Some(1.0),
+            actions: vec![],
+            forward_actions: vec![],
+            annotations: vec![],
+        });
+        assert_eq!(
+            missing_session.excursion_availability.status,
+            MetricStatus::Degraded
+        );
+        assert_eq!(missing_session.mae_base, None);
+        assert_eq!(missing_session.mfe_base, None);
+        assert_eq!(missing_session.holding_period_drawdown, None);
+        assert_eq!(
+            missing_session.drawdown_availability.status,
+            MetricStatus::Degraded
+        );
+
+        let non_trading_gap = calculate_campaign_detail(&CampaignDetailInput {
+            summary: campaign_summary(StockCampaignStatus::Active),
+            cash_flows: vec![flow(1, CampaignCashFlowKind::Buy, 100.0, 10.0)],
+            daily_prices: vec![
+                CampaignPricePoint::complete(date(1), 9.0, 11.0, 10.0),
+                CampaignPricePoint::complete(date(4), 9.0, 11.0, 10.0),
+            ],
+            expected_session_dates: vec![date(1), date(4)],
+            benchmark_prices: vec![],
+            current_price_local: Some(10.0),
+            current_fx_to_base: Some(1.0),
+            actions: vec![],
+            forward_actions: vec![],
+            annotations: vec![],
+        });
+        assert_eq!(
+            non_trading_gap.excursion_availability.status,
+            MetricStatus::Available
+        );
+        assert_eq!(
+            non_trading_gap.drawdown_availability.status,
+            MetricStatus::Available
         );
     }
 }

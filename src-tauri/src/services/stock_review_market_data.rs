@@ -325,20 +325,33 @@ pub fn evaluation_cache_end(action_date: NaiveDate, today: NaiveDate) -> NaiveDa
     )
 }
 
-/// Return the Nth cached market point strictly after the action date.  Missing
-/// future points mean no reliable terminal value, so callers receive `None`.
+/// Return the Nth expected market-session date strictly after the action date.
+/// The selection uses the market or benchmark calendar, not observed stock
+/// candles, so a halt cannot silently move an endpoint to a later quote.
 pub fn nth_market_session_after(
-    points: &[DailyMarketPoint],
+    session_dates: &[NaiveDate],
     action_date: NaiveDate,
     session_number: usize,
-) -> Option<&DailyMarketPoint> {
+) -> Option<NaiveDate> {
     if session_number == 0 {
         return None;
     }
-    points
-        .iter()
-        .filter(|point| point.date > action_date)
+    let mut ordered_dates = session_dates.to_vec();
+    ordered_dates.sort_unstable();
+    ordered_dates.dedup();
+    ordered_dates
+        .into_iter()
+        .filter(|date| *date > action_date)
         .nth(session_number - 1)
+}
+
+/// Resolve a stock quote only when it exists on the chosen market-session
+/// date.  There is deliberately no next-day fallback or forward fill.
+pub fn market_point_on_session(
+    points: &[DailyMarketPoint],
+    session_date: NaiveDate,
+) -> Option<&DailyMarketPoint> {
+    points.iter().find(|point| point.date == session_date)
 }
 
 fn available() -> MetricAvailability {
@@ -367,7 +380,8 @@ mod tests {
     use super::{
         cache_fill_ranges, classify_coverage, classify_return_mode, default_benchmark_symbol,
         evaluation_cache_end, load_benchmark_series, load_stock_price_series,
-        nth_market_session_after, upsert_stock_candles, DailyMarketPoint, MarketReturnMode,
+        market_point_on_session, nth_market_session_after, upsert_stock_candles, DailyMarketPoint,
+        MarketReturnMode,
     };
     use crate::db::Database;
     use crate::models::stock_review::MetricStatus;
@@ -481,15 +495,35 @@ mod tests {
             }
         }
 
+        let session_dates = points.iter().map(|item| item.date).collect::<Vec<_>>();
+        let day_60 = nth_market_session_after(&session_dates, action_date, 60);
+        let day_120 = nth_market_session_after(&session_dates, action_date, 120);
+        assert_eq!(day_60, Some(points[59].date));
+        assert_eq!(day_120, Some(points[119].date));
         assert_eq!(
-            nth_market_session_after(&points, action_date, 60).map(|item| item.date),
-            Some(points[59].date)
+            day_60.and_then(|session| market_point_on_session(&points, session)),
+            Some(&points[59])
         );
         assert_eq!(
-            nth_market_session_after(&points, action_date, 120).map(|item| item.date),
-            Some(points[119].date)
+            day_120.and_then(|session| market_point_on_session(&points, session)),
+            Some(&points[119])
         );
-        assert_eq!(nth_market_session_after(&points, action_date, 121), None);
+        assert_eq!(
+            nth_market_session_after(&session_dates, action_date, 121),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_expected_session_quote_does_not_shift_to_a_later_stock_candle() {
+        // Resolving the next observed quote would hide a halt and fabricate a forward endpoint.
+        let action_date = date("2024-01-05");
+        let session_dates = vec![date("2024-01-08"), date("2024-01-09"), date("2024-01-10")];
+        let stock_points = vec![point(date("2024-01-08")), point(date("2024-01-11"))];
+
+        let target = nth_market_session_after(&session_dates, action_date, 2).unwrap();
+        assert_eq!(target, date("2024-01-09"));
+        assert_eq!(market_point_on_session(&stock_points, target), None);
     }
 
     #[test]

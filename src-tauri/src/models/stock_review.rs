@@ -285,6 +285,7 @@ pub struct StockCampaignDetail {
     pub availability: MetricAvailability,
     pub pnl_availability: MetricAvailability,
     pub excursion_availability: MetricAvailability,
+    pub drawdown_availability: MetricAvailability,
     pub benchmark_availability: MetricAvailability,
     pub summary: StockCampaignSummary,
     pub actions: Vec<StockActionReview>,

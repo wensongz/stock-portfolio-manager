@@ -8,7 +8,7 @@ use crate::models::stock_review::{
     StockCampaignDetail, StockCampaignStatus, StockCampaignSummary, StockReviewAnnotation,
 };
 use crate::services::performance_service::build_twr_return_series;
-use crate::services::stock_review_market_data::MarketReturnMode;
+use crate::services::stock_review_market_data::{nth_market_session_after, MarketReturnMode};
 use crate::services::stock_review_quality::merge_metric_statuses;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -100,33 +100,13 @@ pub struct ResultQualityOutput {
 }
 
 pub fn calculate_result_quality(input: &ResultQualityInput) -> ResultQualityOutput {
-    let actual_valid = input
-        .actual_values
-        .iter()
-        .all(|point| point.value_base.is_finite() && point.value_base >= 0.0)
-        && input
-            .external_flows_base
-            .iter()
-            .all(|flow| flow.amount_base.is_finite());
-    let values = input
-        .actual_values
-        .iter()
-        .map(|point| (point.date, point.value_base, 0.0))
-        .collect::<Vec<_>>();
-    let baseline = input
-        .baseline
-        .as_ref()
-        .map(|point| (point.date, point.value_base));
-    let flows = input
-        .external_flows_base
-        .iter()
-        .map(|flow| (flow.date, flow.amount_base))
-        .collect::<Vec<_>>();
-    let actual_twr_series = if actual_valid {
-        build_twr_return_series(&values, baseline, &flows)
-    } else {
-        Vec::new()
-    };
+    let actual_twr = validated_actual_twr(
+        &input.actual_values,
+        input.baseline.as_ref(),
+        &input.external_flows_base,
+        &input.actual_availability,
+    );
+    let actual_twr_series = actual_twr.clone().unwrap_or_default();
     let actual_return = actual_twr_series
         .last()
         .map(|point| point.cumulative_return / 100.0);
@@ -137,22 +117,34 @@ pub fn calculate_result_quality(input: &ResultQualityInput) -> ResultQualityOutp
         .actual_values
         .last()
         .and_then(|point| benchmark_by_date.get(&point.date).copied().flatten());
-    let benchmark_status = benchmark_status(input);
-    let status = if !actual_valid || actual_return.is_none() || benchmark_return.is_none() {
+    let benchmark_status = benchmark_status(input, &fixed_weights);
+    let actual_usable = actual_return.is_some();
+    let benchmark_usable =
+        benchmark_return.is_some() && benchmark_status != MetricStatus::Unavailable;
+    let status = if !actual_usable {
         MetricStatus::Unavailable
+    } else if !benchmark_usable {
+        MetricStatus::Degraded
     } else {
         merge_metric_statuses(&[input.actual_availability.status.clone(), benchmark_status])
     };
-    let precise = status != MetricStatus::Unavailable;
-    let portfolio_return = precise.then_some(actual_return).flatten();
-    let benchmark_return = precise.then_some(benchmark_return).flatten();
+    let portfolio_return = actual_return;
+    let benchmark_return = benchmark_usable.then_some(benchmark_return).flatten();
+    let note = if !actual_usable {
+        Some(
+            "Actual TWR is unavailable because the value or cash-flow history is invalid."
+                .to_string(),
+        )
+    } else if !benchmark_usable {
+        Some(
+            "Actual TWR is available; the selected fixed-weight benchmark is unavailable."
+                .to_string(),
+        )
+    } else {
+        None
+    };
     let metric = ResultQualityMetric {
-        availability: availability(
-            status.clone(),
-            (status == MetricStatus::Unavailable).then(|| {
-                "Actual TWR or the selected fixed-weight benchmark is unavailable.".to_string()
-            }),
-        ),
+        availability: availability(status, note),
         portfolio_return,
         shadow_return: None,
         benchmark_return,
@@ -163,38 +155,17 @@ pub fn calculate_result_quality(input: &ResultQualityInput) -> ResultQualityOutp
             .zip(benchmark_return)
             .map(|(actual, benchmark)| actual - benchmark),
     };
-    let normalized_curve = input
-        .actual_values
-        .iter()
-        .map(|point| {
-            let portfolio_index = actual_twr_series
-                .iter()
-                .find(|value| value.date == point.date.format("%Y-%m-%d").to_string())
-                .map(|value| 100.0 + value.cumulative_return);
-            let benchmark_index = benchmark_by_date
-                .get(&point.date)
-                .copied()
-                .flatten()
-                .map(|value| 100.0 * (1.0 + value));
-            NormalizedReviewCurvePoint {
-                date: point.date,
-                portfolio_index,
-                shadow_index: input
-                    .shadow_curve
-                    .iter()
-                    .find(|value| value.date == point.date)
-                    .filter(|value| value.cumulative_return.is_finite())
-                    .map(|value| 100.0 * (1.0 + value.cumulative_return)),
-                benchmark_index,
-            }
+    let normalized_curve = normalized_review_curve(input, &actual_twr_series, &benchmark_by_date);
+    let max_drawdown = actual_twr
+        .as_ref()
+        .map(|series| {
+            drawdown_from_twr(
+                series,
+                input.baseline.as_ref(),
+                input.actual_availability.clone(),
+            )
         })
-        .collect();
-    let max_drawdown = calculate_max_drawdown_metric(
-        &input.actual_values,
-        input.baseline.clone(),
-        &input.external_flows_base,
-        input.actual_availability.clone(),
-    );
+        .unwrap_or_else(|_| unavailable_drawdown());
 
     ResultQualityOutput {
         metric,
@@ -206,43 +177,78 @@ pub fn calculate_result_quality(input: &ResultQualityInput) -> ResultQualityOutp
 }
 
 fn opening_weights(input: &ResultQualityInput) -> BTreeMap<String, f64> {
-    let stock_total = input
-        .opening_market_values_base
-        .iter()
-        .filter(|value| value.value_base.is_finite() && value.value_base >= 0.0)
-        .map(|value| value.value_base)
-        .sum::<f64>();
-    let total = stock_total + input.opening_cash_value_base;
-    if !total.is_finite() || total <= 0.0 || input.opening_cash_value_base < 0.0 {
+    if !input.opening_cash_value_base.is_finite()
+        || input.opening_cash_value_base < 0.0
+        || input.opening_market_values_base.iter().any(|value| {
+            !value.value_base.is_finite()
+                || value.value_base < 0.0
+                || value.market.trim().is_empty()
+        })
+    {
         return BTreeMap::new();
     }
-    let mut weights = BTreeMap::new();
+    let mut opening_values = BTreeMap::new();
     for value in &input.opening_market_values_base {
-        *weights.entry(value.market.clone()).or_insert(0.0) += value.value_base / total;
+        if value.value_base > 0.0 {
+            *opening_values
+                .entry(value.market.trim().to_ascii_uppercase())
+                .or_insert(0.0) += value.value_base;
+        }
     }
-    weights.insert("cash".to_string(), input.opening_cash_value_base / total);
+    let stock_total = opening_values.values().sum::<f64>();
+    let total = stock_total + input.opening_cash_value_base;
+    if !total.is_finite() || total <= 0.0 {
+        return BTreeMap::new();
+    }
+    let mut weights = opening_values
+        .into_iter()
+        .map(|(market, value)| (market, value / total))
+        .collect::<BTreeMap<_, _>>();
+    if input.opening_cash_value_base > 0.0 {
+        weights.insert("cash".to_string(), input.opening_cash_value_base / total);
+    }
+    let weight_sum = weights.values().sum::<f64>();
+    if !weight_sum.is_finite() || (weight_sum - 1.0).abs() > EPSILON {
+        return BTreeMap::new();
+    }
     weights
 }
 
-fn benchmark_status(input: &ResultQualityInput) -> MetricStatus {
-    let selected =
-        input
+fn benchmark_status(input: &ResultQualityInput, weights: &BTreeMap<String, f64>) -> MetricStatus {
+    match &input.benchmark_selection {
+        BenchmarkSelection::SingleMarket(market) => input
             .benchmark_series
             .iter()
-            .filter(|series| match &input.benchmark_selection {
-                BenchmarkSelection::AutomaticMixed => input
-                    .opening_market_values_base
-                    .iter()
-                    .any(|value| value.market == series.market && value.value_base > 0.0),
-                BenchmarkSelection::SingleMarket(market) => market == &series.market,
-            });
-    let statuses = selected
-        .map(|series| series.availability.status.clone())
-        .collect::<Vec<_>>();
-    if statuses.is_empty() {
-        MetricStatus::Unavailable
-    } else {
-        merge_metric_statuses(&statuses)
+            .find(|series| series.market == *market)
+            .map(|series| series.availability.status.clone())
+            .unwrap_or(MetricStatus::Unavailable),
+        BenchmarkSelection::AutomaticMixed => {
+            if weights.is_empty() {
+                return MetricStatus::Unavailable;
+            }
+            let markets = weights
+                .keys()
+                .filter(|market| market.as_str() != "cash")
+                .collect::<Vec<_>>();
+            if markets.is_empty() {
+                return MetricStatus::Available;
+            }
+            let statuses = markets
+                .iter()
+                .filter_map(|market| {
+                    input
+                        .benchmark_series
+                        .iter()
+                        .find(|series| series.market.trim().eq_ignore_ascii_case(market))
+                        .map(|series| series.availability.status.clone())
+                })
+                .collect::<Vec<_>>();
+            if statuses.len() != markets.len() {
+                MetricStatus::Unavailable
+            } else {
+                merge_metric_statuses(&statuses)
+            }
+        }
     }
 }
 
@@ -254,6 +260,7 @@ fn benchmark_returns_by_date(
         .actual_values
         .iter()
         .map(|point| point.date)
+        .chain(input.baseline.iter().map(|point| point.date))
         .collect::<BTreeSet<_>>();
     dates
         .into_iter()
@@ -274,7 +281,7 @@ fn benchmark_returns_by_date(
                         let value = input
                             .benchmark_series
                             .iter()
-                            .find(|series| &series.market == market)
+                            .find(|series| series.market.trim().eq_ignore_ascii_case(market))
                             .and_then(|series| series_return_on(series, date));
                         match value {
                             Some(value) => total_return += weight * value,
@@ -290,18 +297,53 @@ fn benchmark_returns_by_date(
 }
 
 fn series_return_on(series: &BenchmarkSeriesInput, date: NaiveDate) -> Option<f64> {
+    if series.availability.status == MetricStatus::Unavailable {
+        return None;
+    }
     let start = series.points.first()?;
     let current = series.points.iter().find(|point| point.date == date)?;
     (start.value.is_finite() && start.value > 0.0 && current.value.is_finite())
         .then_some(current.value / start.value - 1.0)
 }
 
-pub fn calculate_max_drawdown_metric(
+fn validated_actual_twr(
     values: &[PortfolioValuePoint],
-    baseline: Option<PortfolioValuePoint>,
+    baseline: Option<&PortfolioValuePoint>,
     external_flows: &[ExternalFlowBase],
-    input_availability: MetricAvailability,
-) -> MaxDrawdownMetric {
+    input_availability: &MetricAvailability,
+) -> Result<Vec<ReturnDataPoint>, String> {
+    if input_availability.status == MetricStatus::Unavailable || values.is_empty() {
+        return Err("Actual value history is unavailable.".to_string());
+    }
+    if values
+        .iter()
+        .any(|point| !point.value_base.is_finite() || point.value_base <= 0.0)
+        || values.windows(2).any(|pair| pair[0].date >= pair[1].date)
+    {
+        return Err("Actual values must be positive, finite, and strictly ordered.".to_string());
+    }
+    if baseline.is_some_and(|point| {
+        !point.value_base.is_finite() || point.value_base <= 0.0 || point.date >= values[0].date
+    }) {
+        return Err("The baseline must be positive, finite, and predate observations.".to_string());
+    }
+    if external_flows
+        .iter()
+        .any(|flow| !flow.amount_base.is_finite())
+        || external_flows
+            .windows(2)
+            .any(|pair| pair[0].date > pair[1].date)
+    {
+        return Err("External flows must be finite and date-ordered.".to_string());
+    }
+    let origin_date = baseline.map(|point| point.date).unwrap_or(values[0].date);
+    let end_date = values.last().unwrap().date;
+    if external_flows
+        .iter()
+        .any(|flow| flow.date <= origin_date || flow.date > end_date)
+    {
+        return Err("External flows must fall inside the measured period.".to_string());
+    }
     let daily_values = values
         .iter()
         .map(|point| (point.date, point.value_base, 0.0))
@@ -310,13 +352,134 @@ pub fn calculate_max_drawdown_metric(
         .iter()
         .map(|flow| (flow.date, flow.amount_base))
         .collect::<Vec<_>>();
-    let return_series = build_twr_return_series(
+    let series = build_twr_return_series(
         &daily_values,
-        baseline
-            .as_ref()
-            .map(|point| (point.date, point.value_base)),
+        baseline.map(|point| (point.date, point.value_base)),
         &flows,
     );
+    let generated_valid = series.len() == values.len()
+        && series.iter().zip(values).all(|(point, source)| {
+            point.date == source.date.format("%Y-%m-%d").to_string()
+                && point.cumulative_return.is_finite()
+                && point.daily_return.is_finite()
+                && point.portfolio_value.is_finite()
+                && point.daily_pnl.is_finite()
+                && 1.0 + point.cumulative_return / 100.0 > 0.0
+        });
+    generated_valid
+        .then_some(series)
+        .ok_or_else(|| "The generated TWR curve is not finite and usable.".to_string())
+}
+
+fn normalized_review_curve(
+    input: &ResultQualityInput,
+    actual_twr_series: &[ReturnDataPoint],
+    benchmark_by_date: &BTreeMap<NaiveDate, Option<f64>>,
+) -> Vec<NormalizedReviewCurvePoint> {
+    if actual_twr_series.is_empty() {
+        return Vec::new();
+    }
+    let origin = input
+        .baseline
+        .as_ref()
+        .map(|point| point.date)
+        .unwrap_or(input.actual_values[0].date);
+    let shadow_origin = input
+        .shadow_curve
+        .iter()
+        .find(|point| point.date == origin)
+        .filter(|point| point.cumulative_return.is_finite())
+        .map(|point| 1.0 + point.cumulative_return)
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let benchmark_origin = benchmark_by_date
+        .get(&origin)
+        .copied()
+        .flatten()
+        .map(|value| 1.0 + value)
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let dates = std::iter::once(origin)
+        .chain(input.actual_values.iter().map(|point| point.date))
+        .collect::<BTreeSet<_>>();
+    dates
+        .into_iter()
+        .map(|date| {
+            let portfolio_index = if date == origin {
+                Some(100.0)
+            } else {
+                actual_twr_series
+                    .iter()
+                    .find(|point| point.date == date.format("%Y-%m-%d").to_string())
+                    .map(|point| 100.0 + point.cumulative_return)
+            };
+            let shadow_index = if date == origin {
+                shadow_origin.map(|_| 100.0)
+            } else {
+                input
+                    .shadow_curve
+                    .iter()
+                    .find(|point| point.date == date)
+                    .filter(|point| point.cumulative_return.is_finite())
+                    .map(|point| 1.0 + point.cumulative_return)
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .zip(shadow_origin)
+                    .map(|(value, base)| 100.0 * value / base)
+            };
+            let benchmark_index = if date == origin {
+                benchmark_origin.map(|_| 100.0)
+            } else {
+                benchmark_by_date
+                    .get(&date)
+                    .copied()
+                    .flatten()
+                    .map(|value| 1.0 + value)
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .zip(benchmark_origin)
+                    .map(|(value, base)| 100.0 * value / base)
+            };
+            NormalizedReviewCurvePoint {
+                date,
+                portfolio_index,
+                shadow_index,
+                benchmark_index,
+            }
+        })
+        .collect()
+}
+
+pub fn calculate_max_drawdown_metric(
+    values: &[PortfolioValuePoint],
+    baseline: Option<PortfolioValuePoint>,
+    external_flows: &[ExternalFlowBase],
+    input_availability: MetricAvailability,
+) -> MaxDrawdownMetric {
+    let Ok(return_series) = validated_actual_twr(
+        values,
+        baseline.as_ref(),
+        external_flows,
+        &input_availability,
+    ) else {
+        return unavailable_drawdown();
+    };
+    drawdown_from_twr(&return_series, baseline.as_ref(), input_availability)
+}
+
+fn unavailable_drawdown() -> MaxDrawdownMetric {
+    MaxDrawdownMetric {
+        availability: unavailable("A complete cash-flow-adjusted return curve is required."),
+        max_drawdown: None,
+        peak_date: None,
+        trough_date: None,
+        duration_days: None,
+        recovery_date: None,
+        recovery_duration_days: None,
+    }
+}
+
+fn drawdown_from_twr(
+    return_series: &[ReturnDataPoint],
+    baseline: Option<&PortfolioValuePoint>,
+    input_availability: MetricAvailability,
+) -> MaxDrawdownMetric {
     let mut parsed = return_series
         .iter()
         .filter_map(|point| {
@@ -325,23 +488,11 @@ pub fn calculate_max_drawdown_metric(
                 .map(|date| (date, 1.0 + point.cumulative_return / 100.0))
         })
         .collect::<Vec<_>>();
-    if let Some(baseline) = baseline.as_ref().filter(|baseline| {
-        values
-            .first()
-            .is_some_and(|first| baseline.date < first.date)
-    }) {
+    if let Some(baseline) = baseline {
         parsed.insert(0, (baseline.date, 1.0));
     }
-    if parsed.is_empty() || input_availability.status == MetricStatus::Unavailable {
-        return MaxDrawdownMetric {
-            availability: unavailable("A complete cash-flow-adjusted return curve is required."),
-            max_drawdown: None,
-            peak_date: None,
-            trough_date: None,
-            duration_days: None,
-            recovery_date: None,
-            recovery_duration_days: None,
-        };
+    if parsed.is_empty() {
+        return unavailable_drawdown();
     }
     let mut running_peak = parsed[0];
     let mut worst = 0.0;
@@ -398,6 +549,7 @@ pub struct RebalanceValueAddInput {
     pub actual_comparable_total_return: Option<f64>,
     pub actual_comparable_price_return: Option<f64>,
     pub shadow_return: Option<f64>,
+    pub shadow_return_mode: MarketReturnMode,
     pub actual_comparable_ending_value_base: Option<f64>,
     pub shadow_comparable_ending_value_base: Option<f64>,
     pub comparison_mode: MarketReturnMode,
@@ -417,14 +569,16 @@ pub fn calculate_rebalance_value_add(input: &RebalanceValueAddInput) -> Rebalanc
         MarketReturnMode::TotalReturn => input.actual_comparable_total_return,
         MarketReturnMode::PriceOnly => input.actual_comparable_price_return,
     };
-    let complete = [
-        actual_comparable,
-        input.shadow_return,
-        input.actual_comparable_ending_value_base,
-        input.shadow_comparable_ending_value_base,
-    ]
-    .iter()
-    .all(|value| value.is_some_and(f64::is_finite));
+    let modes_match = input.comparison_mode == input.shadow_return_mode;
+    let complete = modes_match
+        && [
+            actual_comparable,
+            input.shadow_return,
+            input.actual_comparable_ending_value_base,
+            input.shadow_comparable_ending_value_base,
+        ]
+        .iter()
+        .all(|value| value.is_some_and(f64::is_finite));
     let status = if !complete || input.availability.status == MetricStatus::Unavailable {
         MetricStatus::Unavailable
     } else if input.comparison_mode == MarketReturnMode::PriceOnly {
@@ -447,12 +601,23 @@ pub fn calculate_rebalance_value_add(input: &RebalanceValueAddInput) -> Rebalanc
         metric: RebalanceValueAddMetric {
             availability: availability(
                 status,
-                (input.comparison_mode == MarketReturnMode::PriceOnly).then(|| {
-                    "Actual and shadow comparable curves both exclude dividends; recorded actual TWR is unchanged."
-                        .to_string()
-                }),
+                if !modes_match {
+                    Some(
+                        "Actual and shadow comparison modes differ; value-add is unavailable."
+                            .to_string(),
+                    )
+                } else if input.comparison_mode == MarketReturnMode::PriceOnly {
+                    Some(
+                        "Actual and shadow comparable curves both exclude dividends; recorded actual TWR is unchanged."
+                            .to_string(),
+                    )
+                } else {
+                    None
+                },
             ),
-            value_add: actual_return.zip(shadow_return).map(|(actual, shadow)| actual - shadow),
+            value_add: actual_return
+                .zip(shadow_return)
+                .map(|(actual, shadow)| actual - shadow),
             actual_return,
             shadow_return,
             ending_value_difference_base: ending_difference,
@@ -481,6 +646,8 @@ pub struct ForwardActionInput {
     pub action_date: NaiveDate,
     pub action_notional_local: f64,
     pub action_day_fx_to_base: Option<f64>,
+    #[serde(default)]
+    pub market_session_dates: Vec<NaiveDate>,
     pub stock_prices_local: Vec<LocalPricePoint>,
     pub benchmark_prices_local: Vec<LocalPricePoint>,
     pub availability: MetricAvailability,
@@ -609,55 +776,6 @@ fn calculate_action_window(action: &ForwardActionInput, window: u16) -> ActionEf
             action.availability.note.clone(),
         );
     }
-    let Some(start_index) = action
-        .stock_prices_local
-        .iter()
-        .position(|point| point.date == action.action_date)
-    else {
-        return empty_action_window(
-            window,
-            MetricStatus::Unavailable,
-            Some("Action-date local stock price is unavailable.".to_string()),
-        );
-    };
-    let Some(end_point) = action.stock_prices_local.get(start_index + window as usize) else {
-        return empty_action_window(
-            window,
-            MetricStatus::Pending,
-            Some("The market-session observation window has not matured.".to_string()),
-        );
-    };
-    let start_point = &action.stock_prices_local[start_index];
-    let benchmark_start = action
-        .benchmark_prices_local
-        .iter()
-        .find(|point| point.date == start_point.date);
-    let benchmark_end = action
-        .benchmark_prices_local
-        .iter()
-        .find(|point| point.date == end_point.date);
-    let fx = action
-        .action_day_fx_to_base
-        .filter(|value| value.is_finite() && *value > 0.0);
-    let valid_prices = start_point.close.is_finite()
-        && start_point.close > 0.0
-        && end_point.close.is_finite()
-        && benchmark_start.is_some_and(|point| point.close.is_finite() && point.close > 0.0)
-        && benchmark_end.is_some_and(|point| point.close.is_finite());
-    if !valid_prices || !action.action_notional_local.is_finite() || fx.is_none() {
-        return empty_action_window(
-            window,
-            MetricStatus::Unavailable,
-            Some(
-                "A local price, market benchmark, or action-day FX rate is unavailable."
-                    .to_string(),
-            ),
-        );
-    }
-    let benchmark_start = benchmark_start.unwrap();
-    let benchmark_end = benchmark_end.unwrap();
-    let stock_return = end_point.close / start_point.close - 1.0;
-    let benchmark_return = benchmark_end.close / benchmark_start.close - 1.0;
     let buy_direction = matches!(action.action_type.as_str(), "open" | "add");
     let sell_direction = matches!(action.action_type.as_str(), "reduce" | "close");
     if !buy_direction && !sell_direction {
@@ -667,6 +785,82 @@ fn calculate_action_window(action: &ForwardActionInput, window: u16) -> ActionEf
             Some("Action type is not evaluable as a stock trade.".to_string()),
         );
     }
+    let fx = action
+        .action_day_fx_to_base
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let valid_notional =
+        action.action_notional_local.is_finite() && action.action_notional_local.abs() > 0.0;
+    let notional_base = fx.map(|value| action.action_notional_local.abs() * value);
+    let start_point = action
+        .stock_prices_local
+        .iter()
+        .find(|point| point.date == action.action_date);
+    let benchmark_start = action
+        .benchmark_prices_local
+        .iter()
+        .find(|point| point.date == action.action_date);
+    let valid_start = start_point.is_some_and(|point| point.close.is_finite() && point.close > 0.0)
+        && benchmark_start.is_some_and(|point| point.close.is_finite() && point.close > 0.0);
+    let valid_calendar = !action.market_session_dates.is_empty()
+        && action
+            .market_session_dates
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]);
+    if !valid_notional
+        || !notional_base.is_some_and(|value| value.is_finite() && value > 0.0)
+        || !valid_start
+        || !valid_calendar
+    {
+        return empty_action_window(
+            window,
+            MetricStatus::Unavailable,
+            Some(
+                "Action type, action-day prices, notional, FX, and market calendar must be valid."
+                    .to_string(),
+            ),
+        );
+    }
+    let Some(target_date) = nth_market_session_after(
+        &action.market_session_dates,
+        action.action_date,
+        window as usize,
+    ) else {
+        return empty_action_window(
+            window,
+            MetricStatus::Pending,
+            Some("The market-session observation window has not matured.".to_string()),
+        );
+    };
+    let Some(end_point) = action
+        .stock_prices_local
+        .iter()
+        .find(|point| point.date == target_date)
+    else {
+        return empty_action_window(
+            window,
+            MetricStatus::Unavailable,
+            Some("The exact target-session stock price is unavailable.".to_string()),
+        );
+    };
+    let benchmark_end = action
+        .benchmark_prices_local
+        .iter()
+        .find(|point| point.date == target_date);
+    let valid_end = end_point.close.is_finite()
+        && end_point.close > 0.0
+        && benchmark_end.is_some_and(|point| point.close.is_finite() && point.close > 0.0);
+    if !valid_end {
+        return empty_action_window(
+            window,
+            MetricStatus::Unavailable,
+            Some("An exact target-session stock or benchmark price is unavailable.".to_string()),
+        );
+    }
+    let start_point = start_point.unwrap();
+    let benchmark_start = benchmark_start.unwrap();
+    let benchmark_end = benchmark_end.unwrap();
+    let stock_return = end_point.close / start_point.close - 1.0;
+    let benchmark_return = benchmark_end.close / benchmark_start.close - 1.0;
     let effect = if buy_direction {
         stock_return - benchmark_return
     } else {
@@ -681,7 +875,7 @@ fn calculate_action_window(action: &ForwardActionInput, window: u16) -> ActionEf
         stock_return: Some(stock_return),
         benchmark_return: Some(benchmark_return),
         effect: Some(effect),
-        notional_base: Some(action.action_notional_local.abs() * fx.unwrap()),
+        notional_base,
     }
 }
 
@@ -942,15 +1136,16 @@ fn concentration(snapshot: &RiskSnapshotInput) -> ConcentrationSnapshot {
             cash_ratio: None,
         };
     }
-    let stock_total = snapshot
-        .stock_values_base
-        .iter()
-        .map(|value| value.value_base)
-        .sum::<f64>();
-    let mut weights = snapshot
-        .stock_values_base
-        .iter()
-        .map(|value| value.value_base / stock_total)
+    let mut values_by_symbol = BTreeMap::new();
+    for value in &snapshot.stock_values_base {
+        *values_by_symbol
+            .entry(value.symbol.trim().to_ascii_uppercase())
+            .or_insert(0.0) += value.value_base;
+    }
+    let stock_total = values_by_symbol.values().sum::<f64>();
+    let mut weights = values_by_symbol
+        .values()
+        .map(|value| value / stock_total)
         .collect::<Vec<_>>();
     weights.sort_by(|left, right| right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal));
     let cash = snapshot.cash_value_base.unwrap();
@@ -1090,8 +1285,9 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
         }
         .to_string(),
     };
-    let (mae_base, mfe_base, close_path, incomplete_intraday) =
-        campaign_excursions(&timeline, &input.daily_prices);
+    let excursions = campaign_excursions(&timeline, &input.daily_prices);
+    let mae_base = excursions.mae_base;
+    let mfe_base = excursions.mfe_base;
     let mae_percent = mae_base
         .zip(max_invested)
         .map(|(amount, capital)| amount / capital);
@@ -1115,12 +1311,31 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
         } else {
             input.summary.availability.status.clone()
         };
-    let excursion_status = if max_invested.is_none() || (mae_base.is_none() && mfe_base.is_none()) {
+    let excursion_status = if max_invested.is_none()
+        || (input.daily_prices.is_empty() && mae_base.is_none() && mfe_base.is_none())
+    {
         MetricStatus::Unavailable
-    } else if incomplete_intraday || mae_base.is_none() || mfe_base.is_none() {
+    } else if !excursions.path_valid
+        || !excursions.intraday_complete
+        || !excursions.close_complete
+        || mae_base.is_none()
+        || mfe_base.is_none()
+    {
         MetricStatus::Degraded
     } else {
         MetricStatus::Available
+    };
+    let holding_period_drawdown = if excursions.path_valid && excursions.close_complete {
+        campaign_drawdown(&excursions.close_path, max_invested)
+    } else {
+        None
+    };
+    let drawdown_status = if max_invested.is_none() || input.daily_prices.is_empty() {
+        MetricStatus::Unavailable
+    } else if holding_period_drawdown.is_some() {
+        MetricStatus::Available
+    } else {
+        MetricStatus::Degraded
     };
     let benchmark_status = if benchmark_return.is_some() {
         MetricStatus::Available
@@ -1188,6 +1403,7 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
         MetricStatus::Unavailable
     } else if pnl_status != MetricStatus::Available
         || excursion_status != MetricStatus::Available
+        || drawdown_status != MetricStatus::Available
         || benchmark_status != MetricStatus::Available
     {
         MetricStatus::Degraded
@@ -1211,8 +1427,20 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
                 .then(|| "Active Campaign current value is unavailable.".to_string()),
         ),
         excursion_availability: availability(
-            excursion_status,
-            incomplete_intraday.then(|| "Daily high/low coverage is incomplete.".to_string()),
+            excursion_status.clone(),
+            (!excursions.path_valid
+                || !excursions.intraday_complete
+                || !excursions.close_complete)
+                .then(|| {
+                    "Daily OHLC/FX coverage is invalid or incomplete; partial paths are not treated as complete."
+                        .to_string()
+                }),
+        ),
+        drawdown_availability: availability(
+            drawdown_status,
+            holding_period_drawdown
+                .is_none()
+                .then(|| "A complete valid daily close path is required for drawdown.".to_string()),
         ),
         benchmark_availability: availability(
             benchmark_status,
@@ -1235,7 +1463,7 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
         mfe_base,
         mae_percent,
         mfe_percent,
-        holding_period_drawdown: campaign_drawdown(&close_path, max_invested),
+        holding_period_drawdown,
         timeline,
         fact_labels,
         completed_sample_count: usize::from(
@@ -1248,17 +1476,28 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
     }
 }
 
+struct CampaignExcursionEvaluation {
+    mae_base: Option<f64>,
+    mfe_base: Option<f64>,
+    close_path: Vec<f64>,
+    intraday_complete: bool,
+    close_complete: bool,
+    path_valid: bool,
+}
+
 fn campaign_excursions(
     flows: &[CampaignCashFlow],
     prices: &[CampaignPricePoint],
-) -> (Option<f64>, Option<f64>, Vec<f64>, bool) {
+) -> CampaignExcursionEvaluation {
     let mut cash = 0.0;
     let mut shares = 0.0;
     let mut applied = 0usize;
     let mut adverse: Option<f64> = None;
     let mut favorable: Option<f64> = None;
     let mut close_path = Vec::new();
-    let mut incomplete = prices.is_empty();
+    let mut intraday_complete = !prices.is_empty();
+    let mut close_complete = !prices.is_empty();
+    let mut path_valid = true;
     let mut ordered_prices = prices.to_vec();
     ordered_prices.sort_by_key(|point| point.date);
     for price in &ordered_prices {
@@ -1278,36 +1517,82 @@ fn campaign_excursions(
             }
             applied += 1;
         }
-        let Some(fx) = price
-            .fx_to_base
-            .filter(|value| value.is_finite() && *value > 0.0)
-        else {
-            incomplete = true;
+        let Some(fx) = price.fx_to_base else {
+            intraday_complete = false;
+            close_complete = false;
             continue;
         };
-        match price.low.filter(|value| value.is_finite()) {
+        if !fx.is_finite() || fx <= 0.0 {
+            path_valid = false;
+            break;
+        }
+        let low = match price.low {
+            Some(value) if value.is_finite() && value >= 0.0 => Some(value),
+            Some(_) => {
+                path_valid = false;
+                break;
+            }
+            None => None,
+        };
+        let high = match price.high {
+            Some(value) if value.is_finite() && value >= 0.0 => Some(value),
+            Some(_) => {
+                path_valid = false;
+                break;
+            }
+            None => None,
+        };
+        if low.zip(high).is_some_and(|(low, high)| low > high) {
+            path_valid = false;
+            break;
+        }
+        match low {
             Some(low) => {
                 let amount = cash + shares * low * fx;
                 adverse = Some(adverse.map_or(amount, |value| value.min(amount)))
             }
-            None => incomplete = true,
+            None => intraday_complete = false,
         }
-        match price.high.filter(|value| value.is_finite()) {
+        match high {
             Some(high) => {
                 let amount = cash + shares * high * fx;
                 favorable = Some(favorable.map_or(amount, |value| value.max(amount)))
             }
-            None => incomplete = true,
+            None => intraday_complete = false,
         }
-        if let Some(close) = price.close.filter(|value| value.is_finite()) {
-            close_path.push(cash + shares * close * fx);
+        match price.close {
+            Some(close) if close.is_finite() && close >= 0.0 => {
+                close_path.push(cash + shares * close * fx)
+            }
+            Some(_) => {
+                path_valid = false;
+                break;
+            }
+            None => close_complete = false,
         }
     }
-    (adverse, favorable, close_path, incomplete)
+    if !path_valid {
+        adverse = None;
+        favorable = None;
+        close_path.clear();
+        intraday_complete = false;
+        close_complete = false;
+    }
+    CampaignExcursionEvaluation {
+        mae_base: adverse,
+        mfe_base: favorable,
+        close_path,
+        intraday_complete,
+        close_complete,
+        path_valid,
+    }
 }
 
 fn campaign_drawdown(pnl_path: &[f64], capital: Option<f64>) -> Option<f64> {
     let capital = capital?;
+    if pnl_path.is_empty() {
+        return None;
+    }
     let mut peak = capital;
     let mut worst = 0.0;
     for pnl in pnl_path {
@@ -1485,6 +1770,135 @@ mod tests {
     }
 
     #[test]
+    fn invalid_actual_inputs_clear_twr_and_every_drawdown_field() {
+        let mut invalid_baseline = result_input(BenchmarkSelection::SingleMarket("US".to_string()));
+        invalid_baseline.baseline = Some(PortfolioValuePoint {
+            date: date(1),
+            value_base: 0.0,
+        });
+        invalid_baseline.actual_values[0].date = date(2);
+        invalid_baseline.actual_values[1].date = date(3);
+        let mut invalid_value = result_input(BenchmarkSelection::SingleMarket("US".to_string()));
+        invalid_value.actual_values[1].value_base = f64::NAN;
+        for input in [invalid_baseline, invalid_value] {
+            let result = calculate_result_quality(&input);
+            assert_eq!(result.metric.portfolio_return, None);
+            assert!(result.actual_twr_series.is_empty());
+            assert_eq!(result.max_drawdown.max_drawdown, None);
+            assert_eq!(result.max_drawdown.peak_date, None);
+            assert_eq!(result.max_drawdown.trough_date, None);
+            assert_eq!(result.max_drawdown.duration_days, None);
+            assert_eq!(result.max_drawdown.recovery_date, None);
+            assert_eq!(result.max_drawdown.recovery_duration_days, None);
+        }
+
+        let mut invalid_flow = result_input(BenchmarkSelection::SingleMarket("US".to_string()));
+        invalid_flow.external_flows_base.push(ExternalFlowBase {
+            date: date(2),
+            amount_base: f64::NAN,
+        });
+        let result = calculate_result_quality(&invalid_flow);
+        assert_eq!(result.metric.portfolio_return, None);
+        assert_eq!(result.max_drawdown.max_drawdown, None);
+    }
+
+    #[test]
+    fn missing_benchmark_preserves_valid_actual_twr() {
+        let mut input = result_input(BenchmarkSelection::SingleMarket("US".to_string()));
+        input.benchmark_series.clear();
+        let result = calculate_result_quality(&input);
+        assert_eq!(result.metric.availability.status, MetricStatus::Degraded);
+        assert_eq!(result.metric.portfolio_return, Some(1.0));
+        assert_eq!(result.metric.benchmark_return, None);
+        assert_eq!(result.metric.excess_return, None);
+        assert_eq!(
+            result.max_drawdown.availability.status,
+            MetricStatus::Available
+        );
+        assert!(result
+            .metric
+            .availability
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("benchmark")));
+    }
+
+    #[test]
+    fn benchmark_openings_ignore_zero_components_support_cash_only_and_reject_malformed() {
+        let mut zero_component = result_input(BenchmarkSelection::AutomaticMixed);
+        zero_component.opening_market_values_base[1].value_base = 0.0;
+        zero_component
+            .benchmark_series
+            .retain(|series| series.market == "US");
+        let result = calculate_result_quality(&zero_component);
+        assert_eq!(result.metric.availability.status, MetricStatus::Available);
+        assert!(!result.fixed_weights.contains_key("CN"));
+        assert!((result.fixed_weights["US"] - 6.0 / 7.0).abs() < 1e-12);
+        assert!((result.metric.benchmark_return.unwrap() - 3.0 / 35.0).abs() < 1e-12);
+
+        let mut cash_only = result_input(BenchmarkSelection::AutomaticMixed);
+        cash_only.opening_market_values_base.clear();
+        cash_only.opening_cash_value_base = 100.0;
+        cash_only.benchmark_series.clear();
+        let result = calculate_result_quality(&cash_only);
+        assert_eq!(result.metric.availability.status, MetricStatus::Available);
+        assert_eq!(result.fixed_weights.get("cash"), Some(&1.0));
+        assert_eq!(result.metric.benchmark_return, Some(0.0));
+
+        let mut malformed = result_input(BenchmarkSelection::AutomaticMixed);
+        malformed.opening_market_values_base[0].value_base = -1.0;
+        let result = calculate_result_quality(&malformed);
+        assert!(result.fixed_weights.is_empty());
+        assert_eq!(result.metric.portfolio_return, Some(1.0));
+        assert_eq!(result.metric.benchmark_return, None);
+        assert_eq!(result.metric.availability.status, MetricStatus::Degraded);
+    }
+
+    #[test]
+    fn normalized_curves_share_an_explicit_baseline_origin_without_changing_twr() {
+        let mut input = result_input(BenchmarkSelection::SingleMarket("US".to_string()));
+        input.baseline = Some(PortfolioValuePoint {
+            date: date(1),
+            value_base: 100.0,
+        });
+        input.actual_values = vec![
+            PortfolioValuePoint {
+                date: date(2),
+                value_base: 110.0,
+            },
+            PortfolioValuePoint {
+                date: date(3),
+                value_base: 121.0,
+            },
+        ];
+        input.benchmark_series[0].points.push(BenchmarkPoint {
+            date: date(3),
+            value: 121.0,
+        });
+        input.shadow_curve = vec![
+            CurveReturnPoint {
+                date: date(1),
+                cumulative_return: 0.20,
+            },
+            CurveReturnPoint {
+                date: date(2),
+                cumulative_return: 0.32,
+            },
+            CurveReturnPoint {
+                date: date(3),
+                cumulative_return: 0.44,
+            },
+        ];
+        let result = calculate_result_quality(&input);
+        assert!((result.metric.portfolio_return.unwrap() - 0.21).abs() < 1e-12);
+        assert_eq!(result.normalized_curve[0].date, date(1));
+        assert_eq!(result.normalized_curve[0].portfolio_index, Some(100.0));
+        assert_eq!(result.normalized_curve[0].shadow_index, Some(100.0));
+        assert_eq!(result.normalized_curve[0].benchmark_index, Some(100.0));
+        assert!((result.normalized_curve[1].shadow_index.unwrap() - 110.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn drawdown_reports_peak_trough_duration_and_recovery() {
         let values = [100.0, 120.0, 90.0, 110.0, 121.0]
             .into_iter()
@@ -1556,6 +1970,7 @@ mod tests {
             actual_comparable_total_return: Some(0.12),
             actual_comparable_price_return: Some(0.08),
             shadow_return: Some(0.05),
+            shadow_return_mode: MarketReturnMode::PriceOnly,
             actual_comparable_ending_value_base: Some(1_080.0),
             shadow_comparable_ending_value_base: Some(1_050.0),
             comparison_mode: MarketReturnMode::PriceOnly,
@@ -1567,6 +1982,26 @@ mod tests {
         assert!((result.metric.value_add.unwrap() - 0.03).abs() < 1e-12);
         assert_eq!(result.metric.ending_value_difference_base, Some(30.0));
         assert_eq!(result.comparison_label, "rebalance_price_value_add");
+    }
+
+    #[test]
+    fn rebalance_value_add_rejects_mismatched_shadow_return_mode() {
+        let result = calculate_rebalance_value_add(&RebalanceValueAddInput {
+            actual_recorded_twr: Some(0.12),
+            actual_comparable_total_return: Some(0.12),
+            actual_comparable_price_return: Some(0.08),
+            shadow_return: Some(0.05),
+            shadow_return_mode: MarketReturnMode::TotalReturn,
+            actual_comparable_ending_value_base: Some(1_080.0),
+            shadow_comparable_ending_value_base: Some(1_050.0),
+            comparison_mode: MarketReturnMode::PriceOnly,
+            availability: available(),
+        });
+        assert_eq!(result.metric.availability.status, MetricStatus::Unavailable);
+        assert_eq!(result.metric.value_add, None);
+        assert_eq!(result.metric.actual_return, None);
+        assert_eq!(result.metric.shadow_return, None);
+        assert_eq!(result.metric.ending_value_difference_base, None);
     }
 
     fn sessions(count: usize, step_days: i64, start: f64, end: f64) -> Vec<LocalPricePoint> {
@@ -1596,6 +2031,10 @@ mod tests {
             action_date: date(1),
             action_notional_local: notional,
             action_day_fx_to_base: Some(fx),
+            market_session_dates: sessions(session_count, step_days, 100.0, stock_end)
+                .into_iter()
+                .map(|point| point.date)
+                .collect(),
             stock_prices_local: sessions(session_count, step_days, 100.0, stock_end),
             benchmark_prices_local: sessions(session_count, step_days, 100.0, benchmark_end),
             availability: available(),
@@ -1673,6 +2112,68 @@ mod tests {
         assert!(result.actions[0]
             .fact_labels
             .contains(&"data_insufficient".to_string()));
+    }
+
+    #[test]
+    fn forward_effect_uses_exact_canonical_session_endpoints_without_quote_shifting() {
+        let mut sparse = forward_action("buy", "open", "US", 120.0, 110.0, 100.0, 1.0, 61, 1);
+        let target_date = sparse.market_session_dates[60];
+        let stock_target = sparse
+            .stock_prices_local
+            .iter()
+            .find(|point| point.date == target_date)
+            .cloned()
+            .unwrap();
+        let benchmark_target = sparse
+            .benchmark_prices_local
+            .iter()
+            .find(|point| point.date == target_date)
+            .cloned()
+            .unwrap();
+        sparse.stock_prices_local = vec![sparse.stock_prices_local[0].clone(), stock_target];
+        sparse.benchmark_prices_local =
+            vec![sparse.benchmark_prices_local[0].clone(), benchmark_target];
+        let result = calculate_forward_effect(&[sparse], &[60]);
+        assert_eq!(
+            result.actions[0].windows[0].status.status,
+            MetricStatus::Available
+        );
+        assert!((result.actions[0].windows[0].effect.unwrap() - 0.10).abs() < 1e-12);
+
+        let mut missing_exact =
+            forward_action("buy", "open", "US", 120.0, 110.0, 100.0, 1.0, 62, 1);
+        let target_date = missing_exact.market_session_dates[60];
+        missing_exact
+            .stock_prices_local
+            .retain(|point| point.date != target_date);
+        let result = calculate_forward_effect(&[missing_exact], &[60]);
+        assert_eq!(
+            result.actions[0].windows[0].status.status,
+            MetricStatus::Unavailable
+        );
+        assert_eq!(result.actions[0].windows[0].effect, None);
+    }
+
+    #[test]
+    fn immutable_forward_input_errors_outrank_pending_and_zero_notional_is_not_usable() {
+        let mut missing_fx = forward_action("buy", "open", "US", 110.0, 100.0, 100.0, 1.0, 30, 1);
+        missing_fx.action_day_fx_to_base = None;
+        let result = calculate_forward_effect(&[missing_fx], &[60]);
+        assert_eq!(
+            result.actions[0].windows[0].status.status,
+            MetricStatus::Unavailable
+        );
+        assert_eq!(result.windows[0].pending_actions, 0);
+
+        let zero = forward_action("zero", "add", "US", 120.0, 100.0, 0.0, 1.0, 61, 1);
+        let result = calculate_forward_effect(&[zero], &[60]);
+        assert_eq!(
+            result.actions[0].windows[0].status.status,
+            MetricStatus::Unavailable
+        );
+        assert_eq!(result.actions[0].windows[0].notional_base, None);
+        assert_eq!(result.windows[0].matured_actions, 0);
+        assert_eq!(result.windows[0].amount_weighted_excess_return, None);
     }
 
     #[test]
@@ -1776,6 +2277,24 @@ mod tests {
         });
         assert_eq!(result.peak.max_stock_weight, Some(0.6));
         assert!((result.peak.hhi.unwrap() - 0.505).abs() < 1e-12);
+    }
+
+    #[test]
+    fn concentration_aggregates_normalized_symbols_across_accounts() {
+        let result = calculate_risk_structure(&RiskStructureInput {
+            snapshots: vec![snapshot(
+                1,
+                &[(" aapl ", 30.0), ("AAPL", 30.0), ("msft", 40.0)],
+                0.0,
+                true,
+            )],
+            stock_changes: vec![],
+            total_stock_trading_fees_base: Some(0.0),
+            average_portfolio_nav_base: Some(100.0),
+        });
+        assert_eq!(result.opening.max_stock_weight, Some(0.6));
+        assert_eq!(result.opening.cr5, Some(1.0));
+        assert!((result.opening.hhi.unwrap() - 0.52).abs() < 1e-12);
     }
 
     fn campaign_summary(status: StockCampaignStatus) -> StockCampaignSummary {
@@ -2023,5 +2542,63 @@ mod tests {
         assert_eq!(detail.pnl.total_pnl_base, Some(40.0));
         assert_eq!(detail.mae_base, Some(-40.0));
         assert_eq!(detail.mfe_base, Some(40.0));
+    }
+
+    #[test]
+    fn invalid_or_incomplete_campaign_ohlc_never_yields_partial_drawdown() {
+        let inverted = calculate_campaign_detail(&CampaignDetailInput {
+            summary: campaign_summary(StockCampaignStatus::Active),
+            cash_flows: vec![flow(1, CampaignCashFlowKind::Buy, 100.0, 10.0)],
+            daily_prices: vec![CampaignPricePoint::complete(date(1), 12.0, 8.0, 10.0)],
+            benchmark_prices: vec![],
+            current_price_local: Some(10.0),
+            current_fx_to_base: Some(1.0),
+            actions: vec![],
+            forward_actions: vec![],
+            annotations: vec![],
+        });
+        assert_eq!(
+            inverted.excursion_availability.status,
+            MetricStatus::Degraded
+        );
+        assert_eq!(inverted.mae_base, None);
+        assert_eq!(inverted.mfe_base, None);
+        assert_eq!(inverted.holding_period_drawdown, None);
+        assert_eq!(
+            inverted.drawdown_availability.status,
+            MetricStatus::Degraded
+        );
+
+        let missing_close = calculate_campaign_detail(&CampaignDetailInput {
+            summary: campaign_summary(StockCampaignStatus::Active),
+            cash_flows: vec![flow(1, CampaignCashFlowKind::Buy, 100.0, 10.0)],
+            daily_prices: vec![
+                CampaignPricePoint::complete(date(1), 9.0, 11.0, 10.0),
+                CampaignPricePoint {
+                    date: date(2),
+                    currency: "USD".to_string(),
+                    low: Some(5.0),
+                    high: Some(10.0),
+                    close: None,
+                    fx_to_base: Some(1.0),
+                },
+                CampaignPricePoint::complete(date(3), 9.0, 11.0, 10.0),
+            ],
+            benchmark_prices: vec![],
+            current_price_local: Some(10.0),
+            current_fx_to_base: Some(1.0),
+            actions: vec![],
+            forward_actions: vec![],
+            annotations: vec![],
+        });
+        assert_eq!(
+            missing_close.excursion_availability.status,
+            MetricStatus::Degraded
+        );
+        assert_eq!(missing_close.holding_period_drawdown, None);
+        assert_eq!(
+            missing_close.drawdown_availability.status,
+            MetricStatus::Degraded
+        );
     }
 }

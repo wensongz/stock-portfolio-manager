@@ -618,3 +618,93 @@ exit code: 0
 - Filtered daily holding snapshots still lack authoritative historical cash by account/market, so denominator-based turnover and fee drag remain unavailable instead of using partial NAV.
 - Legacy holdings without a complete transaction ledger still use the documented fallback; recorded splits are handled exactly once, but unrecorded economic events cannot be reconstructed.
 - The streaming digest is collision-resistant only in the practical concurrency-guard sense, not cryptographic. Its structural framing prevents deterministic type/boundary aliases but does not provide adversarial integrity guarantees.
+
+## Exceptional fix round 6: pinned cross-account override references
+
+This round was explicitly authorized by the user as a narrow exception to the normal five-round Task 9 review cap. It addresses only the final scoped-override coherence blocker and the deterministic holding-snapshot ordering finding.
+
+- Implementation commit: `c8d7ee9a179016ccac607aacb95eacefa75020a3` (`fix: pin cross-account override references`).
+- No dependency or schema change was added. The pre-existing untracked `node_modules` directory remained untouched and unstaged.
+
+### Versioned original reference authority
+
+- Newly confirmed corrections persist a version-2 reference envelope instead of an unversioned transaction vector. Each reference includes normalized symbol, market, transaction type, and currency plus account, economic fields, optional holding/notes, and audit identity. Normalized market is therefore part of the exact original query-scope identity.
+- Version-1 vectors remain readable for audit relevance, but because they do not contain market they are always stale/audit-only and are never replayed as active. A matching legacy account/date remains conservatively visible across market filters. Empty migration-default `[]`, unknown versions, and malformed fingerprints are also audit-only and conservatively visible when no trustworthy original scope survives.
+- Currentness requires a valid correction shape and an exact version-2 fingerprint match. A deleted, mutated, or re-accounted reference is stale before replay.
+
+### One shared scoped override snapshot
+
+- `scoped_override_snapshots` is now the single relevance and currentness authority for report loading, stale issue generation, active-override revision, and user-source revision.
+- Relevance is the union of the immutable confirmed original scope and every current referenced row. Moving or deleting the last currently in-scope leg therefore cannot make the original account's stale issue disappear, while an override whose original and current identities are wholly unrelated remains excluded.
+- The revision reference set is the deterministic union of IDs in the mutable override row and IDs in the stored confirmation fingerprint. For every selected override, both compact revisions frame the override metadata, every reference ID, and either the complete normalized current transaction row or an explicit tombstone. This covers cross-account and cross-market transfer legs even when a report selects only one account or market.
+- Candidate preparation, the post-cache user-source check, the complete candidate-source check, and the final SQLite write transaction all call the same selector/digest path. Mutation, deletion, or re-accounting of an out-of-scope leg therefore rejects confirmation instead of returning a stale preview.
+- Daily holding snapshot revision now selects the unique `id` and orders by `date, account_id, market, symbol, id`, so duplicate logical keys have deterministic identity and order.
+
+### TDD RED/GREEN evidence
+
+The first round-6 persistence run executed 34 tests with 5 intended failures and 29 passes:
+
+```text
+scoped_candidate_rejects_cross_account_reference_mutation:
+candidate save unexpectedly succeeded after the acct-b transfer leg changed
+
+deleting_cross_account_leg_changes_revision_and_keeps_scoped_stale_issue:
+override revision remained 33fa16e6c9209100 after the referenced row was deleted
+
+original_reference_scope_keeps_reaccounted_source_leg_query_relevant:
+acct-a received zero stale rows after its confirmed source leg was moved to acct-b
+
+ambiguous_legacy_reference_fingerprint_is_audit_only:
+the old no-market fingerprint was still replayed as active
+
+holding_snapshot_identity_is_part_of_candidate_revision:
+candidate save unexpectedly succeeded after snapshot id changed
+```
+
+Two additional mutation checks exposed and then closed edge cases during refactoring:
+
+```text
+scoped_revision_keeps_original_reference_ids_after_override_row_drift:
+candidate save unexpectedly succeeded after a formerly referenced cross-account leg changed
+
+empty_migrated_reference_snapshot_remains_conservatively_audit_visible:
+the migration-default fingerprint disappeared after its current row was deleted
+```
+
+The unrelated B/C original scope test passed in RED and GREEN, proving the selector is scoped rather than global. Existing service regressions for successful canonical preview/post-read equality, same-ID stale replacement, async user-source races, corrected replay, Campaigns, calendars, FX, splits, and all twelve acceptance scenarios remained unchanged and GREEN.
+
+### Final verification
+
+```text
+cargo test --lib services::stock_review_persistence::tests --quiet
+36 passed; 0 failed
+
+cargo test --lib services::stock_review_service::tests --quiet
+50 passed; 0 failed
+
+cargo test --lib commands::review::tests --quiet
+2 passed; 0 failed
+
+cargo test --lib --quiet
+509 passed; 0 failed; 8 ignored
+
+cargo check --lib
+passed
+
+npm run build
+TypeScript and Vite production build passed; existing large-chunk warning only
+
+rustfmt --edition 2021 src/services/stock_review_persistence.rs
+exit code: 0
+
+git diff --check
+exit code: 0
+```
+
+### Remaining honest limitations after round 6
+
+- The repository still has no production exchange-calendar importer. Exact-session forward and Campaign metrics remain unavailable without certified calendar coverage.
+- Cached FX remains a global singleton, filtered historical cash authority remains incomplete, and legacy holdings still depend on the previously documented honest-degradation paths.
+- Scoped override snapshots scan persisted override rows and their small referenced-ID sets rather than global transaction history. This keeps the correctness boundary centralized and bounded by correction count, but it is not a per-override revision-counter design.
+- Unknown or empty legacy fingerprints cannot prove account/market ownership. They remain safely excluded from replay and conservatively audit-visible, which can produce a stale audit warning in more than one filtered report until the user reconfirms or removes that legacy correction.
+- The 16-character structurally framed FNV digest remains a noncryptographic probabilistic concurrency guard, not an adversarial integrity mechanism.

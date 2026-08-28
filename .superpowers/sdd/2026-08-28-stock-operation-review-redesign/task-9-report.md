@@ -530,3 +530,91 @@ exit code: 0
 - Filtered daily holding snapshots still do not persist authoritative historical cash by account/market. They can display complete converted stock NAV, but denominator-based turnover and fee drag remain unavailable rather than using a partial portfolio value.
 - Legacy holdings with no transaction history still require the documented fallback. Recorded splits are reversed/replayed exactly once, but an unrecorded trade or unknown holding as-of timestamp cannot be reconstructed.
 - The compact digest is intentionally a lightweight deterministic concurrency guard, not a cryptographic hash. It avoids full-history serialization and global scans, while direct SQL mutations in the exact consumed scope remain detectable by the regression suite.
+
+## Fix round 5: complete revision coverage and scoped stale state
+
+This final Task 9 correction aligns every remaining revision query with the production consumer that reads the source.
+
+- Implementation commit: `86d690c1d509fdf7adbf92bf849be32da8dfd4b2` (`fix: complete stock review revision coverage`).
+- No dependency or schema change was added. The pre-existing untracked `node_modules` directory remained untouched and unstaged.
+
+### Snapshot, split, and override scope
+
+- Daily holding snapshot revision now covers every row read by filtered NAV, attribution, and risk: selected account(s), optional market, and `report_start..=report_end`. It intentionally does not filter by discovered current/transaction securities because historical snapshot-only positions are real consumer inputs.
+- Split parameters use the shared trimmed ASCII-uppercase stock identity and SQL applies `UPPER(TRIM(stock_code))`. A mutation to a stored ` aapl ` split therefore invalidates an `AAPL` candidate exactly as replay would match it.
+- A shared scoped-override SQL predicate defines account, market, and current-ledger horizon semantics for both active-override revision and report loading. Both pre-cache and post-cache report preparation now load only query-relevant active and stale rows and generate issues only for that set. The global `list_overrides` audit API remains global by design.
+- A relevant stale correction remains visible as `stale_override`; an unrelated-account stale correction neither appears in the report nor invalidates its candidate.
+
+### Annotation date semantics
+
+- `effective_date`, `effective_start`, `effective_end`, and `snapshot_date` are parsed by one shared typed boundary. Present values must be strings, must be real calendar dates in exact `YYYY-MM-DD` form, and `effective_start` must not exceed `effective_end`.
+- Annotation save validates dates before opening a write transaction, so every rejected date fixture has zero database side effects. Report/Campaign visibility uses the same parser; a malformed legacy row is unavailable as display context instead of silently becoming an undated note.
+- Candidate revision fingerprints every annotation row the account-scoped loader can return. This deliberately includes future-effective rows before the pure display cutoff is applied, so a concurrent future annotation mutation cannot pass unnoticed. `created_at` remains audit metadata, never an economic date.
+
+### Structurally framed streaming digest
+
+- The 16-character digest remains a compact, O(1)-memory, noncryptographic FNV-based concurrency guard.
+- Every structural component now has an explicit frame tag and payload length. SQLite rows encode row ordinal, declared column count, column index, row terminator, and a distinct type tag for NULL, integer, real, text, and blob before the value bytes.
+- Direct regressions prove that NULL differs from text `null`, text differs from a blob with identical bytes, integer differs from real, and two-column boundary rearrangements differ. This removes the prior NULL/text and text/blob alias while retaining deterministic streaming.
+
+### TDD RED/GREEN evidence
+
+The initial persistence run executed 27 tests with 6 intended failures and 21 passes:
+
+```text
+historical_snapshot_symbol_outside_discovery_still_invalidates_candidate:
+candidate save unexpectedly succeeded after the snapshot-only MSFT row changed
+
+normalized_split_symbol_mutation_invalidates_candidate:
+candidate save unexpectedly succeeded after the stored ` aapl ` split changed
+
+annotation_rejects_invalid_economic_dates_without_writing:
+invalid 2024-02-30 effective_date was accepted
+
+future_annotation_mutation_is_part_of_candidate_revision:
+candidate save unexpectedly succeeded after the future note changed
+
+digest_distinguishes_null_from_text_null:
+both digests were 1e409891730aaf9e
+
+digest_distinguishes_text_from_blob_with_the_same_bytes:
+both digests were d183d9261a9ad525
+```
+
+The integer/real and multi-column boundary digest tests already passed before the structural change and remain as mutation guards. Scoped override loading first failed to compile with `E0432` because the query-scoped API did not exist; after the API was introduced, the production report RED exposed 2 stale issues instead of the expected single relevant issue. The final report regression returns exactly the relevant stale record and excludes the unrelated account.
+
+### Final verification
+
+```text
+cargo test --lib services::stock_review_persistence::tests --quiet
+28 passed; 0 failed
+
+cargo test --lib services::stock_review_service::tests --quiet
+50 passed; 0 failed
+
+cargo test --lib commands::review::tests --quiet
+2 passed; 0 failed
+
+cargo test --lib
+501 passed; 0 failed; 8 ignored
+
+cargo check --lib
+passed
+
+npm run build
+TypeScript and Vite production build passed; existing large-chunk warning only
+
+rustfmt --edition 2021 <two modified Rust files>
+exit code: 0
+
+git diff --check
+exit code: 0
+```
+
+### Remaining honest limitations after round 5
+
+- The repository still has no production exchange-calendar importer. Exact-session forward and Campaign metrics remain unavailable without certified calendar coverage.
+- Cached FX remains a global singleton and historical non-base metrics still require exact daily FX from recorded portfolio snapshots; its candidate revision is necessarily conservative.
+- Filtered daily holding snapshots still lack authoritative historical cash by account/market, so denominator-based turnover and fee drag remain unavailable instead of using partial NAV.
+- Legacy holdings without a complete transaction ledger still use the documented fallback; recorded splits are handled exactly once, but unrecorded economic events cannot be reconstructed.
+- The streaming digest is collision-resistant only in the practical concurrency-guard sense, not cryptographic. Its structural framing prevents deterministic type/boundary aliases but does not provide adversarial integrity guarantees.

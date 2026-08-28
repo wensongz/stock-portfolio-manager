@@ -763,3 +763,79 @@ exit code: 0
 git diff --check
 exit code: 0
 ```
+
+## Exceptional round-6 follow-up 2: separated cross-market stock identities
+
+This cross-module correction remains within the user-authorized identity-coherence scope.
+
+- Implementation commit: `c3d6d618e8e68cf91f7e65749df937a8f8acef64` (`fix: separate cross-market stock identities`).
+- No dependency, schema, command, JSON contract, or stable action/Campaign ID format changed.
+
+### One security identity across replay and Campaigns
+
+- Shared model helpers now normalize markets with the same trim/ASCII-uppercase policy as symbols and compare one security as `(normalized symbol, normalized market)`.
+- Action replay position balances are keyed by account, normalized symbol, and normalized market. Date-only reversal groups add trade date to that key. Same-day rank comparison and same-direction fill merging require the same normalized market, so neither ordering nor aggregation crosses exchanges.
+- The pure action core defensively ignores cross-market duplicate, transfer, and same-day dispositions even if an unvalidated deterministic fixture reaches it. Production persistence remains the authority that decides whether an override is active.
+- Campaign event groups use account, normalized symbol, and normalized market. The first source row still supplies display symbol/market spelling. Equal symbol text in US and CN produces independent fragments and logical Campaigns.
+- Confirmed transfer linkage requires equal normalized symbol and market. A mismatched-market pair remains two Campaigns, retains normal cash effects, and surfaces `invalid_transfer_override` instead of becoming an investment-neutral transfer.
+- Persistence duplicate and transfer validation now uses the identical normalized security equality. The existing same-day persistence regression continues to prove that a cross-market row is irrelevant to a valid market-local order.
+
+### TDD RED/GREEN evidence
+
+```text
+same_day_rank_never_reorders_different_market_positions:
+RED: one merged action was returned instead of two independent market actions
+GREEN: US and CN each retain an open action and fallback order
+
+same_account_same_symbol_in_two_markets_builds_independent_actions_and_campaigns:
+RED: 3 actions were returned instead of 4 because the opens merged and balances crossed
+GREEN: open/open/close/add use independent balances and yield completed US + active CN Campaigns
+
+confirmed_transfer_does_not_link_equal_symbols_across_markets:
+RED: one linked transfer Campaign was returned instead of two
+GREEN: both legs retain cash effects, two Campaigns remain, and the invalid transfer issue is explicit
+
+duplicate_and_transfer_validation_reject_equal_symbols_across_markets:
+RED: persistence accepted the cross-market duplicate (and transfer)
+GREEN: both correction shapes are invalid
+
+malformed_cross_market_duplicate_override_does_not_exclude_either_security:
+RED: the pure core excluded one market and returned 1 action instead of 2
+GREEN: both market-local actions and cash effects remain, with no fabricated duplicate conflict
+```
+
+### Final verification
+
+```text
+cargo test --lib services::stock_action_builder::tests --quiet
+11 passed; 0 failed
+
+cargo test --lib services::stock_campaign_builder::tests --quiet
+11 passed; 0 failed
+
+cargo test --lib services::stock_review_persistence::tests --quiet
+39 passed; 0 failed
+
+cargo test --lib services::stock_review_service::tests --quiet
+50 passed; 0 failed
+
+cargo test --lib commands::review::tests --quiet
+2 passed; 0 failed
+
+cargo test --lib --quiet
+516 passed; 0 failed; 8 ignored
+
+cargo check --lib
+passed
+
+npm run build
+TypeScript and Vite production build passed; existing large-chunk warning only
+
+rustfmt --edition 2021 <four modified Rust files>
+exit code: 0
+
+git diff --check
+exit code: 0
+```
+
+The previously documented calendar, exact historical FX/cash, legacy-ledger, and noncryptographic digest limitations are unchanged. The pre-existing untracked `node_modules` directory remained untouched and unstaged.

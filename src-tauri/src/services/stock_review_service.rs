@@ -1524,34 +1524,46 @@ fn opening_positions(
             quantity: event.shares_after,
         })
         .collect::<Vec<_>>();
-    if positions.is_empty()
-        && replay
-            .position_events
-            .iter()
-            .all(|event| event.trade_date >= query.start_date)
-    {
-        let conn = db.conn.lock().map_err(|error| error.to_string())?;
-        let mut statement = conn
-            .prepare(
-                "SELECT account_id, symbol, market, currency, shares FROM holdings
-                 WHERE shares > 0 AND symbol NOT LIKE '$CASH-%'
-                   AND (?1 IS NULL OR account_id = ?1) AND (?2 IS NULL OR market = ?2)",
+    // Current holdings are an opening fallback only for legacy positions with
+    // no source-ledger events at all. A symbol bought during the report must
+    // not be projected backward merely because it exists in today's holdings.
+    let ledger_keys = replay
+        .position_events
+        .iter()
+        .map(|event| {
+            (
+                event.account_id.clone(),
+                normalized_stock_symbol(&event.symbol).unwrap_or_default(),
             )
-            .map_err(|error| error.to_string())?;
-        positions = statement
-            .query_map(params![query.account_id, query.market], |row| {
-                Ok(OpeningPosition {
-                    account_id: row.get(0)?,
-                    symbol: row.get(1)?,
-                    market: row.get(2)?,
-                    currency: row.get(3)?,
-                    quantity: row.get(4)?,
-                })
+        })
+        .collect::<BTreeSet<_>>();
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let mut statement = conn
+        .prepare(
+            "SELECT account_id, symbol, market, currency, shares FROM holdings
+             WHERE shares > 0 AND symbol NOT LIKE '$CASH-%'
+               AND (?1 IS NULL OR account_id = ?1) AND (?2 IS NULL OR market = ?2)",
+        )
+        .map_err(|error| error.to_string())?;
+    let legacy_positions = statement
+        .query_map(params![query.account_id, query.market], |row| {
+            Ok(OpeningPosition {
+                account_id: row.get(0)?,
+                symbol: row.get(1)?,
+                market: row.get(2)?,
+                currency: row.get(3)?,
+                quantity: row.get(4)?,
             })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-    }
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    positions.extend(legacy_positions.into_iter().filter(|position| {
+        !ledger_keys.contains(&(
+            position.account_id.clone(),
+            normalized_stock_symbol(&position.symbol).unwrap_or_default(),
+        ))
+    }));
     Ok(positions)
 }
 
@@ -4054,6 +4066,63 @@ mod tests {
             shadow.twr_return_series.last().unwrap().cumulative_return,
             0.0
         );
+    }
+
+    #[tokio::test]
+    async fn live_current_holding_with_in_period_buy_is_not_an_opening_position() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "US");
+        insert_live_transaction(
+            &db,
+            "cash",
+            "acct",
+            "$CASH-USD",
+            "US",
+            "BUY",
+            1_000.0,
+            1.0,
+            1_000.0,
+            0.0,
+            "USD",
+            "2023-12-01T08:00:00Z",
+        );
+        insert_live_transaction(
+            &db,
+            "buy",
+            "acct",
+            "AAPL",
+            "US",
+            "BUY",
+            1.0,
+            100.0,
+            100.0,
+            0.0,
+            "USD",
+            "2024-01-10T09:30:00Z",
+        );
+        insert_holding(&db, "stock", "acct", "AAPL", "US", "USD", 1.0);
+        for date in ["2024-01-09", "2024-01-10", "2024-01-11"] {
+            insert_portfolio_value(&db, date, 1_000.0, 7.0);
+        }
+        let cache_start = day("2023-12-31");
+        seed_stock_cache_bounds(
+            &db,
+            "AAPL",
+            "US",
+            cache_start,
+            &[
+                (day("2024-01-09"), 100.0),
+                (day("2024-01-10"), 100.0),
+                (day("2024-01-11"), 100.0),
+            ],
+        );
+        seed_default_benchmarks(&db, cache_start);
+
+        let prepared =
+            prepare_cached_stock_review_input(&db, live_query("2024-01-10", "2024-01-11", None))
+                .await
+                .unwrap();
+        assert!(prepared.shadow_input.opening_positions.is_empty());
     }
 
     #[tokio::test]

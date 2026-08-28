@@ -1,7 +1,7 @@
 ---
 name: 期权策略复盘
 description: 复盘期权历史Campaign与卖方策略执行质量，适用于用户询问"期权复盘""期权交易复盘""期权历史表现""卖期权复盘""权利金留存率""历史Campaign"时
-trigger: 期权复盘,期权交易,期权历史表现,卖期权复盘,权利金留存率,Campaign复盘,历史Campaign
+trigger: 期权复盘,期权交易复盘,期权历史表现复盘,卖期权复盘,权利金留存率复盘,期权历史Campaign复盘
 enabled: true
 ---
 

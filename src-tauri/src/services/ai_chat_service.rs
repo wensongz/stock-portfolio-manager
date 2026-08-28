@@ -930,15 +930,12 @@ pub async fn chat_stream(
     // previous turn doesn't immediately abort this one.
     STOP_REQUESTED.store(false, Ordering::SeqCst);
 
-    let tool_ctx = crate::services::ai_tools::ToolCtx {
+    let tool_ctx = crate::services::ai_tools::ToolCtx::for_untrusted_model_turn(
         db,
         cache,
         quote_cache,
-        stock_review_annotation_confirmation:
-            crate::services::stock_review_service::confirmed_ai_annotation_capability_for_user_turn(
-                latest_user_message(&params),
-            ),
-    };
+        latest_user_message(&params),
+    );
 
     // ── Agentic tool-calling loop ──────────────────────────────────────────
     //
@@ -1660,15 +1657,12 @@ async fn chat_stream_anthropic(
         Vec::new()
     };
 
-    let tool_ctx = crate::services::ai_tools::ToolCtx {
+    let tool_ctx = crate::services::ai_tools::ToolCtx::for_untrusted_model_turn(
         db,
         cache,
         quote_cache,
-        stock_review_annotation_confirmation:
-            crate::services::stock_review_service::confirmed_ai_annotation_capability_for_user_turn(
-                latest_user_message(&params),
-            ),
-    };
+        latest_user_message(&params),
+    );
 
     STOP_REQUESTED.store(false, Ordering::SeqCst);
     let client = http_client::ai_client();

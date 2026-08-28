@@ -585,11 +585,9 @@ where
     I: IntoIterator<Item = &'a Skill>,
 {
     let haystack = text.to_lowercase();
+    let skills: Vec<&Skill> = skills.into_iter().filter(|skill| skill.enabled).collect();
     let mut out = Vec::new();
-    for s in skills {
-        if !s.enabled {
-            continue;
-        }
+    for s in &skills {
         let hit = s.trigger.iter().any(|t| {
             let t = t.trim().to_lowercase();
             if t.is_empty() {
@@ -603,7 +601,38 @@ where
             }
         });
         if hit {
-            out.push(s.clone());
+            out.push((*s).clone());
+        }
+    }
+
+    // Built-in review skills need both an analysis intent and an explicit
+    // instrument domain. Frontmatter keywords remain useful for discovery,
+    // but nouns such as "期权交易" and "Campaign" must not activate a review
+    // merely because they appear in an import or unrelated command.
+    let has_review_intent = haystack.contains("复盘")
+        || contains_whole_word(&haystack, "review")
+        || haystack.contains("历史表现")
+        || haystack.contains("历史campaign")
+        || haystack.contains("权利金留存率");
+    let has_stock_domain = haystack.contains("股票") || haystack.contains("调仓");
+    let has_option_domain = haystack.contains("期权")
+        || contains_whole_word(&haystack, "csp")
+        || haystack.contains("covered call")
+        || haystack.contains("权利金");
+
+    out.retain(|skill| {
+        !matches!(skill.id.as_str(), "stock-review" | "options-review") || has_review_intent
+    });
+    if has_review_intent {
+        for (id, active) in [
+            ("options-review", has_option_domain),
+            ("stock-review", has_stock_domain),
+        ] {
+            if active && !out.iter().any(|skill| skill.id == id) {
+                if let Some(skill) = skills.iter().find(|skill| skill.id == id) {
+                    out.push((**skill).clone());
+                }
+            }
         }
     }
     resolve_builtin_review_conflicts(out)
@@ -966,6 +995,30 @@ mod tests {
             vec!["options-review"]
         );
         assert_eq!(activated_ids("请做期权复盘"), vec!["options-review"]);
+    }
+
+    #[test]
+    fn review_routing_requires_intent_and_keeps_stock_and_option_domains_disjoint() {
+        let cases = [
+            ("股票 Campaign 复盘", vec!["stock-review"]),
+            ("复盘一下我的期权交易", vec!["options-review"]),
+            ("请做期权历史表现复盘", vec!["options-review"]),
+            ("导入一笔期权交易", vec!["trade-review"]),
+            ("Campaign复盘", vec!["trade-review"]),
+            ("复盘", vec!["trade-review"]),
+            (
+                "一起复盘股票调仓和期权交易",
+                vec!["options-review", "stock-review"],
+            ),
+        ];
+
+        for (text, expected) in cases {
+            assert_eq!(
+                activated_ids(text),
+                expected,
+                "activation mismatch for {text}"
+            );
+        }
     }
 
     #[test]

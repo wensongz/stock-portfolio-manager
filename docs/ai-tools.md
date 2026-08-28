@@ -82,7 +82,9 @@
 
 `get_stock_review` 的日期格式为 `YYYY-MM-DD`，基准币种支持 `USD` / `CNY` / `HKD`，市场支持 `US` / `CN` / `HK`。`symbol` 与 `campaign_id` 只控制返回上下文的裁剪；组合摘要仍来自同一份 Rust 报告。`available`、`degraded`、`pending`、`unavailable` 都是成功报告中的数据状态，不能把不可用指标当成工具执行错误，也不能由 AI 补零或重算。
 
-`save_stock_review_annotation` 的 `scope` 是对象，包含 `type`（`period` / `stock` / `campaign` / `action`）、`key` 及可选 `account_id` / `symbol`；`value` 必须是 JSON 对象。只有用户在当前消息明确要求“保存/记录这条背景”时，聊天执行上下文才会获得内部确认能力。模型参数中的布尔值或自报确认不能授权写入；确认前调用没有数据库副作用。AI 工具注册表不提供股票复盘纠正或 override 工具，转仓、重复交易、同日顺序、拆股/非交易变动仍走页面的结构化预演确认流程。
+返回上下文对动作、Campaign、归因、风险向量、问题、注释和 Campaign 详情中的所有可变数组设置确定性上限，并在 `context_limits` 中逐路径返回 `total` / `returned` / `omitted`。问题先在完整的已筛选报告上按影响选择，再做展示上限，因此被选问题引用的动作或问题不会因截断丢失。Campaign 范围按其 `action_ids` 筛归因，只保留该 Campaign/动作注释和真正的全局组合背景；股票代码比较统一采用去空格、大小写归一的身份规则。
+
+`save_stock_review_annotation` 的 `scope` 是对象，包含 `type`（`period` / `stock` / `campaign` / `action`）、`key` 及可选 `account_id` / `symbol`；`value` 必须是 JSON 对象。写入还需要宿主 UI/可信事件签发的内部一次性确认能力，该能力绑定规范化后的完整草稿（ID、scope、source 和 value hash），不匹配或重放都拒绝且不写库。当前聊天宿主尚未接入该可信事件，因此生产默认返回 `confirmation_required`；聊天文字、模型参数中的布尔值/字符串或自报确认都不能授权。AI 工具注册表不提供股票复盘纠正或 override 工具，转仓、重复交易、同日顺序、拆股/非交易变动仍走页面的结构化预演确认流程。
 
 ### 其他
 

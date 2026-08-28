@@ -31,6 +31,7 @@ use crate::services::stock_review_quality::{
 use chrono::{Duration, NaiveDate, Utc};
 use rusqlite::params;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const ALGORITHM_VERSION: &str = "stock-review-v1";
 
@@ -846,64 +847,135 @@ pub fn save_user_stock_review_annotation(
     stock_review_persistence::save_annotation(db, input, AnnotationSaveContext::UserInitiated)
 }
 
-/// Unconstructable outside this module until a real confirmation interaction
-/// supplies the capability in Task 10. It prevents a general command request
-/// field from self-authorizing AI-confirmed provenance.
-pub(crate) struct ConfirmedAiAnnotationCapability {
-    _private: (),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfirmedAnnotationDraftBinding {
+    id: String,
+    scope_type: String,
+    scope_key: String,
+    account_id: Option<String>,
+    symbol: Option<String>,
+    annotation_type: String,
+    source: String,
+    value_hash: u64,
+    canonical_value: String,
 }
 
-/// Derive the private annotation capability from the actual user turn, never
-/// from model-generated tool arguments. The negative phrases deliberately
-/// keep deferred confirmation and draft discussion on the read-only path.
-pub(crate) fn confirmed_ai_annotation_capability_for_user_turn(
-    user_turn: &str,
-) -> Option<ConfirmedAiAnnotationCapability> {
-    let normalized = user_turn.trim().to_lowercase();
-    let defers_confirmation = [
-        "之后我再确认",
-        "稍后确认",
-        "之后再确认",
-        "尚未确认",
-        "不要保存",
-        "不要记录",
-        "later confirm",
-        "confirm later",
-        "do not save",
-        "don't save",
-    ]
-    .iter()
-    .any(|phrase| normalized.contains(phrase));
-    if normalized.is_empty() || defers_confirmation {
-        return None;
+/// Private host-issued approval artifact. Model text and tool JSON cannot
+/// construct it; a future trusted UI confirmation event may be wired to the
+/// private constructor in this module. The artifact is exact-draft-bound and
+/// one-shot even when a model repeats the same tool call in one turn.
+pub(crate) struct ConfirmedAiAnnotationCapability {
+    binding: ConfirmedAnnotationDraftBinding,
+    consumed: AtomicBool,
+}
+
+fn canonical_json(value: &serde_json::Value, output: &mut String) {
+    match value {
+        serde_json::Value::Null => output.push_str("null"),
+        serde_json::Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        serde_json::Value::Number(value) => output.push_str(&value.to_string()),
+        serde_json::Value::String(value) => {
+            output.push_str(&serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()))
+        }
+        serde_json::Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                canonical_json(value, output);
+            }
+            output.push(']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push('{');
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()));
+                output.push(':');
+                canonical_json(value, output);
+            }
+            output.push('}');
+        }
     }
+}
 
-    let requests_save = ["保存", "记录", "save", "record"]
-        .iter()
-        .any(|verb| normalized.contains(verb));
-    let identifies_background = [
-        "这条背景",
-        "该背景",
-        "上述背景",
-        "这段背景",
-        "这条信息",
-        "这段信息",
-        "background",
-        "context",
-    ]
-    .iter()
-    .any(|subject| normalized.contains(subject));
+fn stable_value_hash(value: &serde_json::Value) -> u64 {
+    let mut canonical = String::new();
+    canonical_json(value, &mut canonical);
+    canonical.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
+}
 
-    (requests_save && identifies_background)
-        .then_some(ConfirmedAiAnnotationCapability { _private: () })
+fn confirmed_annotation_binding(
+    input: &StockReviewAnnotationInput,
+) -> Result<ConfirmedAnnotationDraftBinding, String> {
+    let value: serde_json::Value = serde_json::from_str(&input.value_json)
+        .map_err(|error| format!("annotation value is invalid JSON: {error}"))?;
+    if !value.is_object() {
+        return Err("annotation value must be a JSON object".to_string());
+    }
+    let scope_type = input.scope_type.trim().to_ascii_lowercase();
+    let scope_key = if scope_type == "stock" {
+        normalized_stock_symbol(&input.scope_key).unwrap_or_default()
+    } else {
+        input.scope_key.trim().to_string()
+    };
+    let mut canonical_value = String::new();
+    canonical_json(&value, &mut canonical_value);
+    Ok(ConfirmedAnnotationDraftBinding {
+        id: input.id.trim().to_string(),
+        scope_type,
+        scope_key,
+        account_id: input
+            .account_id
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_string),
+        symbol: input.symbol.as_deref().and_then(normalized_stock_symbol),
+        annotation_type: input.annotation_type.trim().to_string(),
+        source: input.source.trim().to_ascii_lowercase(),
+        value_hash: stable_value_hash(&value),
+        canonical_value,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn confirmed_ai_annotation_capability_for_test(
+    input: &StockReviewAnnotationInput,
+) -> ConfirmedAiAnnotationCapability {
+    let mut input = input.clone();
+    input.source = "ai_confirmed".to_string();
+    ConfirmedAiAnnotationCapability {
+        binding: confirmed_annotation_binding(&input).expect("valid approved test draft"),
+        consumed: AtomicBool::new(false),
+    }
 }
 
 pub(crate) fn save_ai_confirmed_stock_review_annotation(
     db: &Database,
     mut input: StockReviewAnnotationInput,
-    _capability: &ConfirmedAiAnnotationCapability,
+    capability: &ConfirmedAiAnnotationCapability,
 ) -> Result<StockReviewAnnotation, String> {
     input.source = "ai_confirmed".to_string();
+    let binding = confirmed_annotation_binding(&input)?;
+    if capability.consumed.load(Ordering::SeqCst) {
+        return Err("confirmation_required: this approval was already consumed".to_string());
+    }
+    if capability.binding != binding {
+        return Err(
+            "confirmation_required: approved annotation draft does not match this write"
+                .to_string(),
+        );
+    }
+    if capability.consumed.swap(true, Ordering::SeqCst) {
+        return Err("confirmation_required: this approval was already consumed".to_string());
+    }
     stock_review_persistence::save_annotation(
         db,
         input,

@@ -172,7 +172,7 @@ pub fn build_stock_actions(
             "sell"
         };
         if let Some(previous) = fills.last() {
-            if !same_action_group(previous, transaction, trade_date, side) {
+            if !same_action_group(previous, transaction, trade_date, side, record.is_transfer) {
                 flush_action_fills(&mut fills, &mut actions);
             }
         }
@@ -305,11 +305,13 @@ fn same_action_group(
     transaction: &Transaction,
     trade_date: NaiveDate,
     side: &str,
+    is_transfer: bool,
 ) -> bool {
     previous.record.transaction.account_id == transaction.account_id
         && previous.record.transaction.symbol == transaction.symbol
         && previous.trade_date == trade_date
         && previous.side == side
+        && previous.record.is_transfer == is_transfer
 }
 
 fn flush_action_fills(fills: &mut Vec<ActionFill<'_>>, actions: &mut Vec<StockActionReview>) {

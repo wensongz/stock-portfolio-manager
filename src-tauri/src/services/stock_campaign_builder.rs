@@ -265,6 +265,185 @@ mod tests {
     }
 
     #[test]
+    fn preserves_ordinary_same_day_fill_when_suppressing_transfer_action() {
+        // Grouping a transfer and ordinary buy into one action would suppress
+        // the ordinary investment action and must make this fail.
+        let overrides = vec![override_record("move", &["a-out", "b-in"])];
+        let action_result = build_stock_actions(
+            &[
+                transaction(
+                    "a-open",
+                    "acct-A",
+                    "AAPL",
+                    "BUY",
+                    100.0,
+                    "2024-01-02T09:30:00Z",
+                ),
+                transaction(
+                    "a-out",
+                    "acct-A",
+                    "AAPL",
+                    "SELL",
+                    100.0,
+                    "2024-01-10T09:30:00Z",
+                ),
+                transaction(
+                    "b-in",
+                    "acct-B",
+                    "AAPL",
+                    "BUY",
+                    100.0,
+                    "2024-01-10T09:30:00Z",
+                ),
+                transaction(
+                    "b-ordinary",
+                    "acct-B",
+                    "AAPL",
+                    "BUY",
+                    10.0,
+                    "2024-01-10T10:30:00Z",
+                ),
+            ],
+            &overrides,
+        );
+
+        let result = build_stock_campaigns(
+            &action_result.position_events,
+            &action_result.actions,
+            &overrides,
+            NaiveDate::from_ymd_opt(2024, 1, 20).unwrap(),
+        );
+
+        assert_eq!(
+            action_result
+                .actions
+                .iter()
+                .map(|action| action.action_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "action:acct-A:AAPL:2024-01-02:buy:a-open",
+                "action:acct-A:AAPL:2024-01-10:sell:a-out",
+                "action:acct-B:AAPL:2024-01-10:buy:b-in",
+                "action:acct-B:AAPL:2024-01-10:buy:b-ordinary",
+            ]
+        );
+        assert_eq!(
+            result.campaigns[0].action_ids,
+            vec![
+                "action:acct-A:AAPL:2024-01-02:buy:a-open",
+                "action:acct-B:AAPL:2024-01-10:buy:b-ordinary",
+            ]
+        );
+        assert_eq!(
+            result.action_campaign_ids["action:acct-B:AAPL:2024-01-10:buy:b-ordinary"],
+            "campaign:transfer:move"
+        );
+    }
+
+    #[test]
+    fn malformed_transfer_override_leaves_fragments_independent_and_reports_error() {
+        // Joining a transfer override without two matched legs would merge
+        // independent account histories and must make this fail.
+        let overrides = vec![override_record("broken", &["a-out"])];
+        let action_result = build_stock_actions(
+            &[
+                transaction(
+                    "a-open",
+                    "acct-A",
+                    "AAPL",
+                    "BUY",
+                    10.0,
+                    "2024-01-02T09:30:00Z",
+                ),
+                transaction(
+                    "a-out",
+                    "acct-A",
+                    "AAPL",
+                    "SELL",
+                    10.0,
+                    "2024-01-03T09:30:00Z",
+                ),
+                transaction(
+                    "b-open",
+                    "acct-B",
+                    "AAPL",
+                    "BUY",
+                    10.0,
+                    "2024-01-03T09:30:00Z",
+                ),
+            ],
+            &overrides,
+        );
+
+        let result = build_stock_campaigns(
+            &action_result.position_events,
+            &action_result.actions,
+            &overrides,
+            NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(),
+        );
+
+        assert_eq!(result.campaigns.len(), 2);
+        assert_eq!(
+            result
+                .campaigns
+                .iter()
+                .map(|campaign| campaign.campaign_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["campaign:acct-A:AAPL:a-open", "campaign:acct-B:AAPL:b-open"]
+        );
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "invalid_transfer_override"));
+    }
+
+    #[test]
+    fn same_symbol_in_two_accounts_without_transfer_stays_separate() {
+        // Grouping same-symbol holdings across accounts without a confirmed
+        // transfer would erase account boundaries and must make this fail.
+        let action_result = build_stock_actions(
+            &[
+                transaction(
+                    "a-open",
+                    "acct-A",
+                    "AAPL",
+                    "BUY",
+                    10.0,
+                    "2024-01-02T09:30:00Z",
+                ),
+                transaction(
+                    "b-open",
+                    "acct-B",
+                    "AAPL",
+                    "BUY",
+                    10.0,
+                    "2024-01-02T09:30:00Z",
+                ),
+            ],
+            &[],
+        );
+
+        let result = build_stock_campaigns(
+            &action_result.position_events,
+            &action_result.actions,
+            &[],
+            NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(),
+        );
+
+        assert_eq!(result.campaigns.len(), 2);
+        assert_eq!(result.campaigns[0].account_ids, vec!["acct-A"]);
+        assert_eq!(
+            result.campaigns[0].campaign_id,
+            "campaign:acct-A:AAPL:a-open"
+        );
+        assert_eq!(result.campaigns[1].account_ids, vec!["acct-B"]);
+        assert_eq!(
+            result.campaigns[1].campaign_id,
+            "campaign:acct-B:AAPL:b-open"
+        );
+    }
+
+    #[test]
     fn stops_campaign_inference_after_negative_position_path() {
         // Continuing into a later buy after an oversell would invent a
         // campaign history and must make this fail.
@@ -315,28 +494,18 @@ mod tests {
     }
 
     #[test]
-    fn refuses_to_guess_campaign_from_synthetic_opening_balance() {
-        // Treating a ledger-import OPEN balance as an investment entry would
-        // manufacture a campaign history and must make this fail.
+    fn synthetic_open_seeds_active_campaign_without_evaluable_action() {
+        // Rejecting an imported opening balance would discard a reconstructed
+        // holding and must make this fail.
         let action_result = build_stock_actions(
-            &[
-                transaction(
-                    "imported-open",
-                    "acct",
-                    "NVDA",
-                    "OPEN",
-                    10.0,
-                    "2024-01-02T09:30:00Z",
-                ),
-                transaction(
-                    "later-buy",
-                    "acct",
-                    "NVDA",
-                    "BUY",
-                    5.0,
-                    "2024-01-03T09:30:00Z",
-                ),
-            ],
+            &[transaction(
+                "imported-open",
+                "acct",
+                "NVDA",
+                "OPEN",
+                10.0,
+                "2024-01-02T09:30:00Z",
+            )],
             &[],
         );
 
@@ -347,10 +516,13 @@ mod tests {
             NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(),
         );
 
-        assert!(result.fragments.is_empty());
-        assert!(result.campaigns.is_empty());
+        assert_eq!(result.fragments.len(), 1);
+        assert_eq!(result.fragments[0].status, StockCampaignStatus::Active);
+        assert_eq!(result.fragments[0].action_ids, Vec::<String>::new());
+        assert_eq!(result.campaigns.len(), 1);
+        assert_eq!(result.campaigns[0].action_ids, Vec::<String>::new());
         assert!(result.action_campaign_ids.is_empty());
-        assert!(result
+        assert!(!result
             .issues
             .iter()
             .any(|issue| issue.code == "campaign_unavailable"));
@@ -478,17 +650,21 @@ fn derive_position_fragments(
     let mut active: Option<FragmentBuildState> = None;
     let mut previous_after = 0.0;
     for event in events {
+        let before_is_zero = is_zero(event.shares_before);
+        let after_is_zero = is_zero(event.shares_after);
+        let is_synthetic_opening = active.is_none()
+            && event.transaction_type == "OPEN"
+            && before_is_zero
+            && !after_is_zero;
         if event.shares_before < -EPSILON
             || event.shares_after < -EPSILON
             || !approximately_equal(event.shares_before, previous_after)
             || !approximately_equal(event.shares_after, event.shares_before + event.shares_delta)
-            || !action_by_transaction.contains_key(&event.transaction_id)
+            || (!action_by_transaction.contains_key(&event.transaction_id) && !is_synthetic_opening)
         {
             issues.push(unavailable_issue(event));
             return;
         }
-        let before_is_zero = is_zero(event.shares_before);
-        let after_is_zero = is_zero(event.shares_after);
         match (&mut active, before_is_zero, after_is_zero) {
             (None, true, false) => {
                 let action_ids = action_by_transaction

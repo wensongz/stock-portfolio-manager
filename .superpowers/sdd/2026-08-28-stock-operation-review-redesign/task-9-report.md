@@ -240,3 +240,100 @@ exit code: 0
 - Dividend total return is available only when a recorded PAY event or complete adjusted-close series exists. A price-only provider without recorded corporate-action income cannot support a fabricated total-return result.
 - Legacy current holdings with no transaction history are treated as the authoritative opening position so the required no-trade report remains usable. The report cannot infer an unrecorded acquisition date; import workflows should preserve OPEN/source-ledger rows when historical dating matters.
 - Stored overrides have no persisted `is_active` column; replay activity is computed by fingerprint revalidation. The confirmation revision therefore fingerprints all stored override rows conservatively, so even a stale-row mutation can require a candidate rebuild.
+
+## Fix round 2: coherent corrected replay and source authority
+
+This section supersedes the round-1 statements that designated benchmark quote rows could provide session authority, that PAY rows could certify shadow dividends, and that no schema change was needed.
+
+- Implementation commit: `01dec52d906209c12ad83c7a02380fe989f3f168` (`fix: unify corrected stock review replay`).
+- No dependency was added. The pre-existing untracked `node_modules` directory remained untouched and unstaged.
+
+### Corrected replay and deterministic live preparation
+
+- `ActionBuildResult.corrected_transactions` is the one ordered, override-corrected ledger. Opening/current cash, opening holdings, actual attribution, risk/turnover actions, Campaign flows, action mapping, and security discovery consume it instead of independently looping raw transactions.
+- Confirmed `non_trade` rows are excluded everywhere; a valid duplicate group keeps one canonical row; a confirmed transfer retains the position movement but has no investment cash effect, action, turnover, fee drag, or Campaign cash flow. Same-day override order is retained before every consumer sees the ledger.
+- Every corrected source fill receives its real grouped action ID. Campaign flow `action_id` references therefore always resolve to an action in that Campaign, including grouped same-day fills.
+- The price/cache horizon is independent from the report valuation cutoff. It extends through the 120th authoritative session after historical actions when today and cached data permit; report and Campaign terminal values remain fixed at `query.end_date`.
+- A new `stock_market_sessions` cache is the sole session authority. Benchmark and stock quote rows are prices only. If explicit session authority is absent, exact forward/Campaign metrics are unavailable with `market_calendar_unavailable`; a missing stock or local-benchmark close on an authoritative target session cannot shift to another quote date.
+- PAY remains actual account cash income but no longer proves complete per-share dividends for shadow holdings. Shadow total return uses `ExplicitDividends` only when the corporate-action field covers every relevant holding/session, otherwise complete adjusted close, otherwise honest price-only degradation.
+- Pre-origin splits scale each source position lot through all later splits up to the explicit actual origin exactly once. Only splits after origin enter the replay engine, preventing both omitted adjustment and double application.
+- Filtered/mixed-currency NAV converts every snapshot row from its local market currency with exact-date FX before aggregation. Missing FX suppresses average NAV and dependent turnover/fee-drag precision with `snapshot_fx_unavailable`; raw local values are never summed as base currency. Required FX currencies include opening positions/cash and discovered securities, not only transaction rows.
+- Incomplete opening cash clears automatic mixed benchmark return, excess/active return, shadow comparison curves, and all value-add comparable fields while preserving the actual recorded TWR and unrelated status regions.
+- Campaign annotations now require an exact campaign/action scope or matching stock scope plus account applicability. Same-symbol notes no longer leak across accounts or logical cycles.
+- Forward quality is derived only from its exact action-window dependencies and maturity. Unrelated global security/FX gaps can still degrade overall quality without changing a valid forward region.
+
+### Override preview consistency and concurrency
+
+- Query validation rejects corrections whose references do not affect the requested account, market, or report cutoff; pre-period references remain legal when they actually affect reconstruction.
+- The canonical candidate override is inserted before Task 5/6/7 materialization, so preview risk, attribution, Campaigns, cash, and actions reflect the same correction that will be persisted.
+- Candidate persistence now fingerprints the complete conservative source set: transactions, holdings, portfolio/holding snapshots, stock and benchmark prices, explicit sessions, splits, annotations, and cached FX, in addition to the active override revision and referenced transactions.
+- Candidate-owned async cache preparation refreshes only the source revision after cache fill. The original active-override revision remains pinned. Persistence rechecks both under one SQLite write transaction; any concurrent source mutation rejects the stale candidate before insertion.
+- A genuine post-in-memory-insertion replay failure returns an error with zero override rows. A successful returned candidate matches a fresh report rebuilt from the saved override state.
+
+### Production-path acceptance coverage and RED evidence
+
+The initial round-2 live suite produced 13 failures (19 passes), including these literal contradictions:
+
+```text
+corrected opening cash: actual 750, expected 900
+pre-origin split quantity: actual 10, expected 20
+historical 60-session window: Pending, expected Available
+missing authoritative target close: Available, expected Unavailable
+mixed-currency filtered NAV: actual 800, expected 200
+incomplete opening cash excess_return: Some(0), expected None
+grouped Campaign flow referenced a nonexistent reconstructed action ID
+candidate replay failure returned Ok and source revision mutation still saved
+```
+
+The final DB/cache-backed tests assert values, statuses, issues, actions, campaigns, and database row counts for:
+
+1. transfer/non-trade/duplicate consistency across cash, attribution, turnover, and Campaign flows;
+2. historical actions maturing beyond the report cutoff without leaking future terminal value;
+3. authoritative interior-session and benchmark endpoint holes;
+4. PAY with a sold actual position while shadow still holds the security;
+5. pre-origin and post-origin splits applied exactly once;
+6. USD-base CN and multi-market snapshot conversion, plus missing exact-FX suppression;
+7. out-of-scope correction rejection, successful preview/save identity, genuine candidate-build failure/no-write, active override race, and full-source revision race;
+8. incomplete opening-cash dependent-field suppression while actual TWR stays visible;
+9. grouped fills and two-account annotation isolation;
+10. unrelated coverage gaps leaving forward quality independent;
+11. two cycles of one symbol, two accounts, pre-period actions, and historical as-of pricing;
+12. the original deterministic twelve-scenario matrix plus same-day uncertainty, duplicate conflict, fixed benchmark, suspension/delisting, and fee zero.
+
+### Final verification
+
+```text
+cargo test --lib services::stock_review_service::tests --quiet
+33 passed; 0 failed
+
+cargo test --lib services::stock_review_persistence::tests --quiet
+13 passed; 0 failed
+
+cargo test --lib services::stock_review_quality::tests --quiet
+5 passed; 0 failed
+
+cargo test --lib services::stock_action_builder::tests --quiet
+9 passed; 0 failed
+
+cargo test --lib
+469 passed; 0 failed; 8 ignored
+
+cargo check --lib
+passed
+
+npm run build
+TypeScript and Vite production build passed; existing large-chunk warning only
+
+rustfmt --edition 2021 --check <seven modified Rust files>
+exit code: 0
+
+git diff --check
+exit code: 0
+```
+
+### Remaining honest limitations after round 2
+
+- The repository still has no production exchange-calendar provider or importer. The explicit `stock_market_sessions` boundary supports deterministic/cache-fed authority; live databases without that cache suppress exact-session forward and Campaign metrics instead of treating sparse quote dates as sessions.
+- The current price provider does not certify complete adjusted-close or corporate-action dividend coverage. PAY can support actual account income only; shadow total-return metrics remain price-only/unavailable unless a complete source is cached.
+- Account/market-filtered snapshots still lack authoritative historical cash. Their actual TWR remains unavailable even when exact local-to-base stock NAV is displayable; no cash balance is fabricated.
+- Full-source candidate revision is deliberately conservative and global. An unrelated write to a reviewed source table can force a rebuild, preferring rejection over returning a stale candidate.

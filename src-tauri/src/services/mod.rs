@@ -24,3 +24,4 @@ pub mod stock_review_market_data;
 pub mod stock_review_metrics;
 pub mod stock_review_persistence;
 pub mod stock_review_quality;
+pub mod stock_review_service;

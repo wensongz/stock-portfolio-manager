@@ -3,6 +3,7 @@
 use crate::models::stock_review::{
     MetricAvailability, MetricStatus, RebalanceAttributionItem, RebalanceAttributionSummary,
 };
+use crate::services::stock_review_quality::classify_residual_status;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,6 +20,7 @@ pub struct AttributionInput {
     pub prices: Vec<AttributionPricePoint>,
     pub fx_rates: Vec<AttributionFxPoint>,
     pub batches: Vec<AttributionBatch>,
+    pub splits: Vec<AttributionSplit>,
     pub dividends: Vec<AttributionDividend>,
     pub fees: Vec<AttributionFee>,
     pub cash_returns: Vec<AttributionCashReturn>,
@@ -122,6 +124,27 @@ impl AttributionBatch {
             action_type: action_type.to_string(),
             effective_date,
             quantity_delta,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttributionSplit {
+    pub date: NaiveDate,
+    pub account_id: String,
+    pub symbol: String,
+    pub market: String,
+    pub ratio: f64,
+}
+
+impl AttributionSplit {
+    pub fn new(date: NaiveDate, account_id: &str, symbol: &str, market: &str, ratio: f64) -> Self {
+        Self {
+            date,
+            account_id: account_id.to_string(),
+            symbol: symbol.to_string(),
+            market: market.to_string(),
+            ratio,
         }
     }
 }
@@ -241,6 +264,10 @@ fn calculate(input: &AttributionInput) -> Result<RebalanceAttributionSummary, St
             let current_price = price(input, current.date, batch)?;
             let prior_fx = fx(input, prior.date, &batch.currency)?;
             let current_fx = fx(input, current.date, &batch.currency)?;
+            let prior_quantity = batch_quantity_on(input, batch, prior.date);
+            let interval_split_ratio = split_ratio_between(input, batch, prior.date, current.date);
+            let current_quantity = prior_quantity * interval_split_ratio;
+            let adjusted_prior_price = prior_price / interval_split_ratio;
             let dividend = input
                 .dividends
                 .iter()
@@ -252,13 +279,14 @@ fn calculate(input: &AttributionInput) -> Result<RebalanceAttributionSummary, St
                 })
                 .map(|dividend| dividend.amount_per_share)
                 .sum::<f64>();
-            let price_amount = batch.quantity_delta * (current_price - prior_price) * current_fx;
-            let dividend_amount = batch.quantity_delta * dividend * current_fx;
+            let price_amount =
+                current_quantity * (current_price - adjusted_prior_price) * current_fx;
+            let dividend_amount = current_quantity * dividend * current_fx;
             *action_amounts
                 .get_mut(&batch.action_id)
                 .expect("all batch IDs are initialized") += price_amount + dividend_amount;
             dividend_contribution += dividend_amount;
-            currency_contribution += batch.quantity_delta * prior_price * (current_fx - prior_fx);
+            currency_contribution += prior_quantity * prior_price * (current_fx - prior_fx);
         }
 
         for cash in &prior.cash_balances {
@@ -320,11 +348,17 @@ fn calculate(input: &AttributionInput) -> Result<RebalanceAttributionSummary, St
         .filter(|item| item.amount > EPSILON)
         .cloned()
         .collect::<Vec<_>>();
-    let detractors = action_contributions
+    let mut detractors = action_contributions
         .iter()
         .filter(|item| item.amount < -EPSILON)
         .cloned()
         .collect::<Vec<_>>();
+    detractors.sort_by(|left, right| {
+        left.amount
+            .partial_cmp(&right.amount)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.action_id.cmp(&right.action_id))
+    });
     let action_total = action_contributions
         .iter()
         .map(|item| item.amount)
@@ -332,6 +366,19 @@ fn calculate(input: &AttributionInput) -> Result<RebalanceAttributionSummary, St
     let explained = action_total + cash_contribution + currency_contribution;
     let ending_difference = ending_value_difference(input)?;
     let residual = ending_difference - explained;
+    let residual_status = classify_residual_status(Some(residual), Some(average_nav));
+    let residual_note = match residual_status {
+        MetricStatus::Available => None,
+        MetricStatus::Degraded => Some(
+            "Attribution residual exceeds 0.1% of average NAV; action attribution is an approximation."
+                .to_string(),
+        ),
+        MetricStatus::Unavailable => Some(
+            "Attribution residual exceeds 0.5% of average NAV; precise action attribution is unavailable."
+                .to_string(),
+        ),
+        MetricStatus::Pending => None,
+    };
     let buy_value_add = action_contributions
         .iter()
         .filter(|item| item.action_type == "open" || item.action_type == "add")
@@ -345,8 +392,8 @@ fn calculate(input: &AttributionInput) -> Result<RebalanceAttributionSummary, St
 
     Ok(RebalanceAttributionSummary {
         availability: MetricAvailability {
-            status: MetricStatus::Available,
-            note: None,
+            status: residual_status,
+            note: residual_note,
         },
         total_value_add: Some(ending_difference),
         buy_value_add: Some(buy_value_add),
@@ -387,6 +434,10 @@ fn validate_numbers(input: &AttributionInput) -> Result<(), String> {
             .batches
             .iter()
             .all(|batch| batch.quantity_delta.is_finite())
+        && input
+            .splits
+            .iter()
+            .all(|split| split.ratio.is_finite() && split.ratio > 0.0)
         && input
             .dividends
             .iter()
@@ -454,7 +505,7 @@ fn validate_batches_explain_positions(input: &AttributionInput) -> Result<(), St
                         && batch.market == position.market
                         && batch.currency == position.currency
                 })
-                .map(|batch| batch.quantity_delta)
+                .map(|batch| batch_quantity_on(input, batch, valuation.date))
                 .sum::<f64>();
             let ledger_delta = position.actual_quantity - position.shadow_quantity;
             if (batch_delta - ledger_delta).abs() > EPSILON {
@@ -484,6 +535,43 @@ fn validate_batches_explain_positions(input: &AttributionInput) -> Result<(), St
         }
     }
     Ok(())
+}
+
+fn batch_quantity_on(input: &AttributionInput, batch: &AttributionBatch, date: NaiveDate) -> f64 {
+    batch.quantity_delta
+        * input
+            .splits
+            .iter()
+            .filter(|split| {
+                split.date > batch.effective_date
+                    && split.date <= date
+                    && split.account_id == batch.account_id
+                    && split.symbol == batch.symbol
+                    && split.market == batch.market
+            })
+            .map(|split| split.ratio)
+            .product::<f64>()
+}
+
+fn split_ratio_between(
+    input: &AttributionInput,
+    batch: &AttributionBatch,
+    start_exclusive: NaiveDate,
+    end_inclusive: NaiveDate,
+) -> f64 {
+    input
+        .splits
+        .iter()
+        .filter(|split| {
+            split.date > batch.effective_date
+                && split.date > start_exclusive
+                && split.date <= end_inclusive
+                && split.account_id == batch.account_id
+                && split.symbol == batch.symbol
+                && split.market == batch.market
+        })
+        .map(|split| split.ratio)
+        .product::<f64>()
 }
 
 fn price(
@@ -715,6 +803,7 @@ mod tests {
                     -5.0,
                 ),
             ],
+            splits: vec![],
             dividends: vec![AttributionDividend::new(
                 day("2024-01-02"),
                 "A",
@@ -822,6 +911,232 @@ mod tests {
             .unwrap()
             .contains("cash balance"));
         assert_eq!(summary.ending_value_difference, None);
+    }
+
+    #[test]
+    fn residual_above_point_one_percent_degrades_calculator_summary() {
+        // 20 / 10,000 = 0.2%, inside the degraded band.
+        let mut input = identity_input();
+        input.valuations[1]
+            .cash_balances
+            .iter_mut()
+            .find(|cash| cash.currency == "USD")
+            .unwrap()
+            .actual_amount += 20.0;
+
+        let summary = calculate_rebalance_attribution(&input);
+
+        assert_eq!(summary.availability.status, MetricStatus::Degraded);
+        assert!((summary.residual.unwrap() - 20.0).abs() < 1e-9);
+        assert!((summary.residual_to_average_nav.unwrap() - 0.002).abs() < 1e-9);
+    }
+
+    #[test]
+    fn residual_above_point_five_percent_disables_calculator_summary() {
+        // 60 / 10,000 = 0.6%, above the unavailable threshold.
+        let mut input = identity_input();
+        input.valuations[1]
+            .cash_balances
+            .iter_mut()
+            .find(|cash| cash.currency == "USD")
+            .unwrap()
+            .actual_amount += 60.0;
+
+        let summary = calculate_rebalance_attribution(&input);
+
+        assert_eq!(summary.availability.status, MetricStatus::Unavailable);
+        assert!((summary.residual.unwrap() - 60.0).abs() < 1e-9);
+        assert!((summary.residual_to_average_nav.unwrap() - 0.006).abs() < 1e-9);
+    }
+
+    #[test]
+    fn split_adjusts_action_batch_quantity_and_price_basis_without_creating_an_action() {
+        // 10 shares at 100 split 2:1 to 20 at 50 (zero P&L), then rise to 55 (+100).
+        let input = AttributionInput {
+            base_currency: "USD".to_string(),
+            average_portfolio_nav: Some(10_000.0),
+            valuations: vec![
+                AttributionValuationPoint {
+                    date: day("2024-01-01"),
+                    positions: vec![AttributionPositionBalance {
+                        account_id: "broker".to_string(),
+                        symbol: "A".to_string(),
+                        market: "US".to_string(),
+                        currency: "USD".to_string(),
+                        actual_quantity: 10.0,
+                        shadow_quantity: 0.0,
+                    }],
+                    cash_balances: vec![AttributionCashBalance {
+                        account_id: "broker".to_string(),
+                        currency: "USD".to_string(),
+                        actual_amount: 0.0,
+                        shadow_amount: 1_000.0,
+                    }],
+                },
+                AttributionValuationPoint {
+                    date: day("2024-01-02"),
+                    positions: vec![AttributionPositionBalance {
+                        account_id: "broker".to_string(),
+                        symbol: "A".to_string(),
+                        market: "US".to_string(),
+                        currency: "USD".to_string(),
+                        actual_quantity: 20.0,
+                        shadow_quantity: 0.0,
+                    }],
+                    cash_balances: vec![AttributionCashBalance {
+                        account_id: "broker".to_string(),
+                        currency: "USD".to_string(),
+                        actual_amount: 0.0,
+                        shadow_amount: 1_000.0,
+                    }],
+                },
+                AttributionValuationPoint {
+                    date: day("2024-01-03"),
+                    positions: vec![AttributionPositionBalance {
+                        account_id: "broker".to_string(),
+                        symbol: "A".to_string(),
+                        market: "US".to_string(),
+                        currency: "USD".to_string(),
+                        actual_quantity: 20.0,
+                        shadow_quantity: 0.0,
+                    }],
+                    cash_balances: vec![AttributionCashBalance {
+                        account_id: "broker".to_string(),
+                        currency: "USD".to_string(),
+                        actual_amount: 0.0,
+                        shadow_amount: 1_000.0,
+                    }],
+                },
+            ],
+            prices: vec![
+                AttributionPricePoint::new(day("2024-01-01"), "A", "US", "USD", 100.0),
+                AttributionPricePoint::new(day("2024-01-02"), "A", "US", "USD", 50.0),
+                AttributionPricePoint::new(day("2024-01-03"), "A", "US", "USD", 55.0),
+            ],
+            fx_rates: vec![],
+            batches: vec![AttributionBatch::new(
+                "buy-a",
+                "broker",
+                "A",
+                "US",
+                "USD",
+                "open",
+                day("2024-01-01"),
+                10.0,
+            )],
+            splits: vec![AttributionSplit::new(
+                day("2024-01-02"),
+                "broker",
+                "A",
+                "US",
+                2.0,
+            )],
+            dividends: vec![],
+            fees: vec![],
+            cash_returns: vec![
+                AttributionCashReturn::new(day("2024-01-02"), "USD", 0.0),
+                AttributionCashReturn::new(day("2024-01-03"), "USD", 0.0),
+            ],
+        };
+
+        let summary = calculate_rebalance_attribution(&input);
+
+        assert_eq!(summary.availability.status, MetricStatus::Available);
+        assert_eq!(summary.action_contributions.len(), 1);
+        assert_eq!(summary.action_contributions[0].action_id, "buy-a");
+        assert!((summary.action_contributions[0].amount - 100.0).abs() < 1e-9);
+        assert!((summary.ending_value_difference.unwrap() - 100.0).abs() < 1e-9);
+        assert!(summary.residual.unwrap().abs() < 1e-9);
+    }
+
+    #[test]
+    fn detractors_are_ordered_most_negative_first() {
+        let positions = vec![
+            AttributionPositionBalance {
+                account_id: "broker".to_string(),
+                symbol: "X".to_string(),
+                market: "US".to_string(),
+                currency: "USD".to_string(),
+                actual_quantity: 0.0,
+                shadow_quantity: 1.0,
+            },
+            AttributionPositionBalance {
+                account_id: "broker".to_string(),
+                symbol: "Y".to_string(),
+                market: "US".to_string(),
+                currency: "USD".to_string(),
+                actual_quantity: 0.0,
+                shadow_quantity: 1.0,
+            },
+        ];
+        let input = AttributionInput {
+            base_currency: "USD".to_string(),
+            average_portfolio_nav: Some(10_000.0),
+            valuations: vec![
+                AttributionValuationPoint {
+                    date: day("2024-01-01"),
+                    positions: positions.clone(),
+                    cash_balances: vec![AttributionCashBalance {
+                        account_id: "broker".to_string(),
+                        currency: "USD".to_string(),
+                        actual_amount: 200.0,
+                        shadow_amount: 0.0,
+                    }],
+                },
+                AttributionValuationPoint {
+                    date: day("2024-01-02"),
+                    positions,
+                    cash_balances: vec![AttributionCashBalance {
+                        account_id: "broker".to_string(),
+                        currency: "USD".to_string(),
+                        actual_amount: 200.0,
+                        shadow_amount: 0.0,
+                    }],
+                },
+            ],
+            prices: vec![
+                AttributionPricePoint::new(day("2024-01-01"), "X", "US", "USD", 100.0),
+                AttributionPricePoint::new(day("2024-01-02"), "X", "US", "USD", 200.0),
+                AttributionPricePoint::new(day("2024-01-01"), "Y", "US", "USD", 100.0),
+                AttributionPricePoint::new(day("2024-01-02"), "Y", "US", "USD", 101.0),
+            ],
+            fx_rates: vec![],
+            batches: vec![
+                AttributionBatch::new(
+                    "sell-x",
+                    "broker",
+                    "X",
+                    "US",
+                    "USD",
+                    "close",
+                    day("2024-01-01"),
+                    -1.0,
+                ),
+                AttributionBatch::new(
+                    "sell-y",
+                    "broker",
+                    "Y",
+                    "US",
+                    "USD",
+                    "close",
+                    day("2024-01-01"),
+                    -1.0,
+                ),
+            ],
+            splits: vec![],
+            dividends: vec![],
+            fees: vec![],
+            cash_returns: vec![AttributionCashReturn::new(day("2024-01-02"), "USD", 0.0)],
+        };
+
+        let summary = calculate_rebalance_attribution(&input);
+
+        assert_eq!(summary.availability.status, MetricStatus::Available);
+        assert_eq!(summary.detractors.len(), 2);
+        assert_eq!(summary.detractors[0].action_id, "sell-x");
+        assert_eq!(summary.detractors[0].amount, -100.0);
+        assert_eq!(summary.detractors[1].action_id, "sell-y");
+        assert_eq!(summary.detractors[1].amount, -1.0);
     }
 
     #[test]

@@ -408,7 +408,12 @@ fn build_stock_review_artifacts(
                     .annotations
                     .iter()
                     .filter(|annotation| {
-                        annotation_applies_to_campaign(annotation, campaign, &campaigns)
+                        annotation_applies_to_campaign(
+                            annotation,
+                            campaign,
+                            &campaigns,
+                            input.query.end_date,
+                        )
                     })
                     .cloned()
                     .collect(),
@@ -625,7 +630,11 @@ fn annotation_applies_to_campaign(
     annotation: &StockReviewAnnotation,
     campaign: &StockCampaignSummary,
     all_campaigns: &[StockCampaignSummary],
+    report_as_of: NaiveDate,
 ) -> bool {
+    if !annotation_visible_as_of(annotation, report_as_of) {
+        return false;
+    }
     if annotation
         .account_id
         .as_ref()
@@ -668,12 +677,16 @@ fn annotation_applies_to_campaign(
                 .started_at
                 .get(..10)
                 .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+            if campaign_start.is_none_or(|start| start > report_as_of) {
+                return false;
+            }
             let campaign_end = campaign
                 .ended_at
                 .as_deref()
                 .and_then(|date| date.get(..10))
                 .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
-                .unwrap_or(NaiveDate::MAX);
+                .unwrap_or(report_as_of)
+                .min(report_as_of);
 
             if let (Some(effective), Some(start)) = (explicit_date, campaign_start) {
                 return effective >= start && effective <= campaign_end;
@@ -705,6 +718,23 @@ fn annotation_applies_to_campaign(
         }
         _ => false,
     }
+}
+
+fn annotation_visible_as_of(annotation: &StockReviewAnnotation, report_as_of: NaiveDate) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&annotation.value_json) else {
+        return false;
+    };
+    let effective_date = value
+        .get("effective_date")
+        .or_else(|| value.get("snapshot_date"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+    let effective_start = value
+        .get("effective_start")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+    effective_date.is_none_or(|date| date <= report_as_of)
+        && effective_start.is_none_or(|date| date <= report_as_of)
 }
 
 fn transaction_date(transaction: &Transaction) -> Option<NaiveDate> {
@@ -903,8 +933,10 @@ where
 {
     validate_query(&query)?;
     validate_account_exists(db, query.account_id.as_deref())?;
+    let today = Utc::now().date_naive();
+    let candidate_record = candidate.clone();
     let mut override_list = stock_review_persistence::list_overrides(db)?;
-    if let Some(candidate) = candidate {
+    if let Some(candidate) = candidate.clone() {
         let candidate_id = candidate.id.clone();
         override_list
             .overrides
@@ -918,7 +950,7 @@ where
         });
         override_list.overrides.push(candidate);
     }
-    let transactions = load_all_transactions_for_review(db)?;
+    let transactions = load_all_transactions_for_review_through(db, today)?;
     let scoped = transactions
         .iter()
         .filter(|transaction| {
@@ -935,13 +967,6 @@ where
         .collect::<Vec<_>>();
     let action_build = build_stock_actions(&scoped, &override_list.overrides);
     let corrected_transactions = &action_build.corrected_transactions;
-    let prepared_campaigns = build_stock_campaigns(
-        &action_build.position_events,
-        &action_build.actions,
-        &override_list.overrides,
-        query.end_date,
-    );
-
     let provider_config = crate::services::quote_provider_service::get_quote_provider_config(db)?;
     let mut security_keys = corrected_transactions
         .iter()
@@ -964,11 +989,10 @@ where
         .map_or(query.start_date - Duration::days(10), |date| {
             date.min(query.start_date - Duration::days(10))
         });
-    let local_markets = security_keys
+    let mut local_markets = security_keys
         .iter()
         .map(|(_, market)| market.clone())
         .collect::<BTreeSet<_>>();
-    let today = Utc::now().date_naive();
     let mut market_calendars_by_market = BTreeMap::new();
     for market in &local_markets {
         market_calendars_by_market.insert(
@@ -980,20 +1004,23 @@ where
         .iter()
         .map(|(market, calendar)| (market.clone(), calendar.sessions.clone()))
         .collect::<BTreeMap<_, _>>();
-    let evaluation_end = action_build
+    let mut evaluation_end = action_build
         .actions
         .iter()
         .filter(|action| action_date(action).is_some_and(|date| date <= query.end_date))
         .filter_map(|action| {
             let action_date = action_date(action)?;
-            market_sessions_by_market
-                .get(&action.market)
-                .and_then(|sessions| nth_market_session_after(sessions, action_date, 120))
+            Some(
+                market_sessions_by_market
+                    .get(&action.market)
+                    .and_then(|sessions| nth_market_session_after(sessions, action_date, 120))
+                    .unwrap_or(today),
+            )
         })
-        .max();
-    let price_end = evaluation_end
-        .map(|date| date.max(query.end_date.min(today)))
-        .unwrap_or(query.end_date.min(today));
+        .max()
+        .unwrap_or(query.end_date.min(today))
+        .max(query.end_date.min(today));
+    let mut price_end = evaluation_end;
     let mut prices_by_security = BTreeMap::new();
     for (symbol, market) in &security_keys {
         let provider = match market.as_str() {
@@ -1039,7 +1066,7 @@ where
         benchmark_points_by_market.insert(market.clone(), points);
     }
     let mut local_benchmark_points_by_market = BTreeMap::new();
-    for market in local_markets {
+    for market in &local_markets {
         let Some(symbol) = default_benchmark_symbol(&market) else {
             continue;
         };
@@ -1051,16 +1078,201 @@ where
         )
         .await;
         local_benchmark_points_by_market.insert(
-            market,
+            market.clone(),
             load_benchmark_series(db, symbol, price_start, price_end)?,
         );
     }
 
+    for (market, _) in &benchmark_specs {
+        if market != "CUSTOM" {
+            local_markets.insert(market.clone());
+        }
+    }
+    let benchmark_symbols = benchmark_specs
+        .iter()
+        .map(|(_, symbol)| symbol.clone())
+        .chain(
+            local_markets
+                .iter()
+                .filter_map(|market| default_benchmark_symbol(market).map(str::to_string)),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let revision_currencies = corrected_transactions
+        .iter()
+        .map(|corrected| corrected.transaction.currency.clone())
+        .chain(load_current_holding_currencies(db, &query)?.into_iter())
+        .chain(
+            security_keys
+                .iter()
+                .map(|(_, market)| market_currency(market).to_string()),
+        )
+        .chain(std::iter::once(query.base_currency.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     after_cache_fill(db)?;
 
+    if let Some(candidate) = candidate_revision.as_deref() {
+        stock_review_persistence::verify_candidate_discovery_revision_after_cache_fill(
+            db, candidate,
+        )?;
+    }
+    // Cache fills or concurrent cache writers may change the authoritative
+    // session plan. Re-read the complete discovery horizon and derive the
+    // exact 120-session endpoint before pinning the cache revision.
+    let refreshed_calendars = local_markets
+        .iter()
+        .map(|market| {
+            load_market_sessions(db, market, price_start, today)
+                .map(|calendar| (market.clone(), calendar))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let refreshed_sessions = refreshed_calendars
+        .iter()
+        .map(|(market, calendar)| (market.clone(), calendar.sessions.clone()))
+        .collect::<BTreeMap<_, _>>();
+    evaluation_end = action_build
+        .actions
+        .iter()
+        .filter(|action| action_date(action).is_some_and(|date| date <= query.end_date))
+        .filter_map(|action| {
+            let action_date = action_date(action)?;
+            Some(
+                refreshed_sessions
+                    .get(&action.market)
+                    .and_then(|sessions| nth_market_session_after(sessions, action_date, 120))
+                    .unwrap_or(today),
+            )
+        })
+        .max()
+        .unwrap_or(query.end_date.min(today))
+        .max(query.end_date.min(today));
+    price_end = evaluation_end;
     if let Some(candidate) = candidate_revision.as_deref_mut() {
+        stock_review_persistence::set_candidate_revision_scope(
+            candidate,
+            stock_review_persistence::CandidateRevisionScope {
+                report_start: query.start_date,
+                report_end: query.end_date,
+                price_start,
+                evaluation_end,
+                current_horizon: today,
+                display_cutoff: query.end_date,
+                account_ids: query.account_id.clone().into_iter().collect(),
+                markets: local_markets.iter().cloned().collect(),
+                securities: security_keys.iter().cloned().collect(),
+                benchmark_symbols,
+                currencies: revision_currencies,
+            },
+        );
         stock_review_persistence::pin_candidate_source_revision_after_cache_fill(db, candidate)?;
     }
+
+    // Every mutable source used by the candidate is loaded again after the
+    // async cache phase has finished and the exact dependency scope is pinned.
+    // The final digest check below rejects any mutation during these reads.
+    let mut override_list = stock_review_persistence::list_overrides(db)?;
+    if let Some(candidate) = candidate_record {
+        let candidate_id = candidate.id.clone();
+        override_list
+            .overrides
+            .retain(|record| record.id != candidate_id);
+        override_list
+            .stale_overrides
+            .retain(|record| record.id != candidate_id);
+        let stale_message_prefix = format!("Override {candidate_id} ");
+        override_list.issues.retain(|issue| {
+            issue.code != "stale_override" || !issue.message.starts_with(&stale_message_prefix)
+        });
+        override_list.overrides.push(candidate);
+    }
+    let transactions = load_all_transactions_for_review_through(db, today)?;
+    let scoped = transactions
+        .iter()
+        .filter(|transaction| {
+            query
+                .account_id
+                .as_ref()
+                .is_none_or(|account| transaction.account_id == *account)
+                && query
+                    .market
+                    .as_ref()
+                    .is_none_or(|market| transaction.market == *market)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let action_build = build_stock_actions(&scoped, &override_list.overrides);
+    let corrected_transactions = &action_build.corrected_transactions;
+    let prepared_campaigns = build_stock_campaigns(
+        &action_build.position_events,
+        &action_build.actions,
+        &override_list.overrides,
+        query.end_date,
+    );
+    let mut reloaded_security_keys = corrected_transactions
+        .iter()
+        .map(|corrected| &corrected.transaction)
+        .filter(|transaction| {
+            transaction_date(transaction).is_some_and(|date| date <= query.end_date)
+        })
+        .filter(|transaction| !crate::services::quote_service::is_cash_symbol(&transaction.symbol))
+        .map(|transaction| (transaction.symbol.clone(), transaction.market.clone()))
+        .collect::<BTreeSet<_>>();
+    for key in load_current_holding_keys(db, &query)? {
+        reloaded_security_keys.insert(key);
+    }
+    if reloaded_security_keys != security_keys {
+        return Err(
+            "User-owned security dependencies changed during cache preparation; rebuild before confirming."
+                .to_string(),
+        );
+    }
+    let security_keys = reloaded_security_keys;
+    let market_calendars_by_market = local_markets
+        .iter()
+        .map(|market| {
+            load_market_sessions(db, market, price_start, evaluation_end)
+                .map(|calendar| (market.clone(), calendar))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let market_sessions_by_market = market_calendars_by_market
+        .iter()
+        .map(|(market, calendar)| (market.clone(), calendar.sessions.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let prices_by_security = security_keys
+        .iter()
+        .map(|(symbol, market)| {
+            load_stock_price_series(db, symbol, market, price_start, price_end)
+                .map(|points| ((symbol.clone(), market.clone()), points))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let mut benchmark_series = Vec::new();
+    let mut benchmark_points_by_market = BTreeMap::new();
+    for (market, symbol) in &benchmark_specs {
+        let points = load_benchmark_series(db, symbol, price_start, price_end)?;
+        benchmark_series.push(BenchmarkSeriesInput {
+            market: market.clone(),
+            availability: cached_point_availability(&points, query.start_date, query.end_date),
+            points: points
+                .iter()
+                .map(|point| BenchmarkPoint {
+                    date: point.date,
+                    value: point.close,
+                })
+                .collect(),
+        });
+        benchmark_points_by_market.insert(market.clone(), points);
+    }
+    let local_benchmark_points_by_market = local_markets
+        .iter()
+        .filter_map(|market| default_benchmark_symbol(market).map(|symbol| (market, symbol)))
+        .map(|(market, symbol)| {
+            load_benchmark_series(db, symbol, price_start, price_end)
+                .map(|points| (market.clone(), points))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
 
     let (baseline, actual_values, mut actual_availability, actual_nav_complete) =
         load_actual_values(db, &query)?;
@@ -1676,16 +1888,24 @@ fn load_transactions_for_review(db: &Database, end: NaiveDate) -> Result<Vec<Tra
 }
 
 fn load_all_transactions_for_review(db: &Database) -> Result<Vec<Transaction>, String> {
+    load_all_transactions_for_review_through(db, Utc::now().date_naive())
+}
+
+fn load_all_transactions_for_review_through(
+    db: &Database,
+    end: NaiveDate,
+) -> Result<Vec<Transaction>, String> {
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
     let mut statement = conn
         .prepare(
             "SELECT id, holding_id, account_id, symbol, name, market, transaction_type,
                     shares, price, total_amount, commission, currency, traded_at, notes, created_at
-             FROM transactions ORDER BY traded_at ASC, created_at ASC, id ASC",
+             FROM transactions WHERE substr(traded_at, 1, 10) <= ?1
+             ORDER BY traded_at ASC, created_at ASC, id ASC",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map(params![end.format("%Y-%m-%d").to_string()], |row| {
             Ok(Transaction {
                 id: row.get(0)?,
                 holding_id: row.get(1)?,
@@ -1731,6 +1951,28 @@ fn load_current_holding_keys(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     Ok(rows)
+}
+
+fn load_current_holding_currencies(
+    db: &Database,
+    query: &StockReviewQuery,
+) -> Result<Vec<String>, String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let mut statement = conn
+        .prepare(
+            "SELECT DISTINCT currency FROM holdings
+             WHERE shares != 0
+               AND (?1 IS NULL OR account_id = ?1)
+               AND (?2 IS NULL OR market = ?2)
+             ORDER BY currency",
+        )
+        .map_err(|error| error.to_string())?;
+    let currencies = statement
+        .query_map(params![query.account_id, query.market], |row| row.get(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(currencies)
 }
 
 fn benchmark_specs(query: &StockReviewQuery) -> Vec<(String, String)> {
@@ -3291,24 +3533,33 @@ fn load_display_context(
             ..Default::default()
         },
     )?;
+    annotations.retain(|annotation| annotation_visible_as_of(annotation, query.end_date));
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
     let mut statement = conn.prepare(
         "SELECT qh.id, qh.account_id, qh.symbol, qh.notes, qh.decision_quality, qs.snapshot_date
          FROM quarterly_holding_snapshots qh JOIN quarterly_snapshots qs ON qs.id = qh.quarterly_snapshot_id
          WHERE (?1 IS NULL OR qh.account_id = ?1) AND (?2 IS NULL OR qh.market = ?2)
+           AND qs.snapshot_date <= ?3
          ORDER BY qs.snapshot_date ASC, qh.id ASC"
     ).map_err(|error| error.to_string())?;
     let historical = statement
-        .query_map(params![query.account_id, query.market], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })
+        .query_map(
+            params![
+                query.account_id,
+                query.market,
+                query.end_date.format("%Y-%m-%d").to_string()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
@@ -5629,7 +5880,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(prepared.forward_actions[0].market_session_dates, sessions);
+        assert_eq!(
+            prepared.forward_actions[0].market_session_dates,
+            sessions[..=120]
+        );
         let artifacts = build_stock_review_artifacts(&prepared).unwrap();
         assert_eq!(
             artifacts.report.summary.forward_effect.day_60.status.status,
@@ -6257,6 +6511,201 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_reloads_future_evaluation_calendar_after_cache_fill() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "US");
+        insert_live_transaction(
+            &db,
+            "cash",
+            "acct",
+            "$CASH-USD",
+            "US",
+            "BUY",
+            1_000.0,
+            1.0,
+            1_000.0,
+            0.0,
+            "USD",
+            "2023-12-01T08:00:00Z",
+        );
+        for id in ["buy-a", "buy-b"] {
+            insert_live_transaction(
+                &db,
+                id,
+                "acct",
+                "AAPL",
+                "US",
+                "BUY",
+                1.0,
+                100.0,
+                100.0,
+                0.0,
+                "USD",
+                "2024-01-01T09:30:00Z",
+            );
+        }
+        for date in ["2023-12-31", "2024-01-01", "2024-01-03"] {
+            insert_portfolio_value(&db, date, 1_000.0, 7.0);
+        }
+        let sessions = calendar_dates(day("2024-01-01"), 130);
+        let missing_future_session = sessions[60];
+        install_market_sessions(&db, "US", &sessions);
+        let stock_points = sessions
+            .iter()
+            .map(|date| (*date, 110.0))
+            .collect::<Vec<_>>();
+        seed_stock_cache_bounds(&db, "AAPL", "US", day("2023-12-20"), &stock_points);
+        seed_benchmark_cache(&db, "^GSPC", day("2023-12-20"), None, 100.0);
+
+        let query = live_query("2024-01-01", "2024-01-03", Some("US"));
+        let mut prepared_candidate = stock_review_persistence::prepare_override_candidate(
+            &db,
+            StockReviewOverrideInput {
+                id: "calendar-race".to_string(),
+                override_type: "duplicate".to_string(),
+                transaction_ids_json: r#"["buy-a","buy-b"]"#.to_string(),
+                value_json: "{}".to_string(),
+            },
+        )
+        .unwrap();
+        stock_review_persistence::scope_candidate_to_query(&db, &mut prepared_candidate, &query)
+            .unwrap();
+        let canonical = prepared_candidate.input.clone();
+        let candidate_record = StockReviewOverride {
+            id: canonical.id,
+            override_type: canonical.override_type,
+            transaction_ids_json: canonical.transaction_ids_json,
+            value_json: canonical.value_json,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let prepared = prepare_cached_stock_review_input_with_candidate_and_cache_hook(
+            &db,
+            query,
+            Some(candidate_record),
+            Some(&mut prepared_candidate),
+            move |db| {
+                let conn = db.conn.lock().map_err(|error| error.to_string())?;
+                conn.execute(
+                    "DELETE FROM stock_market_sessions WHERE market = 'US' AND date = ?1",
+                    params![missing_future_session.format("%Y-%m-%d").to_string()],
+                )
+                .map_err(|error| error.to_string())?;
+                conn.execute(
+                    "UPDATE stock_market_calendar_coverage SET revision = 'fixture-v2' WHERE market = 'US'",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(prepared.forward_actions[0].market_session_dates.is_empty());
+        assert_eq!(
+            prepared.forward_actions[0].availability.status,
+            MetricStatus::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_rejects_post_report_transaction_and_split_mutation() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "US");
+        insert_live_transaction(
+            &db,
+            "buy",
+            "acct",
+            "AAPL",
+            "US",
+            "BUY",
+            1.0,
+            100.0,
+            100.0,
+            0.0,
+            "USD",
+            "2024-01-02T09:30:00Z",
+        );
+        for date in ["2024-01-01", "2024-01-02", "2024-01-03"] {
+            insert_portfolio_value(&db, date, 1_000.0, 7.0);
+        }
+        let cache_start = day("2023-12-20");
+        seed_stock_cache_bounds(
+            &db,
+            "AAPL",
+            "US",
+            cache_start,
+            &[(day("2024-01-01"), 100.0), (day("2024-01-03"), 100.0)],
+        );
+        seed_default_benchmarks(&db, cache_start);
+
+        let query = live_query("2024-01-02", "2024-01-03", Some("US"));
+        let mut prepared_candidate = stock_review_persistence::prepare_override_candidate(
+            &db,
+            StockReviewOverrideInput {
+                id: "future-user-race".to_string(),
+                override_type: "non_trade".to_string(),
+                transaction_ids_json: r#"["buy"]"#.to_string(),
+                value_json: "{}".to_string(),
+            },
+        )
+        .unwrap();
+        stock_review_persistence::scope_candidate_to_query(&db, &mut prepared_candidate, &query)
+            .unwrap();
+        let canonical = prepared_candidate.input.clone();
+        let candidate_record = StockReviewOverride {
+            id: canonical.id,
+            override_type: canonical.override_type,
+            transaction_ids_json: canonical.transaction_ids_json,
+            value_json: canonical.value_json,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let result = prepare_cached_stock_review_input_with_candidate_and_cache_hook(
+            &db,
+            query,
+            Some(candidate_record),
+            Some(&mut prepared_candidate),
+            |db| {
+                insert_live_transaction(
+                    db,
+                    "late-sell",
+                    "acct",
+                    "AAPL",
+                    "US",
+                    "SELL",
+                    1.0,
+                    110.0,
+                    110.0,
+                    0.0,
+                    "USD",
+                    "2024-02-01T09:30:00Z",
+                );
+                db.conn
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .execute(
+                        "INSERT INTO stock_splits (stock_code, split_date, ratio_from, ratio_to, created_at)
+                         VALUES ('AAPL', '2024-02-02', 1, 2, '2024-02-02')",
+                        [],
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            },
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("changed during cache preparation"),
+            "unexpected preparation error: {error}"
         );
     }
 
@@ -7051,24 +7500,101 @@ mod tests {
         assert!(!annotation_applies_to_campaign(
             &undated,
             &campaigns[0],
-            &campaigns
+            &campaigns,
+            day("2026-08-28"),
         ));
         assert!(!annotation_applies_to_campaign(
             &undated,
             &campaigns[1],
-            &campaigns
+            &campaigns,
+            day("2026-08-28"),
         ));
 
         let dated = annotation("dated", r#"{"effective_date":"2024-02-05"}"#);
         assert!(!annotation_applies_to_campaign(
             &dated,
             &campaigns[0],
-            &campaigns
+            &campaigns,
+            day("2026-08-28"),
         ));
         assert!(annotation_applies_to_campaign(
             &dated,
             &campaigns[1],
-            &campaigns
+            &campaigns,
+            day("2026-08-28"),
+        ));
+    }
+
+    #[test]
+    fn historical_display_excludes_future_quarterly_notes() {
+        let db = Database::new(":memory:").unwrap();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO quarterly_snapshots (id, quarter, snapshot_date, created_at)
+             VALUES ('past', '2024Q1', '2024-01-15', '2024-01-15')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO quarterly_snapshots (id, quarter, snapshot_date, created_at)
+             VALUES ('future', '2024Q2', '2024-02-15', '2024-02-15')",
+            [],
+        )
+        .unwrap();
+        for (id, snapshot, note) in [
+            ("past-note", "past", "known then"),
+            ("future-note", "future", "not yet known"),
+        ] {
+            conn.execute(
+                "INSERT INTO quarterly_holding_snapshots
+                    (id, quarterly_snapshot_id, account_id, symbol, name, market, notes)
+                 VALUES (?1, ?2, 'acct', 'AAPL', 'AAPL', 'US', ?3)",
+                params![id, snapshot, note],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let mut query = live_query("2024-01-01", "2024-01-31", Some("US"));
+        query.account_id = Some("acct".to_string());
+        let annotations = load_display_context(&db, &query).unwrap();
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].id, "quarterly:past-note");
+    }
+
+    #[test]
+    fn active_historical_campaign_rejects_annotation_starting_after_report_as_of() {
+        let campaign = StockCampaignSummary {
+            campaign_id: "active".to_string(),
+            account_ids: vec!["acct".to_string()],
+            action_ids: vec![],
+            fragments: vec![],
+            campaign_status: StockCampaignStatus::Active,
+            availability: available(),
+            symbol: "AAPL".to_string(),
+            market: "US".to_string(),
+            started_at: "2024-01-01T09:30:00Z".to_string(),
+            ended_at: None,
+            contribution: None,
+        };
+        let annotation = StockReviewAnnotation {
+            id: "future-thesis".to_string(),
+            scope_type: "stock".to_string(),
+            scope_key: "AAPL".to_string(),
+            account_id: Some("acct".to_string()),
+            symbol: Some("AAPL".to_string()),
+            annotation_type: "thesis".to_string(),
+            value_json: r#"{"effective_start":"2024-02-01"}"#.to_string(),
+            source: "user".to_string(),
+            created_at: "2024-01-15T00:00:00Z".to_string(),
+            updated_at: "2024-01-15T00:00:00Z".to_string(),
+        };
+
+        assert!(!annotation_applies_to_campaign(
+            &annotation,
+            &campaign,
+            std::slice::from_ref(&campaign),
+            day("2024-01-31"),
         ));
     }
 

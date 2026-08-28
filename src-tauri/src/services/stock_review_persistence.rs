@@ -5,8 +5,9 @@ use crate::models::stock_review::{
     StockReviewAnnotation, StockReviewAnnotationInput, StockReviewIssue, StockReviewIssueSeverity,
     StockReviewOverride, StockReviewOverrideInput, StockReviewQuery,
 };
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
+use rusqlite::types::{Value as SqlValue, ValueRef};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -50,16 +51,25 @@ pub struct ValidatedOverrideCandidate {
     pub input: StockReviewOverrideInput,
     active_override_revision: String,
     reference_fingerprint_json: String,
-    source_scope: ReviewSourceScope,
+    preparation_scope: CandidateRevisionScope,
+    source_scope: CandidateRevisionScope,
     preparation_user_revision: String,
     review_source_revision: ReviewSourceRevision,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ReviewSourceScope {
-    account_id: Option<String>,
-    market: Option<String>,
-    end_date: Option<String>,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CandidateRevisionScope {
+    pub report_start: NaiveDate,
+    pub report_end: NaiveDate,
+    pub price_start: NaiveDate,
+    pub evaluation_end: NaiveDate,
+    pub current_horizon: NaiveDate,
+    pub display_cutoff: NaiveDate,
+    pub account_ids: Vec<String>,
+    pub markets: Vec<String>,
+    pub securities: Vec<(String, String)>,
+    pub benchmark_symbols: Vec<String>,
+    pub currencies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -104,6 +114,7 @@ struct StoredTransaction {
     id: String,
     account_id: String,
     symbol: String,
+    market: String,
     transaction_type: String,
     shares: f64,
     price: f64,
@@ -231,27 +242,49 @@ pub fn prepare_override_candidate(
         .iter()
         .map(TransactionReferenceFingerprint::from_transaction)
         .collect::<Vec<_>>();
-    let account_id = references
-        .first()
-        .map(|transaction| transaction.account_id.clone())
-        .filter(|account_id| {
+    let today = Utc::now().date_naive();
+    let first_date = references
+        .iter()
+        .filter_map(|transaction| trade_date(&transaction.traded_at))
+        .min()
+        .unwrap_or(today);
+    let source_scope = CandidateRevisionScope {
+        report_start: first_date,
+        report_end: today,
+        price_start: first_date - Duration::days(10),
+        evaluation_end: today,
+        current_horizon: today,
+        display_cutoff: today,
+        account_ids: sorted_unique(
             references
                 .iter()
-                .all(|transaction| transaction.account_id == *account_id)
-        });
-    let source_scope = ReviewSourceScope {
-        account_id,
-        market: None,
-        end_date: None,
+                .map(|transaction| transaction.account_id.clone()),
+        ),
+        markets: sorted_unique(
+            references
+                .iter()
+                .map(|transaction| transaction.market.clone()),
+        ),
+        // Discovery must remain broad within the referenced account/market;
+        // exact securities are installed only after the async dependency plan
+        // is known, so a new holding cannot alter that plan unnoticed.
+        securities: Vec::new(),
+        benchmark_symbols: Vec::new(),
+        currencies: sorted_unique(
+            references
+                .iter()
+                .map(|transaction| transaction.currency.clone()),
+        ),
     };
     let preparation_user_revision = user_source_revision(&conn, &source_scope)?;
     Ok(ValidatedOverrideCandidate {
         input,
-        active_override_revision: active_override_revision(&conn)?,
+        active_override_revision: active_override_revision(&conn, &source_scope)?,
         reference_fingerprint_json: serde_json::to_string(&fingerprints)
             .map_err(|error| error.to_string())?,
         review_source_revision: review_source_revision(&conn, &source_scope)?,
         preparation_user_revision,
+        preparation_scope: source_scope.clone(),
         source_scope,
     })
 }
@@ -262,14 +295,41 @@ pub fn scope_candidate_to_query(
     query: &StockReviewQuery,
 ) -> Result<(), String> {
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
-    candidate.source_scope = ReviewSourceScope {
-        account_id: query.account_id.clone(),
-        market: query.market.clone(),
-        end_date: Some(query.end_date.format("%Y-%m-%d").to_string()),
+    candidate.source_scope = CandidateRevisionScope {
+        report_start: query.start_date,
+        report_end: query.end_date,
+        price_start: query.start_date - Duration::days(10),
+        evaluation_end: query.end_date.min(Utc::now().date_naive()),
+        current_horizon: Utc::now().date_naive(),
+        display_cutoff: query.end_date,
+        account_ids: query.account_id.clone().into_iter().collect(),
+        markets: query.market.clone().into_iter().collect(),
+        securities: Vec::new(),
+        benchmark_symbols: query.benchmark_symbol.clone().into_iter().collect(),
+        currencies: vec![query.base_currency.clone()],
     };
+    candidate.preparation_scope = candidate.source_scope.clone();
     candidate.preparation_user_revision = user_source_revision(&conn, &candidate.source_scope)?;
+    candidate.active_override_revision = active_override_revision(&conn, &candidate.source_scope)?;
     candidate.review_source_revision = review_source_revision(&conn, &candidate.source_scope)?;
     Ok(())
+}
+
+pub fn set_candidate_revision_scope(
+    candidate: &mut ValidatedOverrideCandidate,
+    mut scope: CandidateRevisionScope,
+) {
+    scope.account_ids.sort();
+    scope.account_ids.dedup();
+    scope.markets.sort();
+    scope.markets.dedup();
+    scope.securities.sort();
+    scope.securities.dedup();
+    scope.benchmark_symbols.sort();
+    scope.benchmark_symbols.dedup();
+    scope.currencies.sort();
+    scope.currencies.dedup();
+    candidate.source_scope = scope;
 }
 
 pub fn pin_candidate_source_revision_after_cache_fill(
@@ -277,14 +337,38 @@ pub fn pin_candidate_source_revision_after_cache_fill(
     candidate: &mut ValidatedOverrideCandidate,
 ) -> Result<(), String> {
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
-    let current_user = user_source_revision(&conn, &candidate.source_scope)?;
+    verify_candidate_discovery_revision(&conn, candidate)?;
+    candidate.active_override_revision = active_override_revision(&conn, &candidate.source_scope)?;
+    candidate.review_source_revision = review_source_revision(&conn, &candidate.source_scope)?;
+    Ok(())
+}
+
+pub fn verify_candidate_discovery_revision_after_cache_fill(
+    db: &Database,
+    candidate: &ValidatedOverrideCandidate,
+) -> Result<(), String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    verify_candidate_discovery_revision(&conn, candidate)
+}
+
+fn verify_candidate_discovery_revision(
+    conn: &Connection,
+    candidate: &ValidatedOverrideCandidate,
+) -> Result<(), String> {
+    let current_user = user_source_revision(&conn, &candidate.preparation_scope)?;
     if current_user != candidate.preparation_user_revision {
         return Err(
             "A user-owned report source changed during cache preparation; rebuild before confirming."
                 .to_string(),
         );
     }
-    candidate.review_source_revision = review_source_revision(&conn, &candidate.source_scope)?;
+    let current_overrides = active_override_revision(&conn, &candidate.preparation_scope)?;
+    if current_overrides != candidate.active_override_revision {
+        return Err(
+            "The scoped override set changed during cache preparation; rebuild before confirming."
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -309,7 +393,9 @@ pub fn save_override_candidate(
     let input = candidate.input;
     let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
     let transaction = conn.transaction().map_err(|error| error.to_string())?;
-    if active_override_revision(&transaction)? != candidate.active_override_revision {
+    if active_override_revision(&transaction, &candidate.source_scope)?
+        != candidate.active_override_revision
+    {
         return Err(
             "The active override set changed while the candidate report was being built; rebuild the report before confirming."
                 .to_string(),
@@ -377,30 +463,41 @@ pub fn save_override_candidate(
     Ok(override_record)
 }
 
-fn active_override_revision(conn: &Connection) -> Result<String, String> {
-    let mut statement = conn
-        .prepare(
-            "SELECT id, updated_at, reference_fingerprint_json
-             FROM stock_review_overrides ORDER BY id ASC",
-        )
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    serde_json::to_string(&rows).map_err(|error| error.to_string())
+fn active_override_revision(
+    conn: &Connection,
+    scope: &CandidateRevisionScope,
+) -> Result<String, String> {
+    let mut digest = StableDigest::new("stock-review-overrides-v2");
+    let accounts = json_string_list(&scope.account_ids)?;
+    let markets = json_string_list(&scope.markets)?;
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "overrides",
+        "SELECT o.id, o.override_type, o.transaction_ids_json, o.value_json,
+                o.reference_fingerprint_json, o.updated_at
+         FROM stock_review_overrides o
+         WHERE EXISTS (
+             SELECT 1 FROM json_each(o.transaction_ids_json) ids
+             JOIN transactions t ON t.id = ids.value
+             WHERE (json_array_length(?1) = 0 OR t.account_id IN (SELECT value FROM json_each(?1)))
+               AND (json_array_length(?2) = 0 OR t.market IN (SELECT value FROM json_each(?2)))
+               AND substr(t.traded_at, 1, 10) <= ?3
+         )
+         ORDER BY o.id ASC",
+        vec![
+            SqlValue::Text(accounts),
+            SqlValue::Text(markets),
+            SqlValue::Text(date_text(scope.current_horizon)),
+        ],
+        6,
+    )?;
+    Ok(digest.finish())
 }
 
 fn review_source_revision(
     conn: &Connection,
-    scope: &ReviewSourceScope,
+    scope: &CandidateRevisionScope,
 ) -> Result<ReviewSourceRevision, String> {
     Ok(ReviewSourceRevision {
         user: user_source_revision(conn, scope)?,
@@ -408,177 +505,332 @@ fn review_source_revision(
     })
 }
 
-fn user_source_revision(conn: &Connection, scope: &ReviewSourceScope) -> Result<String, String> {
-    let tables = [
-        (
-            "transactions",
-            scoped_where(scope, true, true, Some("traded_at")),
-        ),
-        ("holdings", scoped_where(scope, true, true, None)),
-        (
-            "daily_holding_snapshots",
-            scoped_where(scope, true, true, Some("date")),
-        ),
-        (
-            "daily_portfolio_values",
-            scoped_where(scope, false, false, Some("date")),
-        ),
-        (
-            "stock_splits",
-            scoped_where(scope, false, false, Some("split_date")),
-        ),
-        ("stock_review_annotations", scoped_annotation_where(scope)),
-    ];
-    let mut revision = Vec::<(String, Vec<Vec<String>>)>::new();
-    for (table, where_clause) in tables {
-        let mut columns_statement = conn
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .map_err(|error| error.to_string())?;
-        let columns = columns_statement
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        let sql = format!(
-            "SELECT {} FROM {table} {where_clause} ORDER BY rowid",
-            columns.join(", ")
-        );
-        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map(
-                params![scope.account_id, scope.market, scope.end_date],
-                |row| {
-                    (0..columns.len())
-                        .map(|index| row.get_ref(index).map(|value| format!("{value:?}")))
-                        .collect::<Result<Vec<_>, _>>()
-                },
-            )
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        revision.push((table.to_string(), rows));
-    }
-    revision.push((
-        "quarterly_context".to_string(),
-        quarterly_context_revision(conn, scope)?,
-    ));
-    serde_json::to_string(&revision).map_err(|error| error.to_string())
-}
-
-fn cache_source_revision(conn: &Connection, scope: &ReviewSourceScope) -> Result<String, String> {
-    let tables = [
-        (
-            "benchmark_daily_prices",
-            scoped_where(scope, false, false, Some("date")),
-        ),
-        (
-            "stock_daily_prices",
-            scoped_where(scope, false, true, Some("date")),
-        ),
-        (
-            "stock_market_sessions",
-            scoped_where(scope, false, true, Some("date")),
-        ),
-        (
-            "stock_market_calendar_coverage",
-            scoped_where(scope, false, true, Some("complete_through")),
-        ),
-        (
-            "cached_exchange_rates",
-            scoped_where(scope, false, false, None),
-        ),
-    ];
-    let mut revision = Vec::<(String, Vec<Vec<String>>)>::new();
-    for (table, where_clause) in tables {
-        let mut columns_statement = conn
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .map_err(|error| error.to_string())?;
-        let columns = columns_statement
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        let sql = format!(
-            "SELECT {} FROM {table} {where_clause} ORDER BY rowid",
-            columns.join(", ")
-        );
-        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map(
-                params![scope.account_id, scope.market, scope.end_date],
-                |row| {
-                    (0..columns.len())
-                        .map(|index| row.get_ref(index).map(|value| format!("{value:?}")))
-                        .collect::<Result<Vec<_>, _>>()
-                },
-            )
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        revision.push((table.to_string(), rows));
-    }
-    serde_json::to_string(&revision).map_err(|error| error.to_string())
-}
-
-fn scoped_where(
-    _scope: &ReviewSourceScope,
-    has_account: bool,
-    has_market: bool,
-    date_column: Option<&str>,
-) -> String {
-    let account = if has_account {
-        "(?1 IS NULL OR account_id = ?1)".to_string()
-    } else {
-        "(?1 IS NULL OR ?1 IS NOT NULL)".to_string()
-    };
-    let market = if has_market {
-        "(?2 IS NULL OR market = ?2)".to_string()
-    } else {
-        "(?2 IS NULL OR ?2 IS NOT NULL)".to_string()
-    };
-    let date = date_column.map_or_else(
-        || "(?3 IS NULL OR ?3 IS NOT NULL)".to_string(),
-        |column| format!("(?3 IS NULL OR substr({column}, 1, 10) <= ?3)"),
-    );
-    format!("WHERE {account} AND {market} AND {date}")
-}
-
-fn scoped_annotation_where(scope: &ReviewSourceScope) -> String {
-    let _ = scope;
-    "WHERE (?1 IS NULL OR account_id IS NULL OR account_id = ?1)
-       AND (?2 IS NULL OR ?2 IS NOT NULL)
-       AND (?3 IS NULL OR ?3 IS NOT NULL)"
-        .to_string()
-}
-
-fn quarterly_context_revision(
+fn user_source_revision(
     conn: &Connection,
-    scope: &ReviewSourceScope,
-) -> Result<Vec<Vec<String>>, String> {
-    let where_clause = "WHERE (?1 IS NULL OR qh.account_id = ?1)
-                          AND (?2 IS NULL OR qh.market = ?2)
-                          AND (?3 IS NULL OR substr(qs.snapshot_date, 1, 10) <= ?3)";
-    let sql = format!(
-        "SELECT qs.id, qs.quarter, qs.snapshot_date, qs.overall_notes,
-                qh.id, qh.account_id, qh.symbol, qh.market, qh.notes, qh.decision_quality
-         FROM quarterly_snapshots qs
-         LEFT JOIN quarterly_holding_snapshots qh ON qh.quarterly_snapshot_id = qs.id
-         {where_clause} ORDER BY qs.snapshot_date, qs.id, qh.id"
-    );
-    let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map(
-            params![scope.account_id, scope.market, scope.end_date],
-            |row| {
-                (0..10)
-                    .map(|index| row.get_ref(index).map(|value| format!("{value:?}")))
-                    .collect::<Result<Vec<_>, _>>()
-            },
-        )
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
+    scope: &CandidateRevisionScope,
+) -> Result<String, String> {
+    let mut digest = StableDigest::new("stock-review-user-v2");
+    digest_scope(&mut digest, scope)?;
+    let accounts = json_string_list(&scope.account_ids)?;
+    let markets = json_string_list(&scope.markets)?;
+    let symbols = json_string_list(
+        &scope
+            .securities
+            .iter()
+            .map(|(symbol, _)| symbol.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let securities = serde_json::to_string(&scope.securities).map_err(|error| error.to_string())?;
+    let common = || {
+        vec![
+            SqlValue::Text(accounts.clone()),
+            SqlValue::Text(markets.clone()),
+            SqlValue::Text(securities.clone()),
+        ]
+    };
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "accounts",
+        "SELECT id FROM accounts
+         WHERE (json_array_length(?1) = 0 OR id IN (SELECT value FROM json_each(?1)))
+         ORDER BY id",
+        vec![SqlValue::Text(accounts.clone())],
+        1,
+    )?;
+    let mut values = common();
+    values.push(SqlValue::Text(date_text(scope.current_horizon)));
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "transactions",
+        "SELECT id, holding_id, account_id, symbol, name, market, transaction_type,
+                shares, price, total_amount, commission, currency, traded_at, notes, created_at
+         FROM transactions
+         WHERE (json_array_length(?1) = 0 OR account_id IN (SELECT value FROM json_each(?1)))
+           AND (json_array_length(?2) = 0 OR market IN (SELECT value FROM json_each(?2)))
+           AND substr(traded_at, 1, 10) <= ?4
+         ORDER BY traded_at, created_at, id",
+        values,
+        15,
+    )?;
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "holdings",
+        "SELECT id, account_id, symbol, market, shares, currency, created_at, updated_at
+         FROM holdings
+         WHERE (json_array_length(?1) = 0 OR account_id IN (SELECT value FROM json_each(?1)))
+           AND (json_array_length(?2) = 0 OR market IN (SELECT value FROM json_each(?2)))
+           AND (symbol LIKE '$CASH-%' OR json_array_length(?3) = 0 OR EXISTS (
+               SELECT 1 FROM json_each(?3) security
+               WHERE symbol = json_extract(security.value, '$[0]')
+                 AND market = json_extract(security.value, '$[1]')
+           ))
+         ORDER BY account_id, market, symbol, id",
+        common(),
+        8,
+    )?;
+    let mut values = common();
+    values.push(SqlValue::Text(date_text(scope.report_end)));
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "holding_snapshots",
+        "SELECT date, account_id, symbol, market, shares, avg_cost, close_price, market_value
+         FROM daily_holding_snapshots
+         WHERE (json_array_length(?1) = 0 OR account_id IN (SELECT value FROM json_each(?1)))
+           AND (json_array_length(?2) = 0 OR market IN (SELECT value FROM json_each(?2)))
+           AND (json_array_length(?3) = 0 OR EXISTS (
+               SELECT 1 FROM json_each(?3) security
+               WHERE symbol = json_extract(security.value, '$[0]')
+                 AND market = json_extract(security.value, '$[1]')
+           ))
+           AND date <= ?4
+         ORDER BY date, account_id, market, symbol",
+        values,
+        8,
+    )?;
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "portfolio_values",
+        "SELECT date, total_value, exchange_rates FROM daily_portfolio_values
+         WHERE date <= ?1 ORDER BY date",
+        vec![SqlValue::Text(date_text(scope.report_end))],
+        3,
+    )?;
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "splits",
+        "SELECT id, stock_code, split_date, ratio_from, ratio_to, created_at FROM stock_splits
+         WHERE (json_array_length(?1) = 0 OR stock_code IN (SELECT value FROM json_each(?1)))
+           AND split_date <= ?2
+         ORDER BY split_date, id",
+        vec![
+            SqlValue::Text(symbols.clone()),
+            SqlValue::Text(date_text(scope.current_horizon)),
+        ],
+        6,
+    )?;
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "annotations",
+        "SELECT id, scope_type, scope_key, account_id, symbol, annotation_type,
+                value_json, source, created_at, updated_at
+         FROM stock_review_annotations
+         WHERE (json_array_length(?1) = 0 OR account_id IS NULL OR account_id IN (SELECT value FROM json_each(?1)))
+           AND COALESCE(json_extract(value_json, '$.effective_date'), ?2) <= ?2
+           AND COALESCE(json_extract(value_json, '$.effective_start'), ?2) <= ?2
+         ORDER BY updated_at, id",
+        vec![
+            SqlValue::Text(accounts.clone()),
+            SqlValue::Text(date_text(scope.display_cutoff)),
+        ],
+        10,
+    )?;
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "quarterly_context",
+        "SELECT qh.id, qh.account_id, qh.symbol, qh.market, qh.notes,
+                qh.decision_quality, qs.snapshot_date
+         FROM quarterly_holding_snapshots qh
+         JOIN quarterly_snapshots qs ON qs.id = qh.quarterly_snapshot_id
+         WHERE (json_array_length(?1) = 0 OR qh.account_id IN (SELECT value FROM json_each(?1)))
+           AND (json_array_length(?2) = 0 OR qh.market IN (SELECT value FROM json_each(?2)))
+           AND qs.snapshot_date <= ?3
+         ORDER BY qs.snapshot_date, qh.id",
+        vec![
+            SqlValue::Text(accounts),
+            SqlValue::Text(markets),
+            SqlValue::Text(date_text(scope.display_cutoff)),
+        ],
+        7,
+    )?;
+    Ok(digest.finish())
+}
+
+fn cache_source_revision(
+    conn: &Connection,
+    scope: &CandidateRevisionScope,
+) -> Result<String, String> {
+    let mut digest = StableDigest::new("stock-review-cache-v2");
+    digest_scope(&mut digest, scope)?;
+    let markets = json_string_list(&scope.markets)?;
+    let securities = serde_json::to_string(&scope.securities).map_err(|error| error.to_string())?;
+    let benchmarks = json_string_list(&scope.benchmark_symbols)?;
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "stock_prices",
+        "SELECT symbol, market, date, open, high, low, close, volume,
+                adjusted_close, dividend, source, updated_at
+         FROM stock_daily_prices
+         WHERE (json_array_length(?1) = 0 OR market IN (SELECT value FROM json_each(?1)))
+           AND (json_array_length(?2) = 0 OR EXISTS (
+               SELECT 1 FROM json_each(?2) security
+               WHERE symbol = json_extract(security.value, '$[0]')
+                 AND market = json_extract(security.value, '$[1]')
+           ))
+           AND date BETWEEN ?3 AND ?4
+         ORDER BY market, symbol, date",
+        vec![
+            SqlValue::Text(markets.clone()),
+            SqlValue::Text(securities),
+            SqlValue::Text(date_text(scope.price_start)),
+            SqlValue::Text(date_text(scope.evaluation_end)),
+        ],
+        12,
+    )?;
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "benchmark_prices",
+        "SELECT symbol, date, close_price, change_percent FROM benchmark_daily_prices
+         WHERE (json_array_length(?1) = 0 OR symbol IN (SELECT value FROM json_each(?1)))
+           AND date BETWEEN ?2 AND ?3
+         ORDER BY symbol, date",
+        vec![
+            SqlValue::Text(benchmarks),
+            SqlValue::Text(date_text(scope.price_start)),
+            SqlValue::Text(date_text(scope.evaluation_end)),
+        ],
+        4,
+    )?;
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "market_sessions",
+        "SELECT market, date, is_session, source, updated_at FROM stock_market_sessions
+         WHERE (json_array_length(?1) = 0 OR market IN (SELECT value FROM json_each(?1)))
+           AND date BETWEEN ?2 AND ?3
+         ORDER BY market, date",
+        vec![
+            SqlValue::Text(markets.clone()),
+            SqlValue::Text(date_text(scope.price_start)),
+            SqlValue::Text(date_text(scope.evaluation_end)),
+        ],
+        5,
+    )?;
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "calendar_coverage",
+        "SELECT market, source, complete_start, complete_through, revision,
+                encodes_closed_dates, updated_at
+         FROM stock_market_calendar_coverage
+         WHERE (json_array_length(?1) = 0 OR market IN (SELECT value FROM json_each(?1)))
+         ORDER BY market",
+        vec![SqlValue::Text(markets)],
+        7,
+    )?;
+    stream_query_digest(
+        conn,
+        &mut digest,
+        "cached_fx",
+        "SELECT id, usd_cny, usd_hkd, cny_hkd, updated_at
+         FROM cached_exchange_rates ORDER BY id",
+        vec![],
+        5,
+    )?;
+    Ok(digest.finish())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StableDigest(u64);
+
+impl StableDigest {
+    fn new(domain: &str) -> Self {
+        let mut digest = Self(0xcbf29ce484222325);
+        digest.write_bytes(domain.as_bytes());
+        digest
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.0 ^= bytes.len() as u64;
+        self.0 = self.0.wrapping_mul(0x100000001b3);
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn write_value(&mut self, value: ValueRef<'_>) {
+        match value {
+            ValueRef::Null => self.write_bytes(b"null"),
+            ValueRef::Integer(value) => self.write_bytes(&value.to_le_bytes()),
+            ValueRef::Real(value) => self.write_bytes(&value.to_bits().to_le_bytes()),
+            ValueRef::Text(value) => self.write_bytes(value),
+            ValueRef::Blob(value) => self.write_bytes(value),
+        }
+    }
+
+    fn finish(self) -> String {
+        format!("{:016x}", self.0)
+    }
+}
+
+fn stream_query_digest(
+    conn: &Connection,
+    digest: &mut StableDigest,
+    label: &str,
+    sql: &str,
+    values: Vec<SqlValue>,
+    column_count: usize,
+) -> Result<(), String> {
+    digest.write_bytes(label.as_bytes());
+    let mut statement = conn.prepare(sql).map_err(|error| error.to_string())?;
+    let mut rows = statement
+        .query(params_from_iter(values.iter()))
         .map_err(|error| error.to_string())?;
-    Ok(rows)
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        digest.write_bytes(b"row");
+        for index in 0..column_count {
+            digest.write_value(row.get_ref(index).map_err(|error| error.to_string())?);
+        }
+    }
+    Ok(())
+}
+
+fn digest_scope(digest: &mut StableDigest, scope: &CandidateRevisionScope) -> Result<(), String> {
+    for date in [
+        scope.report_start,
+        scope.report_end,
+        scope.price_start,
+        scope.evaluation_end,
+        scope.current_horizon,
+        scope.display_cutoff,
+    ] {
+        digest.write_bytes(date_text(date).as_bytes());
+    }
+    digest.write_bytes(json_string_list(&scope.account_ids)?.as_bytes());
+    digest.write_bytes(json_string_list(&scope.markets)?.as_bytes());
+    digest.write_bytes(
+        serde_json::to_string(&scope.securities)
+            .map_err(|error| error.to_string())?
+            .as_bytes(),
+    );
+    digest.write_bytes(json_string_list(&scope.benchmark_symbols)?.as_bytes());
+    digest.write_bytes(json_string_list(&scope.currencies)?.as_bytes());
+    Ok(())
+}
+
+fn json_string_list(values: &[String]) -> Result<String, String> {
+    serde_json::to_string(values).map_err(|error| error.to_string())
+}
+
+fn date_text(date: NaiveDate) -> String {
+    date.format("%Y-%m-%d").to_string()
+}
+
+fn sorted_unique<T: Ord>(values: impl Iterator<Item = T>) -> Vec<T> {
+    let mut values = values.collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
 }
 
 pub fn list_overrides(db: &Database) -> Result<StockReviewOverrideList, String> {
@@ -872,7 +1124,7 @@ fn load_transactions(conn: &Connection, ids: &[String]) -> Result<Vec<StoredTran
     for id in ids {
         if let Some(transaction) = conn
             .query_row(
-                "SELECT id, account_id, symbol, transaction_type, shares, price, total_amount, commission, currency, traded_at
+                "SELECT id, account_id, symbol, market, transaction_type, shares, price, total_amount, commission, currency, traded_at
                  FROM transactions WHERE id = ?1",
                 params![id],
                 |row| {
@@ -880,13 +1132,14 @@ fn load_transactions(conn: &Connection, ids: &[String]) -> Result<Vec<StoredTran
                         id: row.get(0)?,
                         account_id: row.get(1)?,
                         symbol: row.get(2)?,
-                        transaction_type: row.get(3)?,
-                        shares: row.get(4)?,
-                        price: row.get(5)?,
-                        total_amount: row.get(6)?,
-                        commission: row.get(7)?,
-                        currency: row.get(8)?,
-                        traded_at: row.get(9)?,
+                        market: row.get(3)?,
+                        transaction_type: row.get(4)?,
+                        shares: row.get(5)?,
+                        price: row.get(6)?,
+                        total_amount: row.get(7)?,
+                        commission: row.get(8)?,
+                        currency: row.get(9)?,
+                        traded_at: row.get(10)?,
                     })
                 },
             )
@@ -1129,13 +1382,16 @@ fn format_override_validation_error(validation: &OverrideValidationResult) -> St
 mod tests {
     use super::{
         list_annotations, list_overrides, monotonic_audit_timestamp, prepare_override_candidate,
-        save_annotation, save_override, save_override_candidate, validate_override,
-        AnnotationSaveContext, StockReviewAnnotationFilter,
+        save_annotation, save_override, save_override_candidate, scope_candidate_to_query,
+        set_candidate_revision_scope, validate_override, AnnotationSaveContext,
+        CandidateRevisionScope, StockReviewAnnotationFilter,
     };
     use crate::db::Database;
     use crate::models::stock_review::{
         StockReviewAnnotationInput, StockReviewIssueSeverity, StockReviewOverrideInput,
+        StockReviewQuery,
     };
+    use chrono::NaiveDate;
     use rusqlite::params;
 
     fn database() -> Database {
@@ -1680,6 +1936,136 @@ mod tests {
 
         assert!(save_override_candidate(&db, candidate).is_ok());
         assert_eq!(list_overrides(&db).unwrap().overrides.len(), 1);
+    }
+
+    #[test]
+    fn unrelated_account_override_does_not_invalidate_scoped_candidate() {
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy-a",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        insert_transaction(
+            &db,
+            "buy-b",
+            "acct-b",
+            "MSFT",
+            "BUY",
+            1.0,
+            200.0,
+            "2024-02-01",
+        );
+        save_override(&db, override_input("other", "non_trade", &["buy-b"], "{}")).unwrap();
+        let mut candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["buy-a"], "{}"),
+        )
+        .unwrap();
+        scope_candidate_to_query(
+            &db,
+            &mut candidate,
+            &StockReviewQuery {
+                start_date: NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+                end_date: NaiveDate::from_ymd_opt(2024, 2, 2).unwrap(),
+                account_id: Some("acct-a".to_string()),
+                market: Some("US".to_string()),
+                benchmark_symbol: None,
+                base_currency: "USD".to_string(),
+            },
+        )
+        .unwrap();
+        save_override(
+            &db,
+            override_input("other", "non_trade", &["buy-b"], r#"{"review":"changed"}"#),
+        )
+        .unwrap();
+
+        assert!(save_override_candidate(&db, candidate).is_ok());
+        assert_eq!(list_overrides(&db).unwrap().overrides.len(), 2);
+    }
+
+    #[test]
+    fn unrelated_symbol_market_pair_does_not_invalidate_scoped_candidate() {
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy-a",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        let mut candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["buy-a"], "{}"),
+        )
+        .unwrap();
+        set_candidate_revision_scope(
+            &mut candidate,
+            CandidateRevisionScope {
+                report_start: NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+                report_end: NaiveDate::from_ymd_opt(2024, 2, 2).unwrap(),
+                price_start: NaiveDate::from_ymd_opt(2024, 1, 20).unwrap(),
+                evaluation_end: NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+                current_horizon: NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+                display_cutoff: NaiveDate::from_ymd_opt(2024, 2, 2).unwrap(),
+                account_ids: vec!["acct-a".to_string()],
+                markets: vec!["CN".to_string(), "US".to_string()],
+                securities: vec![
+                    ("600000".to_string(), "CN".to_string()),
+                    ("AAPL".to_string(), "US".to_string()),
+                ],
+                benchmark_symbols: vec![],
+                currencies: vec!["CNY".to_string(), "USD".to_string()],
+            },
+        );
+        super::pin_candidate_source_revision_after_cache_fill(&db, &mut candidate).unwrap();
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO stock_daily_prices
+                    (symbol, market, date, close, source, updated_at)
+                 VALUES ('AAPL', 'CN', '2024-02-02', 100, 'unrelated', '2024-02-02')",
+                [],
+            )
+            .unwrap();
+
+        assert!(save_override_candidate(&db, candidate).is_ok());
+    }
+
+    #[test]
+    fn candidate_revisions_are_compact_streaming_digests() {
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        let candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["buy"], "{}"),
+        )
+        .unwrap();
+
+        assert_eq!(candidate.active_override_revision.len(), 16);
+        assert_eq!(candidate.preparation_user_revision.len(), 16);
+        assert_eq!(candidate.review_source_revision.user.len(), 16);
+        assert_eq!(candidate.review_source_revision.cache.len(), 16);
     }
 
     #[test]

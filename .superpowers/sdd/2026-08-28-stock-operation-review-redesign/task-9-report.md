@@ -337,3 +337,102 @@ exit code: 0
 - The current price provider does not certify complete adjusted-close or corporate-action dividend coverage. PAY can support actual account income only; shadow total-return metrics remain price-only/unavailable unless a complete source is cached.
 - Account/market-filtered snapshots still lack authoritative historical cash. Their actual TWR remains unavailable even when exact local-to-base stock NAV is displayable; no cash balance is fabricated.
 - Full-source candidate revision is deliberately conservative and global. An unrelated write to a reviewed source table can force a rebuild, preferring rejection over returning a stale candidate.
+
+## Fix round 3: scoped source snapshots and explicit authority
+
+This section supersedes round 2's global candidate fingerprint, its session-row-only calendar boundary, and its treatment of filtered stock NAV as an authoritative portfolio denominator.
+
+- Implementation commit: `13e27ae` (`fix: enforce stock review source authority`).
+- No dependency was added. The pre-existing untracked `node_modules` directory remained untouched and unstaged.
+
+### Coherent candidate snapshot and scoped revisions
+
+- Candidate preparation now separates user-owned and cache-owned revisions. The query scope pins account, market, and report cutoff before asynchronous cache work. Cache fills may advance only the cache revision; if transactions, holdings, snapshots, splits, annotations, or quarterly context change during the async phase, pinning rejects the candidate instead of blessing the write.
+- After cache preparation, all candidate inputs are materialized against the pinned scoped revision and rechecked after reads. `save_override_candidate` recomputes the same scoped revision inside its SQLite write transaction before inserting. A concurrent source mutation therefore returns an error and has zero override side effects.
+- User revisions include scoped transactions, holdings, daily holding/portfolio snapshots, splits, annotations, and joined quarterly snapshot/holding context. Cache revisions include scoped stock/benchmark prices, exchange-session rows, calendar coverage metadata, and cached FX. An unrelated account transaction no longer invalidates a single-account candidate, while a report-visible quarterly mutation does.
+- Same-ID preview insertion replaces both the active and stale forms in memory and removes that record's stale issue. The returned preview matches a fresh report after persistence.
+- A production-path test injects an in-scope holding mutation precisely after async cache fill and before candidate pinning. Preparation rejects it with `A user-owned report source changed during cache preparation`, and the override table remains empty.
+
+### NAV, FX, Campaign, and split authority
+
+- Filtered NAV now has an explicit completeness flag. Missing FX on any valuation row clears the whole filtered series rather than averaging surviving rows. Even fully converted stock-only filtered snapshots cannot supply an authoritative cash denominator, so average NAV, turnover, and fee drag remain unavailable with `filtered_nav_cash_unavailable`.
+- Missing exact action-date FX clears action notional, fees, turnover, and fee-drag inputs with `action_fx_unavailable`; no partial or zero result is fabricated.
+- Campaign flows preserve their local amount and currency even when exact FX is absent. Base amounts and all dependent Campaign P&L/excursion fields become unavailable with `campaign_fx_unavailable`, so an economic BUY/SELL/PAY/fee row never disappears merely because conversion is missing.
+- Legacy current holdings with no position ledger are reversed through every recorded post-origin split, then post-origin split events replay exactly once. The live regression proves a current quantity of 20 after a 2:1 split becomes opening quantity 10 and ending quantity 20 with value preserved.
+
+### Authoritative calendar coverage
+
+- Added `stock_market_calendar_coverage` with market, source, complete range, revision, and an explicit `encodes_closed_dates` flag. `stock_market_sessions` now records `is_session`, allowing every calendar day in a certified range to be represented as open or closed.
+- Exact-session calculations require coverage spanning the requested origin/target or Campaign lifetime. A nonempty session table without coverage metadata is unavailable. A declared range with any missing interior calendar-day row is invalid. Campaign terminal metrics are unavailable when certified coverage stops before the report cutoff; the last cached session is never substituted.
+- Existing installations migrate `is_session` with a safe default, but old rows receive no implicit authority because coverage metadata is absent. Reset clears both session rows and coverage metadata. No live importer was invented; databases without an authoritative calendar remain honestly unavailable.
+
+### Annotation lifetime and interface cost
+
+- Campaign-scoped and action-scoped annotations remain exact. A stock-scoped annotation attaches to a Campaign only when `effective_date`, `effective_start`/`effective_end`, or the historical `snapshot_date` overlaps that Campaign, or when there is only one unambiguous account/symbol cycle. `created_at` is never treated as an economic date. Ambiguous undated same-symbol notes remain report/stock-level.
+- `CampaignTimelineItem.amount_base` is now optional and retains `amount_local` plus `currency`. The four base-currency Campaign P&L components are optional as well. This minimal model extension is required to preserve an unconverted economic flow while preventing partial base-currency metrics; snake-case serialization remains unchanged.
+
+### TDD RED/GREEN evidence
+
+The first round-3 production-path suite failed before implementation:
+
+```text
+persistence: 3 intended failures / 16 tests
+- in-scope holding mutation was blessed after async preparation
+- quarterly context mutation was invisible
+- unrelated account transaction invalidated a global source revision
+
+service: 5 intended failures / 38 tests
+- filtered NAV averaged the surviving exact-FX subset
+- stock-only filtered snapshots supplied an authoritative NAV denominator
+- missing action-date FX produced zero-valued ratio inputs
+- Campaign missing FX dropped economic flows
+- a legacy current holding replayed a split twice
+
+database: 2 intended failures
+- calendar coverage metadata table absent
+- reset did not clear coverage authority
+```
+
+Additional focused REDs captured a nonempty session table being accepted without coverage metadata, a missing interior day under declared coverage, Campaign coverage ending before its report cutoff, same-ID stale preview leakage, and the annotation-lifetime API mismatch:
+
+```text
+error[E0061]: annotation_applies_to_campaign expected 2 arguments but the cycle set was supplied
+```
+
+The async race regression first failed to compile because the cache-fill boundary did not exist, then passed only after the hook exercised the production preparation path and the user-source pin rejected the mutation. All focused suites are now GREEN without weakening status expectations.
+
+### Final verification
+
+```text
+cargo test --lib services::stock_review_persistence::tests
+16 passed; 0 failed
+
+cargo test --lib services::stock_review_service::tests
+44 passed; 0 failed
+
+cargo test --lib db::tests
+45 passed; 0 failed
+
+cargo test --lib
+483 passed; 0 failed; 8 ignored
+
+cargo check --lib
+passed
+
+npm run build
+TypeScript and Vite production build passed; existing large-chunk warning only
+
+rustfmt --edition 2021 --check <eight modified Rust files>
+exit code: 0
+
+git diff --check
+exit code: 0
+```
+
+### Remaining honest limitations after round 3
+
+- The repository still has no production exchange-calendar importer. The new schema is an explicit authority boundary for a future provider or deterministic fixture; live databases without certified complete ranges suppress exact-session metrics.
+- Scoped revisions are conservative where a source table has no account or symbol ownership, notably all-account portfolio totals, benchmark prices, and cached FX. A relevant-scope cache or global total mutation can still force a safe rebuild.
+- Filtered daily holding snapshots contain stock rows but no authoritative historical cash balance. They can display fully converted stock values, but portfolio-denominator ratios remain unavailable until account/market cash snapshots are persisted.
+- Legacy holdings with no transaction history remain an explicit fallback for no-trade reports. Recorded splits are handled exactly once, but an unrecorded trade or unknown holding as-of timestamp cannot be reconstructed; imports should preserve authoritative OPEN/transaction history.
+- The current quote provider still does not certify complete adjusted-close or corporate-action dividend coverage. Account PAY rows remain actual cash income only and cannot establish shadow total-return completeness.

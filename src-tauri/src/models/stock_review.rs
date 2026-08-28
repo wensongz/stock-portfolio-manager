@@ -162,12 +162,16 @@ pub struct RiskStructureWeight {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StockActionReview {
-    pub transaction_id: String,
+    pub action_id: String,
+    pub transaction_ids: Vec<String>,
     pub account_id: String,
     pub symbol: String,
     pub market: String,
     pub action_type: String,
     pub traded_at: String,
+    pub weighted_average_price: Option<f64>,
+    pub gross_amount: Option<f64>,
+    pub currency: Option<String>,
     pub shares_before: Option<f64>,
     pub shares_after: Option<f64>,
     pub portfolio_weight_before: Option<f64>,

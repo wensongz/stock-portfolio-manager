@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct ObservationWindowMaturity {
     pub required_market_sessions: u32,
     pub elapsed_market_sessions: u32,
+    pub status: MetricStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -67,15 +68,19 @@ pub fn build_stock_review_quality(input: &QualityInput) -> StockReviewDataQualit
     ]);
     let residual_status =
         classify_residual_status(input.attribution_residual, input.average_portfolio_nav);
-    let maturity_status = if input
-        .observation_windows
-        .iter()
-        .any(|window| window.elapsed_market_sessions < window.required_market_sessions)
-    {
-        MetricStatus::Pending
-    } else {
-        MetricStatus::Available
-    };
+    let maturity_status = merge_metric_statuses(
+        &input
+            .observation_windows
+            .iter()
+            .map(|window| {
+                if window.elapsed_market_sessions < window.required_market_sessions {
+                    merge_metric_statuses(&[window.status.clone(), MetricStatus::Pending])
+                } else {
+                    window.status.clone()
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
 
     let actual_result_status = input.actual_result_status.clone();
     let mut shadow_value_add_status = merge_metric_statuses(&[
@@ -252,10 +257,12 @@ mod tests {
             ObservationWindowMaturity {
                 required_market_sessions: 60,
                 elapsed_market_sessions: 42,
+                status: MetricStatus::Pending,
             },
             ObservationWindowMaturity {
                 required_market_sessions: 120,
                 elapsed_market_sessions: 42,
+                status: MetricStatus::Pending,
             },
         ];
 

@@ -4,7 +4,6 @@ use crate::models::stock_review::{
     StockCampaignDetail, StockReviewAnnotation, StockReviewAnnotationInput,
     StockReviewOverrideInput, StockReviewQuery, StockReviewReport,
 };
-use crate::services::stock_review_persistence::AnnotationSaveContext;
 use crate::services::{review_service, stock_review_service};
 use chrono::NaiveDate;
 use tauri::State;
@@ -31,6 +30,11 @@ fn query(
     };
     stock_review_service::validate_query(&query)?;
     Ok(query)
+}
+
+fn normalize_user_annotation(mut input: StockReviewAnnotationInput) -> StockReviewAnnotationInput {
+    input.source = "user".to_string();
+    input
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -82,15 +86,9 @@ pub async fn get_stock_campaign_detail(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn save_stock_review_annotation(
     input: StockReviewAnnotationInput,
-    ai_confirmed: Option<bool>,
     db: State<'_, Database>,
 ) -> Result<StockReviewAnnotation, String> {
-    let context = if ai_confirmed.unwrap_or(false) {
-        AnnotationSaveContext::AiAfterExplicitUserConfirmation
-    } else {
-        AnnotationSaveContext::UserInitiated
-    };
-    stock_review_service::save_stock_review_annotation(&db, input, context)
+    stock_review_service::save_user_stock_review_annotation(&db, normalize_user_annotation(input))
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -149,7 +147,24 @@ pub async fn get_reviewed_symbols(
 
 #[cfg(test)]
 mod tests {
-    use super::query;
+    use super::{normalize_user_annotation, query};
+    use crate::models::stock_review::StockReviewAnnotationInput;
+
+    #[test]
+    fn general_annotation_command_always_uses_user_provenance() {
+        // Caller data must not be able to self-authorize ai_confirmed provenance.
+        let normalized = normalize_user_annotation(StockReviewAnnotationInput {
+            id: "note".to_string(),
+            scope_type: "period".to_string(),
+            scope_key: "2024".to_string(),
+            account_id: None,
+            symbol: None,
+            annotation_type: "note".to_string(),
+            value_json: "{}".to_string(),
+            source: "ai_confirmed".to_string(),
+        });
+        assert_eq!(normalized.source, "user");
+    }
 
     #[test]
     fn stock_review_query_boundary_validates_and_normalizes_displayable_inputs() {

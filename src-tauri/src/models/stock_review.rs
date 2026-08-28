@@ -317,6 +317,7 @@ pub struct StockCampaignDetail {
     pub completed_sample_count: usize,
     pub active_sample_count: usize,
     pub annotations: Vec<StockReviewAnnotation>,
+    pub issues: Vec<StockReviewIssue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

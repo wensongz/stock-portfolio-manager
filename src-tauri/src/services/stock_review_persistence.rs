@@ -45,6 +45,13 @@ pub struct StockReviewOverrideList {
     pub issues: Vec<StockReviewIssue>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ValidatedOverrideCandidate {
+    pub input: StockReviewOverrideInput,
+    active_override_revision: String,
+    reference_fingerprint_json: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct TransactionReferenceFingerprint {
     id: String,
@@ -188,9 +195,47 @@ pub fn save_override(
     db: &Database,
     input: StockReviewOverrideInput,
 ) -> Result<StockReviewOverride, String> {
+    let candidate = prepare_override_candidate(db, input)?;
+    save_override_candidate(db, candidate)
+}
+
+pub fn prepare_override_candidate(
+    db: &Database,
+    input: StockReviewOverrideInput,
+) -> Result<ValidatedOverrideCandidate, String> {
     let input = normalize_override_input(input)?;
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let validation = validate_normalized_override(&conn, &input)?;
+    if !validation.is_valid {
+        return Err(format_override_validation_error(&validation));
+    }
+    let references =
+        load_transactions(&conn, &parse_transaction_ids(&input.transaction_ids_json)?)?;
+    let fingerprints = references
+        .iter()
+        .map(TransactionReferenceFingerprint::from_transaction)
+        .collect::<Vec<_>>();
+    Ok(ValidatedOverrideCandidate {
+        input,
+        active_override_revision: active_override_revision(&conn)?,
+        reference_fingerprint_json: serde_json::to_string(&fingerprints)
+            .map_err(|error| error.to_string())?,
+    })
+}
+
+pub fn save_override_candidate(
+    db: &Database,
+    candidate: ValidatedOverrideCandidate,
+) -> Result<StockReviewOverride, String> {
+    let input = candidate.input;
     let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
     let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    if active_override_revision(&transaction)? != candidate.active_override_revision {
+        return Err(
+            "The active override set changed while the candidate report was being built; rebuild the report before confirming."
+                .to_string(),
+        );
+    }
     let validation = validate_normalized_override(&transaction, &input)?;
     if !validation.is_valid {
         return Err(format_override_validation_error(&validation));
@@ -203,6 +248,14 @@ pub fn save_override(
         .iter()
         .map(TransactionReferenceFingerprint::from_transaction)
         .collect::<Vec<_>>();
+    let current_fingerprint_json =
+        serde_json::to_string(&fingerprints).map_err(|error| error.to_string())?;
+    if current_fingerprint_json != candidate.reference_fingerprint_json {
+        return Err(
+            "The referenced source transactions changed while the candidate report was being built; rebuild before confirming."
+                .to_string(),
+        );
+    }
     let now = next_audit_timestamp(&transaction, "stock_review_overrides", &input.id)?;
     transaction
         .execute(
@@ -220,7 +273,7 @@ pub fn save_override(
                 input.override_type,
                 input.transaction_ids_json,
                 input.value_json,
-                serde_json::to_string(&fingerprints).map_err(|error| error.to_string())?,
+                current_fingerprint_json,
                 now,
             ],
         )
@@ -235,6 +288,27 @@ pub fn save_override(
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(override_record)
+}
+
+fn active_override_revision(conn: &Connection) -> Result<String, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, updated_at, reference_fingerprint_json
+             FROM stock_review_overrides ORDER BY id ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    serde_json::to_string(&rows).map_err(|error| error.to_string())
 }
 
 pub fn list_overrides(db: &Database) -> Result<StockReviewOverrideList, String> {
@@ -784,8 +858,9 @@ fn format_override_validation_error(validation: &OverrideValidationResult) -> St
 #[cfg(test)]
 mod tests {
     use super::{
-        list_annotations, list_overrides, monotonic_audit_timestamp, save_annotation,
-        save_override, validate_override, AnnotationSaveContext, StockReviewAnnotationFilter,
+        list_annotations, list_overrides, monotonic_audit_timestamp, prepare_override_candidate,
+        save_annotation, save_override, save_override_candidate, validate_override,
+        AnnotationSaveContext, StockReviewAnnotationFilter,
     };
     use crate::db::Database;
     use crate::models::stock_review::{
@@ -1156,6 +1231,45 @@ mod tests {
             second.transaction_ids_json,
             r#"["transfer-out","transfer-in"]"#
         );
+    }
+
+    #[test]
+    fn prepared_override_rejects_a_changed_active_override_revision() {
+        // Saving another active correction after preview must invalidate the
+        // prepared candidate instead of returning a stale report.
+        let db = database();
+        insert_transaction(
+            &db,
+            "first",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        insert_transaction(
+            &db,
+            "second",
+            "acct-a",
+            "MSFT",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        let candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["first"], "{}"),
+        )
+        .unwrap();
+        save_override(
+            &db,
+            override_input("concurrent", "non_trade", &["second"], "{}"),
+        )
+        .unwrap();
+        assert!(save_override_candidate(&db, candidate).is_err());
+        assert_eq!(list_overrides(&db).unwrap().overrides.len(), 1);
     }
 
     #[test]

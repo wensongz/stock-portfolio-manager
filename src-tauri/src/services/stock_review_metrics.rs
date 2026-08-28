@@ -1519,6 +1519,7 @@ pub fn calculate_campaign_detail(input: &CampaignDetailInput) -> StockCampaignDe
             input.summary.campaign_status == StockCampaignStatus::Active,
         ),
         annotations: input.annotations.clone(),
+        issues: vec![],
     }
 }
 

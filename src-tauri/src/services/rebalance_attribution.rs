@@ -950,6 +950,79 @@ mod tests {
     }
 
     #[test]
+    fn missing_average_nav_makes_calculator_summary_unavailable() {
+        // Defaulting a missing average NAV to any numeric denominator must make this fail.
+        let mut input = identity_input();
+        input.average_portfolio_nav = None;
+
+        let summary = calculate_rebalance_attribution(&input);
+
+        assert_eq!(summary.availability.status, MetricStatus::Unavailable);
+        assert!(summary
+            .availability
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("Average portfolio NAV"));
+        assert_eq!(summary.residual, None);
+        assert_eq!(summary.action_contributions, vec![]);
+    }
+
+    #[test]
+    fn non_positive_or_non_finite_average_nav_makes_calculator_summary_unavailable() {
+        // Zero, negative, and NaN cannot be valid percentage denominators.
+        for invalid_nav in [0.0, -1.0, f64::NAN] {
+            let mut input = identity_input();
+            input.average_portfolio_nav = Some(invalid_nav);
+
+            let summary = calculate_rebalance_attribution(&input);
+
+            assert_eq!(
+                summary.availability.status,
+                MetricStatus::Unavailable,
+                "invalid average NAV {invalid_nav:?} must be unavailable"
+            );
+            assert_eq!(summary.residual_to_average_nav, None);
+        }
+    }
+
+    #[test]
+    fn residual_exactly_point_one_percent_remains_available() {
+        // 10 / 10,000 = exactly 0.1%, the inclusive available boundary.
+        let mut input = identity_input();
+        input.valuations[1]
+            .cash_balances
+            .iter_mut()
+            .find(|cash| cash.currency == "USD")
+            .unwrap()
+            .actual_amount += 10.0;
+
+        let summary = calculate_rebalance_attribution(&input);
+
+        assert_eq!(summary.availability.status, MetricStatus::Available);
+        assert!((summary.residual.unwrap() - 10.0).abs() < 1e-9);
+        assert!((summary.residual_to_average_nav.unwrap() - 0.001).abs() < 1e-12);
+    }
+
+    #[test]
+    fn residual_exactly_point_five_percent_remains_degraded() {
+        // 50 / 10,000 = exactly 0.5%, the inclusive degraded boundary.
+        let mut input = identity_input();
+        input.valuations[1]
+            .cash_balances
+            .iter_mut()
+            .find(|cash| cash.currency == "USD")
+            .unwrap()
+            .actual_amount += 50.0;
+
+        let summary = calculate_rebalance_attribution(&input);
+
+        assert_eq!(summary.availability.status, MetricStatus::Degraded);
+        assert!((summary.residual.unwrap() - 50.0).abs() < 1e-9);
+        assert!((summary.residual_to_average_nav.unwrap() - 0.005).abs() < 1e-12);
+    }
+
+    #[test]
     fn split_adjusts_action_batch_quantity_and_price_basis_without_creating_an_action() {
         // 10 shares at 100 split 2:1 to 20 at 50 (zero P&L), then rise to 55 (+100).
         let input = AttributionInput {

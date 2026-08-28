@@ -1643,6 +1643,93 @@ fn collection_row_key(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+fn canonical_value_sort_key(value: &Value, output: &mut String) {
+    match value {
+        Value::Null => output.push_str("null"),
+        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        Value::Number(value) => output.push_str(&value.to_string()),
+        Value::String(value) => {
+            output.push_str(&serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()))
+        }
+        Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                canonical_value_sort_key(value, output);
+            }
+            output.push(']');
+        }
+        Value::Object(object) => {
+            output.push('{');
+            let mut entries: Vec<_> = object.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()));
+                output.push(':');
+                canonical_value_sort_key(value, output);
+            }
+            output.push('}');
+        }
+    }
+}
+
+fn append_sort_key_field(output: &mut String, value: &str) {
+    output.push_str(&value.len().to_string());
+    output.push(':');
+    output.push_str(value);
+    output.push('|');
+}
+
+fn issue_semantic_sort_key(issue: &Value) -> String {
+    let code = issue
+        .get("code")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let symbol = issue
+        .get("affected_symbol")
+        .and_then(Value::as_str)
+        .and_then(crate::models::stock_review::normalized_stock_symbol)
+        .unwrap_or_default();
+    let date = issue
+        .get("affected_date")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let mut value = String::new();
+    canonical_value_sort_key(issue.get("value").unwrap_or(&Value::Null), &mut value);
+    let mut details = String::new();
+    canonical_value_sort_key(issue.get("details").unwrap_or(&Value::Null), &mut details);
+    let mut remaining = issue.clone();
+    if let Some(object) = remaining.as_object_mut() {
+        for key in [
+            "code",
+            "affected_symbol",
+            "affected_date",
+            "value",
+            "details",
+        ] {
+            object.remove(key);
+        }
+    }
+    let remaining = {
+        let mut key = String::new();
+        canonical_value_sort_key(&remaining, &mut key);
+        key
+    };
+
+    let mut key = String::new();
+    for field in [code, &symbol, date, &value, &details, &remaining] {
+        append_sort_key_field(&mut key, field);
+    }
+    key
+}
+
 fn row_is_selected_reference(
     value: &Value,
     path: &str,
@@ -1716,7 +1803,9 @@ fn cap_stock_review_collections(
                         path,
                         "report.data_quality.issues" | "campaign_detail.issues"
                     ) {
-                        selected_order
+                        selected_order.then_with(|| {
+                            issue_semantic_sort_key(left).cmp(&issue_semantic_sort_key(right))
+                        })
                     } else {
                         selected_order
                             .then_with(|| {
@@ -2534,6 +2623,66 @@ mod tests {
                 .as_u64()
                 .unwrap()
                 > 0
+        );
+    }
+
+    #[test]
+    fn issue_caps_are_byte_stable_for_equivalent_permuted_inputs() {
+        let issues = (0..32)
+            .map(|index| {
+                let code = if index < 3 {
+                    format!("ambiguous-{index:02}")
+                } else {
+                    format!("quality-{index:02}")
+                };
+                json!({
+                    "code": code,
+                    "severity": if index % 2 == 0 { "warning" } else { "error" },
+                    "affected_symbol": if index % 2 == 0 { " aapl " } else { "MSFT" },
+                    "affected_date": format!("2026-01-{:02}", index % 28 + 1),
+                    "details": { "z": index, "a": index % 3 },
+                    "value": { "b": index % 5, "a": index },
+                    "message": format!("issue {index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut permuted = issues.clone();
+        permuted.reverse();
+        let payload = |report_issues: Vec<Value>, detail_issues: Vec<Value>| {
+            compact_stock_review_payload(
+                json!({
+                    "summary": {},
+                    "actions": [],
+                    "campaigns": [],
+                    "attribution": {},
+                    "risk_structure": {},
+                    "data_quality": { "issues": report_issues },
+                    "annotations": []
+                }),
+                None,
+                None,
+                Some(json!({ "issues": detail_issues })),
+            )
+            .unwrap()
+        };
+
+        let forward = payload(issues.clone(), issues);
+        let reverse = payload(permuted.clone(), permuted);
+        assert_eq!(
+            forward["report"]["data_quality"]["issues"].to_string(),
+            reverse["report"]["data_quality"]["issues"].to_string()
+        );
+        assert_eq!(
+            forward["campaign_detail"]["issues"].to_string(),
+            reverse["campaign_detail"]["issues"].to_string()
+        );
+        assert_eq!(
+            forward["context_limits"]["report.data_quality.issues"].to_string(),
+            reverse["context_limits"]["report.data_quality.issues"].to_string()
+        );
+        assert_eq!(
+            forward["context_limits"]["campaign_detail.issues"].to_string(),
+            reverse["context_limits"]["campaign_detail.issues"].to_string()
         );
     }
 

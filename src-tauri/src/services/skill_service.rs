@@ -87,7 +87,7 @@ pub fn skills_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// whose on-disk version is older than this — but ONLY if the user hasn't
 /// edited it (the `.builtin/{stem}` marker still exists). User-edited skills
 /// (marker removed by `save_skill`) are never auto-overwritten.
-const BUILTIN_SKILLS_VERSION: u32 = 8;
+const BUILTIN_SKILLS_VERSION: u32 = 9;
 
 /// Materialise built-in skills into the user directory on first launch, and
 /// auto-update them when [`BUILTIN_SKILLS_VERSION`] bumps.
@@ -605,33 +605,41 @@ where
         }
     }
 
-    // Built-in review skills need both an analysis intent and an explicit
-    // instrument domain. Frontmatter keywords remain useful for discovery,
-    // but nouns such as "期权交易" and "Campaign" must not activate a review
-    // merely because they appear in an import or unrelated command.
-    let has_review_intent = haystack.contains("复盘")
-        || contains_whole_word(&haystack, "review")
-        || haystack.contains("历史表现")
-        || haystack.contains("历史campaign")
-        || haystack.contains("权利金留存率");
-    let has_stock_domain = haystack.contains("股票") || haystack.contains("调仓");
+    // Built-in review skills need an explicit review intent and instrument
+    // semantics; option-only historical aliases are the narrow exception.
+    // Frontmatter keywords remain useful for discovery, but nouns such as
+    // "期权交易" and "Campaign" must not activate an unrelated review.
+    let explicit_review_intent =
+        haystack.contains("复盘") || contains_whole_word(&haystack, "review");
     let has_option_domain = haystack.contains("期权")
         || contains_whole_word(&haystack, "csp")
         || haystack.contains("covered call")
         || haystack.contains("权利金");
+    let option_historical_alias = has_option_domain
+        && (haystack.contains("历史表现")
+            || haystack.contains("历史campaign")
+            || haystack.contains("权利金留存率"));
+    let has_option_review =
+        has_option_domain && (explicit_review_intent || option_historical_alias);
+    let has_stock_review = explicit_review_intent
+        && (haystack.contains("调仓")
+            || (haystack.contains("股票")
+                && (haystack.contains("操作")
+                    || haystack.contains("campaign")
+                    || haystack.contains("复盘报告"))));
 
     out.retain(|skill| {
-        !matches!(skill.id.as_str(), "stock-review" | "options-review") || has_review_intent
+        !matches!(skill.id.as_str(), "stock-review" | "options-review")
+            || (skill.id == "stock-review" && has_stock_review)
+            || (skill.id == "options-review" && has_option_review)
     });
-    if has_review_intent {
-        for (id, active) in [
-            ("options-review", has_option_domain),
-            ("stock-review", has_stock_domain),
-        ] {
-            if active && !out.iter().any(|skill| skill.id == id) {
-                if let Some(skill) = skills.iter().find(|skill| skill.id == id) {
-                    out.push((**skill).clone());
-                }
+    for (id, active) in [
+        ("options-review", has_option_review),
+        ("stock-review", has_stock_review),
+    ] {
+        if active && !out.iter().any(|skill| skill.id == id) {
+            if let Some(skill) = skills.iter().find(|skill| skill.id == id) {
+                out.push((**skill).clone());
             }
         }
     }
@@ -1022,6 +1030,29 @@ mod tests {
     }
 
     #[test]
+    fn stock_review_requires_operation_rebalance_or_campaign_review_semantics() {
+        for text in [
+            "这只股票历史表现怎么样",
+            "查询这只股票的风险",
+            "导入股票交易记录",
+            "查询股票行情",
+        ] {
+            assert!(
+                !activated_ids(text).iter().any(|id| id == "stock-review"),
+                "stock-review must stay inactive for {text}"
+            );
+        }
+
+        for text in ["股票操作复盘", "复盘股票调仓", "股票 Campaign 复盘"] {
+            assert_eq!(activated_ids(text), vec!["stock-review"], "{text}");
+        }
+        assert_eq!(
+            activated_ids("一起复盘股票调仓和期权交易"),
+            vec!["options-review", "stock-review"]
+        );
+    }
+
+    #[test]
     fn stock_review_response_policy_is_fact_first_and_non_judgmental() {
         let policy = stock_review_response_policy();
         assert_eq!(
@@ -1160,10 +1191,70 @@ mod tests {
         assert!(skills_dir.join("stock-review.md").exists());
         assert_eq!(
             fs::read_to_string(marker_dir.join("stock-review")).unwrap(),
-            "8"
+            "9"
         );
         assert!(skills_dir.join("my-private-process.md").exists());
         assert!(!marker_dir.join("my-private-process").exists());
+    }
+
+    #[test]
+    fn version_eight_upgrade_replaces_review_builtins_and_routes_from_migrated_disk_content() {
+        let dir = tempdir().unwrap();
+        let skills_dir = dir.path();
+        let marker_dir = skills_dir.join(BUILTIN_MARKER_DIR);
+        fs::create_dir_all(&marker_dir).unwrap();
+        write(
+            &skills_dir.join("options-review.md"),
+            "---\nname: old options\ndescription: old\ntrigger: 期权交易,Campaign复盘\nenabled: true\n---\nold options\n",
+        );
+        write(
+            &skills_dir.join("stock-review.md"),
+            "---\nname: old stock\ndescription: old\ntrigger: 股票历史表现\nenabled: true\n---\nold stock\n",
+        );
+        write(&marker_dir.join("options-review"), "8");
+        write(&marker_dir.join("stock-review"), "8");
+        let custom = "---\nname: private\ndescription: user owned\ntrigger: private\nenabled: true\n---\ncustom body\n";
+        write(&skills_dir.join("my-private-process.md"), custom);
+
+        export_builtin_skills_to_dir(skills_dir).unwrap();
+
+        for stem in ["options-review", "stock-review"] {
+            let embedded = BUILTIN_SKILLS
+                .iter()
+                .find(|(candidate, _)| *candidate == stem)
+                .unwrap()
+                .1;
+            assert_eq!(
+                fs::read_to_string(skills_dir.join(format!("{stem}.md"))).unwrap(),
+                embedded
+            );
+            assert_eq!(fs::read_to_string(marker_dir.join(stem)).unwrap(), "9");
+        }
+        assert_eq!(
+            fs::read_to_string(skills_dir.join("my-private-process.md")).unwrap(),
+            custom
+        );
+        assert!(!marker_dir.join("my-private-process").exists());
+
+        let migrated = ["trade-review", "options-review", "stock-review"]
+            .into_iter()
+            .map(|stem| parse_skill_file(&skills_dir.join(format!("{stem}.md"))).unwrap())
+            .collect::<Vec<_>>();
+        let disk_ids = |text: &str| {
+            match_triggers(&migrated, text)
+                .into_iter()
+                .map(|skill| skill.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(disk_ids("股票 Campaign 复盘"), vec!["stock-review"]);
+        assert_eq!(disk_ids("复盘期权交易"), vec!["options-review"]);
+        assert_eq!(
+            disk_ids("一起复盘股票调仓和期权交易"),
+            vec!["options-review", "stock-review"]
+        );
+        assert!(!disk_ids("这只股票历史表现怎么样")
+            .iter()
+            .any(|id| id == "stock-review"));
     }
 
     // --- parse_frontmatter ---------------------------------------------------

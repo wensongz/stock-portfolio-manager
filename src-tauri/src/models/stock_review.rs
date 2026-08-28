@@ -14,6 +14,26 @@ pub fn stock_symbols_equal(left: &str, right: &str) -> bool {
     normalized_stock_symbol(left) == normalized_stock_symbol(right)
 }
 
+/// Canonical comparison key for stock markets. Display strings remain sourced
+/// from the first ledger row; identity comparisons use this trimmed key.
+pub fn normalized_stock_market(market: &str) -> Option<String> {
+    let market = market.trim();
+    (!market.is_empty()).then(|| market.to_ascii_uppercase())
+}
+
+pub fn stock_markets_equal(left: &str, right: &str) -> bool {
+    normalized_stock_market(left) == normalized_stock_market(right)
+}
+
+pub fn stock_securities_equal(
+    left_symbol: &str,
+    left_market: &str,
+    right_symbol: &str,
+    right_market: &str,
+) -> bool {
+    stock_symbols_equal(left_symbol, right_symbol) && stock_markets_equal(left_market, right_market)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricStatus {

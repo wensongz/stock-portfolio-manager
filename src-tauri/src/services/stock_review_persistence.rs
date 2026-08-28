@@ -2,8 +2,9 @@
 
 use crate::db::Database;
 use crate::models::stock_review::{
-    normalized_stock_symbol, StockReviewAnnotation, StockReviewAnnotationInput, StockReviewIssue,
-    StockReviewIssueSeverity, StockReviewOverride, StockReviewOverrideInput, StockReviewQuery,
+    normalized_stock_symbol, stock_securities_equal, StockReviewAnnotation,
+    StockReviewAnnotationInput, StockReviewIssue, StockReviewIssueSeverity, StockReviewOverride,
+    StockReviewOverrideInput, StockReviewQuery,
 };
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
 use rusqlite::types::{Value as SqlValue, ValueRef};
@@ -1353,7 +1354,7 @@ fn validate_transfer(transactions: &[StoredTransaction], issues: &mut Vec<StockR
         || (normalized_type(&first.transaction_type) == "BUY"
             && normalized_type(&second.transaction_type) == "SELL");
     if first.account_id == second.account_id
-        || normalize_symbol(&first.symbol).ok() != normalize_symbol(&second.symbol).ok()
+        || !stock_securities_equal(&first.symbol, &first.market, &second.symbol, &second.market)
         || !reversed_sides
         || !approximately_equal(first.shares.abs(), second.shares.abs())
         || first.shares <= 0.0
@@ -1361,7 +1362,7 @@ fn validate_transfer(transactions: &[StoredTransaction], issues: &mut Vec<StockR
     {
         issues.push(validation_issue(
             "invalid_transfer",
-            "Transfer references must be opposite BUY/SELL records in different accounts with the same normalized symbol and quantity.",
+            "Transfer references must be opposite BUY/SELL records in different accounts with the same normalized symbol, normalized market, and quantity.",
         ));
     }
 }
@@ -1382,7 +1383,7 @@ fn validate_duplicate(transactions: &[StoredTransaction], issues: &mut Vec<Stock
     {
         issues.push(validation_issue(
             "invalid_duplicate",
-            "Duplicate transactions must have the same account, symbol, type, trade date, quantity, price, amount, commission, and currency.",
+            "Duplicate transactions must have the same account, symbol, market, type, trade date, quantity, price, amount, commission, and currency.",
         ));
     }
 }
@@ -1578,7 +1579,7 @@ fn parse_transaction_ids(json: &str) -> Result<Vec<String>, String> {
 
 fn economically_equivalent(left: &StoredTransaction, right: &StoredTransaction) -> bool {
     left.account_id == right.account_id
-        && normalize_symbol(&left.symbol).ok() == normalize_symbol(&right.symbol).ok()
+        && stock_securities_equal(&left.symbol, &left.market, &right.symbol, &right.market)
         && normalized_type(&left.transaction_type) == normalized_type(&right.transaction_type)
         && trade_date(&left.traded_at) == trade_date(&right.traded_at)
         && approximately_equal(left.shares, right.shares)
@@ -3621,5 +3622,85 @@ mod tests {
         assert!(listed.overrides.is_empty());
         assert_eq!(listed.stale_overrides.len(), 1);
         assert_eq!(listed.stale_overrides[0].id, "us-order");
+    }
+
+    #[test]
+    fn duplicate_and_transfer_validation_reject_equal_symbols_across_markets() {
+        // Duplicate and transfer confirmation both represent one economic
+        // security, so symbol-only equality must not bridge US and CN rows.
+        let db = database();
+        insert_transaction(
+            &db,
+            "duplicate-us",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        insert_transaction(
+            &db,
+            "duplicate-cn",
+            "acct-a",
+            "aapl",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        insert_transaction(
+            &db,
+            "transfer-us",
+            "acct-a",
+            "AAPL",
+            "SELL",
+            5.0,
+            100.0,
+            "2024-02-02",
+        );
+        insert_transaction(
+            &db,
+            "transfer-cn",
+            "acct-b",
+            "aapl",
+            "BUY",
+            5.0,
+            100.0,
+            "2024-02-02",
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE transactions SET market = 'CN'
+                 WHERE id IN ('duplicate-cn', 'transfer-cn')",
+                [],
+            )
+            .unwrap();
+
+        let duplicate = validate_override(
+            &db,
+            &override_input(
+                "cross-market-duplicate",
+                "duplicate",
+                &["duplicate-us", "duplicate-cn"],
+                "{}",
+            ),
+        )
+        .unwrap();
+        let transfer = validate_override(
+            &db,
+            &override_input(
+                "cross-market-transfer",
+                "transfer",
+                &["transfer-us", "transfer-cn"],
+                "{}",
+            ),
+        )
+        .unwrap();
+
+        assert!(!duplicate.is_valid);
+        assert!(!transfer.is_valid);
     }
 }

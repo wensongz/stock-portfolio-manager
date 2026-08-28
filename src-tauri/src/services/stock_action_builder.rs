@@ -1,6 +1,7 @@
 use crate::models::stock_review::{
-    normalized_stock_symbol, stock_symbols_equal, ForwardEffectWindow, MetricStatus,
-    StockActionReview, StockReviewIssue, StockReviewIssueSeverity, StockReviewOverride,
+    normalized_stock_market, normalized_stock_symbol, stock_securities_equal, ForwardEffectWindow,
+    MetricStatus, StockActionReview, StockReviewIssue, StockReviewIssueSeverity,
+    StockReviewOverride,
 };
 use crate::models::Transaction;
 use crate::services::quote_service::is_cash_symbol;
@@ -67,7 +68,7 @@ pub fn build_stock_actions(
     transactions: &[Transaction],
     overrides: &[StockReviewOverride],
 ) -> ActionBuildResult {
-    let override_state = OverrideState::from_overrides(overrides);
+    let override_state = OverrideState::from_overrides(overrides, transactions);
     let mut records: Vec<ReplayRecord<'_>> = transactions
         .iter()
         .filter(|transaction| !override_state.excluded_ids.contains(&transaction.id))
@@ -87,12 +88,12 @@ pub fn build_stock_actions(
         })
         .collect::<Vec<_>>();
 
-    let mut shares_by_position: HashMap<(String, String), f64> = HashMap::new();
+    let mut shares_by_position: HashMap<(String, String, String), f64> = HashMap::new();
     let mut actions = Vec::new();
     let mut position_events = Vec::new();
     let mut issues = duplicate_issues(&override_state.duplicate_ids, transactions);
     let mut fills: Vec<ActionFill<'_>> = Vec::new();
-    let mut date_only_reversals: HashSet<(String, String, NaiveDate)> = HashSet::new();
+    let mut date_only_reversals: HashSet<(String, String, String, NaiveDate)> = HashSet::new();
 
     for record in records {
         let transaction = record.transaction;
@@ -117,6 +118,7 @@ pub fn build_stock_actions(
         let key = (
             transaction.account_id.clone(),
             symbol_key(&transaction.symbol),
+            market_key(&transaction.market),
         );
         let shares_before = *shares_by_position.get(&key).unwrap_or(&0.0);
         let delta = match transaction.transaction_type.as_str() {
@@ -213,6 +215,7 @@ pub fn build_stock_actions(
             date_only_reversals.insert((
                 transaction.account_id.clone(),
                 symbol_key(&transaction.symbol),
+                market_key(&transaction.market),
                 trade_date,
             ));
         }
@@ -233,12 +236,13 @@ pub fn build_stock_actions(
             .map(|value| (*value).to_string());
     }
 
-    for (account_id, normalized_symbol, date) in date_only_reversals {
+    for (account_id, normalized_symbol, normalized_market, date) in date_only_reversals {
         let relevant_events = position_events
             .iter()
             .filter(|event| {
                 event.account_id == account_id
                     && symbol_key(&event.symbol) == normalized_symbol
+                    && market_key(&event.market) == normalized_market
                     && event.trade_date == date
                     && event.is_date_precision
                     && (event.transaction_type == "BUY" || event.transaction_type == "SELL")
@@ -281,18 +285,28 @@ struct OverrideState {
 }
 
 impl OverrideState {
-    fn from_overrides(overrides: &[StockReviewOverride]) -> Self {
+    fn from_overrides(overrides: &[StockReviewOverride], transactions: &[Transaction]) -> Self {
         let mut state = Self {
             excluded_ids: HashSet::new(),
             duplicate_ids: HashSet::new(),
             transfer_ids: HashSet::new(),
             same_day_order: HashMap::new(),
         };
+        let transactions_by_id = transactions
+            .iter()
+            .map(|transaction| (transaction.id.as_str(), transaction))
+            .collect::<HashMap<_, _>>();
         for override_record in overrides {
             let ids = parse_ids(&override_record.transaction_ids_json);
+            let references = override_references(&ids, &transactions_by_id);
             match override_record.override_type.as_str() {
                 "non_trade" => state.excluded_ids.extend(ids),
                 "duplicate" => {
+                    if references.as_ref().is_some_and(|references| {
+                        references.len() >= 2 && !same_account_security(references)
+                    }) {
+                        continue;
+                    }
                     state.duplicate_ids.extend(ids.iter().cloned());
                     if ids.len() < 2 {
                         state.excluded_ids.extend(ids);
@@ -302,8 +316,21 @@ impl OverrideState {
                         state.excluded_ids.extend(ids.into_iter().skip(1));
                     }
                 }
-                "transfer" => state.transfer_ids.extend(ids),
+                "transfer" => {
+                    if references.as_ref().is_some_and(|references| {
+                        references.len() == 2 && !same_security(references)
+                    }) {
+                        continue;
+                    }
+                    state.transfer_ids.extend(ids);
+                }
                 "same_day_order" => {
+                    if references
+                        .as_ref()
+                        .is_some_and(|references| !same_position_day(references))
+                    {
+                        continue;
+                    }
                     let ordered_ids = parse_ids(&override_record.value_json);
                     for (index, id) in ordered_ids.iter().enumerate() {
                         state.same_day_order.insert(id.clone(), index);
@@ -316,6 +343,55 @@ impl OverrideState {
     }
 }
 
+fn override_references<'a>(
+    ids: &[String],
+    transactions_by_id: &HashMap<&str, &'a Transaction>,
+) -> Option<Vec<&'a Transaction>> {
+    let references = ids
+        .iter()
+        .filter_map(|id| transactions_by_id.get(id.as_str()).copied())
+        .collect::<Vec<_>>();
+    (references.len() == ids.len()).then_some(references)
+}
+
+fn same_security(references: &[&Transaction]) -> bool {
+    references.first().is_none_or(|first| {
+        references.iter().skip(1).all(|transaction| {
+            stock_securities_equal(
+                &first.symbol,
+                &first.market,
+                &transaction.symbol,
+                &transaction.market,
+            )
+        })
+    })
+}
+
+fn same_account_security(references: &[&Transaction]) -> bool {
+    references.first().is_none_or(|first| {
+        references
+            .iter()
+            .skip(1)
+            .all(|transaction| transaction.account_id == first.account_id)
+    }) && same_security(references)
+}
+
+fn same_position_day(references: &[&Transaction]) -> bool {
+    references.first().is_none_or(|first| {
+        let first_date = trade_date(&first.traded_at);
+        references.iter().skip(1).all(|transaction| {
+            transaction.account_id == first.account_id
+                && stock_securities_equal(
+                    &first.symbol,
+                    &first.market,
+                    &transaction.symbol,
+                    &transaction.market,
+                )
+                && trade_date(&transaction.traded_at) == first_date
+        })
+    })
+}
+
 fn compare_records(
     left: &ReplayRecord<'_>,
     right: &ReplayRecord<'_>,
@@ -324,7 +400,12 @@ fn compare_records(
     let left_date = trade_date(&left.transaction.traded_at);
     let right_date = trade_date(&right.transaction.traded_at);
     if left.transaction.account_id == right.transaction.account_id
-        && stock_symbols_equal(&left.transaction.symbol, &right.transaction.symbol)
+        && stock_securities_equal(
+            &left.transaction.symbol,
+            &left.transaction.market,
+            &right.transaction.symbol,
+            &right.transaction.market,
+        )
         && left_date == right_date
     {
         if let (Some(left_rank), Some(right_rank)) = (
@@ -353,7 +434,12 @@ fn same_action_group(
     is_transfer: bool,
 ) -> bool {
     previous.record.transaction.account_id == transaction.account_id
-        && stock_symbols_equal(&previous.record.transaction.symbol, &transaction.symbol)
+        && stock_securities_equal(
+            &previous.record.transaction.symbol,
+            &previous.record.transaction.market,
+            &transaction.symbol,
+            &transaction.market,
+        )
         && previous.trade_date == trade_date
         && previous.side == side
         && previous.record.is_transfer == is_transfer
@@ -453,6 +539,10 @@ fn symbol_key(symbol: &str) -> String {
     normalized_stock_symbol(symbol).unwrap_or_else(|| symbol.trim().to_string())
 }
 
+fn market_key(market: &str) -> String {
+    normalized_stock_market(market).unwrap_or_else(|| market.trim().to_string())
+}
+
 fn trade_date(traded_at: &str) -> Option<NaiveDate> {
     traded_at
         .get(..10)
@@ -501,19 +591,46 @@ mod tests {
         price: f64,
         traded_at: &str,
     ) -> Transaction {
+        transaction_in_market(
+            id,
+            account_id,
+            symbol,
+            "US",
+            transaction_type,
+            shares,
+            price,
+            traded_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transaction_in_market(
+        id: &str,
+        account_id: &str,
+        symbol: &str,
+        market: &str,
+        transaction_type: &str,
+        shares: f64,
+        price: f64,
+        traded_at: &str,
+    ) -> Transaction {
         Transaction {
             id: id.to_string(),
             holding_id: None,
             account_id: account_id.to_string(),
             symbol: symbol.to_string(),
             name: symbol.to_string(),
-            market: "US".to_string(),
+            market: market.to_string(),
             transaction_type: transaction_type.to_string(),
             shares,
             price,
             total_amount: shares * price,
             commission: 0.0,
-            currency: "USD".to_string(),
+            currency: if market.eq_ignore_ascii_case("CN") {
+                "CNY".to_string()
+            } else {
+                "USD".to_string()
+            },
             traded_at: traded_at.to_string(),
             notes: None,
             created_at: format!("{}T00:00:00Z", &traded_at[..10]),
@@ -908,6 +1025,86 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == "same_day_order_uncertain"));
+    }
+
+    #[test]
+    fn same_day_rank_never_reorders_different_market_positions() {
+        // Omitting market from the rank guard lets a malformed cross-market
+        // override reorder otherwise independent positions.
+        let transactions = vec![
+            transaction_in_market(
+                "a-us",
+                "acct",
+                "AAPL",
+                "US",
+                "BUY",
+                1.0,
+                100.0,
+                "2024-01-02",
+            ),
+            transaction_in_market("z-cn", "acct", "aapl", "CN", "BUY", 2.0, 50.0, "2024-01-02"),
+        ];
+        let overrides = vec![override_record(
+            "bad-cross-market-order",
+            "same_day_order",
+            &["a-us", "z-cn"],
+            r#"["z-cn","a-us"]"#,
+        )];
+
+        let result = build_stock_actions(&transactions, &overrides);
+
+        assert_eq!(result.actions.len(), 2);
+        assert_eq!(result.actions[0].transaction_ids, vec!["a-us"]);
+        assert_eq!(result.actions[0].market, "US");
+        assert_eq!(result.actions[0].action_type, "open");
+        assert_eq!(result.actions[1].transaction_ids, vec!["z-cn"]);
+        assert_eq!(result.actions[1].market, "CN");
+        assert_eq!(result.actions[1].action_type, "open");
+    }
+
+    #[test]
+    fn malformed_cross_market_duplicate_override_does_not_exclude_either_security() {
+        // The deterministic core must not apply a duplicate disposition across
+        // markets even if an unvalidated fixture reaches this pure boundary.
+        let transactions = vec![
+            transaction_in_market(
+                "us-buy",
+                "acct",
+                "AAPL",
+                "US",
+                "BUY",
+                1.0,
+                100.0,
+                "2024-01-02T09:30:00Z",
+            ),
+            transaction_in_market(
+                "cn-buy",
+                "acct",
+                "aapl",
+                "CN",
+                "BUY",
+                1.0,
+                100.0,
+                "2024-01-02T09:31:00Z",
+            ),
+        ];
+        let overrides = vec![override_record(
+            "bad-cross-market-duplicate",
+            "duplicate",
+            &["us-buy", "cn-buy"],
+            "{}",
+        )];
+
+        let result = build_stock_actions(&transactions, &overrides);
+
+        assert_eq!(result.actions.len(), 2);
+        assert!(result.corrected_transactions.iter().all(|row| {
+            row.transaction.id != "us-buy" && row.transaction.id != "cn-buy" || row.has_cash_effect
+        }));
+        assert!(!result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "source_ledger_conflict"));
     }
 
     fn override_record(

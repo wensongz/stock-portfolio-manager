@@ -16,19 +16,43 @@ mod tests {
         shares: f64,
         traded_at: &str,
     ) -> Transaction {
+        transaction_in_market(
+            id,
+            account_id,
+            symbol,
+            "US",
+            transaction_type,
+            shares,
+            traded_at,
+        )
+    }
+
+    fn transaction_in_market(
+        id: &str,
+        account_id: &str,
+        symbol: &str,
+        market: &str,
+        transaction_type: &str,
+        shares: f64,
+        traded_at: &str,
+    ) -> Transaction {
         Transaction {
             id: id.to_string(),
             holding_id: None,
             account_id: account_id.to_string(),
             symbol: symbol.to_string(),
             name: symbol.to_string(),
-            market: "US".to_string(),
+            market: market.to_string(),
             transaction_type: transaction_type.to_string(),
             shares,
             price: 100.0,
             total_amount: shares * 100.0,
             commission: 0.0,
-            currency: "USD".to_string(),
+            currency: if market.eq_ignore_ascii_case("CN") {
+                "CNY".to_string()
+            } else {
+                "USD".to_string()
+            },
             traded_at: traded_at.to_string(),
             notes: None,
             created_at: format!("{}T00:00:00Z", &traded_at[..10]),
@@ -581,6 +605,160 @@ mod tests {
             .any(|issue| issue.code == "campaign_unavailable"));
     }
 
+    #[test]
+    fn same_account_same_symbol_in_two_markets_builds_independent_actions_and_campaigns() {
+        // A symbol-only position key merges same-direction opens, then applies
+        // opposite later flows to the wrong market balance and Campaign.
+        let action_result = build_stock_actions(
+            &[
+                transaction_in_market(
+                    "us-open",
+                    "acct",
+                    "AAPL",
+                    "US",
+                    "BUY",
+                    10.0,
+                    "2024-01-02T09:30:00Z",
+                ),
+                transaction_in_market(
+                    "cn-open",
+                    "acct",
+                    "aapl",
+                    "CN",
+                    "BUY",
+                    20.0,
+                    "2024-01-02T09:31:00Z",
+                ),
+                transaction_in_market(
+                    "us-close",
+                    "acct",
+                    "AAPL",
+                    "US",
+                    "SELL",
+                    10.0,
+                    "2024-01-03T09:30:00Z",
+                ),
+                transaction_in_market(
+                    "cn-add",
+                    "acct",
+                    "AAPL",
+                    "CN",
+                    "BUY",
+                    5.0,
+                    "2024-01-03T09:31:00Z",
+                ),
+            ],
+            &[],
+        );
+
+        assert_eq!(action_result.actions.len(), 4);
+        assert_eq!(
+            action_result
+                .actions
+                .iter()
+                .map(|action| (
+                    action.transaction_ids[0].as_str(),
+                    action.market.as_str(),
+                    action.action_type.as_str(),
+                    action.shares_before,
+                    action.shares_after,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("us-open", "US", "open", Some(0.0), Some(10.0)),
+                ("cn-open", "CN", "open", Some(0.0), Some(20.0)),
+                ("us-close", "US", "close", Some(10.0), Some(0.0)),
+                ("cn-add", "CN", "add", Some(20.0), Some(25.0)),
+            ]
+        );
+        assert!(action_result.issues.is_empty());
+
+        let result = build_stock_campaigns(
+            &action_result.position_events,
+            &action_result.actions,
+            &[],
+            NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(),
+        );
+        assert_eq!(result.campaigns.len(), 2);
+        let us = result
+            .campaigns
+            .iter()
+            .find(|campaign| campaign.market == "US")
+            .unwrap();
+        let cn = result
+            .campaigns
+            .iter()
+            .find(|campaign| campaign.market == "CN")
+            .unwrap();
+        assert_eq!(us.symbol, "AAPL");
+        assert_eq!(us.campaign_status, StockCampaignStatus::Completed);
+        assert_eq!(us.action_ids.len(), 2);
+        assert_eq!(cn.symbol, "aapl");
+        assert_eq!(cn.campaign_status, StockCampaignStatus::Active);
+        assert_eq!(cn.action_ids.len(), 2);
+        assert!(result.issues.is_empty());
+    }
+
+    #[test]
+    fn confirmed_transfer_does_not_link_equal_symbols_across_markets() {
+        // Transfer linkage represents one economic security and must reject
+        // equal symbol text when source and destination markets differ.
+        let overrides = vec![override_record("cross-market", &["us-out", "cn-in"])];
+        let action_result = build_stock_actions(
+            &[
+                transaction_in_market(
+                    "us-open",
+                    "acct-a",
+                    "AAPL",
+                    "US",
+                    "BUY",
+                    10.0,
+                    "2024-01-02T09:30:00Z",
+                ),
+                transaction_in_market(
+                    "us-out",
+                    "acct-a",
+                    "AAPL",
+                    "US",
+                    "SELL",
+                    10.0,
+                    "2024-01-03T09:30:00Z",
+                ),
+                transaction_in_market(
+                    "cn-in",
+                    "acct-b",
+                    "aapl",
+                    "CN",
+                    "BUY",
+                    10.0,
+                    "2024-01-03T09:31:00Z",
+                ),
+            ],
+            &overrides,
+        );
+        assert!(action_result
+            .corrected_transactions
+            .iter()
+            .filter(|row| matches!(row.transaction.id.as_str(), "us-out" | "cn-in"))
+            .all(|row| row.has_cash_effect && !row.is_transfer));
+        let result = build_stock_campaigns(
+            &action_result.position_events,
+            &action_result.actions,
+            &overrides,
+            NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(),
+        );
+
+        assert_eq!(result.campaigns.len(), 2);
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "invalid_transfer_override"));
+        assert!(result
+            .campaigns
+            .iter()
+            .all(|campaign| !campaign.campaign_id.starts_with("campaign:transfer:")));
+    }
+
     fn override_record(id: &str, transaction_ids: &[&str]) -> StockReviewOverride {
         StockReviewOverride {
             id: id.to_string(),
@@ -593,9 +771,10 @@ mod tests {
     }
 }
 use crate::models::stock_review::{
-    normalized_stock_symbol, stock_symbols_equal, AccountCampaignFragment, MetricAvailability,
-    MetricStatus, StockActionReview, StockCampaignStatus, StockCampaignSummary,
-    StockCampaignTransferFact, StockReviewIssue, StockReviewIssueSeverity, StockReviewOverride,
+    normalized_stock_market, normalized_stock_symbol, stock_securities_equal,
+    AccountCampaignFragment, MetricAvailability, MetricStatus, StockActionReview,
+    StockCampaignStatus, StockCampaignSummary, StockCampaignTransferFact, StockReviewIssue,
+    StockReviewIssueSeverity, StockReviewOverride,
 };
 use crate::services::stock_action_builder::PositionEvent;
 use chrono::NaiveDate;
@@ -638,17 +817,22 @@ pub fn build_stock_campaigns(
         .filter(|event| event.trade_date <= as_of)
         .cloned()
         .collect::<Vec<_>>();
-    let mut events_by_position: BTreeMap<(String, String), Vec<&PositionEvent>> = BTreeMap::new();
+    let mut events_by_position: BTreeMap<(String, String, String), Vec<&PositionEvent>> =
+        BTreeMap::new();
     for event in &retained_events {
         events_by_position
-            .entry((event.account_id.clone(), symbol_key(&event.symbol)))
+            .entry((
+                event.account_id.clone(),
+                symbol_key(&event.symbol),
+                market_key(&event.market),
+            ))
             .or_default()
             .push(event);
     }
 
     let mut fragments = Vec::new();
     let mut issues = Vec::new();
-    for ((account_id, _symbol_key), position_events) in events_by_position {
+    for ((account_id, _symbol_key, _market_key), position_events) in events_by_position {
         let symbol = &position_events[0].symbol;
         derive_position_fragments(
             &account_id,
@@ -822,7 +1006,12 @@ fn valid_transfer_links(
         if !source.is_transfer
             || !destination.is_transfer
             || source.account_id == destination.account_id
-            || !stock_symbols_equal(&source.symbol, &destination.symbol)
+            || !stock_securities_equal(
+                &source.symbol,
+                &source.market,
+                &destination.symbol,
+                &destination.market,
+            )
             || !approximately_equal(source.shares_delta.abs(), destination.shares_delta.abs())
             || source_fragment.is_none()
             || destination_fragment.is_none()
@@ -1024,6 +1213,10 @@ fn parse_ids(json: &str) -> Vec<String> {
 
 fn symbol_key(symbol: &str) -> String {
     normalized_stock_symbol(symbol).unwrap_or_else(|| symbol.trim().to_string())
+}
+
+fn market_key(market: &str) -> String {
+    normalized_stock_market(market).unwrap_or_else(|| market.trim().to_string())
 }
 
 fn fragment_id(account_id: &str, symbol: &str, opening_event_id: &str) -> String {

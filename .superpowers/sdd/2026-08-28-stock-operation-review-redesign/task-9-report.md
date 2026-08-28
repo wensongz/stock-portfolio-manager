@@ -134,3 +134,109 @@ exit code: 0
 - The current quote candle provider contract does not reliably expose adjusted closes and dividend fields. Live value-add is therefore price-only or unavailable according to the established return-mode contract until providers supply total-return-quality data.
 - Static/latest exchange rates remain cache-fill hints only and are never silently backdated. Historical FX absence must stay visible in UI quality/issue regions.
 - Task 10 should present the five status regions independently, preserve actual-ledger visibility during benchmark/replay gaps, display `historical_manual_assessment` as manual context, and require explicit confirmation before choosing the AI-confirmed annotation context or calling override confirmation.
+
+## Fix round 1: live replay materialization
+
+This section supersedes the original report's limitations where the live path previously supplied empty Task 5/6/7 inputs.
+
+- Live replay implementation: `f36dcb7` (`fix: materialize live stock review replay`).
+- Opening-position follow-up: `a1774c3` (`fix: keep in-period buys out of opening holdings`).
+- The pre-existing untracked `node_modules` directory remained untouched and unstaged.
+
+### Production boundary and interface decisions
+
+- `prepare_cached_stock_review_input` now materializes the same `CachedStockReviewInput` consumed by the deterministic report/detail core: exact opening holdings and cash, actual and shadow daily balances, exact prices, daily FX, explicit zero cash-return keys, fees, recorded splits, recorded PAY dividends, corrected action batches, attribution, and reliable full-portfolio risk snapshots where the database supports them.
+- Opening cash replays all pre-origin cash effects through the application's canonical `cash_delta`, including deposits, withdrawals, BUY, SELL, PAY, OPEN, and fees. A current authoritative cash holding is unwound with every later database transaction, including transactions after a historical report cutoff. If neither a complete cash ledger anchor nor authoritative current cash exists, `opening_cash_incomplete` disables shadow and opening-weight-dependent mixed benchmark/value-add outputs while leaving actual-ledger results visible.
+- Current stock holdings are used as opening positions only for account/symbol keys with no source-ledger position events. A holding created by an in-period BUY is never projected backward; no-history legacy holdings still produce a no-trade result.
+- Recorded `stock_splits` become replay/attribution events. PAY rows with positive shares become explicit per-share dividend events. Otherwise the existing adjusted-close/price-only return-mode contract degrades total-return-dependent regions honestly.
+- Daily attribution now carries actual and shadow positions/cash, exact daily price and FX keys, corrected action batches, splits, dividends, fees, and one unique explicit `0.0` cash-return observation per date/currency. Base currency remains the only implicit FX ratio. Static FX retains its source date and may only be used by the existing explicit forward-fill contract.
+- Campaign inputs are keyed by logical `campaign_id`, account set, and campaign lifetime rather than symbol. They include pre-period actions, lifetime-scoped flows, local-market benchmark sessions, exact report-cutoff terminal prices, issues, and relevant annotations. Two cycles of one symbol and the same symbol in two accounts remain separate.
+- A stock's designated broad-market cache (`^GSPC`, `000300.SS`, or `^HSI`) supplies local session authority for forward/Campaign calculations. The user-selected benchmark remains a portfolio-result comparison only. Sparse stock quotes never define sessions, exact endpoint holes stay unavailable, and the report emits `derived_market_calendar_authority` because this repository has no first-class exchange-calendar table.
+- Risk turnover and fees are built from corrected replay actions. Confirmed transfers, splits, and non-trade corrections do not become turnover, actions, or new campaigns.
+- Forward 60/120 statuses and maturity now feed `QualityInput` directly. Pending and unavailable endpoint states propagate to forward quality while actual result, risk, attribution, and other status regions remain independent.
+- Override confirmation now normalizes and validates once, captures the stored override-set revision and source fingerprints, inserts the exact canonical record only in memory, builds a complete candidate report, rechecks revision/fingerprints transactionally, then persists and returns that same candidate. Candidate-build failure has no write; a concurrent stored override or referenced-source change rejects the candidate.
+- The general Tauri annotation command no longer accepts caller-controlled AI authority. It always persists user provenance. `AiAfterExplicitUserConfirmation` is reachable only through a crate-private typed capability boundary reserved for Task 10's real confirmation interaction.
+- `StockCampaignDetail` gained only one required contract field, `issues`, so Campaign-specific missing-session/price/FX problems remain displayable. No dependency or schema change was introduced.
+
+### DB/cache-backed acceptance coverage
+
+The live preparation tests assert values, status, issue, action, and campaign behavior rather than mere completion:
+
+1. Deposit 1000, then pre-period BUY 600 plus fee 1 reconstructs opening cash as 399.
+2. Authoritative current cash is unwound past a historical report cutoff to its exact origin value.
+3. Incomplete opening cash emits `opening_cash_incomplete`, suppresses shadow/mixed fixed benchmark/value-add, and preserves actual result.
+4. A recorded 1:2 split preserves shadow ending value and zero return.
+5. An in-period BUY present in current holdings is excluded from opening positions, while a no-history holding produces available risk, one-third cash, and known-zero value-add/turnover.
+6. PAY dividends and exact daily FX populate shadow and attribution; explicit currency contribution is known zero for a fully CNY-funded CNY trade while action contribution is separately positive.
+7. Two AAPL cycles plus a second account remain three logical campaigns; the closed cycle includes pre-period actions, account-scoped flows/annotations, and no price beyond the historical cutoff.
+8. A selected QQQ portfolio benchmark cannot replace the AAPL local `^GSPC` sessions; a missing exact stock close makes the 60-session effect and forward-quality region unavailable.
+9. A confirmed cross-account transfer yields zero displayed actions, one campaign, zero turnover, and unique date/currency cash-return keys.
+10. A successful canonical `non_trade` preview already has zero actions before persistence; a genuine after-in-memory-insertion candidate failure writes zero override rows.
+11. A concurrent override-set mutation invalidates a prepared candidate and leaves only the concurrent row.
+12. Recent observations propagate Pending, missing endpoints propagate Unavailable, and unrelated quality regions keep their own statuses.
+
+The original deterministic 12-scenario matrix remains intact, including same-day uncertainty, duplicate conflict, fixed benchmark, suspension/delisting, and fee `0.0` coverage.
+
+### TDD RED/GREEN and mutation evidence
+
+The initial DB/cache-backed RED suite failed at the live boundary before production edits:
+
+```text
+opening cash: actual 1000, expected 399
+recorded splits: actual 0, expected 1
+no-trade value-add: actual None, expected Some(0)
+dividend events: actual 0; attribution batches empty
+local benchmark: selected QQQ close 200 used, expected ^GSPC close 100
+historical first Campaign actions: actual 0, expected 2
+confirmed-transfer turnover: actual 0.1, expected 0
+```
+
+Additional behavior REDs captured canonical preview returning one action instead of zero, a genuine post-insertion invalid candidate returning `Ok`, missing prepare/save candidate concurrency APIs, recent quality returning Available instead of Pending, incomplete-cash shadow returning `Some(0)` instead of `None`, a missing Campaign `issues` field, caller-controlled annotation provenance, and historical authoritative cash returning today's 800 instead of origin 1000.
+
+Two final mutation-sensitive REDs were also captured:
+
+```text
+multi-account cash returns: 1 unique date/currency key, 2 stored rows
+in-period current holding: opening_positions unexpectedly non-empty
+```
+
+Each failed before its production guard and passed after it. The CNY attribution fixture's initial expectation of a positive currency effect was corrected as a test-only hand-calculation error: CNY cash converted into CNY stock has a literal zero currency differential, while the action contribution remains independently positive. No production status or threshold was weakened.
+
+### Final verification
+
+```text
+cargo test --lib services::stock_review_service::tests --quiet
+21 passed; 0 failed
+
+cargo test --lib services::stock_review_persistence::tests --quiet
+12 passed; 0 failed
+
+cargo test --lib services::stock_review_quality::tests --quiet
+5 passed; 0 failed
+
+cargo test --lib services::stock_review_metrics::tests --quiet
+30 passed; 0 failed
+
+cargo test --lib commands::review::tests --quiet
+2 passed; 0 failed
+
+cargo test --lib --quiet
+456 passed; 0 failed; 8 ignored
+
+npm run build
+TypeScript and Vite production build passed; existing large-chunk warning only
+
+rustfmt --edition 2021 --check <six modified Rust files>
+exit code: 0
+
+git diff --check
+exit code: 0
+```
+
+### Remaining honest limitations
+
+- The database has no first-class exchange-calendar table. Live session authority is therefore the designated broad-market benchmark cache and is explicitly labeled as derived; if that cache is insufficient, forward/Campaign path metrics are unavailable rather than inferred from sparse stock quotes.
+- Account- or market-filtered daily holding snapshots do not contain authoritative historical cash totals. Their actual TWR and risk cash ratios remain unavailable where exact reconstruction is impossible; the all-account path uses recorded portfolio totals and remains available when coverage is complete.
+- Dividend total return is available only when a recorded PAY event or complete adjusted-close series exists. A price-only provider without recorded corporate-action income cannot support a fabricated total-return result.
+- Legacy current holdings with no transaction history are treated as the authoritative opening position so the required no-trade report remains usable. The report cannot infer an unrecorded acquisition date; import workflows should preserve OPEN/source-ledger rows when historical dating matters.
+- Stored overrides have no persisted `is_active` column; replay activity is computed by fingerprint revalidation. The confirmation revision therefore fingerprints all stored override rows conservatively, so even a stale-row mutation can require a candidate rebuild.

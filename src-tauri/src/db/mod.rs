@@ -520,6 +520,48 @@ impl Database {
         ",
         );
 
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS stock_daily_prices (
+              symbol TEXT NOT NULL,
+              market TEXT NOT NULL,
+              date TEXT NOT NULL,
+              open REAL,
+              high REAL,
+              low REAL,
+              close REAL NOT NULL,
+              volume REAL,
+              adjusted_close REAL,
+              dividend REAL,
+              source TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (symbol, market, date)
+            );
+
+            CREATE TABLE IF NOT EXISTS stock_review_annotations (
+              id TEXT PRIMARY KEY,
+              scope_type TEXT NOT NULL CHECK(scope_type IN ('period','stock','campaign','action')),
+              scope_key TEXT NOT NULL,
+              account_id TEXT,
+              symbol TEXT,
+              annotation_type TEXT NOT NULL,
+              value_json TEXT NOT NULL,
+              source TEXT NOT NULL CHECK(source IN ('user','ai_confirmed')),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS stock_review_overrides (
+              id TEXT PRIMARY KEY,
+              override_type TEXT NOT NULL CHECK(override_type IN ('transfer','duplicate','same_day_order','non_trade')),
+              transaction_ids_json TEXT NOT NULL,
+              value_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+        ",
+        )?;
+
         Ok(())
     }
 }

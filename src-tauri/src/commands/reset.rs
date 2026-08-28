@@ -5,6 +5,7 @@ use crate::models::quote_provider::QuoteProviderConfig;
 use crate::services::exchange_rate_service::ExchangeRateCache;
 use crate::services::quote_service::{self, QuoteCache};
 use chrono::Utc;
+use rusqlite::{Result as SqlResult, Transaction};
 use tauri::State;
 use tracing::warn;
 
@@ -18,6 +19,17 @@ const SYSTEM_CATEGORIES: [(&str, &str, &str, i64); 4] = [
     ("成长股", "#F97316", "🚀", 3),
     ("套利", "#8B5CF6", "🔄", 4),
 ];
+
+pub(crate) fn clear_stock_review_data(tx: &Transaction<'_>) -> SqlResult<()> {
+    for table in [
+        "stock_daily_prices",
+        "stock_review_annotations",
+        "stock_review_overrides",
+    ] {
+        tx.execute(&format!("DELETE FROM {table};"), [])?;
+    }
+    Ok(())
+}
 
 /// Wipe every user-owned row in the database and reset the two config
 /// tables to their built-in defaults, then clear the in-memory caches and
@@ -51,6 +63,8 @@ pub fn factory_reset(
     // from tables in any order without surprises, then re-enable it.
     tx.execute_batch("PRAGMA foreign_keys = OFF;")
         .map_err(|e| e.to_string())?;
+
+    clear_stock_review_data(&tx).map_err(|e| format!("failed to clear stock review data: {e}"))?;
 
     for table in [
         // AI chat history

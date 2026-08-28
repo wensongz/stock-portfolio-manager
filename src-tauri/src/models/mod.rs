@@ -16,6 +16,7 @@ pub mod quote_provider;
 pub mod review;
 pub mod skill;
 pub mod statistics;
+pub mod stock_review;
 pub mod stock_split;
 pub mod transaction;
 

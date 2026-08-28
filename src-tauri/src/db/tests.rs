@@ -23,6 +23,185 @@ mod tests {
     }
 
     #[test]
+    fn stock_review_tables_are_created_and_resettable() {
+        // Break caught: removing a review-table migration or its declared key
+        // would leave report inputs unsafe to persist.
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+
+        let table_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('stock_daily_prices', 'stock_review_annotations', 'stock_review_overrides')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 3);
+
+        conn.execute(
+            "INSERT INTO stock_daily_prices (symbol, market, date, close, source, updated_at)
+             VALUES ('AAPL', 'US', '2024-01-15', 185.0, 'test', '2024-01-15T16:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let duplicate_price = conn.execute(
+            "INSERT INTO stock_daily_prices (symbol, market, date, close, source, updated_at)
+             VALUES ('AAPL', 'US', '2024-01-15', 186.0, 'test', '2024-01-15T16:00:00Z')",
+            [],
+        );
+        assert!(duplicate_price.is_err());
+        conn.execute(
+            "INSERT INTO stock_daily_prices (symbol, market, date, close, source, updated_at)
+             VALUES ('AAPL', 'US', '2024-01-15', 186.0, 'test', '2024-01-15T17:00:00Z')
+             ON CONFLICT(symbol, market, date) DO UPDATE SET
+               close = excluded.close,
+               updated_at = excluded.updated_at",
+            [],
+        )
+        .unwrap();
+        let close: f64 = conn
+            .query_row(
+                "SELECT close FROM stock_daily_prices WHERE symbol = 'AAPL' AND market = 'US' AND date = '2024-01-15'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(close, 186.0);
+
+        conn.execute(
+            "INSERT INTO stock_review_annotations (id, scope_type, scope_key, annotation_type, value_json, source, created_at, updated_at)
+             VALUES ('annotation-1', 'stock', 'AAPL', 'thesis', '{}', 'user', '2024-01-15T16:00:00Z', '2024-01-15T16:00:00Z')",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO stock_review_annotations (id, scope_type, scope_key, annotation_type, value_json, source, created_at, updated_at)
+                 VALUES ('annotation-1', 'stock', 'AAPL', 'thesis', '{}', 'user', '2024-01-15T16:00:00Z', '2024-01-15T16:00:00Z')",
+                [],
+            )
+            .is_err());
+
+        conn.execute(
+            "INSERT INTO stock_review_overrides (id, override_type, transaction_ids_json, value_json, created_at, updated_at)
+             VALUES ('override-1', 'transfer', '[\"transaction-1\"]', '{}', '2024-01-15T16:00:00Z', '2024-01-15T16:00:00Z')",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO stock_review_overrides (id, override_type, transaction_ids_json, value_json, created_at, updated_at)
+                 VALUES ('override-1', 'transfer', '[\"transaction-1\"]', '{}', '2024-01-15T16:00:00Z', '2024-01-15T16:00:00Z')",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn stock_review_contract_serializes_status_and_reset_clears_rows() {
+        // Break caught: changing the public status spelling or omitting a
+        // review table from the actual factory-reset deletion scope.
+        let status =
+            serde_json::to_value(crate::models::stock_review::MetricStatus::Available).unwrap();
+        assert_eq!(status, serde_json::Value::String("available".to_string()));
+
+        let unavailable = crate::models::stock_review::ResultQualityMetric {
+            availability: crate::models::stock_review::MetricAvailability {
+                status: crate::models::stock_review::MetricStatus::Unavailable,
+                note: Some("missing prices".to_string()),
+            },
+            portfolio_return: None,
+            shadow_return: None,
+            benchmark_return: None,
+            active_return: None,
+        };
+        assert_eq!(
+            serde_json::to_value(unavailable).unwrap()["portfolio_return"],
+            serde_json::Value::Null
+        );
+
+        let methodology = crate::models::stock_review::StockReviewMethodology {
+            query: crate::models::stock_review::StockReviewQuery {
+                start_date: chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                end_date: chrono::NaiveDate::from_ymd_opt(2024, 12, 31).unwrap(),
+                account_id: None,
+                market: Some("US".to_string()),
+                benchmark_symbol: Some("SPY".to_string()),
+                base_currency: "USD".to_string(),
+            },
+            actual_return_method: "time_weighted_return".to_string(),
+            shadow_return_method: "fixed_weight_shadow".to_string(),
+            benchmark_return_method: "benchmark_close_return".to_string(),
+            fixed_weights: vec![crate::models::stock_review::FixedWeight {
+                key: "AAPL".to_string(),
+                weight: Some(0.25),
+            }],
+            benchmark_symbol: Some("SPY".to_string()),
+            market_data_coverage: crate::models::stock_review::DataCoverage {
+                availability: crate::models::stock_review::MetricAvailability {
+                    status: crate::models::stock_review::MetricStatus::Available,
+                    note: None,
+                },
+                covered_days: Some(252),
+                expected_days: Some(252),
+                coverage_ratio: Some(1.0),
+            },
+            exchange_rate_coverage: crate::models::stock_review::DataCoverage {
+                availability: crate::models::stock_review::MetricAvailability {
+                    status: crate::models::stock_review::MetricStatus::Unavailable,
+                    note: Some("USD-only portfolio".to_string()),
+                },
+                covered_days: None,
+                expected_days: None,
+                coverage_ratio: None,
+            },
+            algorithm_version: "v1".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(methodology).unwrap()["fixed_weights"][0]["weight"],
+            serde_json::json!(0.25)
+        );
+
+        let db = create_test_db();
+        let mut conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO stock_daily_prices (symbol, market, date, close, source, updated_at)
+             VALUES ('MSFT', 'US', '2024-01-16', 400.0, 'test', '2024-01-16T16:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stock_review_annotations (id, scope_type, scope_key, annotation_type, value_json, source, created_at, updated_at)
+             VALUES ('annotation-reset', 'stock', 'MSFT', 'thesis', '{}', 'user', '2024-01-16T16:00:00Z', '2024-01-16T16:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stock_review_overrides (id, override_type, transaction_ids_json, value_json, created_at, updated_at)
+             VALUES ('override-reset', 'transfer', '[\"transaction-2\"]', '{}', '2024-01-16T16:00:00Z', '2024-01-16T16:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        crate::commands::reset::clear_stock_review_data(&tx).unwrap();
+        tx.commit().unwrap();
+
+        for table in [
+            "stock_daily_prices",
+            "stock_review_annotations",
+            "stock_review_overrides",
+        ] {
+            let count: i32 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} should be cleared by reset");
+        }
+    }
+
+    #[test]
     fn test_system_categories_seeded() {
         let db = create_test_db();
         let conn = db.conn.lock().unwrap();

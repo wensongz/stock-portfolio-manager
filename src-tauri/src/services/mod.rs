@@ -22,4 +22,5 @@ pub mod stock_action_builder;
 pub mod stock_campaign_builder;
 pub mod stock_review_market_data;
 pub mod stock_review_metrics;
+pub mod stock_review_persistence;
 pub mod stock_review_quality;

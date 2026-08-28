@@ -386,6 +386,9 @@ pub struct StockReviewAnnotation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StockReviewAnnotationInput {
+    /// Stable caller-supplied ID for idempotent persistence. Audit timestamps
+    /// are always assigned by the persistence service.
+    pub id: String,
     pub scope_type: String,
     pub scope_key: String,
     pub account_id: Option<String>,
@@ -407,6 +410,9 @@ pub struct StockReviewOverride {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StockReviewOverrideInput {
+    /// Stable caller-supplied ID for idempotent persistence. Audit timestamps
+    /// and reference snapshots are always assigned by the persistence service.
+    pub id: String,
     pub override_type: String,
     pub transaction_ids_json: String,
     pub value_json: String,

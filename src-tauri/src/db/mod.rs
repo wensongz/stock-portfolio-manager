@@ -556,11 +556,27 @@ impl Database {
               override_type TEXT NOT NULL CHECK(override_type IN ('transfer','duplicate','same_day_order','non_trade')),
               transaction_ids_json TEXT NOT NULL,
               value_json TEXT NOT NULL,
+              reference_fingerprint_json TEXT NOT NULL DEFAULT '[]',
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
         ",
         )?;
+
+        // Existing installations created before durable override reference
+        // snapshots need the column before corrections can be safely replayed.
+        let has_override_reference_fingerprints = conn
+            .prepare("PRAGMA table_info(stock_review_overrides)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "reference_fingerprint_json");
+        if !has_override_reference_fingerprints {
+            conn.execute(
+                "ALTER TABLE stock_review_overrides ADD COLUMN reference_fingerprint_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
 
         Ok(())
     }

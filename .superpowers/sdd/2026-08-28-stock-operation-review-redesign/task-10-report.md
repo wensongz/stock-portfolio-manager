@@ -154,3 +154,109 @@ passed
 - Ruling: the confirmation capability is derived from the current user turn, not prior conversation text or model arguments. The intentionally narrow classifier may ask a user to restate a vague confirmation, preferring no write over an inferred durable mutation.
 - Concern: Task 9's documented live calendar, historical FX/cash, provider total-return, and legacy-ledger limitations remain. The AI path exposes their statuses/issues unchanged and does not repair or hide them.
 - Concern: question candidates generated from report data cover contribution, weight, result/risk conflict, and metric-changing ambiguity. Durable reusable context still requires semantic judgment under the Skill instructions; the deterministic selector nevertheless enforces its eligibility, exclusions, sorting, and cap when such a candidate is supplied.
+
+---
+
+## Fix round 1: boundary hardening (2026-08-29)
+
+Implementation commit: `180c9a91c152884965caa695bcf632a1795742ad` (`fix: harden stock review assistant boundaries`). This section supersedes the original current-turn text-classifier ruling above.
+
+### Review RED evidence
+
+The new routing matrix was added before the router change and run with:
+
+```text
+cargo test --lib services::skill_service::tests::review_routing_requires_intent_and_keeps_stock_and_option_domains_disjoint -- --exact
+```
+
+It exited 101: `股票 Campaign 复盘` activated `trade-review` instead of `stock-review`.
+
+The tool boundary, exact-draft confirmation, scoped projection, question-selection, cap, and validation regressions were then added before production changes and run with:
+
+```text
+cargo test --lib services::ai_tools::tests -- --nocapture
+```
+
+It exited 101 because the trusted untrusted-turn context and exact-draft test capability did not exist. The pre-fix code also still exposed `confirmed_ai_annotation_capability_for_user_turn`, which inferred write authority from natural-language substrings. These were the intended REDs; no Skill-body substring assertion was used.
+
+### Confirmation boundary
+
+- Natural-language confirmation inference was deleted. Both OpenAI-style and Anthropic chat paths now construct an untrusted-turn tool context that always starts without write capability, including quoted, hypothetical, interrogative, negated, and model-supplied confirmation text.
+- The private capability is bound to normalized ID, scope, annotation type, source, canonical JSON value, and its stable value hash. JSON object key order is canonicalized, while a different value or scope does not match.
+- The capability uses an atomic one-shot state. A mismatched draft has zero side effect and does not consume the approval; the first exact write consumes it; an exact replay or any later payload fails with `confirmation_required` and leaves the row count unchanged.
+- Tool JSON has no confirmation field. Unknown root/scope fields, a forged `explicitly_confirmed`, and non-string/blank/null optional strings are rejected before persistence.
+- There is intentionally no production capability constructor until a trusted host/UI approval event is implemented. The safe production behavior is therefore read-only plus `confirmation_required`; ordinary chat text cannot cross the Task 9 private AI-confirmed persistence boundary.
+
+### Routing matrix
+
+Exact forward activation IDs after the fix:
+
+| User text | Activated IDs |
+| --- | --- |
+| `股票 Campaign 复盘` | `stock-review` |
+| `复盘一下我的期权交易` | `options-review` |
+| `请做期权历史表现复盘` | `options-review` |
+| `导入一笔期权交易` | `trade-review` only; never `options-review` |
+| `Campaign复盘` | `trade-review` |
+| `复盘` | `trade-review` |
+| `一起复盘股票调仓和期权交易` | `options-review`, `stock-review` |
+
+The options Skill no longer has bare `期权交易` or `Campaign复盘` triggers. Runtime resolution requires review intent plus an explicit stock/option domain for the two specialized built-ins, preserves generic fallback, and supports a genuinely mixed request.
+
+### Campaign/symbol projection and bounded context
+
+- Campaign scope filters report actions and all attribution arrays by the Campaign's exact `action_ids`, not by symbol. A two-Campaign/same-symbol fixture proves that the other cycle's 99-unit contribution and annotations do not leak.
+- Campaign annotations are limited to the exact Campaign, its exact actions, and account/symbol-free period context. Campaign detail annotations use the same filter.
+- Symbol matching reuses the shared trimmed, case-normalized stock-symbol identity helper.
+- Question eligibility, semantic deduplication, impact ordering, and maximum-three selection run on the complete scoped report before display caps. Repeated issue rows collapse by code + normalized scope + date. Existing action, Campaign, issue, and global structured context suppresses already-answered questions.
+- The 6pp regression places a qualifying action beyond the normal top 12 and proves both its question and referenced action survive the cap.
+- Every variable report/detail array is recursively bounded. High-value paths use explicit 12/20/40 limits; nested arrays use a deterministic default limit. `context_limits` records `limit`, `total`, `returned`, and `omitted` for every path, including deliberately removed curves. Ranked collections use stable tie-breaking and selected-question references take priority without altering any retained value/status.
+
+### Strict input contract
+
+- Runtime validation now mirrors `additionalProperties: false` rather than trusting provider schema enforcement.
+- `get_stock_review` rejects unknown fields and present optional values that are null, blank, or non-string, so invalid scope never silently broadens.
+- Annotation root and scope objects reject unknown fields. `value` must be an object. `period` rejects a symbol; `stock` requires a normalized matching symbol/key; action/Campaign/period scopes retain only their documented optional account/symbol fields.
+- All invalid-shape regressions assert a zero annotation row count.
+
+### Manual Skill review
+
+The repository-native Skills remain concise and behavior-first. `stock-review.md` still requires deterministic read-first behavior, the six-section order, fact/status/background/inference separation, result/value-add priority, strict question predicates, and all no-recompute/no-score/no-causality/no-quote/no-prediction/no-concrete-trade-advice constraints. Its write section now requires trusted exact-draft host confirmation, treats chat text/tool arguments as non-authority, and forbids retrying or claiming success after `confirmation_required`. `options-review.md` retains its deterministic options-review instructions with only narrow review triggers.
+
+### GREEN verification
+
+```text
+cargo test --lib services::ai_tools::tests -- --nocapture
+20 passed; 0 failed
+
+cargo test --lib services::skill_service::tests -- --nocapture
+29 passed; 0 failed
+
+cargo test --lib services::stock_review_persistence::tests -- --nocapture
+39 passed; 0 failed
+
+cargo test --lib services::stock_review_service::tests -- --nocapture
+50 passed; 0 failed
+
+cargo test --lib
+533 passed; 0 failed; 8 ignored
+
+cargo check --lib
+passed with no warnings
+
+npm run build
+passed; repository's existing large-chunk warning only
+
+rustfmt --edition 2021 --check <four changed Rust files>
+passed
+
+git diff --check
+passed
+```
+
+### Interface rulings and remaining concern
+
+- Ruling: host confirmation is a separate capability artifact, not a boolean/string tool argument and not a linguistic classification. Until a trusted approval UI is wired, annotation writes remain safely unavailable from production chat.
+- Ruling: question selection occurs after semantic scope filtering but before any size cap; this keeps symbol/Campaign answers relevant without losing lower-ranked qualifying rows.
+- Ruling: collection omission metadata is part of successful result data, alongside Task 9 metric availability/statuses; it is never a tool error.
+- Remaining concern: the trusted host/UI approval event is deliberately not fabricated in this task. A future UI integration must construct the private exact-draft capability inside the trusted boundary rather than reintroducing text inference or a caller-supplied token.

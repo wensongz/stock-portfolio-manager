@@ -815,6 +815,29 @@ pub async fn get_stock_campaign_detail(
     build_stock_campaign_detail_from_cached_data(&input, campaign_id)
 }
 
+/// AI projection boundary: materialize one Task 9 input snapshot and build the
+/// report plus optional Campaign detail from the same artifact set.
+pub(crate) async fn get_stock_review_for_ai(
+    db: &Database,
+    query: StockReviewQuery,
+    campaign_id: Option<&str>,
+) -> Result<(StockReviewReport, Option<StockCampaignDetail>), String> {
+    let input = prepare_cached_stock_review_input(db, query).await?;
+    let artifacts = build_stock_review_artifacts(&input)?;
+    let campaign_detail = if let Some(campaign_id) = campaign_id {
+        Some(
+            artifacts
+                .campaign_details
+                .into_iter()
+                .find(|detail| detail.summary.campaign_id == campaign_id)
+                .ok_or_else(|| format!("Campaign '{campaign_id}' was not found in this report."))?,
+        )
+    } else {
+        None
+    };
+    Ok((artifacts.report, campaign_detail))
+}
+
 pub fn save_user_stock_review_annotation(
     db: &Database,
     mut input: StockReviewAnnotationInput,
@@ -828,6 +851,51 @@ pub fn save_user_stock_review_annotation(
 /// field from self-authorizing AI-confirmed provenance.
 pub(crate) struct ConfirmedAiAnnotationCapability {
     _private: (),
+}
+
+/// Derive the private annotation capability from the actual user turn, never
+/// from model-generated tool arguments. The negative phrases deliberately
+/// keep deferred confirmation and draft discussion on the read-only path.
+pub(crate) fn confirmed_ai_annotation_capability_for_user_turn(
+    user_turn: &str,
+) -> Option<ConfirmedAiAnnotationCapability> {
+    let normalized = user_turn.trim().to_lowercase();
+    let defers_confirmation = [
+        "之后我再确认",
+        "稍后确认",
+        "之后再确认",
+        "尚未确认",
+        "不要保存",
+        "不要记录",
+        "later confirm",
+        "confirm later",
+        "do not save",
+        "don't save",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase));
+    if normalized.is_empty() || defers_confirmation {
+        return None;
+    }
+
+    let requests_save = ["保存", "记录", "save", "record"]
+        .iter()
+        .any(|verb| normalized.contains(verb));
+    let identifies_background = [
+        "这条背景",
+        "该背景",
+        "上述背景",
+        "这段背景",
+        "这条信息",
+        "这段信息",
+        "background",
+        "context",
+    ]
+    .iter()
+    .any(|subject| normalized.contains(subject));
+
+    (requests_save && identifies_background)
+        .then_some(ConfirmedAiAnnotationCapability { _private: () })
 }
 
 pub(crate) fn save_ai_confirmed_stock_review_annotation(

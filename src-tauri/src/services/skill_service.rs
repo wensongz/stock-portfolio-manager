@@ -57,6 +57,7 @@ static BUILTIN_SKILLS: &[(&str, &str)] = &[
         "options-review",
         include_str!("../skills/options-review.md"),
     ),
+    ("stock-review", include_str!("../skills/stock-review.md")),
     (
         "munger-perspective",
         include_str!("../skills/munger-perspective.md"),
@@ -86,7 +87,7 @@ pub fn skills_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// whose on-disk version is older than this — but ONLY if the user hasn't
 /// edited it (the `.builtin/{stem}` marker still exists). User-edited skills
 /// (marker removed by `save_skill`) are never auto-overwritten.
-const BUILTIN_SKILLS_VERSION: u32 = 7;
+const BUILTIN_SKILLS_VERSION: u32 = 8;
 
 /// Materialise built-in skills into the user directory on first launch, and
 /// auto-update them when [`BUILTIN_SKILLS_VERSION`] bumps.
@@ -101,6 +102,10 @@ const BUILTIN_SKILLS_VERSION: u32 = 7;
 ///   it) → never overwrite; the user's version wins.
 pub fn export_builtin_skills(app: &AppHandle) -> Result<(), String> {
     let dir = skills_dir(app)?;
+    export_builtin_skills_to_dir(&dir)
+}
+
+fn export_builtin_skills_to_dir(dir: &Path) -> Result<(), String> {
     let marker_dir = dir.join(BUILTIN_MARKER_DIR);
     if !marker_dir.exists() {
         fs::create_dir_all(&marker_dir).map_err(|e| format!("创建内置标记目录失败：{e}"))?;
@@ -601,7 +606,188 @@ where
             out.push(s.clone());
         }
     }
-    out
+    resolve_builtin_review_conflicts(out)
+}
+
+fn resolve_builtin_review_conflicts(mut skills: Vec<Skill>) -> Vec<Skill> {
+    let has_stock_review = skills.iter().any(|skill| skill.id == "stock-review");
+    let has_options_review = skills.iter().any(|skill| skill.id == "options-review");
+    if has_stock_review {
+        skills.retain(|skill| {
+            !matches!(
+                skill.id.as_str(),
+                "trade-review" | "quarterly-report" | "return-attribution"
+            )
+        });
+    }
+    if has_options_review {
+        skills.retain(|skill| skill.id != "trade-review");
+    }
+    skills
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StockReviewSection {
+    Conclusion,
+    DeterministicFacts,
+    DidWell,
+    WorthReviewing,
+    CannotInferFromData,
+    NextCycleSuggestions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StockReviewFactGroup {
+    ResultQuality,
+    RebalanceValueAdd,
+    Forward60And120,
+    RiskStructure,
+    Attribution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StockReviewEvidenceClass {
+    FactAndStatus,
+    DataInference,
+    UserBackground,
+    Question,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StockReviewMetricSource {
+    DeterministicTool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StockReviewResponsePolicy {
+    pub sections: Vec<StockReviewSection>,
+    pub fact_priority: Vec<StockReviewFactGroup>,
+    pub evidence_classes: Vec<StockReviewEvidenceClass>,
+    pub metric_source: StockReviewMetricSource,
+    pub allow_metric_recomputation: bool,
+    pub allow_composite_score: bool,
+    pub allow_correct_wrong_labels: bool,
+    pub allow_causal_claims: bool,
+    pub allow_quotes_or_predictions: bool,
+    pub allow_concrete_trade_advice: bool,
+}
+
+pub fn stock_review_response_policy() -> StockReviewResponsePolicy {
+    StockReviewResponsePolicy {
+        sections: vec![
+            StockReviewSection::Conclusion,
+            StockReviewSection::DeterministicFacts,
+            StockReviewSection::DidWell,
+            StockReviewSection::WorthReviewing,
+            StockReviewSection::CannotInferFromData,
+            StockReviewSection::NextCycleSuggestions,
+        ],
+        fact_priority: vec![
+            StockReviewFactGroup::ResultQuality,
+            StockReviewFactGroup::RebalanceValueAdd,
+            StockReviewFactGroup::Forward60And120,
+            StockReviewFactGroup::RiskStructure,
+            StockReviewFactGroup::Attribution,
+        ],
+        evidence_classes: vec![
+            StockReviewEvidenceClass::FactAndStatus,
+            StockReviewEvidenceClass::DataInference,
+            StockReviewEvidenceClass::UserBackground,
+            StockReviewEvidenceClass::Question,
+        ],
+        metric_source: StockReviewMetricSource::DeterministicTool,
+        allow_metric_recomputation: false,
+        allow_composite_score: false,
+        allow_correct_wrong_labels: false,
+        allow_causal_claims: false,
+        allow_quotes_or_predictions: false,
+        allow_concrete_trade_advice: false,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StockReviewQuestionCandidate {
+    pub id: String,
+    pub impact: f64,
+    pub contribution_share: Option<f64>,
+    pub absolute_weight_change_pp: Option<f64>,
+    pub result_risk_conflict: bool,
+    pub metric_changing_ambiguity: bool,
+    pub durable_context: bool,
+    pub already_answered: bool,
+    pub determinable_from_report: bool,
+    pub prose_completion_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StockReviewQuestionReason {
+    ContributionOverTwentyPercent,
+    WeightChangeOverFivePoints,
+    ResultRiskConflict,
+    MetricChangingAmbiguity,
+    DurableReusableContext,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SelectedStockReviewQuestion {
+    pub id: String,
+    pub impact: f64,
+    pub reason: StockReviewQuestionReason,
+    pub skippable: bool,
+}
+
+pub fn select_stock_review_questions(
+    candidates: &[StockReviewQuestionCandidate],
+) -> Vec<SelectedStockReviewQuestion> {
+    let mut selected: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| {
+            !candidate.already_answered
+                && !candidate.determinable_from_report
+                && !candidate.prose_completion_only
+        })
+        .filter_map(|candidate| {
+            let reason = if candidate.metric_changing_ambiguity {
+                Some(StockReviewQuestionReason::MetricChangingAmbiguity)
+            } else if candidate.result_risk_conflict {
+                Some(StockReviewQuestionReason::ResultRiskConflict)
+            } else if candidate
+                .contribution_share
+                .is_some_and(|share| share.abs() > 0.20)
+            {
+                Some(StockReviewQuestionReason::ContributionOverTwentyPercent)
+            } else if candidate
+                .absolute_weight_change_pp
+                .is_some_and(|change| change.abs() > 5.0)
+            {
+                Some(StockReviewQuestionReason::WeightChangeOverFivePoints)
+            } else if candidate.durable_context {
+                Some(StockReviewQuestionReason::DurableReusableContext)
+            } else {
+                None
+            }?;
+            Some(SelectedStockReviewQuestion {
+                id: candidate.id.clone(),
+                impact: candidate.impact,
+                reason,
+                skippable: true,
+            })
+        })
+        .collect();
+    selected.sort_by(|left, right| {
+        right
+            .impact
+            .partial_cmp(&left.impact)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    selected.truncate(3);
+    selected
 }
 
 /// Whole-word ASCII containment: matches `needle` in `haystack` only when
@@ -735,6 +921,196 @@ mod tests {
                 "broad current-risk trigger must be absent: {broad_trigger}"
             );
         }
+    }
+
+    fn parsed_builtins() -> Vec<Skill> {
+        BUILTIN_SKILLS
+            .iter()
+            .map(|(stem, body)| {
+                parse_skill_from_str(stem, body, Path::new(stem)).expect("builtin parses")
+            })
+            .collect()
+    }
+
+    fn activated_ids(text: &str) -> Vec<String> {
+        let skills = parsed_builtins();
+        match_triggers(&skills, text)
+            .into_iter()
+            .map(|skill| skill.id)
+            .collect()
+    }
+
+    #[test]
+    fn stock_review_builtin_parses_registers_and_routes_without_generic_review_conflicts() {
+        let skills = parsed_builtins();
+        let stock_review = skills
+            .iter()
+            .find(|skill| skill.id == "stock-review")
+            .expect("stock-review builtin must be registered");
+        assert_eq!(
+            stock_review.trigger,
+            vec![
+                "股票操作复盘",
+                "调仓复盘",
+                "股票复盘报告",
+                "股票Campaign复盘"
+            ]
+        );
+
+        assert_eq!(activated_ids("股票操作复盘"), vec!["stock-review"]);
+        assert_eq!(activated_ids("请做调仓复盘"), vec!["stock-review"]);
+        assert_eq!(activated_ids("生成股票复盘报告"), vec!["stock-review"]);
+        assert_eq!(activated_ids("复盘"), vec!["trade-review"]);
+        assert_eq!(
+            activated_ids("复盘一下我的期权交易"),
+            vec!["options-review"]
+        );
+        assert_eq!(activated_ids("请做期权复盘"), vec!["options-review"]);
+    }
+
+    #[test]
+    fn stock_review_response_policy_is_fact_first_and_non_judgmental() {
+        let policy = stock_review_response_policy();
+        assert_eq!(
+            policy.sections,
+            vec![
+                StockReviewSection::Conclusion,
+                StockReviewSection::DeterministicFacts,
+                StockReviewSection::DidWell,
+                StockReviewSection::WorthReviewing,
+                StockReviewSection::CannotInferFromData,
+                StockReviewSection::NextCycleSuggestions,
+            ]
+        );
+        assert_eq!(
+            policy.fact_priority,
+            vec![
+                StockReviewFactGroup::ResultQuality,
+                StockReviewFactGroup::RebalanceValueAdd,
+                StockReviewFactGroup::Forward60And120,
+                StockReviewFactGroup::RiskStructure,
+                StockReviewFactGroup::Attribution,
+            ]
+        );
+        assert_eq!(
+            policy.evidence_classes,
+            vec![
+                StockReviewEvidenceClass::FactAndStatus,
+                StockReviewEvidenceClass::DataInference,
+                StockReviewEvidenceClass::UserBackground,
+                StockReviewEvidenceClass::Question,
+            ]
+        );
+        assert_eq!(
+            policy.metric_source,
+            StockReviewMetricSource::DeterministicTool
+        );
+        assert!(!policy.allow_metric_recomputation);
+        assert!(!policy.allow_composite_score);
+        assert!(!policy.allow_correct_wrong_labels);
+        assert!(!policy.allow_causal_claims);
+        assert!(!policy.allow_quotes_or_predictions);
+        assert!(!policy.allow_concrete_trade_advice);
+    }
+
+    fn question(id: &str, impact: f64) -> StockReviewQuestionCandidate {
+        StockReviewQuestionCandidate {
+            id: id.to_string(),
+            impact,
+            contribution_share: None,
+            absolute_weight_change_pp: None,
+            result_risk_conflict: false,
+            metric_changing_ambiguity: false,
+            durable_context: false,
+            already_answered: false,
+            determinable_from_report: false,
+            prose_completion_only: false,
+        }
+    }
+
+    #[test]
+    fn stock_review_question_policy_returns_zero_for_boundaries_and_low_value_prompts() {
+        let mut contribution_boundary = question("contribution-boundary", 100.0);
+        contribution_boundary.contribution_share = Some(0.20);
+        let mut weight_boundary = question("weight-boundary", 90.0);
+        weight_boundary.absolute_weight_change_pp = Some(5.0);
+        let mut answered = question("answered", 80.0);
+        answered.metric_changing_ambiguity = true;
+        answered.already_answered = true;
+        let mut determinable = question("determinable", 70.0);
+        determinable.result_risk_conflict = true;
+        determinable.determinable_from_report = true;
+        let mut prose_only = question("prose", 60.0);
+        prose_only.durable_context = true;
+        prose_only.prose_completion_only = true;
+
+        assert!(select_stock_review_questions(&[
+            contribution_boundary,
+            weight_boundary,
+            answered,
+            determinable,
+            prose_only,
+        ])
+        .is_empty());
+    }
+
+    #[test]
+    fn stock_review_question_policy_sorts_by_impact_caps_three_and_marks_skippable() {
+        let mut contribution = question("contribution", 70.0);
+        contribution.contribution_share = Some(-0.200_001);
+        let mut weight = question("weight", 80.0);
+        weight.absolute_weight_change_pp = Some(5.001);
+        let mut conflict = question("conflict", 100.0);
+        conflict.result_risk_conflict = true;
+        let mut ambiguity = question("ambiguity", 90.0);
+        ambiguity.metric_changing_ambiguity = true;
+
+        let selected = select_stock_review_questions(&[contribution, weight, conflict, ambiguity]);
+        assert_eq!(selected.len(), 3);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["conflict", "ambiguity", "weight"]
+        );
+        assert_eq!(
+            selected[0].reason,
+            StockReviewQuestionReason::ResultRiskConflict
+        );
+        assert_eq!(
+            selected[1].reason,
+            StockReviewQuestionReason::MetricChangingAmbiguity
+        );
+        assert_eq!(
+            selected[2].reason,
+            StockReviewQuestionReason::WeightChangeOverFivePoints
+        );
+        assert!(selected.iter().all(|item| item.skippable));
+    }
+
+    #[test]
+    fn version_seven_upgrade_installs_stock_review_without_deleting_user_skills() {
+        let dir = tempdir().unwrap();
+        let skills_dir = dir.path();
+        let marker_dir = skills_dir.join(BUILTIN_MARKER_DIR);
+        fs::create_dir_all(&marker_dir).unwrap();
+        write(&skills_dir.join("trade-review.md"), "old builtin");
+        write(&marker_dir.join("trade-review"), "7");
+        write(
+            &skills_dir.join("my-private-process.md"),
+            "---\nname: private\ndescription: user owned\ntrigger: private\n---\nbody\n",
+        );
+
+        export_builtin_skills_to_dir(skills_dir).unwrap();
+
+        assert!(skills_dir.join("stock-review.md").exists());
+        assert_eq!(
+            fs::read_to_string(marker_dir.join("stock-review")).unwrap(),
+            "8"
+        );
+        assert!(skills_dir.join("my-private-process.md").exists());
+        assert!(!marker_dir.join("my-private-process").exists());
     }
 
     // --- parse_frontmatter ---------------------------------------------------

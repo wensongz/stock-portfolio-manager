@@ -27,7 +27,7 @@
 
 ## 内置工具清单
 
-共 21 个工具，按用途分组：
+共 23 个工具，按用途分组：
 
 ### 行情类
 
@@ -72,6 +72,17 @@
 | --- | --- | --- |
 | `get_option_positions` | `accountId` | 当前持仓和到期风险 |
 | `get_option_review` | `accountId`，`symbol?`，`periodDays?=365`，`allHistory?=false` | 每笔SELL开仓对应一个Campaign；`gross_premium`/`net_premium_pnl`为含进行中Campaign的累计现金口径，`completed_gross_premium`/`completed_net_premium_pnl`及留存率、年化收益率和最差Campaign为已完成口径；`allHistory=true` 返回全部历史并覆盖 `periodDays` |
+
+### 股票操作复盘
+
+| 工具名 | 参数 | 性质与作用 |
+| --- | --- | --- |
+| `get_stock_review` | `start_date`，`end_date`，`base_currency`，`account_id?`，`market?`，`benchmark_symbol?`，`symbol?`，`campaign_id?` | 只读。调用与股票操作复盘页面相同的 `stock_review_service` 确定性报告；可按股票或 Campaign 裁剪上下文，保留的数值、状态和问题不改值 |
+| `save_stock_review_annotation` | `id`，`scope`，`annotation_type`，`value` | 写入。仅保存结构化复盘背景注释，不纠正交易、不覆盖指标、不触发重算 |
+
+`get_stock_review` 的日期格式为 `YYYY-MM-DD`，基准币种支持 `USD` / `CNY` / `HKD`，市场支持 `US` / `CN` / `HK`。`symbol` 与 `campaign_id` 只控制返回上下文的裁剪；组合摘要仍来自同一份 Rust 报告。`available`、`degraded`、`pending`、`unavailable` 都是成功报告中的数据状态，不能把不可用指标当成工具执行错误，也不能由 AI 补零或重算。
+
+`save_stock_review_annotation` 的 `scope` 是对象，包含 `type`（`period` / `stock` / `campaign` / `action`）、`key` 及可选 `account_id` / `symbol`；`value` 必须是 JSON 对象。只有用户在当前消息明确要求“保存/记录这条背景”时，聊天执行上下文才会获得内部确认能力。模型参数中的布尔值或自报确认不能授权写入；确认前调用没有数据库副作用。AI 工具注册表不提供股票复盘纠正或 override 工具，转仓、重复交易、同日顺序、拆股/非交易变动仍走页面的结构化预演确认流程。
 
 ### 其他
 

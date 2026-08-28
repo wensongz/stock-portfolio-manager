@@ -17,6 +17,7 @@ use crate::commands::transactions::query_transactions_inner;
 use crate::db::Database;
 use crate::models::dashboard::DashboardSummary;
 use crate::models::option_review::OptionReviewReport;
+use crate::models::stock_review::{StockReviewAnnotationInput, StockReviewQuery};
 use crate::services::ai_chat_service::build_portfolio_context;
 use crate::services::alert_service;
 use crate::services::exchange_rate_service::{
@@ -28,7 +29,9 @@ use crate::services::option_review_service;
 use crate::services::performance_service::{self, PerformanceFilter};
 use crate::services::quote_provider_service;
 use crate::services::quote_service::{self, resolve_index_secid, QuoteCache};
-use chrono::{Duration, Utc};
+use crate::services::skill_service::{self, StockReviewQuestionCandidate};
+use crate::services::stock_review_service::{self, ConfirmedAiAnnotationCapability};
+use chrono::{Duration, NaiveDate, Utc};
 use serde_json::{json, Value};
 
 /// Maximum number of sequential tool rounds in a single chat turn. Each round
@@ -377,6 +380,55 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "get_stock_review",
+                "description": "读取与股票操作复盘页面相同的 Rust 确定性报告。只解释返回的数值、状态、问题和事实标签，不重算指标。指标 unavailable/degraded/pending 仍是成功数据。symbol 或 campaign_id 可裁剪到相关详情。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "start_date": { "type": "string", "description": "开始日期，YYYY-MM-DD" },
+                        "end_date": { "type": "string", "description": "结束日期，YYYY-MM-DD" },
+                        "base_currency": { "type": "string", "enum": ["USD", "CNY", "HKD"] },
+                        "account_id": { "type": "string", "description": "可选账户 ID" },
+                        "market": { "type": "string", "enum": ["US", "CN", "HK"] },
+                        "benchmark_symbol": { "type": "string", "description": "可选组合基准代码" },
+                        "symbol": { "type": "string", "description": "可选股票代码，仅保留相关动作、Campaign、归因和问题" },
+                        "campaign_id": { "type": "string", "description": "可选 Campaign ID，返回确定性 Campaign 详情" }
+                    },
+                    "required": ["start_date", "end_date", "base_currency"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "save_stock_review_annotation",
+                "description": "Save structured stock-review background only after explicit user confirmation in the current turn. This writes an annotation only; it cannot correct, override, or recalculate report data. A model-supplied confirmation field cannot authorize execution.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "稳定、幂等的注释 ID" },
+                        "scope": {
+                            "type": "object",
+                            "properties": {
+                                "type": { "type": "string", "enum": ["period", "stock", "campaign", "action"] },
+                                "key": { "type": "string" },
+                                "account_id": { "type": "string" },
+                                "symbol": { "type": "string" }
+                            },
+                            "required": ["type", "key"],
+                            "additionalProperties": false
+                        },
+                        "annotation_type": { "type": "string" },
+                        "value": { "type": "object", "description": "结构化 JSON 背景对象" }
+                    },
+                    "required": ["id", "scope", "annotation_type", "value"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "get_stock_fundamentals",
                 "description": "获取某只股票的估值与基本面指标：市盈率(PE-TTM)、市净率(PB)、总市值、股息率、每股收益(EPS)、净资产收益率(ROE)、换手率。当用户询问\"这只股票贵不贵\"\"估值\"\"市盈率\"\"市净率\"\"市值\"\"分红\"等估值/基本面问题时调用，是做投资价值分析的关键数据之一。",
                 "parameters": {
@@ -456,6 +508,7 @@ pub struct ToolCtx<'a> {
     pub db: &'a Database,
     pub cache: &'a ExchangeRateCache,
     pub quote_cache: &'a QuoteCache,
+    pub(crate) stock_review_annotation_confirmation: Option<ConfirmedAiAnnotationCapability>,
 }
 
 /// Result of a single tool call, ready to be serialized into the `tool`-role
@@ -519,6 +572,8 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, arguments: &str) -> Too
         "check_price_alerts" => tool_check_alerts(ctx).await,
         "get_option_positions" => tool_option_positions(ctx, &args).await,
         "get_option_review" => tool_option_review(ctx, &args).await,
+        "get_stock_review" => tool_stock_review(ctx, &args).await,
+        "save_stock_review_annotation" => tool_save_stock_review_annotation(ctx, &args),
         "get_stock_fundamentals" => tool_stock_fundamentals(ctx, &args).await,
         "get_technical_indicators" => tool_technical_indicators(ctx, &args).await,
         "get_financial_statements" => tool_financial_statements(ctx, &args).await,
@@ -1229,6 +1284,420 @@ async fn tool_option_review(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     }
 }
 
+fn required_trimmed_string(args: &Value, key: &str) -> Result<String, String> {
+    match args.get(key) {
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+        Some(Value::String(_)) => Err(format!("参数 {key} 不能为空。")),
+        Some(_) => Err(format!("参数 {key} 必须是字符串。")),
+        None => Err(format!("缺少参数 {key}。")),
+    }
+}
+
+fn optional_trimmed_string(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            Ok(Some(value.trim().to_string()))
+        }
+        Some(Value::String(_)) => Err(format!("参数 {key} 不能为空。")),
+        Some(_) => Err(format!("参数 {key} 必须是字符串。")),
+    }
+}
+
+fn parse_stock_review_query(args: &Value) -> Result<StockReviewQuery, String> {
+    let start = required_trimmed_string(args, "start_date")?;
+    let end = required_trimmed_string(args, "end_date")?;
+    let start_date = NaiveDate::parse_from_str(&start, "%Y-%m-%d")
+        .map_err(|_| "参数 start_date 格式无效，请使用 YYYY-MM-DD。".to_string())?;
+    let end_date = NaiveDate::parse_from_str(&end, "%Y-%m-%d")
+        .map_err(|_| "参数 end_date 格式无效，请使用 YYYY-MM-DD。".to_string())?;
+    let query = StockReviewQuery {
+        start_date,
+        end_date,
+        account_id: optional_trimmed_string(args, "account_id")?,
+        market: optional_trimmed_string(args, "market")?.map(|value| value.to_ascii_uppercase()),
+        benchmark_symbol: optional_trimmed_string(args, "benchmark_symbol")?,
+        base_currency: required_trimmed_string(args, "base_currency")?.to_ascii_uppercase(),
+    };
+    stock_review_service::validate_query(&query)?;
+    Ok(query)
+}
+
+fn value_symbol_matches(value: &Value, symbol: &str) -> bool {
+    value
+        .get("symbol")
+        .and_then(Value::as_str)
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(symbol))
+}
+
+fn retain_matching_symbol(values: &mut Value, symbol: &str) {
+    if let Some(values) = values.as_array_mut() {
+        values.retain(|value| value_symbol_matches(value, symbol));
+    }
+}
+
+fn trim_high_value_rows(values: &mut Value, limit: usize) {
+    let Some(values) = values.as_array_mut() else {
+        return;
+    };
+    values.sort_by(|left, right| {
+        let impact = |value: &Value| {
+            value
+                .get("contribution")
+                .and_then(Value::as_f64)
+                .map(f64::abs)
+                .or_else(|| {
+                    let before = value.get("portfolio_weight_before")?.as_f64()?;
+                    let after = value.get("portfolio_weight_after")?.as_f64()?;
+                    Some((after - before).abs())
+                })
+                .unwrap_or(0.0)
+        };
+        impact(right)
+            .partial_cmp(&impact(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    values.truncate(limit);
+}
+
+fn structured_stock_review_questions(
+    report: &Value,
+) -> Vec<skill_service::SelectedStockReviewQuestion> {
+    let denominator = report
+        .pointer("/attribution/ending_value_difference")
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            report
+                .pointer("/summary/rebalance_value_add/ending_value_difference_base")
+                .and_then(Value::as_f64)
+        })
+        .map(f64::abs)
+        .filter(|value| *value > f64::EPSILON);
+    let annotated_action_ids: std::collections::HashSet<&str> = report
+        .get("annotations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|annotation| annotation.get("scope_type").and_then(Value::as_str) == Some("action"))
+        .filter_map(|annotation| annotation.get("scope_key").and_then(Value::as_str))
+        .collect();
+    let mut candidates = Vec::new();
+    for action in report
+        .get("actions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = action.get("action_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let contribution_share = denominator.and_then(|denominator| {
+            action
+                .get("contribution")
+                .and_then(Value::as_f64)
+                .map(|contribution| contribution / denominator)
+        });
+        let absolute_weight_change_pp = action
+            .get("portfolio_weight_before")
+            .and_then(Value::as_f64)
+            .zip(action.get("portfolio_weight_after").and_then(Value::as_f64))
+            .map(|(before, after)| (after - before).abs() * 100.0);
+        candidates.push(StockReviewQuestionCandidate {
+            id: format!("action:{id}"),
+            impact: contribution_share
+                .map(f64::abs)
+                .unwrap_or(0.0)
+                .max(absolute_weight_change_pp.unwrap_or(0.0) / 100.0),
+            contribution_share,
+            absolute_weight_change_pp,
+            result_risk_conflict: false,
+            metric_changing_ambiguity: false,
+            durable_context: false,
+            already_answered: annotated_action_ids.contains(id),
+            determinable_from_report: false,
+            prose_completion_only: false,
+        });
+    }
+
+    let value_add = report
+        .pointer("/summary/rebalance_value_add/value_add")
+        .and_then(Value::as_f64);
+    let risk_change = report
+        .pointer("/summary/risk_structure/opening_max_stock_weight")
+        .and_then(Value::as_f64)
+        .zip(
+            report
+                .pointer("/summary/risk_structure/ending_max_stock_weight")
+                .and_then(Value::as_f64),
+        )
+        .map(|(opening, ending)| ending - opening);
+    if value_add
+        .zip(risk_change)
+        .is_some_and(|(value_add, risk_change)| value_add * risk_change > 0.0)
+    {
+        candidates.push(StockReviewQuestionCandidate {
+            id: "result-risk-conflict".to_string(),
+            impact: value_add.unwrap_or_default().abs() + risk_change.unwrap_or_default().abs(),
+            contribution_share: None,
+            absolute_weight_change_pp: None,
+            result_risk_conflict: true,
+            metric_changing_ambiguity: false,
+            durable_context: false,
+            already_answered: false,
+            determinable_from_report: false,
+            prose_completion_only: false,
+        });
+    }
+
+    for issue in report
+        .pointer("/data_quality/issues")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(code) = issue.get("code").and_then(Value::as_str) else {
+            continue;
+        };
+        let changes_metric = ["uncertain", "ambigu", "conflict", "duplicate", "stale"]
+            .iter()
+            .any(|marker| code.to_ascii_lowercase().contains(marker));
+        if changes_metric {
+            candidates.push(StockReviewQuestionCandidate {
+                id: format!("issue:{code}"),
+                impact: 1.0,
+                contribution_share: None,
+                absolute_weight_change_pp: None,
+                result_risk_conflict: false,
+                metric_changing_ambiguity: true,
+                durable_context: false,
+                already_answered: false,
+                determinable_from_report: false,
+                prose_completion_only: false,
+            });
+        }
+    }
+    skill_service::select_stock_review_questions(&candidates)
+}
+
+fn compact_stock_review_payload(
+    mut report: Value,
+    symbol: Option<&str>,
+    campaign_id: Option<&str>,
+    campaign_detail: Option<Value>,
+) -> Result<Value, String> {
+    let object = report
+        .as_object_mut()
+        .ok_or_else(|| "股票复盘报告序列化结果不是对象。".to_string())?;
+    object.remove("curves");
+
+    let symbol = symbol.map(str::trim).filter(|value| !value.is_empty());
+    let campaign_id = campaign_id.map(str::trim).filter(|value| !value.is_empty());
+    let mut effective_symbol = symbol.map(str::to_string);
+    let mut campaign_action_ids = std::collections::HashSet::new();
+
+    if let Some(campaign_id) = campaign_id {
+        let campaigns = object
+            .get_mut("campaigns")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| "报告缺少 Campaign 列表。".to_string())?;
+        campaigns.retain(|campaign| {
+            campaign.get("campaign_id").and_then(Value::as_str) == Some(campaign_id)
+        });
+        let campaign = campaigns
+            .first()
+            .ok_or_else(|| format!("报告中找不到 Campaign '{campaign_id}'。"))?;
+        let campaign_symbol = campaign.get("symbol").and_then(Value::as_str);
+        if effective_symbol
+            .as_deref()
+            .zip(campaign_symbol)
+            .is_some_and(|(requested, actual)| !requested.eq_ignore_ascii_case(actual))
+        {
+            return Err(format!(
+                "Campaign '{campaign_id}' 不属于请求的股票 '{}'。",
+                effective_symbol.as_deref().unwrap_or_default()
+            ));
+        }
+        if effective_symbol.is_none() {
+            effective_symbol = campaign_symbol.map(str::to_string);
+        }
+        if let Some(ids) = campaign.get("action_ids").and_then(Value::as_array) {
+            campaign_action_ids.extend(ids.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+    } else if let Some(symbol) = symbol {
+        if let Some(campaigns) = object.get_mut("campaigns") {
+            retain_matching_symbol(campaigns, symbol);
+        }
+    } else {
+        if let Some(actions) = object.get_mut("actions") {
+            trim_high_value_rows(actions, 12);
+        }
+        if let Some(campaigns) = object.get_mut("campaigns") {
+            trim_high_value_rows(campaigns, 12);
+        }
+    }
+
+    if let Some(actions) = object.get_mut("actions").and_then(Value::as_array_mut) {
+        if !campaign_action_ids.is_empty() {
+            actions.retain(|action| {
+                action
+                    .get("action_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| campaign_action_ids.contains(id))
+            });
+        } else if let Some(symbol) = effective_symbol.as_deref() {
+            actions.retain(|action| value_symbol_matches(action, symbol));
+        }
+    }
+
+    if let Some(symbol) = effective_symbol.as_deref() {
+        if let Some(attribution) = object.get_mut("attribution").and_then(Value::as_object_mut) {
+            for key in ["action_contributions", "contributors", "detractors"] {
+                if let Some(items) = attribution.get_mut(key) {
+                    retain_matching_symbol(items, symbol);
+                }
+            }
+        }
+        if let Some(issues) = object
+            .get_mut("data_quality")
+            .and_then(Value::as_object_mut)
+            .and_then(|quality| quality.get_mut("issues"))
+            .and_then(Value::as_array_mut)
+        {
+            issues.retain(|issue| {
+                issue.get("affected_symbol").is_none_or(Value::is_null)
+                    || issue
+                        .get("affected_symbol")
+                        .and_then(Value::as_str)
+                        .is_some_and(|affected| affected.eq_ignore_ascii_case(symbol))
+            });
+        }
+        if let Some(annotations) = object.get_mut("annotations").and_then(Value::as_array_mut) {
+            annotations.retain(|annotation| {
+                annotation.get("symbol").is_none_or(Value::is_null)
+                    || annotation
+                        .get("symbol")
+                        .and_then(Value::as_str)
+                        .is_some_and(|annotated| annotated.eq_ignore_ascii_case(symbol))
+            });
+        }
+    }
+
+    let response_policy = skill_service::stock_review_response_policy();
+    let questions = structured_stock_review_questions(&report);
+    Ok(json!({
+        "deterministic_source": "stock_review_service",
+        "scope": {
+            "symbol": symbol,
+            "campaign_id": campaign_id,
+        },
+        "report": report,
+        "campaign_detail": campaign_detail,
+        "assistant_policy": response_policy,
+        "question_candidates": questions,
+    }))
+}
+
+async fn tool_stock_review(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+    let query = match parse_stock_review_query(args) {
+        Ok(query) => query,
+        Err(error) => return ToolResult::err_json(error),
+    };
+    let symbol = match optional_trimmed_string(args, "symbol") {
+        Ok(symbol) => symbol,
+        Err(error) => return ToolResult::err_json(error),
+    };
+    let campaign_id = match optional_trimmed_string(args, "campaign_id") {
+        Ok(campaign_id) => campaign_id,
+        Err(error) => return ToolResult::err_json(error),
+    };
+    let (report, campaign_detail) =
+        match stock_review_service::get_stock_review_for_ai(ctx.db, query, campaign_id.as_deref())
+            .await
+        {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                return ToolResult::err_json(format!("股票复盘报告参数或数据准备失败：{error}"))
+            }
+        };
+    let campaign_detail = match campaign_detail.map(serde_json::to_value).transpose() {
+        Ok(detail) => detail,
+        Err(error) => return ToolResult::err_json(format!("Campaign 详情序列化失败：{error}")),
+    };
+    let report = match serde_json::to_value(report) {
+        Ok(report) => report,
+        Err(error) => return ToolResult::err_json(format!("股票复盘报告序列化失败：{error}")),
+    };
+    match compact_stock_review_payload(
+        report,
+        symbol.as_deref(),
+        campaign_id.as_deref(),
+        campaign_detail,
+    ) {
+        Ok(payload) => ToolResult::ok_json(payload),
+        Err(error) => ToolResult::err_json(error),
+    }
+}
+
+fn tool_save_stock_review_annotation(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+    let capability = match ctx.stock_review_annotation_confirmation.as_ref() {
+        Some(capability) => capability,
+        None => {
+            return ToolResult::err_json(
+                "当前用户消息未明确要求保存/记录这条背景；未写入任何注释。",
+            )
+        }
+    };
+    let id = match required_trimmed_string(args, "id") {
+        Ok(value) => value,
+        Err(error) => return ToolResult::err_json(error),
+    };
+    let annotation_type = match required_trimmed_string(args, "annotation_type") {
+        Ok(value) => value,
+        Err(error) => return ToolResult::err_json(error),
+    };
+    let scope = match args.get("scope").and_then(Value::as_object) {
+        Some(scope) => scope,
+        None => return ToolResult::err_json("参数 scope 必须是结构化 JSON 对象。"),
+    };
+    let scope_type = match scope.get("type").and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => return ToolResult::err_json("参数 scope.type 不能为空。"),
+    };
+    let scope_key = match scope.get("key").and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => return ToolResult::err_json("参数 scope.key 不能为空。"),
+    };
+    let value = match args.get("value") {
+        Some(value @ Value::Object(_)) => value,
+        _ => return ToolResult::err_json("参数 value 必须是 JSON 对象。"),
+    };
+    let input = StockReviewAnnotationInput {
+        id,
+        scope_type,
+        scope_key,
+        account_id: scope
+            .get("account_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        symbol: scope
+            .get("symbol")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        annotation_type,
+        value_json: value.to_string(),
+        source: "ai_confirmed".to_string(),
+    };
+    match stock_review_service::save_ai_confirmed_stock_review_annotation(ctx.db, input, capability)
+    {
+        Ok(annotation) => ToolResult::ok_json(json!(annotation)),
+        Err(error) => ToolResult::err_json(format!("保存股票复盘注释失败：{error}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,7 +1766,7 @@ mod tests {
     #[test]
     fn tool_definitions_are_valid_json() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 21);
+        assert_eq!(defs.len(), 23);
         for d in &defs {
             assert_eq!(d["type"], "function");
             assert!(d["function"]["name"].is_string());
@@ -1313,7 +1782,204 @@ mod tests {
             .iter()
             .map(|d| d["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 23);
+    }
+
+    #[test]
+    fn stock_review_tools_have_structured_schemas_and_no_correction_writer() {
+        let defs = tool_definitions();
+        let names: Vec<_> = defs
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        let read = defs
+            .iter()
+            .find(|tool| tool["function"]["name"] == "get_stock_review")
+            .expect("get_stock_review definition");
+        assert_eq!(
+            read["function"]["parameters"]["required"],
+            json!(["start_date", "end_date", "base_currency"])
+        );
+        let properties = read["function"]["parameters"]["properties"]
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            properties
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>(),
+            [
+                "start_date",
+                "end_date",
+                "base_currency",
+                "account_id",
+                "market",
+                "benchmark_symbol",
+                "symbol",
+                "campaign_id",
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let write = defs
+            .iter()
+            .find(|tool| tool["function"]["name"] == "save_stock_review_annotation")
+            .expect("save_stock_review_annotation definition");
+        assert_eq!(
+            write["function"]["parameters"]["required"],
+            json!(["id", "scope", "annotation_type", "value"])
+        );
+        assert_eq!(
+            write["function"]["parameters"]["properties"]["scope"]["type"],
+            "object"
+        );
+        assert_eq!(
+            write["function"]["parameters"]["properties"]["value"]["type"],
+            "object"
+        );
+        assert!(names.iter().all(|name| {
+            !name.contains("stock_review_override") && !name.contains("stock_review_correction")
+        }));
+    }
+
+    #[test]
+    fn stock_review_scoping_preserves_retained_numbers_statuses_and_issues() {
+        let report = json!({
+            "summary": {
+                "result_quality": { "availability": { "status": "degraded" }, "portfolio_return": 0.123456789 },
+                "rebalance_value_add": { "availability": { "status": "unavailable" }, "value_add": null }
+            },
+            "curves": [{ "date": "2026-01-01", "portfolio_return": 0.01 }],
+            "actions": [
+                { "action_id": "keep-action", "symbol": "AAPL", "status": "pending", "contribution": -42.125 },
+                { "action_id": "drop-action", "symbol": "MSFT", "status": "available", "contribution": 10.0 }
+            ],
+            "campaigns": [
+                { "campaign_id": "keep-campaign", "symbol": "AAPL", "availability": { "status": "degraded" }, "contribution": -42.125 },
+                { "campaign_id": "drop-campaign", "symbol": "MSFT", "availability": { "status": "available" }, "contribution": 10.0 }
+            ],
+            "attribution": {
+                "availability": { "status": "degraded" },
+                "contributors": [{ "action_id": "drop-action", "symbol": "MSFT", "amount": 10.0 }],
+                "detractors": [{ "action_id": "keep-action", "symbol": "AAPL", "amount": -42.125 }]
+            },
+            "data_quality": {
+                "forward_effect_availability": { "status": "pending" },
+                "issues": [
+                    { "code": "keep_issue", "affected_symbol": "AAPL", "message": "keep exact" },
+                    { "code": "drop_issue", "affected_symbol": "MSFT", "message": "drop" },
+                    { "code": "global_issue", "affected_symbol": null, "message": "global exact" }
+                ]
+            }
+        });
+
+        let payload =
+            compact_stock_review_payload(report.clone(), Some("aapl"), Some("keep-campaign"), None)
+                .unwrap();
+        let scoped = &payload["report"];
+        assert!(scoped.get("curves").is_none());
+        assert_eq!(scoped["summary"], report["summary"]);
+        assert_eq!(scoped["actions"].as_array().unwrap().len(), 1);
+        assert_eq!(scoped["actions"][0], report["actions"][0]);
+        assert_eq!(scoped["campaigns"].as_array().unwrap().len(), 1);
+        assert_eq!(scoped["campaigns"][0], report["campaigns"][0]);
+        assert_eq!(scoped["attribution"]["detractors"][0]["amount"], -42.125);
+        assert_eq!(scoped["attribution"]["availability"]["status"], "degraded");
+        assert_eq!(
+            scoped["data_quality"]["issues"],
+            json!([
+                { "code": "keep_issue", "affected_symbol": "AAPL", "message": "keep exact" },
+                { "code": "global_issue", "affected_symbol": null, "message": "global exact" }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn stock_review_dispatch_uses_deterministic_service_and_unavailable_is_success_data() {
+        let db = Database::new(":memory:").unwrap();
+        let cache = ExchangeRateCache::new();
+        let quote_cache = QuoteCache::new();
+        let ctx = ToolCtx {
+            db: &db,
+            cache: &cache,
+            quote_cache: &quote_cache,
+            stock_review_annotation_confirmation: None,
+        };
+        let result = execute_tool(
+            &ctx,
+            "get_stock_review",
+            r#"{"start_date":"2026-01-01","end_date":"2026-01-31","base_currency":"USD"}"#,
+        )
+        .await;
+        assert!(result.ok, "{}", result.content);
+        let payload: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(payload["deterministic_source"], "stock_review_service");
+        assert!(payload["report"]["summary"].is_object());
+        assert!(payload["report"]["data_quality"].is_object());
+    }
+
+    #[tokio::test]
+    async fn annotation_tool_requires_execution_capability_and_model_boolean_cannot_authorize() {
+        let db = Database::new(":memory:").unwrap();
+        let cache = ExchangeRateCache::new();
+        let quote_cache = QuoteCache::new();
+        assert!(
+            stock_review_service::confirmed_ai_annotation_capability_for_user_turn(
+                "先替我记下来，之后我再确认"
+            )
+            .is_none()
+        );
+        let args = r#"{
+            "id":"annotation-ai-tool",
+            "scope":{"type":"period","key":"2026-01"},
+            "annotation_type":"investment_background",
+            "value":{"reason":"durable context"},
+            "explicitly_confirmed":true
+        }"#;
+        let unconfirmed = ToolCtx {
+            db: &db,
+            cache: &cache,
+            quote_cache: &quote_cache,
+            stock_review_annotation_confirmation: None,
+        };
+        let denied = execute_tool(&unconfirmed, "save_stock_review_annotation", args).await;
+        assert!(!denied.ok);
+        let before: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM stock_review_annotations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(before, 0);
+
+        let confirmed = ToolCtx {
+            db: &db,
+            cache: &cache,
+            quote_cache: &quote_cache,
+            stock_review_annotation_confirmation:
+                stock_review_service::confirmed_ai_annotation_capability_for_user_turn(
+                    "请保存/记录这条背景",
+                ),
+        };
+        let saved = execute_tool(&confirmed, "save_stock_review_annotation", args).await;
+        assert!(saved.ok, "{}", saved.content);
+        let payload: Value = serde_json::from_str(&saved.content).unwrap();
+        assert_eq!(payload["source"], "ai_confirmed");
+    }
+
+    #[test]
+    fn stock_review_parameter_errors_are_actionable() {
+        let error = parse_stock_review_query(&json!({
+            "start_date": "2026/01/01",
+            "end_date": "2026-01-31",
+            "base_currency": "USD"
+        }))
+        .unwrap_err();
+        assert!(error.contains("start_date"));
+        assert!(error.contains("YYYY-MM-DD"));
     }
 
     #[test]

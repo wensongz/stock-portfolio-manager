@@ -115,18 +115,22 @@ fn resolve_active_skills(app: &AppHandle, params: &ChatParams) -> Vec<Skill> {
     }
 
     // Auto-activation path: scan the latest user message for trigger hits.
-    let latest_user = params
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.as_str())
-        .unwrap_or("");
+    let latest_user = latest_user_message(params);
     if latest_user.trim().is_empty() {
         return Vec::new();
     }
     let skills = skill_service::list_skills(app).unwrap_or_default();
     skill_service::match_triggers(&skills, latest_user)
+}
+
+fn latest_user_message(params: &ChatParams) -> &str {
+    params
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.as_str())
+        .unwrap_or("")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -930,6 +934,10 @@ pub async fn chat_stream(
         db,
         cache,
         quote_cache,
+        stock_review_annotation_confirmation:
+            crate::services::stock_review_service::confirmed_ai_annotation_capability_for_user_turn(
+                latest_user_message(&params),
+            ),
     };
 
     // ── Agentic tool-calling loop ──────────────────────────────────────────
@@ -1656,6 +1664,10 @@ async fn chat_stream_anthropic(
         db,
         cache,
         quote_cache,
+        stock_review_annotation_confirmation:
+            crate::services::stock_review_service::confirmed_ai_annotation_capability_for_user_turn(
+                latest_user_message(&params),
+            ),
     };
 
     STOP_REQUESTED.store(false, Ordering::SeqCst);

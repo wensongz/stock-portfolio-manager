@@ -436,3 +436,97 @@ exit code: 0
 - Filtered daily holding snapshots contain stock rows but no authoritative historical cash balance. They can display fully converted stock values, but portfolio-denominator ratios remain unavailable until account/market cash snapshots are persisted.
 - Legacy holdings with no transaction history remain an explicit fallback for no-trade reports. Recorded splits are handled exactly once, but an unrecorded trade or unknown holding as-of timestamp cannot be reconstructed; imports should preserve authoritative OPEN/transaction history.
 - The current quote provider still does not certify complete adjusted-close or corporate-action dividend coverage. Account PAY rows remain actual cash income only and cannot establish shadow total-return completeness.
+
+## Fix round 4: aligned candidate snapshots and historical display cutoffs
+
+This section supersedes round 3's looser candidate-range fingerprint and row-vector serialization approach.
+
+- Implementation commit: `441ca81405c3d83c2ed91a1157e0616936bd09b2` (`fix: align stock review candidate snapshots`).
+- No dependency was added. The pre-existing untracked `node_modules` directory remained untouched and unstaged.
+
+### Exact consumed-range model and coherent reload
+
+- `CandidateRevisionScope` is the explicit dependency contract for confirmation. It carries report start/end, price start, exact evaluation end, current-ledger/split horizon, display cutoff, selected accounts and markets, exact `(symbol, market)` securities, portfolio/local benchmark symbols, and required currencies.
+- Candidate discovery first pins the broad in-scope user ledger and active-override set through today. Async price/benchmark cache preparation may then complete. User-owned transactions, holdings, snapshots, splits, annotations, and quarterly history are rechecked immediately after that boundary and are never refreshed or blessed.
+- Cache-owned calendar rows and coverage are reloaded after cache preparation, and `evaluation_end` is recomputed from the 120th authoritative local-market session for every report action. The exact scope is pinned only after this dependency plan is current.
+- Every mutable report source is then reloaded: active/stale overrides with candidate replacement, transactions and corrected actions/Campaigns, holding/security discovery, calendar authority, stock prices, selected benchmark prices, and local benchmark prices. Security dependencies must still equal discovery, and the compact exact-scope revision is checked after materialization.
+- The save transaction recomputes the identical active-override, user-source, and cache-source digests before persistence. A post-end transaction or split that can affect current-cash unwind/opening reconstruction is included through `current_horizon`; prices, benchmark rows, sessions, and coverage are included through `evaluation_end`; quarterly/display inputs use `display_cutoff`.
+- A cache fill that legitimately changes future session/coverage data is visible to the recomputed plan rather than leaving stale pre-fill rows in the candidate. A concurrent user mutation during the same async boundary rejects the candidate and produces no override write.
+
+### Scoped streaming revisions
+
+- The former nested JSON row vectors were replaced with deterministic sorted SQLite scans feeding separate 16-character user/cache/override digests. Rows are hashed as they are read, so memory use is O(1) with respect to source history and the write transaction compares only compact digest values.
+- Transactions remain broad within the selected account/market through the current horizon because even a post-report trade changes authoritative current-cash unwind. Holdings, snapshots, prices, benchmarks, sessions, coverage, annotations, and quarterly context are narrowed to the exact ranges and keys each loader consumes.
+- Security SQL uses exact `(symbol, market)` tuple identity rather than independent symbol/market filters. A cross-product cache row such as `AAPL/CN` therefore cannot invalidate a candidate consuming only `AAPL/US` and `600000/CN`.
+- Active-override revision scans only override rows whose referenced transactions intersect the query's selected account/market/current-horizon source scope. An unrelated-account override update no longer invalidates confirmation, while an in-scope override mutation still does.
+
+### Historical display as-of
+
+- Quarterly holding notes and manual `decision_quality` rows are loaded only when the joined quarterly snapshot date is on or before `query.end_date`.
+- Annotation visibility uses explicit `effective_date`, `snapshot_date`, or `effective_start`; `created_at` is not treated as an economic date. Campaign matching receives the report as-of date, caps an active Campaign's effective end at that date, and rejects annotation ranges that begin later.
+- These annotations remain display-only and never enter metric, attribution, replay, or quality inputs.
+
+### TDD RED/GREEN evidence
+
+The round-four production-path/persistence RED suite failed before implementation with these intended contradictions:
+
+```text
+candidate_revisions_are_compact_streaming_digests:
+active override revision length was 2 instead of 16
+
+unrelated_account_override_does_not_invalidate_scoped_candidate:
+candidate save was rejected by a global override revision
+
+candidate_rejects_post_report_transaction_and_split_mutation:
+expected revision error but preparation returned Ok(CachedStockReviewInput)
+
+candidate_reloads_future_evaluation_calendar_after_cache_fill:
+candidate retained the stale future session plan
+
+historical_display_excludes_future_quarterly_notes:
+2 notes loaded instead of 1
+
+active_historical_campaign_rejects_annotation_starting_after_report_as_of:
+error[E0061]: annotation matcher had no report-as-of argument
+
+unrelated_symbol_market_pair_does_not_invalidate_scoped_candidate:
+candidate was rejected by an unrelated cross-product price row
+```
+
+All fail-first tests passed after the coherent snapshot, exact range, historical cutoff, and tuple-scope changes. Existing Task 9 corrected-ledger, 120-session maturity, calendar authority, dividend mode, split, FX completeness, opening suppression, Campaign integrity, forward-quality independence, stale-replacement, AI provenance, and twelve-scenario acceptance tests remained unchanged and GREEN.
+
+### Final verification
+
+```text
+cargo test --lib services::stock_review_persistence::tests --quiet
+19 passed; 0 failed
+
+cargo test --lib services::stock_review_service::tests --quiet
+48 passed; 0 failed
+
+cargo test --lib commands::review::tests --quiet
+2 passed; 0 failed
+
+cargo test --lib
+490 passed; 0 failed; 8 ignored
+
+cargo check --lib
+passed
+
+npm run build
+TypeScript and Vite production build passed; existing large-chunk warning only
+
+rustfmt --edition 2021 <two modified Rust files>
+exit code: 0
+
+git diff --check
+exit code: 0
+```
+
+### Remaining honest limitations after round 4
+
+- The repository still has no production exchange-calendar importer. Cache preparation can consume authoritative rows supplied through the explicit calendar/coverage boundary, but a normal live database without certified coverage continues to suppress exact-session forward and Campaign metrics.
+- Cached FX is a global singleton rather than a per-date/per-scope source table. Its revision is necessarily conservative, and historical non-base metrics remain unavailable where exact daily FX cannot be resolved from recorded portfolio snapshots.
+- Filtered daily holding snapshots still do not persist authoritative historical cash by account/market. They can display complete converted stock NAV, but denominator-based turnover and fee drag remain unavailable rather than using a partial portfolio value.
+- Legacy holdings with no transaction history still require the documented fallback. Recorded splits are reversed/replayed exactly once, but an unrecorded trade or unknown holding as-of timestamp cannot be reconstructed.
+- The compact digest is intentionally a lightweight deterministic concurrency guard, not a cryptographic hash. It avoids full-history serialization and global scans, while direct SQL mutations in the exact consumed scope remain detectable by the regression suite.

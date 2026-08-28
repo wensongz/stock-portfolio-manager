@@ -50,6 +50,7 @@ pub struct ValidatedOverrideCandidate {
     pub input: StockReviewOverrideInput,
     active_override_revision: String,
     reference_fingerprint_json: String,
+    review_source_revision: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -220,7 +221,20 @@ pub fn prepare_override_candidate(
         active_override_revision: active_override_revision(&conn)?,
         reference_fingerprint_json: serde_json::to_string(&fingerprints)
             .map_err(|error| error.to_string())?,
+        review_source_revision: review_source_revision(&conn)?,
     })
+}
+
+/// Refresh only after the asynchronous cache preparation owned by this
+/// candidate has completed. The active override revision deliberately remains
+/// the original one so a concurrent confirmation is still detected.
+pub fn refresh_candidate_source_revision(
+    db: &Database,
+    candidate: &mut ValidatedOverrideCandidate,
+) -> Result<(), String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    candidate.review_source_revision = review_source_revision(&conn)?;
+    Ok(())
 }
 
 pub fn save_override_candidate(
@@ -233,6 +247,12 @@ pub fn save_override_candidate(
     if active_override_revision(&transaction)? != candidate.active_override_revision {
         return Err(
             "The active override set changed while the candidate report was being built; rebuild the report before confirming."
+                .to_string(),
+        );
+    }
+    if review_source_revision(&transaction)? != candidate.review_source_revision {
+        return Err(
+            "A report source changed while the candidate report was being built; rebuild before confirming."
                 .to_string(),
         );
     }
@@ -309,6 +329,45 @@ fn active_override_revision(conn: &Connection) -> Result<String, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     serde_json::to_string(&rows).map_err(|error| error.to_string())
+}
+
+fn review_source_revision(conn: &Connection) -> Result<String, String> {
+    const TABLES: &[&str] = &[
+        "transactions",
+        "holdings",
+        "daily_portfolio_values",
+        "daily_holding_snapshots",
+        "benchmark_daily_prices",
+        "stock_daily_prices",
+        "stock_market_sessions",
+        "stock_splits",
+        "stock_review_annotations",
+        "cached_exchange_rates",
+    ];
+    let mut revision = Vec::<(&str, Vec<Vec<String>>)>::new();
+    for table in TABLES {
+        let mut columns_statement = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|error| error.to_string())?;
+        let columns = columns_statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let sql = format!("SELECT {} FROM {table} ORDER BY rowid", columns.join(", "));
+        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                (0..columns.len())
+                    .map(|index| row.get_ref(index).map(|value| format!("{value:?}")))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        revision.push((table, rows));
+    }
+    serde_json::to_string(&revision).map_err(|error| error.to_string())
 }
 
 pub fn list_overrides(db: &Database) -> Result<StockReviewOverrideList, String> {
@@ -1270,6 +1329,40 @@ mod tests {
         .unwrap();
         assert!(save_override_candidate(&db, candidate).is_err());
         assert_eq!(list_overrides(&db).unwrap().overrides.len(), 1);
+    }
+
+    #[test]
+    fn prepared_override_rejects_a_changed_full_review_source_revision() {
+        // A split, price, session, FX, annotation, or other report source
+        // changing after candidate materialization must prevent a stale save.
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        let candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["buy"], "{}"),
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO stock_splits (stock_code, split_date, ratio_from, ratio_to, created_at)
+                 VALUES ('AAPL', '2024-02-02', 1, 2, '2024-02-01')",
+                [],
+            )
+            .unwrap();
+
+        assert!(save_override_candidate(&db, candidate).is_err());
+        assert_eq!(list_overrides(&db).unwrap().overrides.len(), 0);
     }
 
     #[test]

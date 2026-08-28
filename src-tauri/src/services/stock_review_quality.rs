@@ -92,7 +92,10 @@ pub fn build_stock_review_quality(input: &QualityInput) -> StockReviewDataQualit
         coverage_status.clone(),
         residual_status,
     ]);
-    let forward_effect_status = merge_metric_statuses(&[coverage_status.clone(), maturity_status]);
+    // Forward windows have their own exact-session dependency graph. Missing
+    // data for an unrelated security or currency must not suppress an action
+    // whose stock, local benchmark, and authoritative target sessions exist.
+    let forward_effect_status = maturity_status;
 
     let mut issues = input.issues.clone();
     let source_ledger_conflict = issues
@@ -277,7 +280,7 @@ mod tests {
         let degraded = build_stock_review_quality(&input);
         assert_eq!(
             degraded.forward_effect_availability.status,
-            MetricStatus::Degraded
+            MetricStatus::Pending
         );
         assert_eq!(degraded.availability.status, MetricStatus::Degraded);
     }

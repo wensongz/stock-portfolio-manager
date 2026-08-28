@@ -28,11 +28,23 @@ pub struct PositionEvent {
 }
 
 /// Pure derivation output used by review orchestration and campaign building.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ActionBuildResult {
     pub actions: Vec<StockActionReview>,
     pub position_events: Vec<PositionEvent>,
+    pub corrected_transactions: Vec<CorrectedTransaction>,
     pub issues: Vec<StockReviewIssue>,
+}
+
+/// Canonical ordered source row after active override disposition. Every
+/// stock-review cash/flow consumer must use this materialization rather than
+/// iterating the raw transaction table independently.
+#[derive(Debug, Clone)]
+pub struct CorrectedTransaction {
+    pub transaction: Transaction,
+    pub is_transfer: bool,
+    pub has_cash_effect: bool,
+    pub action_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -65,6 +77,15 @@ pub fn build_stock_actions(
         })
         .collect();
     records.sort_by(|left, right| compare_records(left, right, &override_state.same_day_order));
+    let mut corrected_transactions = records
+        .iter()
+        .map(|record| CorrectedTransaction {
+            transaction: record.transaction.clone(),
+            is_transfer: record.is_transfer,
+            has_cash_effect: !record.is_transfer,
+            action_id: None,
+        })
+        .collect::<Vec<_>>();
 
     let mut shares_by_position: HashMap<(String, String), f64> = HashMap::new();
     let mut actions = Vec::new();
@@ -197,6 +218,20 @@ pub fn build_stock_actions(
         }
     }
     flush_action_fills(&mut fills, &mut actions);
+    let action_ids_by_transaction = actions
+        .iter()
+        .flat_map(|action| {
+            action
+                .transaction_ids
+                .iter()
+                .map(move |transaction_id| (transaction_id.as_str(), action.action_id.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
+    for corrected in &mut corrected_transactions {
+        corrected.action_id = action_ids_by_transaction
+            .get(corrected.transaction.id.as_str())
+            .map(|value| (*value).to_string());
+    }
 
     for (account_id, normalized_symbol, date) in date_only_reversals {
         let relevant_events = position_events
@@ -233,6 +268,7 @@ pub fn build_stock_actions(
     ActionBuildResult {
         actions,
         position_events,
+        corrected_transactions,
         issues,
     }
 }
@@ -258,7 +294,13 @@ impl OverrideState {
                 "non_trade" => state.excluded_ids.extend(ids),
                 "duplicate" => {
                     state.duplicate_ids.extend(ids.iter().cloned());
-                    state.excluded_ids.extend(ids);
+                    if ids.len() < 2 {
+                        state.excluded_ids.extend(ids);
+                    } else {
+                        // The confirmed first reference is the canonical source
+                        // row; later equivalent references are excluded.
+                        state.excluded_ids.extend(ids.into_iter().skip(1));
+                    }
                 }
                 "transfer" => state.transfer_ids.extend(ids),
                 "same_day_order" => {

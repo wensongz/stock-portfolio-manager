@@ -23,6 +23,7 @@ const SYSTEM_CATEGORIES: [(&str, &str, &str, i64); 4] = [
 pub(crate) fn clear_stock_review_data(tx: &Transaction<'_>) -> SqlResult<()> {
     for table in [
         "stock_daily_prices",
+        "stock_market_sessions",
         "stock_review_annotations",
         "stock_review_overrides",
     ] {

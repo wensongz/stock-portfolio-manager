@@ -538,6 +538,14 @@ impl Database {
               PRIMARY KEY (symbol, market, date)
             );
 
+            CREATE TABLE IF NOT EXISTS stock_market_sessions (
+              market TEXT NOT NULL CHECK(market IN ('US','CN','HK')),
+              date TEXT NOT NULL,
+              source TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (market, date)
+            );
+
             CREATE TABLE IF NOT EXISTS stock_review_annotations (
               id TEXT PRIMARY KEY,
               scope_type TEXT NOT NULL CHECK(scope_type IN ('period','stock','campaign','action')),

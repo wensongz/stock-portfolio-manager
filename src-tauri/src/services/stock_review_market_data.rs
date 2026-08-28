@@ -306,6 +306,41 @@ pub fn load_benchmark_series(
     .collect()
 }
 
+/// Load exchange sessions from the explicit calendar cache. Quote rows are
+/// deliberately not accepted as calendar authority.
+pub fn load_market_sessions(
+    db: &Database,
+    market: &str,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Result<Vec<NaiveDate>, String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let mut statement = conn
+        .prepare(
+            "SELECT date FROM stock_market_sessions
+             WHERE market = ?1 AND date BETWEEN ?2 AND ?3
+             ORDER BY date ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let sessions = statement
+        .query_map(
+            params![
+                market,
+                start.format("%Y-%m-%d").to_string(),
+                end.format("%Y-%m-%d").to_string()
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| error.to_string())?
+        .map(|row| {
+            let date = row.map_err(|error| error.to_string())?;
+            NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .map_err(|error| format!("Invalid cached market-session date '{date}': {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(sessions)
+}
+
 pub fn default_benchmark_symbol(market: &str) -> Option<&'static str> {
     match market {
         "US" => Some("^GSPC"),

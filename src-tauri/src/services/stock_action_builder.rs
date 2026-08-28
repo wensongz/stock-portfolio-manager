@@ -55,7 +55,7 @@ pub fn build_stock_actions(
     transactions: &[Transaction],
     overrides: &[StockReviewOverride],
 ) -> ActionBuildResult {
-    let mut override_state = OverrideState::from_overrides(overrides);
+    let override_state = OverrideState::from_overrides(overrides);
     let mut records: Vec<ReplayRecord<'_>> = transactions
         .iter()
         .filter(|transaction| !override_state.excluded_ids.contains(&transaction.id))
@@ -64,21 +64,6 @@ pub fn build_stock_actions(
             is_transfer: override_state.transfer_ids.contains(&transaction.id),
         })
         .collect();
-    for record in &records {
-        if override_state
-            .same_day_order
-            .contains_key(&record.transaction.id)
-        {
-            if let Some(date) = trade_date(&record.transaction.traded_at) {
-                override_state.same_day_override_keys.insert((
-                    record.transaction.account_id.clone(),
-                    record.transaction.symbol.clone(),
-                    date,
-                ));
-            }
-        }
-    }
-
     records.sort_by(|left, right| compare_records(left, right, &override_state.same_day_order));
 
     let mut shares_by_position: HashMap<(String, String), f64> = HashMap::new();
@@ -211,7 +196,7 @@ pub fn build_stock_actions(
     flush_action_fills(&mut fills, &mut actions);
 
     for (account_id, symbol, date) in date_only_reversals {
-        let sides: HashSet<&str> = position_events
+        let relevant_events = position_events
             .iter()
             .filter(|event| {
                 event.account_id == account_id
@@ -220,15 +205,18 @@ pub fn build_stock_actions(
                     && event.is_date_precision
                     && (event.transaction_type == "BUY" || event.transaction_type == "SELL")
             })
+            .collect::<Vec<_>>();
+        let sides: HashSet<&str> = relevant_events
+            .iter()
             .map(|event| event.transaction_type.as_str())
             .collect();
-        if sides.len() > 1
-            && !override_state.same_day_override_keys.contains(&(
-                account_id.clone(),
-                symbol.clone(),
-                date,
-            ))
-        {
+        let order_is_complete = !relevant_events.is_empty()
+            && relevant_events.iter().all(|event| {
+                override_state
+                    .same_day_order
+                    .contains_key(&event.transaction_id)
+            });
+        if sides.len() > 1 && !order_is_complete {
             issues.push(StockReviewIssue {
                 code: "same_day_order_uncertain".to_string(),
                 severity: StockReviewIssueSeverity::Warning,
@@ -251,7 +239,6 @@ struct OverrideState {
     duplicate_ids: HashSet<String>,
     transfer_ids: HashSet<String>,
     same_day_order: HashMap<String, usize>,
-    same_day_override_keys: HashSet<(String, String, NaiveDate)>,
 }
 
 impl OverrideState {
@@ -261,7 +248,6 @@ impl OverrideState {
             duplicate_ids: HashSet::new(),
             transfer_ids: HashSet::new(),
             same_day_order: HashMap::new(),
-            same_day_override_keys: HashSet::new(),
         };
         for override_record in overrides {
             let ids = parse_ids(&override_record.transaction_ids_json);
@@ -384,14 +370,14 @@ fn duplicate_issues(ids: &HashSet<String>, transactions: &[Transaction]) -> Vec<
     transactions
         .iter()
         .filter(|transaction| ids.contains(&transaction.id))
-        .filter_map(|transaction| {
-            trade_date(&transaction.traded_at).map(|date| issue(
+        .map(|transaction| {
+            issue(
                 "source_ledger_conflict",
                 StockReviewIssueSeverity::Error,
                 "A duplicate override excludes this transaction; attribution and shadow metrics require ledger review.",
                 transaction,
-                Some(date),
-            ))
+                trade_date(&transaction.traded_at),
+            )
         })
         .collect()
 }
@@ -756,6 +742,59 @@ mod tests {
                 .is_transfer
         );
         assert!(!result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "same_day_order_uncertain"));
+    }
+
+    #[test]
+    fn duplicate_override_reports_conflict_when_its_trade_date_is_malformed() {
+        // Dropping an excluded duplicate just because its date is malformed
+        // would hide a source-ledger conflict from the report.
+        let transactions = vec![transaction(
+            "duplicate",
+            "acct",
+            "AAPL",
+            "BUY",
+            10.0,
+            100.0,
+            "not-a-date",
+        )];
+        let overrides = vec![override_record(
+            "duplicate",
+            "duplicate",
+            &["duplicate"],
+            "{}",
+        )];
+
+        let result = build_stock_actions(&transactions, &overrides);
+
+        let conflict = result
+            .issues
+            .iter()
+            .find(|issue| issue.code == "source_ledger_conflict")
+            .expect("duplicate conflicts must be reported regardless of date quality");
+        assert_eq!(conflict.affected_date, None);
+    }
+
+    #[test]
+    fn partial_same_day_order_override_keeps_reversal_order_uncertain() {
+        // Treating one ranked leg as confirmation of a two-leg reversal would
+        // hide the remaining ordering ambiguity.
+        let transactions = vec![
+            transaction("buy", "acct", "AAPL", "BUY", 10.0, 100.0, "2024-01-02"),
+            transaction("sell", "acct", "AAPL", "SELL", 10.0, 110.0, "2024-01-02"),
+        ];
+        let overrides = vec![override_record(
+            "partial-order",
+            "same_day_order",
+            &["buy", "sell"],
+            r#"["buy"]"#,
+        )];
+
+        let result = build_stock_actions(&transactions, &overrides);
+
+        assert!(result
             .issues
             .iter()
             .any(|issue| issue.code == "same_day_order_uncertain"));

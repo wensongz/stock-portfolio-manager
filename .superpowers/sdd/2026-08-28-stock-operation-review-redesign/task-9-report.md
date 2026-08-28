@@ -708,3 +708,58 @@ exit code: 0
 - Scoped override snapshots scan persisted override rows and their small referenced-ID sets rather than global transaction history. This keeps the correctness boundary centralized and bounded by correction count, but it is not a per-override revision-counter design.
 - Unknown or empty legacy fingerprints cannot prove account/market ownership. They remain safely excluded from replay and conservatively audit-visible, which can produce a stale audit warning in more than one filtered report until the user reconfirms or removes that legacy correction.
 - The 16-character structurally framed FNV digest remains a noncryptographic probabilistic concurrency guard, not an adversarial integrity mechanism.
+
+## Exceptional round-6 follow-up: pinned override validation state
+
+This narrow follow-up remains within the user-authorized round-6 coherence scope.
+
+- Implementation commit: `5c9a352597e3cf72831cc74f53c06562a0b5baf5` (`fix: pin override validation state`).
+- No dependency, schema, command, or report-contract change was added.
+
+### Semantic ruling and defense in depth
+
+- Same-day ordering now uses the same stock-position identity as action and Campaign replay: exact account, trimmed/case-normalized symbol, trimmed/case-normalized market, and trade date. A CN reversal can no longer alter a US ordering correction for the same account/symbol/date.
+- The complete reversal-set SQL now includes normalized market, and the referenced rows themselves must all share that market.
+- The shared scoped override digest explicitly frames `snapshot.is_current`. Any validation dependency that changes a correction from active to stale, or stale to active, therefore changes both the active-override and user-source digests even when the persisted override row and referenced rows are unchanged.
+
+### TDD RED/GREEN evidence
+
+```text
+cross_market_same_day_reversals_do_not_stale_us_order_or_candidate:
+RED: only 1 active override remained instead of 2; the US order became stale
+GREEN: the unrelated CN reversals leave the US order active and the pinned US candidate saves
+
+same_market_extra_reversal_changes_override_revision_and_rejects_candidate:
+RED: active override digest stayed 7a2c23110a6486a6 after completeness changed
+GREEN: the digest changes, the pinned candidate is rejected, and the US order is audit-visible as stale
+```
+
+The existing canonical preview/post-read equality and same-ID stale replacement tests were rerun unchanged and passed.
+
+### Final verification
+
+```text
+cargo test --lib services::stock_review_persistence::tests --quiet
+38 passed; 0 failed
+
+cargo test --lib services::stock_review_service::tests --quiet
+50 passed; 0 failed
+
+cargo test --lib commands::review::tests --quiet
+2 passed; 0 failed
+
+cargo test --lib --quiet
+511 passed; 0 failed; 8 ignored
+
+cargo check --lib
+passed
+
+npm run build
+TypeScript and Vite production build passed; existing large-chunk warning only
+
+rustfmt --edition 2021 src/services/stock_review_persistence.rs
+exit code: 0
+
+git diff --check
+exit code: 0
+```

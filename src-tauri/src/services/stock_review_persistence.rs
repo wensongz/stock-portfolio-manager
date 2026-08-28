@@ -13,13 +13,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 const EPSILON: f64 = 1e-9;
-const SCOPED_OVERRIDE_EXISTS: &str = "EXISTS (
-        SELECT 1 FROM json_each(o.transaction_ids_json) ids
-        JOIN transactions t ON t.id = ids.value
-        WHERE (json_array_length(?1) = 0 OR t.account_id IN (SELECT value FROM json_each(?1)))
-          AND (json_array_length(?2) = 0 OR t.market IN (SELECT value FROM json_each(?2)))
-          AND substr(t.traded_at, 1, 10) <= ?3
-    )";
+const REFERENCE_FINGERPRINT_VERSION: u8 = 2;
 
 /// The caller's trust boundary for an annotation write. `ai_confirmed` is a
 /// provenance label, never standalone authority for an AI to write data.
@@ -96,39 +90,10 @@ struct ReviewSourceRevision {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct TransactionReferenceFingerprint {
     id: String,
+    holding_id: Option<String>,
     account_id: String,
     symbol: String,
-    transaction_type: String,
-    shares: f64,
-    price: f64,
-    total_amount: f64,
-    commission: f64,
-    currency: String,
-    traded_at: String,
-}
-
-impl TransactionReferenceFingerprint {
-    fn from_transaction(transaction: &StoredTransaction) -> Self {
-        Self {
-            id: transaction.id.clone(),
-            account_id: transaction.account_id.clone(),
-            symbol: transaction.symbol.clone(),
-            transaction_type: transaction.transaction_type.clone(),
-            shares: transaction.shares,
-            price: transaction.price,
-            total_amount: transaction.total_amount,
-            commission: transaction.commission,
-            currency: transaction.currency.clone(),
-            traded_at: transaction.traded_at.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct StoredTransaction {
-    id: String,
-    account_id: String,
-    symbol: String,
+    name: String,
     market: String,
     transaction_type: String,
     shares: f64,
@@ -137,6 +102,93 @@ struct StoredTransaction {
     commission: f64,
     currency: String,
     traded_at: String,
+    notes: Option<String>,
+    created_at: String,
+}
+
+impl TransactionReferenceFingerprint {
+    fn from_transaction(transaction: &StoredTransaction) -> Self {
+        Self {
+            id: transaction.id.clone(),
+            holding_id: transaction.holding_id.clone(),
+            account_id: transaction.account_id.trim().to_string(),
+            symbol: normalize_symbol(&transaction.symbol)
+                .unwrap_or_else(|_| transaction.symbol.trim().to_ascii_uppercase()),
+            name: transaction.name.clone(),
+            market: transaction.market.trim().to_ascii_uppercase(),
+            transaction_type: normalized_type(&transaction.transaction_type),
+            shares: transaction.shares,
+            price: transaction.price,
+            total_amount: transaction.total_amount,
+            commission: transaction.commission,
+            currency: transaction.currency.trim().to_ascii_uppercase(),
+            traded_at: transaction.traded_at.clone(),
+            notes: transaction.notes.clone(),
+            created_at: transaction.created_at.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct VersionedTransactionReferenceFingerprints {
+    version: u8,
+    transactions: Vec<TransactionReferenceFingerprint>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyTransactionReferenceFingerprint {
+    id: String,
+    account_id: String,
+    #[allow(dead_code)]
+    symbol: String,
+    #[allow(dead_code)]
+    transaction_type: String,
+    #[allow(dead_code)]
+    shares: f64,
+    #[allow(dead_code)]
+    price: f64,
+    #[allow(dead_code)]
+    total_amount: f64,
+    #[allow(dead_code)]
+    commission: f64,
+    #[allow(dead_code)]
+    currency: String,
+    traded_at: String,
+}
+
+#[derive(Debug, Clone)]
+enum DecodedReferenceFingerprints {
+    Current(Vec<TransactionReferenceFingerprint>),
+    Legacy(Vec<LegacyTransactionReferenceFingerprint>),
+    Invalid,
+}
+
+#[derive(Debug, Clone)]
+struct ScopedOverrideSnapshot {
+    record: StockReviewOverride,
+    stored_fingerprint_json: String,
+    reference_ids: Vec<String>,
+    current_references: Vec<Option<StoredTransaction>>,
+    is_current: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StoredTransaction {
+    id: String,
+    holding_id: Option<String>,
+    account_id: String,
+    symbol: String,
+    name: String,
+    market: String,
+    transaction_type: String,
+    shares: f64,
+    price: f64,
+    total_amount: f64,
+    commission: f64,
+    currency: String,
+    traded_at: String,
+    notes: Option<String>,
+    created_at: String,
 }
 
 pub fn list_annotations(
@@ -295,8 +347,7 @@ pub fn prepare_override_candidate(
     Ok(ValidatedOverrideCandidate {
         input,
         active_override_revision: active_override_revision(&conn, &source_scope)?,
-        reference_fingerprint_json: serde_json::to_string(&fingerprints)
-            .map_err(|error| error.to_string())?,
+        reference_fingerprint_json: encode_reference_fingerprints(&fingerprints)?,
         review_source_revision: review_source_revision(&conn, &source_scope)?,
         preparation_user_revision,
         preparation_scope: source_scope.clone(),
@@ -436,8 +487,7 @@ pub fn save_override_candidate(
         .iter()
         .map(TransactionReferenceFingerprint::from_transaction)
         .collect::<Vec<_>>();
-    let current_fingerprint_json =
-        serde_json::to_string(&fingerprints).map_err(|error| error.to_string())?;
+    let current_fingerprint_json = encode_reference_fingerprints(&fingerprints)?;
     if current_fingerprint_json != candidate.reference_fingerprint_json {
         return Err(
             "The referenced source transactions changed while the candidate report was being built; rebuild before confirming."
@@ -482,29 +532,243 @@ fn active_override_revision(
     conn: &Connection,
     scope: &CandidateRevisionScope,
 ) -> Result<String, String> {
-    let mut digest = StableDigest::new("stock-review-overrides-v2");
-    let accounts = json_string_list(&scope.account_ids)?;
-    let markets = json_string_list(&scope.markets)?;
-    let sql = format!(
-        "SELECT o.id, o.override_type, o.transaction_ids_json, o.value_json,
-                o.reference_fingerprint_json, o.updated_at
-         FROM stock_review_overrides o
-         WHERE {SCOPED_OVERRIDE_EXISTS}
-         ORDER BY o.id ASC"
-    );
-    stream_query_digest(
-        conn,
-        &mut digest,
-        "overrides",
-        &sql,
-        vec![
-            SqlValue::Text(accounts),
-            SqlValue::Text(markets),
-            SqlValue::Text(date_text(scope.current_horizon)),
-        ],
-        6,
-    )?;
+    let mut digest = StableDigest::new("stock-review-overrides-v3");
+    digest_scoped_override_snapshots(conn, scope, &mut digest)?;
     Ok(digest.finish())
+}
+
+fn encode_reference_fingerprints(
+    fingerprints: &[TransactionReferenceFingerprint],
+) -> Result<String, String> {
+    serde_json::to_string(&VersionedTransactionReferenceFingerprints {
+        version: REFERENCE_FINGERPRINT_VERSION,
+        transactions: fingerprints.to_vec(),
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn decode_reference_fingerprints(value: &str) -> DecodedReferenceFingerprints {
+    if let Ok(versioned) = serde_json::from_str::<VersionedTransactionReferenceFingerprints>(value)
+    {
+        if versioned.version == REFERENCE_FINGERPRINT_VERSION {
+            return DecodedReferenceFingerprints::Current(versioned.transactions);
+        }
+        return DecodedReferenceFingerprints::Invalid;
+    }
+    if let Ok(legacy) = serde_json::from_str::<Vec<LegacyTransactionReferenceFingerprint>>(value) {
+        return if legacy.is_empty() {
+            DecodedReferenceFingerprints::Invalid
+        } else {
+            DecodedReferenceFingerprints::Legacy(legacy)
+        };
+    }
+    DecodedReferenceFingerprints::Invalid
+}
+
+fn scoped_override_snapshots(
+    conn: &Connection,
+    scope: Option<&CandidateRevisionScope>,
+) -> Result<Vec<ScopedOverrideSnapshot>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, override_type, transaction_ids_json, value_json,
+                    created_at, updated_at, reference_fingerprint_json
+             FROM stock_review_overrides
+             ORDER BY id ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| Ok((map_override(row)?, row.get::<_, String>(6)?)))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut snapshots = Vec::new();
+    for (record, stored_fingerprint_json) in rows {
+        let declared_transaction_ids =
+            parse_transaction_ids(&record.transaction_ids_json).unwrap_or_default();
+        let decoded_fingerprints = decode_reference_fingerprints(&stored_fingerprint_json);
+        let mut reference_ids = declared_transaction_ids.clone();
+        let mut seen = reference_ids.iter().cloned().collect::<HashSet<_>>();
+        for original_id in decoded_reference_ids(&decoded_fingerprints) {
+            if seen.insert(original_id.clone()) {
+                reference_ids.push(original_id);
+            }
+        }
+        let current_references = load_transaction_references(conn, &reference_ids)?;
+        if !override_snapshot_is_relevant(&decoded_fingerprints, &current_references, scope) {
+            continue;
+        }
+        let input = StockReviewOverrideInput {
+            id: record.id.clone(),
+            override_type: record.override_type.clone(),
+            transaction_ids_json: record.transaction_ids_json.clone(),
+            value_json: record.value_json.clone(),
+        };
+        let valid = normalize_override_input(input)
+            .and_then(|input| validate_normalized_override(conn, &input))
+            .is_ok_and(|validation| validation.is_valid);
+        let is_current = match &decoded_fingerprints {
+            DecodedReferenceFingerprints::Current(stored) if valid && !stored.is_empty() => {
+                declared_transaction_ids.len() == stored.len()
+                    && current_references
+                        .iter()
+                        .take(declared_transaction_ids.len())
+                        .map(|reference| {
+                            reference
+                                .as_ref()
+                                .map(TransactionReferenceFingerprint::from_transaction)
+                        })
+                        .eq(stored.iter().cloned().map(Some))
+            }
+            // Legacy snapshots did not include market and therefore cannot
+            // prove the exact original report scope. Preserve them for audit,
+            // but never silently replay them as active corrections.
+            DecodedReferenceFingerprints::Legacy(_) | DecodedReferenceFingerprints::Invalid => {
+                false
+            }
+            DecodedReferenceFingerprints::Current(_) => false,
+        };
+        snapshots.push(ScopedOverrideSnapshot {
+            record,
+            stored_fingerprint_json,
+            reference_ids,
+            current_references,
+            is_current,
+        });
+    }
+    Ok(snapshots)
+}
+
+fn decoded_reference_ids(decoded: &DecodedReferenceFingerprints) -> Vec<String> {
+    match decoded {
+        DecodedReferenceFingerprints::Current(references) => references
+            .iter()
+            .map(|reference| reference.id.clone())
+            .collect(),
+        DecodedReferenceFingerprints::Legacy(references) => references
+            .iter()
+            .map(|reference| reference.id.clone())
+            .collect(),
+        DecodedReferenceFingerprints::Invalid => Vec::new(),
+    }
+}
+
+fn override_snapshot_is_relevant(
+    decoded: &DecodedReferenceFingerprints,
+    current: &[Option<StoredTransaction>],
+    scope: Option<&CandidateRevisionScope>,
+) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    let current_matches = current.iter().flatten().any(|transaction| {
+        transaction_reference_in_scope(
+            &TransactionReferenceFingerprint::from_transaction(transaction),
+            scope,
+        )
+    });
+    let original_matches = match decoded {
+        DecodedReferenceFingerprints::Current(references) => references
+            .iter()
+            .any(|reference| transaction_reference_in_scope(reference, scope)),
+        // Market was absent in the legacy format. Account/date identity can
+        // exclude an unrelated query, but a matching account is conservatively
+        // audit-visible for every market and never replay-active.
+        DecodedReferenceFingerprints::Legacy(references) => references
+            .iter()
+            .any(|reference| legacy_reference_in_scope(reference, scope)),
+        // A malformed migrated row has no trustworthy original identity.
+        // Keeping it visible is conservative and ensures it cannot disappear
+        // merely because all current referenced rows were deleted.
+        DecodedReferenceFingerprints::Invalid => true,
+    };
+    original_matches || current_matches
+}
+
+fn transaction_reference_in_scope(
+    reference: &TransactionReferenceFingerprint,
+    scope: &CandidateRevisionScope,
+) -> bool {
+    scope_identity_matches(
+        &reference.account_id,
+        Some(&reference.market),
+        &reference.traded_at,
+        scope,
+    )
+}
+
+fn legacy_reference_in_scope(
+    reference: &LegacyTransactionReferenceFingerprint,
+    scope: &CandidateRevisionScope,
+) -> bool {
+    scope_identity_matches(&reference.account_id, None, &reference.traded_at, scope)
+}
+
+fn scope_identity_matches(
+    account_id: &str,
+    market: Option<&str>,
+    traded_at: &str,
+    scope: &CandidateRevisionScope,
+) -> bool {
+    let account_matches = scope.account_ids.is_empty()
+        || scope
+            .account_ids
+            .iter()
+            .any(|expected| expected.trim() == account_id.trim());
+    let market_matches = scope.markets.is_empty()
+        || market.is_none()
+        || scope.markets.iter().any(|expected| {
+            market.is_some_and(|actual| expected.trim().eq_ignore_ascii_case(actual.trim()))
+        });
+    let date_matches = trade_date(traded_at).is_none_or(|date| date <= scope.current_horizon);
+    account_matches && market_matches && date_matches
+}
+
+fn digest_scoped_override_snapshots(
+    conn: &Connection,
+    scope: &CandidateRevisionScope,
+    digest: &mut StableDigest,
+) -> Result<(), String> {
+    digest.write_frame(0x30, b"scoped_override_snapshots_v3");
+    for (override_index, snapshot) in scoped_override_snapshots(conn, Some(scope))?
+        .into_iter()
+        .enumerate()
+    {
+        digest.write_frame(0x31, &(override_index as u64).to_le_bytes());
+        for value in [
+            snapshot.record.id.as_str(),
+            snapshot.record.override_type.as_str(),
+            snapshot.record.transaction_ids_json.as_str(),
+            snapshot.record.value_json.as_str(),
+            snapshot.record.created_at.as_str(),
+            snapshot.record.updated_at.as_str(),
+            snapshot.stored_fingerprint_json.as_str(),
+        ] {
+            digest.write_frame(0x32, value.as_bytes());
+        }
+        for (reference_index, (id, current)) in snapshot
+            .reference_ids
+            .iter()
+            .zip(snapshot.current_references.iter())
+            .enumerate()
+        {
+            digest.write_frame(0x33, &(reference_index as u64).to_le_bytes());
+            digest.write_frame(0x34, id.as_bytes());
+            match current {
+                Some(transaction) => {
+                    digest.write_frame(0x35, b"present");
+                    let fingerprint =
+                        TransactionReferenceFingerprint::from_transaction(transaction);
+                    let encoded =
+                        serde_json::to_vec(&fingerprint).map_err(|error| error.to_string())?;
+                    digest.write_frame(0x36, &encoded);
+                }
+                None => digest.write_frame(0x37, b"tombstone"),
+            }
+        }
+        digest.write_frame(0x38, &[]);
+    }
+    Ok(())
 }
 
 fn review_source_revision(
@@ -521,8 +785,13 @@ fn user_source_revision(
     conn: &Connection,
     scope: &CandidateRevisionScope,
 ) -> Result<String, String> {
-    let mut digest = StableDigest::new("stock-review-user-v2");
+    let mut digest = StableDigest::new("stock-review-user-v3");
     digest_scope(&mut digest, scope)?;
+    // Scoped corrections consume every referenced ledger row, including a
+    // cross-account/cross-market leg and explicit absence. Hash the same
+    // centralized snapshot used by replay selection so async preparation
+    // cannot bless a mutation outside the visible account filter.
+    digest_scoped_override_snapshots(conn, scope, &mut digest)?;
     let accounts = json_string_list(&scope.account_ids)?;
     let markets = json_string_list(&scope.markets)?;
     let symbols = json_string_list(&sorted_unique(
@@ -586,19 +855,19 @@ fn user_source_revision(
         conn,
         &mut digest,
         "holding_snapshots",
-        "SELECT date, account_id, symbol, market, shares, avg_cost, close_price, market_value
+        "SELECT id, date, account_id, symbol, market, shares, avg_cost, close_price, market_value
          FROM daily_holding_snapshots
          WHERE (json_array_length(?1) = 0 OR account_id IN (SELECT value FROM json_each(?1)))
            AND (json_array_length(?2) = 0 OR market IN (SELECT value FROM json_each(?2)))
            AND date BETWEEN ?3 AND ?4
-         ORDER BY date, account_id, market, symbol",
+         ORDER BY date, account_id, market, symbol, id",
         vec![
             SqlValue::Text(accounts.clone()),
             SqlValue::Text(markets.clone()),
             SqlValue::Text(date_text(scope.report_start)),
             SqlValue::Text(date_text(scope.report_end)),
         ],
-        8,
+        9,
     )?;
     stream_query_digest(
         conn,
@@ -864,80 +1133,44 @@ pub fn list_overrides_for_query(
     current_horizon: NaiveDate,
 ) -> Result<StockReviewOverrideList, String> {
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
-    let accounts = json_string_list(&query.account_id.clone().into_iter().collect::<Vec<_>>())?;
-    let markets = json_string_list(&query.market.clone().into_iter().collect::<Vec<_>>())?;
-    list_overrides_from_connection(&conn, Some((accounts, markets, date_text(current_horizon))))
+    let scope = CandidateRevisionScope {
+        report_start: query.start_date,
+        report_end: query.end_date,
+        price_start: query.start_date,
+        evaluation_end: query.end_date,
+        current_horizon,
+        display_cutoff: query.end_date,
+        account_ids: query.account_id.clone().into_iter().collect(),
+        markets: query.market.clone().into_iter().collect(),
+        securities: Vec::new(),
+        benchmark_symbols: Vec::new(),
+        currencies: vec![query.base_currency.clone()],
+    };
+    list_overrides_from_connection(&conn, Some(&scope))
 }
 
 fn list_overrides_from_connection(
     conn: &Connection,
-    scope: Option<(String, String, String)>,
+    scope: Option<&CandidateRevisionScope>,
 ) -> Result<StockReviewOverrideList, String> {
-    let sql = match scope {
-        Some(_) => format!(
-            "SELECT o.id, o.override_type, o.transaction_ids_json, o.value_json,
-                    o.created_at, o.updated_at, o.reference_fingerprint_json
-             FROM stock_review_overrides o
-             WHERE {SCOPED_OVERRIDE_EXISTS}
-             ORDER BY o.created_at ASC, o.id ASC"
-        ),
-        None => "SELECT o.id, o.override_type, o.transaction_ids_json, o.value_json,
-                        o.created_at, o.updated_at, o.reference_fingerprint_json
-                 FROM stock_review_overrides o
-                 ORDER BY o.created_at ASC, o.id ASC"
-            .to_string(),
-    };
-    let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
-    let rows = match scope {
-        Some((accounts, markets, horizon)) => statement
-            .query_map(params![accounts, markets, horizon], |row| {
-                Ok((map_override(row)?, row.get::<_, String>(6)?))
-            })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?,
-        None => statement
-            .query_map([], |row| Ok((map_override(row)?, row.get::<_, String>(6)?)))
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?,
-    };
-
     let mut result = StockReviewOverrideList {
         overrides: Vec::new(),
         stale_overrides: Vec::new(),
         issues: Vec::new(),
     };
-    for (override_record, stored_fingerprint_json) in rows {
-        let input = StockReviewOverrideInput {
-            id: override_record.id.clone(),
-            override_type: override_record.override_type.clone(),
-            transaction_ids_json: override_record.transaction_ids_json.clone(),
-            value_json: override_record.value_json.clone(),
-        };
-        let validation = normalize_override_input(input)
-            .and_then(|input| validate_normalized_override(&conn, &input));
-        let fingerprints =
-            serde_json::from_str::<Vec<TransactionReferenceFingerprint>>(&stored_fingerprint_json);
-        let is_current = match (validation, fingerprints) {
-            (Ok(validation), Ok(fingerprints))
-                if validation.is_valid && !fingerprints.is_empty() =>
-            {
-                let ids = parse_transaction_ids(&override_record.transaction_ids_json)?;
-                let current = load_transactions(&conn, &ids)?;
-                current.len() == fingerprints.len()
-                    && current
-                        .iter()
-                        .map(TransactionReferenceFingerprint::from_transaction)
-                        .eq(fingerprints.into_iter())
-            }
-            _ => false,
-        };
-        if is_current {
-            result.overrides.push(override_record);
+    let mut snapshots = scoped_override_snapshots(conn, scope)?;
+    snapshots.sort_by(|left, right| {
+        left.record
+            .created_at
+            .cmp(&right.record.created_at)
+            .then_with(|| left.record.id.cmp(&right.record.id))
+    });
+    for snapshot in snapshots {
+        if snapshot.is_current {
+            result.overrides.push(snapshot.record);
         } else {
-            result.issues.push(stale_override_issue(&override_record));
-            result.stale_overrides.push(override_record);
+            result.issues.push(stale_override_issue(&snapshot.record));
+            result.stale_overrides.push(snapshot.record);
         }
     }
     Ok(result)
@@ -1217,36 +1450,47 @@ fn validate_non_trade(transactions: &[StoredTransaction], issues: &mut Vec<Stock
 }
 
 fn load_transactions(conn: &Connection, ids: &[String]) -> Result<Vec<StoredTransaction>, String> {
-    let mut transactions = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(transaction) = conn
-            .query_row(
-                "SELECT id, account_id, symbol, market, transaction_type, shares, price, total_amount, commission, currency, traded_at
+    Ok(load_transaction_references(conn, ids)?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
+fn load_transaction_references(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<Vec<Option<StoredTransaction>>, String> {
+    ids.iter()
+        .map(|id| {
+            conn.query_row(
+                "SELECT id, holding_id, account_id, symbol, name, market, transaction_type,
+                        shares, price, total_amount, commission, currency, traded_at, notes, created_at
                  FROM transactions WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok(StoredTransaction {
                         id: row.get(0)?,
-                        account_id: row.get(1)?,
-                        symbol: row.get(2)?,
-                        market: row.get(3)?,
-                        transaction_type: row.get(4)?,
-                        shares: row.get(5)?,
-                        price: row.get(6)?,
-                        total_amount: row.get(7)?,
-                        commission: row.get(8)?,
-                        currency: row.get(9)?,
-                        traded_at: row.get(10)?,
+                        holding_id: row.get(1)?,
+                        account_id: row.get(2)?,
+                        symbol: row.get(3)?,
+                        name: row.get(4)?,
+                        market: row.get(5)?,
+                        transaction_type: row.get(6)?,
+                        shares: row.get(7)?,
+                        price: row.get(8)?,
+                        total_amount: row.get(9)?,
+                        commission: row.get(10)?,
+                        currency: row.get(11)?,
+                        traded_at: row.get(12)?,
+                        notes: row.get(13)?,
+                        created_at: row.get(14)?,
                     })
                 },
             )
             .optional()
-            .map_err(|error| error.to_string())?
-        {
-            transactions.push(transaction);
-        }
-    }
-    Ok(transactions)
+            .map_err(|error| error.to_string())
+        })
+        .collect()
 }
 
 fn same_day_reversal_ids(
@@ -2815,5 +3059,396 @@ mod tests {
         assert_eq!(result.issues.len(), 1);
         assert_eq!(result.issues[0].code, "stale_override");
         assert!(result.issues[0].message.contains("stale-a"));
+    }
+
+    fn scoped_query(account_id: &str) -> StockReviewQuery {
+        StockReviewQuery {
+            start_date: NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            end_date: NaiveDate::from_ymd_opt(2024, 2, 2).unwrap(),
+            account_id: Some(account_id.to_string()),
+            market: Some("US".to_string()),
+            benchmark_symbol: None,
+            base_currency: "USD".to_string(),
+        }
+    }
+
+    fn save_cross_account_transfer(db: &Database, id: &str) {
+        insert_transaction(
+            db,
+            &format!("{id}-source"),
+            "acct-a",
+            "AAPL",
+            "SELL",
+            5.0,
+            100.0,
+            "2024-02-01",
+        );
+        insert_transaction(
+            db,
+            &format!("{id}-destination"),
+            "acct-b",
+            "AAPL",
+            "BUY",
+            5.0,
+            100.0,
+            "2024-02-01",
+        );
+        save_override(
+            db,
+            override_input(
+                id,
+                "transfer",
+                &[&format!("{id}-source"), &format!("{id}-destination")],
+                "{}",
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scoped_candidate_rejects_cross_account_reference_mutation() {
+        // Omitting out-of-scope transfer legs from the scoped revision would
+        // let a report for acct-a save against a transfer state it never built.
+        let db = database();
+        save_cross_account_transfer(&db, "book-transfer");
+        insert_transaction(
+            &db,
+            "candidate-row",
+            "acct-a",
+            "MSFT",
+            "OPEN",
+            1.0,
+            200.0,
+            "2024-02-02",
+        );
+        let mut candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["candidate-row"], "{}"),
+        )
+        .unwrap();
+        scope_candidate_to_query(&db, &mut candidate, &scoped_query("acct-a")).unwrap();
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE transactions SET shares = 4, total_amount = 400
+                 WHERE id = 'book-transfer-destination'",
+                [],
+            )
+            .unwrap();
+
+        assert!(save_override_candidate(&db, candidate).is_err());
+        assert!(!list_overrides(&db)
+            .unwrap()
+            .overrides
+            .iter()
+            .any(|record| record.id == "candidate"));
+    }
+
+    #[test]
+    fn scoped_revision_keeps_original_reference_ids_after_override_row_drift() {
+        // The revision set is the union of the persisted confirmation IDs and
+        // the mutable override row IDs. Otherwise an altered override row can
+        // orphan an original cross-account leg from candidate coherence.
+        let db = database();
+        save_cross_account_transfer(&db, "book-transfer");
+        insert_transaction(
+            &db,
+            "replacement-reference",
+            "acct-a",
+            "MSFT",
+            "OPEN",
+            1.0,
+            200.0,
+            "2024-02-02",
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE stock_review_overrides
+                 SET transaction_ids_json = '[\"replacement-reference\"]'
+                 WHERE id = 'book-transfer'",
+                [],
+            )
+            .unwrap();
+        let mut candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["replacement-reference"], "{}"),
+        )
+        .unwrap();
+        scope_candidate_to_query(&db, &mut candidate, &scoped_query("acct-a")).unwrap();
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE transactions SET shares = 4, total_amount = 400
+                 WHERE id = 'book-transfer-destination'",
+                [],
+            )
+            .unwrap();
+
+        assert!(save_override_candidate(&db, candidate).is_err());
+    }
+
+    #[test]
+    fn deleting_cross_account_leg_changes_revision_and_keeps_scoped_stale_issue() {
+        // A missing referenced row must be represented by a tombstone rather
+        // than falling out of both relevance selection and the digest.
+        let db = database();
+        save_cross_account_transfer(&db, "book-transfer");
+        let query = scoped_query("acct-a");
+        let scope = CandidateRevisionScope {
+            report_start: query.start_date,
+            report_end: query.end_date,
+            price_start: query.start_date,
+            evaluation_end: query.end_date,
+            current_horizon: NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+            display_cutoff: query.end_date,
+            account_ids: vec!["acct-a".to_string()],
+            markets: vec!["US".to_string()],
+            ..CandidateRevisionScope::default()
+        };
+        let before = super::active_override_revision(&db.conn.lock().unwrap(), &scope).unwrap();
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM transactions WHERE id = 'book-transfer-destination'",
+                [],
+            )
+            .unwrap();
+
+        let after = super::active_override_revision(&db.conn.lock().unwrap(), &scope).unwrap();
+        assert_ne!(before, after);
+        let listed =
+            list_overrides_for_query(&db, &query, NaiveDate::from_ymd_opt(2024, 3, 1).unwrap())
+                .unwrap();
+        assert!(listed.overrides.is_empty());
+        assert_eq!(listed.stale_overrides.len(), 1);
+        assert_eq!(listed.stale_overrides[0].id, "book-transfer");
+        assert_eq!(listed.issues.len(), 1);
+        assert_eq!(listed.issues[0].code, "stale_override");
+    }
+
+    #[test]
+    fn original_reference_scope_keeps_reaccounted_source_leg_query_relevant() {
+        // Relevance cannot be recomputed solely from mutable current rows:
+        // moving the last acct-a leg must surface a stale audit issue in acct-a.
+        let db = database();
+        save_cross_account_transfer(&db, "book-transfer");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE transactions SET account_id = 'acct-b'
+                 WHERE id = 'book-transfer-source'",
+                [],
+            )
+            .unwrap();
+
+        let listed = list_overrides_for_query(
+            &db,
+            &scoped_query("acct-a"),
+            NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+        )
+        .unwrap();
+        assert!(listed.overrides.is_empty());
+        assert_eq!(listed.stale_overrides.len(), 1);
+        assert_eq!(listed.stale_overrides[0].id, "book-transfer");
+    }
+
+    #[test]
+    fn unrelated_original_and_current_override_scope_stays_excluded() {
+        let db = database();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, name, market, created_at, updated_at)
+                 VALUES ('acct-c', 'Account C', 'US', '2024-01-01', '2024-01-01')",
+                [],
+            )
+            .unwrap();
+        insert_transaction(
+            &db,
+            "bc-source",
+            "acct-b",
+            "AAPL",
+            "SELL",
+            5.0,
+            100.0,
+            "2024-02-01",
+        );
+        insert_transaction(
+            &db,
+            "bc-destination",
+            "acct-c",
+            "AAPL",
+            "BUY",
+            5.0,
+            100.0,
+            "2024-02-01",
+        );
+        save_override(
+            &db,
+            override_input(
+                "unrelated-transfer",
+                "transfer",
+                &["bc-source", "bc-destination"],
+                "{}",
+            ),
+        )
+        .unwrap();
+
+        let listed = list_overrides_for_query(
+            &db,
+            &scoped_query("acct-a"),
+            NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+        )
+        .unwrap();
+        assert!(listed.overrides.is_empty());
+        assert!(listed.stale_overrides.is_empty());
+        assert!(listed.issues.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_legacy_reference_fingerprint_is_audit_only() {
+        // Version-1 fingerprints had no market identity. They must remain
+        // visible for audit but must never silently authorize replay.
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy-a",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        save_override(&db, override_input("legacy", "non_trade", &["buy-a"], "{}")).unwrap();
+        let legacy = serde_json::json!([{
+            "id": "buy-a",
+            "account_id": "acct-a",
+            "symbol": "AAPL",
+            "transaction_type": "BUY",
+            "shares": 1.0,
+            "price": 100.0,
+            "total_amount": 100.0,
+            "commission": 0.0,
+            "currency": "USD",
+            "traded_at": "2024-02-01"
+        }]);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE stock_review_overrides SET reference_fingerprint_json = ?1
+                 WHERE id = 'legacy'",
+                params![legacy.to_string()],
+            )
+            .unwrap();
+
+        let listed = list_overrides_for_query(
+            &db,
+            &scoped_query("acct-a"),
+            NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+        )
+        .unwrap();
+        assert!(listed.overrides.is_empty());
+        assert_eq!(listed.stale_overrides.len(), 1);
+        assert_eq!(listed.stale_overrides[0].id, "legacy");
+        assert_eq!(listed.issues[0].code, "stale_override");
+    }
+
+    #[test]
+    fn empty_migrated_reference_snapshot_remains_conservatively_audit_visible() {
+        // The migration default `[]` has neither account nor market authority.
+        // Once its current row is deleted it must not silently disappear.
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy-a",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO stock_review_overrides
+                    (id, override_type, transaction_ids_json, value_json,
+                     reference_fingerprint_json, created_at, updated_at)
+                 VALUES ('migrated', 'non_trade', '[\"buy-a\"]', '{}', '[]',
+                         '2024-02-01', '2024-02-01')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM transactions WHERE id = 'buy-a'", [])
+            .unwrap();
+
+        let listed = list_overrides_for_query(
+            &db,
+            &scoped_query("acct-a"),
+            NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listed.stale_overrides.len(), 1);
+        assert_eq!(listed.stale_overrides[0].id, "migrated");
+        assert_eq!(listed.issues[0].code, "stale_override");
+    }
+
+    #[test]
+    fn holding_snapshot_identity_is_part_of_candidate_revision() {
+        // Duplicate logical snapshot keys are legal, so row identity must be
+        // both hashed and used as the final ordering key.
+        let db = database();
+        insert_transaction(
+            &db,
+            "buy-a",
+            "acct-a",
+            "AAPL",
+            "BUY",
+            1.0,
+            100.0,
+            "2024-02-01",
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO daily_holding_snapshots
+                    (id, date, account_id, symbol, market, shares, avg_cost, close_price, market_value)
+                 VALUES (10, '2024-02-01', 'acct-a', 'AAPL', 'US', 1, 100, 100, 100)",
+                [],
+            )
+            .unwrap();
+        let mut candidate = prepare_override_candidate(
+            &db,
+            override_input("candidate", "non_trade", &["buy-a"], "{}"),
+        )
+        .unwrap();
+        scope_candidate_to_query(&db, &mut candidate, &scoped_query("acct-a")).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE daily_holding_snapshots SET id = 20 WHERE id = 10",
+                [],
+            )
+            .unwrap();
+
+        assert!(save_override_candidate(&db, candidate).is_err());
     }
 }

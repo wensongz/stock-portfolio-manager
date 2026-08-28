@@ -113,6 +113,7 @@ mod tests {
             portfolio_return: None,
             shadow_return: None,
             benchmark_return: None,
+            excess_return: None,
             active_return: None,
         };
         assert_eq!(

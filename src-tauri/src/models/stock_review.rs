@@ -84,6 +84,8 @@ pub struct ResultQualityMetric {
     pub portfolio_return: Option<f64>,
     pub shadow_return: Option<f64>,
     pub benchmark_return: Option<f64>,
+    pub excess_return: Option<f64>,
+    /// Legacy alias retained until the report migration is complete.
     pub active_return: Option<f64>,
 }
 
@@ -93,7 +95,9 @@ pub struct MaxDrawdownMetric {
     pub max_drawdown: Option<f64>,
     pub peak_date: Option<NaiveDate>,
     pub trough_date: Option<NaiveDate>,
+    pub duration_days: Option<i64>,
     pub recovery_date: Option<NaiveDate>,
+    pub recovery_duration_days: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -102,6 +106,7 @@ pub struct RebalanceValueAddMetric {
     pub value_add: Option<f64>,
     pub actual_return: Option<f64>,
     pub shadow_return: Option<f64>,
+    pub ending_value_difference_base: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -113,18 +118,25 @@ pub struct ForwardEffectMetric {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ForwardEffectWindow {
-    pub trading_days: u32,
-    pub return_value: Option<f64>,
-    pub benchmark_return: Option<f64>,
-    pub excess_return: Option<f64>,
+    pub trading_days: u16,
+    pub status: MetricAvailability,
+    pub matured_actions: usize,
+    pub pending_actions: usize,
+    pub amount_weighted_excess_return: Option<f64>,
+    pub positive_notional_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RiskStructureMetric {
     pub availability: MetricAvailability,
-    pub concentration: Option<f64>,
-    pub diversification_score: Option<f64>,
-    pub largest_position_weight: Option<f64>,
+    pub opening_max_stock_weight: Option<f64>,
+    pub ending_max_stock_weight: Option<f64>,
+    pub opening_cr5: Option<f64>,
+    pub ending_cr5: Option<f64>,
+    pub opening_cash_ratio: Option<f64>,
+    pub ending_cash_ratio: Option<f64>,
+    pub one_way_turnover: Option<f64>,
+    pub fee_drag: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -169,11 +181,30 @@ pub struct RebalanceAttributionItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RiskStructureDetail {
     pub availability: MetricAvailability,
+    pub concentration_availability: MetricAvailability,
+    pub turnover_availability: MetricAvailability,
+    pub fee_availability: MetricAvailability,
+    pub opening: ConcentrationSnapshot,
+    pub ending: ConcentrationSnapshot,
+    pub peak: ConcentrationSnapshot,
+    pub one_way_turnover: Option<f64>,
+    pub fee_drag: Option<f64>,
+    pub data_hints: Vec<String>,
+    pub fact_labels: Vec<String>,
     pub market_weights: Vec<RiskStructureWeight>,
     pub category_weights: Vec<RiskStructureWeight>,
     pub top_position_weights: Vec<RiskStructureWeight>,
     pub concentration: Option<f64>,
     pub diversification_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConcentrationSnapshot {
+    pub date: Option<NaiveDate>,
+    pub max_stock_weight: Option<f64>,
+    pub cr5: Option<f64>,
+    pub hhi: Option<f64>,
+    pub cash_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -251,10 +282,61 @@ pub struct AccountCampaignFragment {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StockCampaignDetail {
+    pub availability: MetricAvailability,
+    pub pnl_availability: MetricAvailability,
+    pub excursion_availability: MetricAvailability,
+    pub benchmark_availability: MetricAvailability,
     pub summary: StockCampaignSummary,
     pub actions: Vec<StockActionReview>,
     pub forward_effect_20d: ForwardEffectWindow,
+    pub forward_effect_60d: ForwardEffectWindow,
+    pub forward_effect_120d: ForwardEffectWindow,
+    pub pnl: CampaignPnl,
+    pub campaign_return: Option<f64>,
+    pub benchmark_return: Option<f64>,
+    pub excess_return: Option<f64>,
+    pub mae_base: Option<f64>,
+    pub mfe_base: Option<f64>,
+    pub mae_percent: Option<f64>,
+    pub mfe_percent: Option<f64>,
+    pub holding_period_drawdown: Option<f64>,
+    pub timeline: Vec<CampaignTimelineItem>,
+    pub fact_labels: Vec<String>,
+    pub completed_sample_count: usize,
+    pub active_sample_count: usize,
     pub annotations: Vec<StockReviewAnnotation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CampaignPnl {
+    pub buy_outlays_base: f64,
+    pub sell_proceeds_base: f64,
+    pub dividends_base: f64,
+    pub trading_fees_base: f64,
+    pub remaining_shares: f64,
+    pub remaining_market_value_base: Option<f64>,
+    pub total_pnl_base: Option<f64>,
+    pub max_invested_capital_base: Option<f64>,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignCashFlowKind {
+    Buy,
+    Sell,
+    Dividend,
+    Fee,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CampaignTimelineItem {
+    pub date: NaiveDate,
+    pub kind: CampaignCashFlowKind,
+    pub amount_base: f64,
+    pub shares: f64,
+    pub account_id: String,
+    pub action_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

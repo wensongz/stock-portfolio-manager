@@ -56,7 +56,7 @@ beforeEach(() => {
   });
 });
 
-test("persist, reload, then regenerate restores and revalidates prefilled stock-review context", async () => {
+test("host provenance survives model-id collision, persistence, reload, regeneration, and a later live turn", async () => {
   const chatTurn = deferred();
   const eventHandlers = new Map();
   const savedSnapshots = [];
@@ -93,17 +93,55 @@ test("persist, reload, then regenerate restores and revalidates prefilled stock-
       arguments: JSON.stringify(exactContext.arguments),
       status: "success",
       result: "{}",
+      origin: "host_prefill",
     },
   });
+  eventHandlers.get("ai-chat-tool-call")({
+    payload: {
+      id: "prefilled-stock-review",
+      name: "get_transactions",
+      arguments: "{}",
+      status: "running",
+      origin: "model",
+    },
+  });
+  const collidingCalls = useChatStore.getState().messages[1].toolCalls;
+  assert.equal(collidingCalls.length, 2, "model lifecycle must not overwrite host provenance");
+  assert.deepEqual(
+    collidingCalls.find((call) => call.origin === "host_prefill"),
+    {
+      id: "prefilled-stock-review",
+      name: "get_stock_review",
+      arguments: JSON.stringify(exactContext.arguments),
+      status: "success",
+      result: "{}",
+      origin: "host_prefill",
+    },
+  );
+  assert.equal(
+    collidingCalls.find((call) => call.origin === "model").id,
+    "model:prefilled-stock-review",
+  );
   eventHandlers.get("ai-chat-delta")({ payload: "completed answer" });
   eventHandlers.get("ai-chat-done")({ payload: null });
   chatTurn.resolve();
   await sending;
   await new Promise((resolve) => setImmediate(resolve));
 
-  records = savedSnapshots.findLast((snapshot) => snapshot.length === 2);
-  assert.ok(records, "completed turn should persist both messages");
-  assert.equal(JSON.parse(records[1].tool_calls)[0].id, "prefilled-stock-review");
+  assert.equal(useChatStore.getState().pendingToolContext, null);
+  const ordinarySending = useChatStore.getState().sendMessage("ordinary follow-up", "session-1");
+  await Promise.resolve();
+  assert.equal(chatRequests[1].toolContext, null, "host context is live-one-shot");
+  eventHandlers.get("ai-chat-delta")({ payload: "ordinary answer" });
+  eventHandlers.get("ai-chat-done")({ payload: null });
+  await ordinarySending;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  records = savedSnapshots.findLast((snapshot) => snapshot.length === 4);
+  assert.ok(records, "both completed turns should be persisted");
+  const persistedToolCalls = JSON.parse(records[1].tool_calls);
+  assert.equal(persistedToolCalls[0].id, "prefilled-stock-review");
+  assert.equal(persistedToolCalls[0].origin, "host_prefill");
 
   useChatStore.setState({ messages: [], sending: false, viewSessionId: null });
   await useChatStore.getState().loadSessionMessages("session-1");
@@ -112,10 +150,10 @@ test("persist, reload, then regenerate restores and revalidates prefilled stock-
   assert.deepEqual(restored.explicitSkillIds, ["stock-review"]);
 
   await useChatStore.getState().regenerateMessage(restored.id, "session-1");
-  assert.equal(chatRequests.length, 2);
-  assert.deepEqual(chatRequests[1].toolContext, exactContext);
-  assert.deepEqual(chatRequests[1].activeSkills, ["stock-review"]);
-  assert.deepEqual(chatRequests[1].messages, [
+  assert.equal(chatRequests.length, 3);
+  assert.deepEqual(chatRequests[2].toolContext, exactContext);
+  assert.deepEqual(chatRequests[2].activeSkills, ["stock-review"]);
+  assert.deepEqual(chatRequests[2].messages, [
     { role: "user", content: "approved visible prompt" },
   ]);
 });

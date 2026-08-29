@@ -1193,8 +1193,10 @@ export interface AiToolContext {
  * and results as the agentic loop runs.
  */
 export interface ToolCallInfo {
-  /** Stable id (the model's `tool_call_id`). */
+  /** Stable renderer id. Model-origin ids are namespaced by the host. */
   id: string;
+  /** Set by the Rust host; provider/model payloads cannot choose this value. */
+  origin: "host_prefill" | "model";
   /** Function name, e.g. `get_stock_quote`. */
   name: string;
   /** Raw JSON arguments string the model supplied (may be undefined/empty). */

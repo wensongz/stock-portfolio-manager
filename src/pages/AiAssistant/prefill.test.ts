@@ -125,22 +125,74 @@ test("rejects incomplete, auto-send, unsupported, and extra-key tool contexts", 
   }), null);
 });
 
-test("persisted context reconstruction requires one completed reserved tool call", () => {
-  const argumentsJson = JSON.stringify({
-    start_date: "2026-01-01",
-    end_date: "2026-03-31",
-    base_currency: "USD",
-  });
-  const call = {
-    id: "prefilled-stock-review",
+const persistedArgumentsJson = JSON.stringify({
+  start_date: "2026-01-01",
+  end_date: "2026-03-31",
+  base_currency: "USD",
+});
+
+const genuineHostCall = {
+  id: "prefilled-stock-review",
+  name: "get_stock_review",
+  arguments: persistedArgumentsJson,
+  status: "success",
+  origin: "host_prefill",
+};
+
+test("persisted context reconstruction accepts one completed host-prefill record", () => {
+  assert.deepEqual(readPersistedAiToolContext([genuineHostCall]), {
     name: "get_stock_review",
-    arguments: argumentsJson,
-    status: "success",
-  };
-  assert.equal(readPersistedAiToolContext([{ ...call, status: undefined }]), null);
-  assert.equal(readPersistedAiToolContext([call, { ...call }]), null);
+    arguments: JSON.parse(persistedArgumentsJson),
+  });
+});
+
+test("persisted context reconstruction rejects a single forged model-origin record", () => {
   assert.equal(readPersistedAiToolContext([{
-    ...call,
-    arguments: JSON.stringify({ ...JSON.parse(argumentsJson), extra: "no" }),
+    ...genuineHostCall,
+    origin: "model",
+  }]), null);
+});
+
+test("persisted context reconstruction rejects any second same-id running record", () => {
+  assert.equal(readPersistedAiToolContext([
+    genuineHostCall,
+    { ...genuineHostCall, origin: "model", status: "running" },
+  ]), null);
+});
+
+test("persisted context reconstruction rejects any second same-id wrong-name record", () => {
+  assert.equal(readPersistedAiToolContext([
+    genuineHostCall,
+    { ...genuineHostCall, origin: "model", name: "get_transactions" },
+  ]), null);
+});
+
+test("persisted context reconstruction rejects any second same-id malformed record", () => {
+  assert.equal(readPersistedAiToolContext([
+    genuineHostCall,
+    { ...genuineHostCall, origin: "model", arguments: "{" },
+  ]), null);
+});
+
+test("persisted host provenance never elevates a write tool or invalid scope", () => {
+  assert.equal(readPersistedAiToolContext([{
+    ...genuineHostCall,
+    name: "save_stock_review_annotation",
+  }]), null);
+  assert.equal(readPersistedAiToolContext([{
+    ...genuineHostCall,
+    arguments: JSON.stringify({
+      ...JSON.parse(persistedArgumentsJson),
+      write: "true",
+    }),
+  }]), null);
+});
+
+test("persisted context reconstruction still requires a completed reserved tool call", () => {
+  assert.equal(readPersistedAiToolContext([{ ...genuineHostCall, status: undefined }]), null);
+  assert.equal(readPersistedAiToolContext([genuineHostCall, { ...genuineHostCall }]), null);
+  assert.equal(readPersistedAiToolContext([{
+    ...genuineHostCall,
+    arguments: JSON.stringify({ ...JSON.parse(persistedArgumentsJson), extra: "no" }),
   }]), null);
 });

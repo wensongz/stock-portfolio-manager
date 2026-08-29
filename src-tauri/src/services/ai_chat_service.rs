@@ -584,8 +584,10 @@ struct AssembledToolCall {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallEvent {
-    /// Stable id (the model's `tool_call_id`). The frontend upserts cards by it.
+    /// Stable renderer id. Model-origin ids are namespaced away from host ids.
     pub id: String,
+    /// Host-assigned provenance. Provider response fields never populate it.
+    pub origin: ToolCallOrigin,
     /// Function name, e.g. `get_stock_quote`.
     pub name: String,
     /// Raw JSON arguments string the model supplied (best-effort; may be empty).
@@ -611,6 +613,19 @@ pub enum ToolCallStatus {
     Error,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallOrigin {
+    HostPrefill,
+    Model,
+}
+
+const HOST_PREFILLED_TOOL_CALL_ID: &str = "prefilled-stock-review";
+
+fn model_tool_call_event_id(provider_id: &str) -> String {
+    format!("model:{provider_id}")
+}
+
 /// Cap on the size of a tool `result` payload we ship to the UI, to keep IPC
 /// payloads and React re-renders cheap. The model still receives the full
 /// result; this only trims what is shown in the expandable card.
@@ -633,12 +648,13 @@ async fn execute_prefilled_tool(
     context: &PrefilledToolContext,
 ) -> Result<(String, String, bool), String> {
     let arguments = validated_prefilled_tool(context)?;
-    let id = "prefilled-stock-review".to_string();
+    let id = HOST_PREFILLED_TOOL_CALL_ID.to_string();
     let _ = app.emit("ai-chat-tool", vec![context.name.clone()]);
     let _ = app.emit(
         "ai-chat-tool-call",
         ToolCallEvent {
             id: id.clone(),
+            origin: ToolCallOrigin::HostPrefill,
             name: context.name.clone(),
             arguments: Some(arguments.clone()),
             status: ToolCallStatus::Running,
@@ -655,6 +671,7 @@ async fn execute_prefilled_tool(
         "ai-chat-tool-call",
         ToolCallEvent {
             id,
+            origin: ToolCallOrigin::HostPrefill,
             name: context.name.clone(),
             arguments: Some(arguments.clone()),
             status: if ok {
@@ -1080,14 +1097,14 @@ pub async fn chat_stream(
         messages.push(json!({
             "role": "assistant",
             "tool_calls": [{
-                "id": "prefilled-stock-review",
+                "id": HOST_PREFILLED_TOOL_CALL_ID,
                 "type": "function",
                 "function": { "name": context.name, "arguments": arguments },
             }],
         }));
         messages.push(json!({
             "role": "tool",
-            "tool_call_id": "prefilled-stock-review",
+            "tool_call_id": HOST_PREFILLED_TOOL_CALL_ID,
             "content": content,
         }));
     }
@@ -1392,7 +1409,8 @@ pub async fn chat_stream(
             let _ = app.emit(
                 "ai-chat-tool-call",
                 ToolCallEvent {
-                    id: tc.id.clone(),
+                    id: model_tool_call_event_id(&tc.id),
+                    origin: ToolCallOrigin::Model,
                     name: tc.function_name.clone(),
                     arguments: args_for_ui.clone(),
                     status: ToolCallStatus::Running,
@@ -1423,7 +1441,8 @@ pub async fn chat_stream(
                 let _ = app.emit(
                     "ai-chat-tool-call",
                     ToolCallEvent {
-                        id: tc.id.clone(),
+                        id: model_tool_call_event_id(&tc.id),
+                        origin: ToolCallOrigin::Model,
                         name: tc.function_name.clone(),
                         arguments: args_for_ui.clone(),
                         status: ToolCallStatus::Success,
@@ -1445,7 +1464,8 @@ pub async fn chat_stream(
                 let _ = app.emit(
                     "ai-chat-tool-call",
                     ToolCallEvent {
-                        id: tc.id.clone(),
+                        id: model_tool_call_event_id(&tc.id),
+                        origin: ToolCallOrigin::Model,
                         name: tc.function_name.clone(),
                         arguments: args_for_ui.clone(),
                         status: ToolCallStatus::Error,
@@ -1825,7 +1845,7 @@ async fn chat_stream_anthropic(
             "role": "assistant",
             "content": [{
                 "type": "tool_use",
-                "id": "prefilled-stock-review",
+                "id": HOST_PREFILLED_TOOL_CALL_ID,
                 "name": context.name,
                 "input": parsed_arguments,
             }],
@@ -1834,7 +1854,7 @@ async fn chat_stream_anthropic(
             "role": "user",
             "content": [{
                 "type": "tool_result",
-                "tool_use_id": "prefilled-stock-review",
+                "tool_use_id": HOST_PREFILLED_TOOL_CALL_ID,
                 "content": content,
             }],
         }));
@@ -2064,7 +2084,8 @@ async fn chat_stream_anthropic(
                 let _ = app.emit(
                     "ai-chat-tool-call",
                     ToolCallEvent {
-                        id: tu.id.clone(),
+                        id: model_tool_call_event_id(&tu.id),
+                        origin: ToolCallOrigin::Model,
                         name: tu.name.clone(),
                         arguments: args_for_ui.clone(),
                         status: ToolCallStatus::Running,
@@ -2084,7 +2105,8 @@ async fn chat_stream_anthropic(
                 let _ = app.emit(
                     "ai-chat-tool-call",
                     ToolCallEvent {
-                        id: tu.id.clone(),
+                        id: model_tool_call_event_id(&tu.id),
+                        origin: ToolCallOrigin::Model,
                         name: tu.name.clone(),
                         arguments: args_for_ui.clone(),
                         status: if is_err {
@@ -2267,6 +2289,48 @@ mod tests {
     #[test]
     fn merge_tool_calls_empty() {
         assert!(merge_tool_calls(&[]).is_empty());
+    }
+
+    #[test]
+    fn model_lifecycle_ids_cannot_enter_the_host_prefill_namespace() {
+        assert_eq!(
+            model_tool_call_event_id("prefilled-stock-review"),
+            "model:prefilled-stock-review"
+        );
+        assert_ne!(
+            model_tool_call_event_id("prefilled-stock-review"),
+            HOST_PREFILLED_TOOL_CALL_ID
+        );
+        assert_eq!(model_tool_call_event_id("call_7"), "model:call_7");
+    }
+
+    #[test]
+    fn tool_lifecycle_serialization_marks_host_and_model_origin_explicitly() {
+        let host = ToolCallEvent {
+            id: HOST_PREFILLED_TOOL_CALL_ID.to_string(),
+            name: "get_stock_review".to_string(),
+            arguments: Some("{}".to_string()),
+            status: ToolCallStatus::Success,
+            origin: ToolCallOrigin::HostPrefill,
+            result: Some("{}".to_string()),
+            error: None,
+            duration_ms: Some(1),
+        };
+        let model = ToolCallEvent {
+            id: model_tool_call_event_id(HOST_PREFILLED_TOOL_CALL_ID),
+            name: "get_stock_review".to_string(),
+            arguments: Some("{}".to_string()),
+            status: ToolCallStatus::Running,
+            origin: ToolCallOrigin::Model,
+            result: None,
+            error: None,
+            duration_ms: None,
+        };
+        assert_eq!(
+            serde_json::to_value(host).unwrap()["origin"],
+            "host_prefill"
+        );
+        assert_eq!(serde_json::to_value(model).unwrap()["origin"], "model");
     }
 
     #[test]

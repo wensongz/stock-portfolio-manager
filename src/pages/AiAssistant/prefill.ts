@@ -27,6 +27,8 @@ export function readAiPrefillActiveSkill(state: unknown): string | null {
 
 export type AiPrefillToolContext = AiToolContext;
 
+export const HOST_PREFILLED_TOOL_CALL_ID = "prefilled-stock-review";
+
 const STOCK_REVIEW_TOOL_ARGUMENT_KEYS = new Set([
   "start_date",
   "end_date",
@@ -77,17 +79,22 @@ export function consumeAiPrefillToolContext(
 export function readPersistedAiToolContext(
   toolCalls: ToolCallInfo[],
 ): AiToolContext | null {
-  const matches = toolCalls.filter(
-    (call) =>
-      call.id === "prefilled-stock-review" &&
-      call.name === "get_stock_review" &&
-      (call.status === "success" || call.status === "error") &&
-      typeof call.arguments === "string",
+  const reserved = toolCalls.filter(
+    (call) => call.id === HOST_PREFILLED_TOOL_CALL_ID,
   );
-  if (matches.length !== 1) return null;
+  if (reserved.length !== 1) return null;
+  const [persisted] = reserved;
+  if (
+    persisted.origin !== "host_prefill" ||
+    persisted.name !== "get_stock_review" ||
+    (persisted.status !== "success" && persisted.status !== "error") ||
+    typeof persisted.arguments !== "string"
+  ) {
+    return null;
+  }
   let args: unknown;
   try {
-    args = JSON.parse(matches[0].arguments!);
+    args = JSON.parse(persisted.arguments);
   } catch {
     return null;
   }

@@ -12,6 +12,7 @@ import type {
 } from "../types";
 import {
   consumeAiPrefillToolContext,
+  HOST_PREFILLED_TOOL_CALL_ID,
   readPersistedAiToolContext,
 } from "../pages/AiAssistant/prefill.ts";
 
@@ -161,6 +162,21 @@ function findLastIndex<T>(arr: T[], predicate: (item: T, index: number) => boole
     if (predicate(arr[i], i)) return i;
   }
   return -1;
+}
+
+/**
+ * Treat every lifecycle event as model-origin unless the Rust host explicitly
+ * marks it as its prefill execution. Model ids are defensively moved out of
+ * the single reserved host id even though current backends already namespace
+ * them before emitting the event.
+ */
+function normalizeToolCallEvent(toolCall: ToolCallInfo): ToolCallInfo {
+  const origin = toolCall.origin === "host_prefill" ? "host_prefill" : "model";
+  const id =
+    origin === "model" && toolCall.id === HOST_PREFILLED_TOOL_CALL_ID
+      ? `model:${toolCall.id}`
+      : toolCall.id;
+  return { ...toolCall, id, origin };
 }
 
 /**
@@ -542,11 +558,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // + durationMs after. We upsert by id so a running card updates in place
     // when its result arrives. Replaces the coarse name-only badge.
     listen<ToolCallInfo>("ai-chat-tool-call", (event) => {
-      const tc = event.payload;
-      if (!tc || !tc.id || !streamingId) return;
+      const incoming = event.payload;
+      if (!incoming || !incoming.id || !streamingId) return;
+      const tc = normalizeToolCallEvent(incoming);
       applyStreamUpdate(set, (m) => {
         const list = m.toolCalls ? [...m.toolCalls] : [];
-        const idx = list.findIndex((c) => c.id === tc.id);
+        const idx = list.findIndex(
+          (c) => c.id === tc.id && c.origin === tc.origin,
+        );
         if (idx >= 0) {
           list[idx] = { ...list[idx], ...tc };
         } else {

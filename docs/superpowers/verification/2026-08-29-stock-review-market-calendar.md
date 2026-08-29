@@ -79,3 +79,49 @@ rg -n "TO[D]O|TB[D]|FIXM[E]|placeholde[r]|console\.log|dbg!" src src-tauri/src s
 1. `cargo fmt --check` 的全 crate 检查因四个未触碰的既有文件失败；本分支所有变更 Rust 文件的 scoped rustfmt 检查通过。
 2. 原生 Tauri UI 无法由允许的浏览器表面控制，因此上述四项原生交互没有直接视觉证据，状态为 DONE_WITH_CONCERNS。
 3. Tauri 启动时的既有后台行情刷新在 `2026-08-29T11:58:27Z` 更新了派生缓存表 `cached_quotes`。受保护用户表完全不变，日历写入本身仅修改两个日历表，但严格的“整个进程只改变日历表”断言未满足；未尝试回滚或清理该派生缓存，因此不宣称严格 live acceptance 通过。
+
+## Final-fix addendum（2026-08-29）
+
+本节覆盖提交 `5346f0b`、`db3d82c`、`cbb5209`，并取代上文旧的资源版本、测试数量和生产日历范围；上文原生 UI 与历史 `cached_quotes` 关注项继续保留。
+
+### 最终修复与 RED → GREEN
+
+- 美国 2025 日历补入 `2025-01-09` 卡特总统全国哀悼日全天休市，资源修订升至 `exchange-holidays-v2-2025-2026`，并记录 Nasdaq 2024-12-30 与 NYSE 2025-01-02 两份官方通知。RED 分别暴露旧 v1 修订和 `MissingExpectedSession(2025-01-09)`；资源及整周验证测试转绿。
+- 同修订复用现在逐项验证 coverage source/bounds/finalized flag、所有自然日、每行 session flag/source、无范围外行，以及由完整内容重算的稳定 revision。缺行、改旗标、未 finalized、source/bounds 不一致的四类 RED 都曾错误返回 `Reused`，现均重新验证并原子修复为 coherent `Published`。
+- 单来源警告会在 `Reused`/合法 stale cache 中从持久 provenance 重建；跨不相交区间若来源身份变化，会先对完整并集重验，不能把 Xueqiu-only 与 EastMoney-only 片段拼成虚假的双来源 authority。对应 RED 从错误 `Published` 改为保留旧 `xueqiu` coverage 的 `StaleCacheUsed`。
+- 批量同步把任意历史请求裁到内置资源的受支持交集，但在 outcome 中保留原始请求边界；报告再按每项指标实际区间判定 authority。pre-2025 holding、2025 下界查询与同日盘前倒置区间测试从 RED 转绿；未支持的 2024 日期没有被造为 session。
+- 自审追加了一条端到端 RED：同修订行损坏且提供方重验失败时，报告曾把受损 cache 用作 `Available`。现在首次、cache-fill 后和最终三次 calendar reload 都服从已验证 sync outcome；测试夹具也改用真实稳定 revision/source identity。该测试现为 GREEN。
+
+### 最终自动化矩阵
+
+| 命令 | 最终结果 |
+| --- | --- |
+| branch-changed 11-file `rustfmt --check --edition 2021` | PASS；未格式化四个既有 baseline command 文件。 |
+| `cargo test --lib stock_review_calendar::tests -q` | PASS：32 passed。 |
+| `cargo test --lib stock_review_market_data::tests -q` | PASS：10 passed。 |
+| `cargo test --lib stock_review_persistence::tests -q` | PASS：39 passed。 |
+| `cargo test --lib stock_review_quality::tests -q` | PASS：6 passed。 |
+| `cargo test --lib stock_review_service::tests -q` | PASS：74 passed。 |
+| `cargo test --lib stock_review_tables_are_created_and_resettable -q` | PASS：1 passed。 |
+| `cargo test --lib -q` | PASS：607 passed，0 failed，8 ignored。 |
+| 精确 15-file `node --test ...` 命令 | PASS：106 passed，0 failed，0 skipped。 |
+| `cargo check` | PASS。 |
+| `npm run build` | PASS；保留主 JS chunk 约 4,249.05 kB 的既有警告。 |
+
+### 最终有界生产同步与幂等性
+
+未启动原生 Tauri UI。临时测试 probe 仅调用生产 `sync_market_calendars`，固定请求起点 `2024-01-01`、固定时刻 `2026-08-29T12:30:00Z`，目标市场仅 CN/HK/US；执行后已从工作树删除。
+
+第一次同步三市场均为 `Published`，实际发布起点均正确裁到 `2025-01-01`；CN/HK 发布至 `2026-08-29`，US 发布至 `2026-08-28`。第二次相同同步三市场均为 `Reused`，且仍各返回一条 `market_calendar_single_provider` 警告。
+
+| 市场 | durable source | 完整范围 | revision | 自然日行数 | coverage / session 最大更新时间 |
+| --- | --- | --- | --- | ---: | --- |
+| CN | xueqiu | 2025-01-01..2026-08-29 | `exchange-holidays-v2-2025-2026:860963fd28fa79ed` | 606 | `2026-08-29T13:25:18.986871000Z` |
+| HK | xueqiu | 2025-01-01..2026-08-29 | `exchange-holidays-v2-2025-2026:e1a5cffcbb9d1f7c` | 606 | `2026-08-29T13:25:31.547353000Z` |
+| US | xueqiu | 2025-01-01..2026-08-28 | `exchange-holidays-v2-2025-2026:ce5f805c4ee64c6b` | 605 | `2026-08-29T13:25:43.152781000Z` |
+
+最终共有 1,817 个逐自然日 session rows、3 个 finalized coverage rows，递归完整性查询缺失数为 0。`US / 2025-01-09` 恰有一行、`is_session = 0`、source 为 `xueqiu`。第二次同步前后，上表 revision、范围、行数、coverage `updated_at` 与 session `MAX(updated_at)` 完全一致。
+
+受保护表在 final-fix 第一次和第二次同步前后均保持 `transactions=551`、`holdings=162`、`stock_review_annotations=0`、`stock_review_overrides=0`，每表 SQLite SHA-3 内容摘要逐字节一致。`cached_quotes=80` 且 SHA-3 也完全一致；本轮未修改、清理或回滚该派生缓存。最终 authority 查询全部使用 SQLite `-readonly`，没有输出证券明细。
+
+此前 cache-only YTD 报告证据继续有效；本轮以只读完整性查询及 pre-2025/lower-fence 集成测试补充，不再次运行可能触发行情缓存写入的原生报告路径。原生 UI 未重启，因此既有原生交互视觉限制仍为本分支唯一 live acceptance 关注项之一。

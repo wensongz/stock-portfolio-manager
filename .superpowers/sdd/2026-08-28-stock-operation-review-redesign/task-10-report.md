@@ -364,3 +364,51 @@ passed
 ```
 
 No new interface concern was introduced. The prior trusted-host confirmation integration concern remains unchanged.
+
+---
+
+## Fix round 3: total issue-cap ordering (2026-08-29)
+
+Implementation commit: `d4e005573b9ba518e9eea071918f4413656ad8bf` (`fix: make stock review issue caps total`).
+
+### RED evidence
+
+The regression constructs 24 byte-distinct issues that collapse to the same normalized semantic fields: code/date whitespace differs and symbols vary between `aapl`, `AAPL`, and padded forms. The collisions straddle the 20-item cap. It runs both forward and reversed arrays through report and Campaign-detail projection.
+
+```text
+cargo test --lib services::ai_tools::tests::issue_caps_total_order_byte_distinct_normalization_collisions_at_boundary -- --exact --nocapture
+```
+
+Exited 101 before the fix: forward projection kept the first 20 padded variants, while reversed projection kept the opposite 20 and in the opposite order. This demonstrated that stable sort was falling back to input order when normalized semantic keys compared equal.
+
+### Total-order implementation
+
+- Selected-question priority and the existing normalized semantic key remain the primary ordering.
+- The recursively canonicalized serialization of the complete original issue is now the final comparator component. It includes the original whitespace/case distinctions needed to order byte-distinct normalization collisions.
+- Object keys are recursively sorted before both comparison and retained output serialization. Nested objects and arrays are traversed explicitly, so determinism does not depend on `serde_json::Map` insertion order.
+- Comparator fields remain length-prefixed to avoid boundary ambiguity.
+- The regression proves byte-identical retained report issues, retained Campaign-detail issues, and per-path omission metadata after reversing the input; it also verifies `total = 24` and `omitted = 4`.
+
+### GREEN verification
+
+```text
+cargo test --lib services::ai_tools::tests -- --nocapture
+22 passed; 0 failed
+
+cargo test --lib
+537 passed; 0 failed; 8 ignored
+
+cargo check --lib
+passed with no warnings
+
+npm run build
+passed; repository's existing large-chunk warning only
+
+rustfmt --edition 2021 --check src-tauri/src/services/ai_tools.rs
+passed
+
+git diff --check
+passed
+```
+
+No new interface concern was introduced; retained issue values and statuses are unchanged, with only deterministic object-key and collection ordering applied.

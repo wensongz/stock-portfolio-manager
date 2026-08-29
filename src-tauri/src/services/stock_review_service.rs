@@ -1295,6 +1295,10 @@ where
         .iter()
         .map(|outcome| (outcome.market.clone(), outcome.requested_through))
         .collect::<BTreeMap<_, _>>();
+    let calendar_sync_usable_by_market = calendar_outcomes
+        .iter()
+        .map(|outcome| (outcome.market.clone(), outcome.status.is_success()))
+        .collect::<BTreeMap<_, _>>();
     let calendar_load_through_by_market = calendar_outcomes
         .iter()
         .map(|outcome| {
@@ -1314,9 +1318,16 @@ where
             .get(market)
             .copied()
             .unwrap_or(today);
+        let calendar = load_market_sessions(db, market, price_start, required_through)?;
         market_calendars_by_market.insert(
             market.clone(),
-            load_market_sessions(db, market, price_start, required_through)?,
+            calendar_for_sync_outcome(
+                calendar,
+                calendar_sync_usable_by_market
+                    .get(market)
+                    .copied()
+                    .unwrap_or(false),
+            ),
         );
     }
     let market_sessions_by_market = market_calendars_by_market
@@ -1461,8 +1472,18 @@ where
                 .get(market)
                 .copied()
                 .unwrap_or(today);
-            load_market_sessions(db, market, price_start, required_through)
-                .map(|calendar| (market.clone(), calendar))
+            load_market_sessions(db, market, price_start, required_through).map(|calendar| {
+                (
+                    market.clone(),
+                    calendar_for_sync_outcome(
+                        calendar,
+                        calendar_sync_usable_by_market
+                            .get(market)
+                            .copied()
+                            .unwrap_or(false),
+                    ),
+                )
+            })
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     let refreshed_sessions = refreshed_calendars
@@ -1615,8 +1636,18 @@ where
                 .copied()
                 .unwrap_or(evaluation_end)
                 .min(evaluation_end);
-            load_market_sessions(db, market, price_start, required_through)
-                .map(|calendar| (market.clone(), calendar))
+            load_market_sessions(db, market, price_start, required_through).map(|calendar| {
+                (
+                    market.clone(),
+                    calendar_for_sync_outcome(
+                        calendar,
+                        calendar_sync_usable_by_market
+                            .get(market)
+                            .copied()
+                            .unwrap_or(false),
+                    ),
+                )
+            })
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     let market_sessions_by_market = market_calendars_by_market
@@ -2439,6 +2470,19 @@ fn required_review_markets(
         .map(|(_, market)| market.clone())
         .chain(query.market.clone())
         .collect()
+}
+
+fn calendar_for_sync_outcome(mut calendar: MarketCalendar, sync_usable: bool) -> MarketCalendar {
+    if !sync_usable {
+        calendar.sessions.clear();
+        calendar.availability = MetricAvailability {
+            status: MetricStatus::Unavailable,
+            note: Some(
+                "Calendar synchronization did not validate a reusable cache revision.".to_string(),
+            ),
+        };
+    }
+    calendar
 }
 
 fn calendar_sync_issues(outcomes: &[CalendarSyncOutcome]) -> Vec<StockReviewIssue> {
@@ -4535,8 +4579,8 @@ mod tests {
         AttributionPositionBalance, AttributionPricePoint, AttributionValuationPoint,
     };
     use crate::services::stock_review_calendar::{
-        load_market_holiday_rules, CalendarProvider, IndexHistoryEvidence, IndexHistorySource,
-        ReferenceIndex,
+        load_market_holiday_rules, stable_calendar_revision, CalendarProvider,
+        IndexHistoryEvidence, IndexHistorySource, ReferenceIndex, ValidatedMarketCalendar,
     };
     use chrono::{DateTime, Datelike, Weekday};
     use std::future::Future;
@@ -5407,6 +5451,29 @@ mod tests {
         };
         let last = dates.iter().max().copied().unwrap();
         let open_dates = dates.iter().copied().collect::<BTreeSet<_>>();
+        let references = match market {
+            "CN" => vec!["sse_composite", "shenzhen_component"],
+            "HK" => vec!["hang_seng", "hang_seng_china_enterprises"],
+            "US" => vec!["sp500", "nasdaq_composite"],
+            _ => panic!("unsupported fixture market {market}"),
+        }
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let rows = calendar_dates(first, (last - first).num_days() as usize + 1)
+            .into_iter()
+            .map(|date| (date, open_dates.contains(&date)))
+            .collect::<Vec<_>>();
+        let revision = stable_calendar_revision(&ValidatedMarketCalendar {
+            market: market.to_string(),
+            start: first,
+            end: last,
+            resource_revision: "fixture-v1".to_string(),
+            rows: rows.clone(),
+            providers: vec!["eastmoney".to_string()],
+            references,
+            warnings: Vec::new(),
+        });
         let conn = db.conn.lock().unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS stock_market_sessions (
@@ -5429,20 +5496,23 @@ mod tests {
         )
         .unwrap();
         conn.execute(
+            "DELETE FROM stock_market_sessions WHERE market = ?1",
+            [market],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT OR REPLACE INTO stock_market_calendar_coverage
                 (market, source, complete_start, complete_through, revision, encodes_closed_dates, updated_at)
-             VALUES (?1, 'fixture_exchange_calendar', ?2, ?3, 'fixture-v1', 1, '2024-01-01T00:00:00Z')",
-            params![market, first.format("%Y-%m-%d").to_string(), last.format("%Y-%m-%d").to_string()],
+             VALUES (?1, 'eastmoney', ?2, ?3, ?4, 1, '2024-01-01T00:00:00Z')",
+            params![market, first.format("%Y-%m-%d").to_string(), last.format("%Y-%m-%d").to_string(), revision],
         ).unwrap();
-        let mut date = first;
-        while date <= last {
+        for (date, is_session) in rows {
             conn.execute(
                 "INSERT OR REPLACE INTO stock_market_sessions (market, date, is_session, source, updated_at)
-                 VALUES (?1, ?2, ?3, 'fixture_exchange_calendar', '2024-01-01T00:00:00Z')",
-                params![market, date.format("%Y-%m-%d").to_string(), i64::from(open_dates.contains(&date))],
+                 VALUES (?1, ?2, ?3, 'eastmoney', '2024-01-01T00:00:00Z')",
+                params![market, date.format("%Y-%m-%d").to_string(), i64::from(is_session)],
             )
             .unwrap();
-            date += Duration::days(1);
         }
     }
 
@@ -7882,6 +7952,57 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == "market_calendar_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn corrupted_same_revision_cache_is_not_used_when_revalidation_fails() {
+        let db = complete_live_review_db_without_calendars("US");
+        let now = fixed_now("2026-08-28T22:00:00Z");
+        let initial = stock_review_calendar::sync_market_calendars_with_sources(
+            &db,
+            &BTreeSet::from(["US".to_string()]),
+            day("2025-12-23"),
+            now,
+            &complete_fake_sources(),
+        )
+        .await;
+        assert_eq!(initial[0].status, CalendarSyncStatus::Published);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE stock_market_sessions SET is_session = 0
+                 WHERE market = 'US' AND date = '2026-02-03'",
+                [],
+            )
+            .unwrap();
+
+        let prepared = prepare_cached_stock_review_input_with_calendar_sources(
+            &db,
+            live_query("2026-01-02", "2026-08-28", Some("US")),
+            None,
+            None,
+            &all_sources_failed(),
+            now,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prepared.forward_actions[0].availability.status,
+            MetricStatus::Unavailable
+        );
+        let report = build_stock_review_report_from_cached_data(&prepared).unwrap();
+
+        assert_eq!(
+            report.summary.forward_effect.day_60.status.status,
+            MetricStatus::Unavailable
+        );
+        assert!(report
+            .data_quality
+            .issues
+            .iter()
+            .any(|issue| issue.code == "market_calendar_sync_failed"));
     }
 
     #[tokio::test]

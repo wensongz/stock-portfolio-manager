@@ -560,9 +560,12 @@ pub fn stable_calendar_revision(calendar: &ValidatedMarketCalendar) -> String {
     for reference in references {
         digest.write(&reference);
     }
-    for (date, is_session) in &calendar.rows {
+    let mut rows = calendar.rows.clone();
+    rows.sort();
+    rows.dedup();
+    for (date, is_session) in rows {
         digest.write(&date.format("%Y-%m-%d").to_string());
-        digest.write(if *is_session { "1" } else { "0" });
+        digest.write(if is_session { "1" } else { "0" });
     }
     format!("{}:{:016x}", calendar.resource_revision, digest.finish())
 }
@@ -1223,6 +1226,12 @@ mod tests {
             "nasdaq_composite".to_owned(),
             "sp500".to_owned(),
             "nasdaq_composite".to_owned(),
+        ];
+        reordered.rows = vec![
+            (day("2026-01-03"), false),
+            (day("2026-01-02"), true),
+            (day("2026-01-01"), false),
+            (day("2026-01-02"), true),
         ];
 
         assert_eq!(

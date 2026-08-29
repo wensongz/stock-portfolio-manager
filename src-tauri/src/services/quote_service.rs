@@ -2369,6 +2369,10 @@ pub(crate) async fn fetch_index_history_xueqiu(
     fetch_history_xueqiu_api_symbol(api_symbol, api_symbol, market, start_date, end_date).await
 }
 
+fn xueqiu_history_request_count(start_date: chrono::NaiveDate, end_date: chrono::NaiveDate) -> i64 {
+    (end_date - start_date).num_days().saturating_add(1).max(2)
+}
+
 async fn fetch_history_xueqiu_api_symbol(
     api_symbol: &str,
     display_symbol: &str,
@@ -2379,7 +2383,7 @@ async fn fetch_history_xueqiu_api_symbol(
     // Xueqiu returns trading days going backwards from begin.
     // Calendar days in range is a safe upper bound (there are fewer
     // trading days than calendar days), with a minimum of 2.
-    let count = (end_date - start_date).num_days().max(2);
+    let count = xueqiu_history_request_count(start_date, end_date);
 
     // The Xueqiu kline API `begin` parameter is a millisecond timestamp.
     // With `type=before`, the API returns `count` trading days going
@@ -2556,6 +2560,14 @@ mod tests {
         assert!(resolve_index_secid("AAPL").is_none());
         assert!(resolve_index_secid("0700.HK").is_none());
         assert!(resolve_index_secid("sh600519").is_none());
+    }
+
+    #[test]
+    fn xueqiu_history_count_is_inclusive_for_short_weekday_window() {
+        let monday = chrono::NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        let friday = chrono::NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+
+        assert_eq!(xueqiu_history_request_count(monday, friday), 5);
     }
 
     // Helper: build a synthetic East Money JSON response.

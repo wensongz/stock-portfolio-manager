@@ -2,7 +2,7 @@
 
 Date: 2026-08-29
 Branch: `codex/stock-operation-review-redesign`
-Implementation commit: `49b8f75`
+Implementation commits: `49b8f75`, `7a98479`
 
 ## Outcome
 
@@ -99,6 +99,28 @@ GREEN coverage:
 
 These cover stale/missing baseline, missing terminal, sparse internal paths, exact 95% and 80% boundaries, below-80% suppression, a complete interval, missing calendar authority, exact baseline cutoff, and actual/shadow independent degradation.
 
+## 5. Non-session snapshot projection
+
+Decision:
+
+- Portfolio observations are projected onto the explicit authoritative session set before conversion completeness, coverage, TWR, drawdown, benchmark endpoints, normalized chart output, and downstream NAV use.
+- A weekend or other non-session snapshot is ignored rather than treated as missing calendar authority or admitted into path calculations.
+- Non-session-only observations cannot satisfy session coverage or the exact terminal requirement.
+- The metrics layer repeats the projection defensively for deterministic cached inputs, while the service layer performs it before FX conversion completeness so an unusable non-session row cannot degrade an otherwise complete session series.
+- The established exact baseline/terminal rules and 95%/80% thresholds are unchanged.
+
+RED evidence:
+
+- `actual_metrics_project_observations_onto_authoritative_sessions` initially returned `Unavailable` instead of `Available` because the Saturday observation invalidated valuation coverage.
+- The two service regressions initially failed to compile with `E0061`: `load_actual_values` had no authoritative-session input and therefore could not project loaded snapshots before completeness evaluation.
+
+GREEN coverage:
+
+- `actual_metrics_project_observations_onto_authoritative_sessions` proves complete Friday/Monday observations remain usable with a Saturday value of `1`, portfolio return remains 21%, drawdown remains 0%, and Saturday is absent from TWR and normalized curve output.
+- `non_session_only_actual_data_cannot_satisfy_coverage_or_terminal` proves a weekend-only point yields unavailable return, no TWR/curve, and no drawdown.
+- `actual_snapshot_loading_excludes_non_sessions_before_completeness` proves the service returns only authoritative Friday/Monday observations and keeps NAV completeness available.
+- `non_session_only_snapshot_loading_is_not_complete` proves service-side weekend-only data is empty and unavailable after projection.
+
 ## Changed implementation files
 
 - `src-tauri/src/services/stock_review_metrics.rs`
@@ -111,10 +133,10 @@ No public model, TypeScript type, frontend view, dependency manifest, migration,
 All commands ran from the designated worktree after feature-file formatting:
 
 - `rustfmt --edition 2021 src-tauri/src/services/stock_review_metrics.rs src-tauri/src/services/stock_review_service.rs` — PASS.
-- `cargo test --manifest-path src-tauri/Cargo.toml --lib stock_ -- --nocapture` — PASS, 186 passed, 0 failed, 373 filtered.
-- `cargo test --manifest-path src-tauri/Cargo.toml stock_review_metrics::tests -- --nocapture` — PASS, 36 passed, 0 failed.
-- `cargo test --manifest-path src-tauri/Cargo.toml stock_review_service::tests -- --nocapture` — PASS, 55 passed, 0 failed.
-- `cargo test --manifest-path src-tauri/Cargo.toml` — PASS, 551 passed, 0 failed, 8 ignored.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib stock_ -- --nocapture` — PASS, 190 passed, 0 failed, 373 filtered.
+- `cargo test --manifest-path src-tauri/Cargo.toml stock_review_metrics::tests -- --nocapture` — PASS, 38 passed, 0 failed.
+- `cargo test --manifest-path src-tauri/Cargo.toml stock_review_service::tests -- --nocapture` — PASS, 57 passed, 0 failed.
+- `cargo test --manifest-path src-tauri/Cargo.toml` — PASS, 555 passed, 0 failed, 8 ignored.
 - Full Node inventory including the quarterly `.mjs` tests — PASS, 104 passed, 0 failed, 0 skipped.
 - `cargo check --manifest-path src-tauri/Cargo.toml` — PASS.
 - `cargo build --manifest-path src-tauri/Cargo.toml` — PASS.

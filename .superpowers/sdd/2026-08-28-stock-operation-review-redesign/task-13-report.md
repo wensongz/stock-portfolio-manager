@@ -207,12 +207,12 @@ Results:
 
 ## Final-review fix addendum (2026-08-29)
 
-The later final-review remediation added eleven Rust regression tests without changing the public report/TypeScript contract. Fresh post-fix verification supersedes the earlier counts where applicable:
+The later final-review remediation and non-session projection follow-up added fifteen Rust regression tests without changing the public report/TypeScript contract. Fresh post-fix verification supersedes the earlier counts where applicable:
 
-- Focused stock-review Rust suite: **186 passed**, 0 failed, 373 filtered (previously 175 passed).
-- Full Rust suite: **551 passed**, 0 failed, 8 ignored (previously 540 passed).
+- Focused stock-review Rust suite: **190 passed**, 0 failed, 373 filtered (previously 175 passed).
+- Full Rust suite: **555 passed**, 0 failed, 8 ignored (previously 540 passed).
 - Full Node inventory: **104 passed**, 0 failed, 0 skipped. This count includes the two existing `src/pages/Quarterly/aggregateSnapshotHoldings.test.mjs` cases omitted from the earlier 102-test command.
 - `cargo check`, `cargo build`, and `npm run build`: **PASS**.
 - Feature-file `rustfmt` and `git diff --check`: **PASS**.
 
-Detailed RED/GREEN evidence, design decisions, compatibility notes, and limitations are recorded in `final-fix-report.md`. The implementation is commit `49b8f75`; the report/addendum are committed separately.
+Detailed RED/GREEN evidence, design decisions, compatibility notes, and limitations are recorded in `final-fix-report.md`. The implementation commits are `49b8f75` and `7a98479`; the report/addendum are committed separately.

@@ -32,13 +32,20 @@ interface StockReviewState {
   ) => Promise<void>;
   saveAnnotation: (
     input: StockReviewAnnotationInput,
+    campaignContext?: StockCampaignMutationContext,
   ) => Promise<StockReviewAnnotation | null>;
   confirmOverride: (
     filters: StockReviewFilters,
     input: StockReviewOverrideInput,
+    campaignContext?: StockCampaignMutationContext,
   ) => Promise<StockReviewReport | null>;
   clearSelectedCampaign: () => void;
   clearError: () => void;
+}
+
+export interface StockCampaignMutationContext {
+  campaignId: string;
+  reportIdentity: string;
 }
 
 let latestReportRequestId = 0;
@@ -58,6 +65,40 @@ function queryArguments(filters: StockReviewFilters) {
     benchmarkSymbol: filters.benchmarkSymbol,
     baseCurrency: filters.baseCurrency,
   };
+}
+
+export function stockReviewReportIdentity(report: StockReviewReport): string {
+  return JSON.stringify({
+    generatedAt: report.generated_at,
+    query: report.methodology.query,
+  });
+}
+
+function filtersMatchReport(
+  filters: StockReviewFilters,
+  report: StockReviewReport,
+): boolean {
+  const query = report.methodology.query;
+  return (
+    filters.startDate === query.start_date &&
+    filters.endDate === query.end_date &&
+    filters.accountId === query.account_id &&
+    filters.market === query.market &&
+    filters.benchmarkSymbol === query.benchmark_symbol &&
+    filters.baseCurrency === query.base_currency
+  );
+}
+
+function campaignContextIsCurrent(
+  state: Pick<StockReviewState, "report" | "reportLoading" | "selectedCampaign">,
+  context: StockCampaignMutationContext,
+): boolean {
+  return Boolean(
+    !state.reportLoading &&
+      state.report &&
+      stockReviewReportIdentity(state.report) === context.reportIdentity &&
+      state.selectedCampaign?.summary.campaign_id === context.campaignId,
+  );
 }
 
 function replaceAnnotation(
@@ -150,9 +191,12 @@ export const useStockReviewStore = create<StockReviewState>((set, get) => ({
       ) {
         return;
       }
+      latestCampaignRequestId += 1;
       set((state) => ({
         report,
         reportLoading: false,
+        campaignLoading: false,
+        selectedCampaign: null,
         ...clearRelevantError(state, ["report"]),
       }));
     } catch (error) {
@@ -171,6 +215,12 @@ export const useStockReviewStore = create<StockReviewState>((set, get) => ({
   },
 
   loadCampaignDetail: async (filters, campaignId) => {
+    const sourceReport = get().report;
+    if (!sourceReport || !filtersMatchReport(filters, sourceReport)) {
+      set({ campaignLoading: false, selectedCampaign: null });
+      return;
+    }
+    const sourceReportIdentity = stockReviewReportIdentity(sourceReport);
     const requestId = ++latestCampaignRequestId;
     const reportRequestId = latestReportRequestId;
     const filterGeneration = latestFilterGeneration;
@@ -189,7 +239,9 @@ export const useStockReviewStore = create<StockReviewState>((set, get) => ({
       if (
         requestId !== latestCampaignRequestId ||
         reportRequestId !== latestReportRequestId ||
-        filterGeneration !== latestFilterGeneration
+        filterGeneration !== latestFilterGeneration ||
+        !get().report ||
+        stockReviewReportIdentity(get().report!) !== sourceReportIdentity
       ) {
         return;
       }
@@ -214,7 +266,10 @@ export const useStockReviewStore = create<StockReviewState>((set, get) => ({
     }
   },
 
-  saveAnnotation: async (input) => {
+  saveAnnotation: async (input, campaignContext) => {
+    if (campaignContext && !campaignContextIsCurrent(get(), campaignContext)) {
+      return null;
+    }
     const requestId = ++latestAnnotationRequestId;
     latestAnnotationRequestById.set(input.id, requestId);
     const filterGeneration = latestFilterGeneration;
@@ -230,7 +285,8 @@ export const useStockReviewStore = create<StockReviewState>((set, get) => ({
       );
       if (
         latestAnnotationRequestById.get(input.id) === requestId &&
-        filterGeneration === latestFilterGeneration
+        filterGeneration === latestFilterGeneration &&
+        (!campaignContext || campaignContextIsCurrent(get(), campaignContext))
       ) {
         set((state) => {
           const context = state.report
@@ -294,7 +350,10 @@ export const useStockReviewStore = create<StockReviewState>((set, get) => ({
     }
   },
 
-  confirmOverride: async (filters, input) => {
+  confirmOverride: async (filters, input, campaignContext) => {
+    if (campaignContext && !campaignContextIsCurrent(get(), campaignContext)) {
+      return null;
+    }
     if (!filtersEqual(get().filters, filters)) latestFilterGeneration += 1;
     const filterGeneration = latestFilterGeneration;
     const requestId = ++latestOverrideRequestId;

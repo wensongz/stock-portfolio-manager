@@ -10,7 +10,10 @@ import type {
   ToolCallInfo,
   AiToolContext,
 } from "../types";
-import { consumeAiPrefillToolContext } from "../pages/AiAssistant/prefill";
+import {
+  consumeAiPrefillToolContext,
+  readPersistedAiToolContext,
+} from "../pages/AiAssistant/prefill.ts";
 
 interface ChatState {
   messages: ChatMessageWithMeta[];
@@ -603,9 +606,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
             ? (() => {
                 try {
                   const parsed = JSON.parse(r.tool_calls);
-                  return Array.isArray(parsed) && parsed.length > 0
-                    ? { toolCalls: parsed }
-                    : {};
+                  if (!Array.isArray(parsed) || parsed.length === 0) return {};
+                  const toolContext = readPersistedAiToolContext(parsed);
+                  return {
+                    toolCalls: parsed,
+                    ...(toolContext
+                      ? {
+                          explicitToolContext: toolContext,
+                          explicitSkillIds: ["stock-review"],
+                        }
+                      : {}),
+                  };
                 } catch (e) {
                   console.warn(
                     "[chatStore] failed to parse persisted tool_calls",

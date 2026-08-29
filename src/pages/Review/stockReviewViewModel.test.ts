@@ -508,9 +508,12 @@ test("same-day correction has a real explicit order independent of selection ord
   assert.match(getStockReviewOverrideGuidance("transfer").selection, /恰好 2 笔/);
   assert.match(getStockReviewOverrideGuidance("duplicate").eligibility, /同一经济交易/);
   assert.match(getStockReviewOverrideGuidance("same_day_order").selection, /至少 2 笔/);
-  assert.match(getStockReviewOverrideGuidance("non_trade").selection, /至少 1 笔/);
+  assert.match(getStockReviewOverrideGuidance("non_trade").selection, /恰好 1 笔/);
   assert.equal(isStockReviewOverrideSelectionValid("transfer", ["out", "in"]), true);
   assert.equal(isStockReviewOverrideSelectionValid("transfer", ["out", "in", "extra"]), false);
+  assert.equal(isStockReviewOverrideSelectionValid("non_trade", []), false);
+  assert.equal(isStockReviewOverrideSelectionValid("non_trade", ["one"]), true);
+  assert.equal(isStockReviewOverrideSelectionValid("non_trade", ["one", "two"]), false);
 });
 
 test("summary display follows backend return mode and never invents recovery text", () => {

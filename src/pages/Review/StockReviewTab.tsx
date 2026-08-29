@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAccountStore } from "../../stores/accountStore";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
-import { useStockReviewStore } from "../../stores/stockReviewStore";
+import { stockReviewReportIdentity, useStockReviewStore } from "../../stores/stockReviewStore";
 import type { Currency, StockCampaignDetail, StockReviewFilters as Filters, StockReviewOverrideInput } from "../../types";
 import {
   buildStockCampaignAiPrefill,
@@ -104,8 +104,18 @@ export default function StockReviewTab() {
       );
     }
   };
+  const campaignMutationContext = report && selectedCampaign ? {
+    campaignId: selectedCampaign.summary.campaign_id,
+    reportIdentity: stockReviewReportIdentity(report),
+  } : null;
+  const saveCampaignAnnotation = (input: Parameters<typeof saveAnnotation>[0]) =>
+    campaignMutationContext
+      ? saveAnnotation(input, campaignMutationContext)
+      : Promise.resolve(null);
   const applyOverride = (input: StockReviewOverrideInput) =>
-    reportFilters ? confirmOverride(reportFilters, input) : Promise.resolve(null);
+    reportFilters && campaignMutationContext
+      ? confirmOverride(reportFilters, input, campaignMutationContext)
+      : Promise.resolve(null);
 
   return (
     <div className="space-y-5">
@@ -172,7 +182,7 @@ export default function StockReviewTab() {
         transactionCandidates={transactionCandidates}
         onClose={clearSelectedCampaign}
         onAskAi={askCampaignAi}
-        onSaveAnnotation={saveAnnotation}
+        onSaveAnnotation={saveCampaignAnnotation}
         onConfirmOverride={applyOverride}
       />
     </div>

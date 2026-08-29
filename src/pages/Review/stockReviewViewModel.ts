@@ -245,7 +245,7 @@ const OVERRIDE_GUIDANCE: Record<StockReviewOverrideType, { selection: string; el
     eligibility: "应为同一账户、股票和交易日的反向交易；列表顺序会原样提交后端。",
   },
   non_trade: {
-    selection: "至少 1 笔交易。",
+    selection: "恰好 1 笔交易。",
     eligibility: "仅选择实际代表非交易持仓变化的记录；后端会重新生成报告。",
   },
 };
@@ -258,7 +258,9 @@ export function isStockReviewOverrideSelectionValid(
   type: StockReviewOverrideType,
   transactionIds: string[],
 ): boolean {
-  return type === "transfer" ? transactionIds.length === 2 : transactionIds.length >= (type === "non_trade" ? 1 : 2);
+  if (type === "transfer") return transactionIds.length === 2;
+  if (type === "non_trade") return transactionIds.length === 1;
+  return transactionIds.length >= 2;
 }
 
 export function moveStockReviewTransaction(

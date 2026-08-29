@@ -1,4 +1,4 @@
-import type { AiToolContext } from "../../types";
+import type { AiToolContext, ToolCallInfo } from "../../types";
 
 export function readAiPrefill(state: unknown): string | null {
   if (!state || typeof state !== "object" || !("prefillPrompt" in state)) return null;
@@ -72,6 +72,32 @@ export function consumeAiPrefillToolContext(
   pending: AiPrefillToolContext | null,
 ): { current: AiPrefillToolContext | null; next: null } {
   return { current: pending, next: null };
+}
+
+export function readPersistedAiToolContext(
+  toolCalls: ToolCallInfo[],
+): AiToolContext | null {
+  const matches = toolCalls.filter(
+    (call) =>
+      call.id === "prefilled-stock-review" &&
+      call.name === "get_stock_review" &&
+      (call.status === "success" || call.status === "error") &&
+      typeof call.arguments === "string",
+  );
+  if (matches.length !== 1) return null;
+  let args: unknown;
+  try {
+    args = JSON.parse(matches[0].arguments!);
+  } catch {
+    return null;
+  }
+  return readAiPrefillToolContext({
+    prefillPrompt: "persisted stock review context",
+    prefillActiveSkill: "stock-review",
+    prefillAutoSend: false,
+    prefillToolName: "get_stock_review",
+    prefillToolArguments: args,
+  });
 }
 
 export function resolveAiPrefillSessionId(

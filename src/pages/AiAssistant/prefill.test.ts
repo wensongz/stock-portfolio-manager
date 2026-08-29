@@ -7,6 +7,7 @@ import {
   readAiPrefill,
   readAiPrefillActiveSkill,
   readAiPrefillToolContext,
+  readPersistedAiToolContext,
   resolveAiPrefillSessionId,
 } from "./prefill.ts";
 
@@ -122,4 +123,24 @@ test("rejects incomplete, auto-send, unsupported, and extra-key tool contexts", 
     ...base,
     prefillToolArguments: { ...base.prefillToolArguments, unexpected: true },
   }), null);
+});
+
+test("persisted context reconstruction requires one completed reserved tool call", () => {
+  const argumentsJson = JSON.stringify({
+    start_date: "2026-01-01",
+    end_date: "2026-03-31",
+    base_currency: "USD",
+  });
+  const call = {
+    id: "prefilled-stock-review",
+    name: "get_stock_review",
+    arguments: argumentsJson,
+    status: "success",
+  };
+  assert.equal(readPersistedAiToolContext([{ ...call, status: undefined }]), null);
+  assert.equal(readPersistedAiToolContext([call, { ...call }]), null);
+  assert.equal(readPersistedAiToolContext([{
+    ...call,
+    arguments: JSON.stringify({ ...JSON.parse(argumentsJson), extra: "no" }),
+  }]), null);
 });

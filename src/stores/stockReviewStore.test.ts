@@ -329,7 +329,7 @@ globalThis.window = {
   },
 };
 
-const { useStockReviewStore } = await import("./stockReviewStore.ts");
+const { stockReviewReportIdentity, useStockReviewStore } = await import("./stockReviewStore.ts");
 
 beforeEach(() => {
   invokeImpl = () => Promise.reject(new Error("invoke not configured"));
@@ -697,6 +697,77 @@ test("a new report generation ignores a pending Campaign error", async () => {
   assert.equal(useStockReviewStore.getState().selectedCampaign, null);
   assert.equal(useStockReviewStore.getState().campaignLoading, false);
   assert.equal(useStockReviewStore.getState().error, null);
+});
+
+test("old Campaign detail that resolves before a refreshing report is cleared again on report commit", async () => {
+  const reportRequest = deferred();
+  const detailRequest = deferred();
+  const oldReport = reportWithReviewScopes("old-report", "account-a");
+  const newReport = reportWithReviewScopes("new-report", "account-b");
+  useStockReviewStore.setState({ filters: filters("account-a"), report: oldReport });
+  invokeImpl = (command) =>
+    command === "get_stock_review_report" ? reportRequest.promise : detailRequest.promise;
+
+  const refreshing = useStockReviewStore.getState().loadReport(filters("account-b"));
+  const openingOldCampaign = useStockReviewStore
+    .getState()
+    .loadCampaignDetail(filters("account-a"), "campaign-current");
+  detailRequest.resolve(campaignDetail("campaign-current"));
+  await openingOldCampaign;
+  assert.equal(useStockReviewStore.getState().selectedCampaign?.summary.campaign_id, "campaign-current");
+
+  reportRequest.resolve(newReport);
+  await refreshing;
+  assert.equal(useStockReviewStore.getState().report, newReport);
+  assert.equal(useStockReviewStore.getState().selectedCampaign, null);
+  assert.equal(useStockReviewStore.getState().campaignLoading, false);
+});
+
+test("old Campaign detail that resolves after a refreshing report cannot attach or mutate", async () => {
+  const reportRequest = deferred();
+  const detailRequest = deferred();
+  const calls = [];
+  const oldReport = reportWithReviewScopes("old-report", "account-a");
+  const newReport = reportWithReviewScopes("new-report", "account-b");
+  useStockReviewStore.setState({ filters: filters("account-a"), report: oldReport });
+  invokeImpl = (command, args) => {
+    calls.push({ command, args });
+    return command === "get_stock_review_report" ? reportRequest.promise : detailRequest.promise;
+  };
+
+  const refreshing = useStockReviewStore.getState().loadReport(filters("account-b"));
+  const openingOldCampaign = useStockReviewStore
+    .getState()
+    .loadCampaignDetail(filters("account-a"), "campaign-current");
+  const staleContext = {
+    campaignId: "campaign-current",
+    reportIdentity: stockReviewReportIdentity(oldReport),
+  };
+  reportRequest.resolve(newReport);
+  await refreshing;
+  detailRequest.resolve(campaignDetail("campaign-current"));
+  await openingOldCampaign;
+
+  assert.equal(useStockReviewStore.getState().report, newReport);
+  assert.equal(useStockReviewStore.getState().selectedCampaign, null);
+  const callCount = calls.length;
+  assert.equal(await useStockReviewStore.getState().saveAnnotation({
+    id: "stale-note",
+    scope_type: "campaign",
+    scope_key: "campaign-current",
+    account_id: "account-a",
+    symbol: "AAPL",
+    annotation_type: "note",
+    value_json: "{}",
+    source: "user",
+  }, staleContext), null);
+  assert.equal(await useStockReviewStore.getState().confirmOverride(filters("account-a"), {
+    id: "stale-override",
+    override_type: "non_trade",
+    transaction_ids_json: '["tx-a"]',
+    value_json: "{}",
+  }, staleContext), null);
+  assert.equal(calls.length, callCount);
 });
 
 test("saveAnnotation appends only rows visible to the current report and drawer", async () => {

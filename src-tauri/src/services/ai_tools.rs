@@ -1678,6 +1678,25 @@ fn canonical_value_sort_key(value: &Value, output: &mut String) {
     }
 }
 
+fn canonicalize_object_keys(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                canonicalize_object_keys(value);
+            }
+        }
+        Value::Object(object) => {
+            let mut entries: Vec<_> = std::mem::take(object).into_iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, mut value) in entries {
+                canonicalize_object_keys(&mut value);
+                object.insert(key, value);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn append_sort_key_field(output: &mut String, value: &str) {
     output.push_str(&value.len().to_string());
     output.push(':');
@@ -1722,9 +1741,14 @@ fn issue_semantic_sort_key(issue: &Value) -> String {
         canonical_value_sort_key(&remaining, &mut key);
         key
     };
+    let original = {
+        let mut key = String::new();
+        canonical_value_sort_key(issue, &mut key);
+        key
+    };
 
     let mut key = String::new();
-    for field in [code, &symbol, date, &value, &details, &remaining] {
+    for field in [code, &symbol, date, &value, &details, &remaining, &original] {
         append_sort_key_field(&mut key, field);
     }
     key
@@ -1790,6 +1814,14 @@ fn cap_stock_review_collections(
                     | "campaign_detail.issues"
             );
             if ranked {
+                if matches!(
+                    path,
+                    "report.data_quality.issues" | "campaign_detail.issues"
+                ) {
+                    for issue in values.iter_mut() {
+                        canonicalize_object_keys(issue);
+                    }
+                }
                 values.sort_by(|left, right| {
                     let selected_order =
                         row_is_selected_reference(right, path, selected_actions, selected_issues)
@@ -2683,6 +2715,70 @@ mod tests {
         assert_eq!(
             forward["context_limits"]["campaign_detail.issues"].to_string(),
             reverse["context_limits"]["campaign_detail.issues"].to_string()
+        );
+    }
+
+    #[test]
+    fn issue_caps_total_order_byte_distinct_normalization_collisions_at_boundary() {
+        let issues = (0..24)
+            .map(|index| {
+                let padding = " ".repeat(index + 1);
+                json!({
+                    "code": format!("{padding}quality_collision{padding}"),
+                    "affected_symbol": if index % 2 == 0 {
+                        format!("{padding}aapl{padding}")
+                    } else {
+                        format!("{padding}AAPL{padding}")
+                    },
+                    "affected_date": format!("{padding}2026-01-15{padding}"),
+                    "severity": "warning",
+                    "details": { "nested": { "z": 2, "a": 1 } },
+                    "value": { "b": 2, "a": 1 },
+                    "message": "same semantic issue"
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut reversed = issues.clone();
+        reversed.reverse();
+        let payload = |report_issues: Vec<Value>, detail_issues: Vec<Value>| {
+            compact_stock_review_payload(
+                json!({
+                    "summary": {},
+                    "actions": [],
+                    "campaigns": [],
+                    "attribution": {},
+                    "risk_structure": {},
+                    "data_quality": { "issues": report_issues },
+                    "annotations": []
+                }),
+                None,
+                None,
+                Some(json!({ "issues": detail_issues })),
+            )
+            .unwrap()
+        };
+
+        let forward = payload(issues.clone(), issues);
+        let reverse = payload(reversed.clone(), reversed);
+        for pointer in [
+            "/report/data_quality/issues",
+            "/campaign_detail/issues",
+            "/context_limits/report.data_quality.issues",
+            "/context_limits/campaign_detail.issues",
+        ] {
+            assert_eq!(
+                forward.pointer(pointer).unwrap().to_string(),
+                reverse.pointer(pointer).unwrap().to_string(),
+                "permutation changed {pointer}"
+            );
+        }
+        assert_eq!(
+            forward["context_limits"]["report.data_quality.issues"]["total"],
+            24
+        );
+        assert_eq!(
+            forward["context_limits"]["report.data_quality.issues"]["omitted"],
+            4
         );
     }
 

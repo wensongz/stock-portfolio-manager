@@ -5,6 +5,7 @@
 - Complete.
 - Implementation commit: `71661c298a879246525b44f60701a56b2cb96c31` (`feat: add stock review frontend data layer`).
 - Fix-round implementation commit: `8bceba8e484d3062cdb5dcddb3fe52e42248948b` (`fix: harden stock review frontend state`).
+- Backend-parity implementation commit: `7df9068a476bdf74c7eaa8a6445d8fcf1114495b` (`fix: align stock review annotation visibility`).
 - No npm or Cargo dependency was added.
 - The pre-existing untracked `node_modules` symlink/directory was preserved and never staged.
 
@@ -31,7 +32,8 @@
 - Latest-request errors retain the last successful report and same-generation detail; starting a new report generation intentionally clears the old drawer. Error provenance is tracked internally so a successful report, Campaign, annotation, or override clears only its own stale error rather than hiding an unrelated failure.
 - Annotations and overrides use separate monotonic sequences plus a shared pending-operation count. Annotation writes are latest-wins per stable annotation ID; annotation error ownership remains independent from override completion; `mutating` remains true until every overlapping mutation settles.
 - Override confirmation participates in the report-generation sequence and is guarded by its own latest override ID, the captured report request, and the filter generation. A later annotation cannot invalidate an override, two overrides remain latest-wins, and a filter change invalidates all old-filter override completions.
-- `saveAnnotation` applies only the authoritative command-returned row, including authoritative source/timestamps/value. A pure visibility matcher validates annotation economic dates and checks the current report query/end/account plus actual action, Campaign, and normalized symbol identities. Campaign drawer matching additionally requires exact Campaign/action/global scope or an applicable stock date/range; an undated stock note is rejected when multiple same-symbol Campaign cycles make it ambiguous. Cross-account, future-effective, malformed, and unrelated annotations are not appended.
+- `saveAnnotation` applies only the authoritative command-returned row, including authoritative source/timestamps/value. Two explicitly named pure predicates mirror the backend, whose Rust implementation is authoritative. The `load_display_context` predicate validates economic dates/as-of and applies exact account filtering: an account-scoped report excludes null/global and other-account rows, while an all-account report includes every backend-equivalent row. It deliberately does not infer action, Campaign, or symbol membership from the period-filtered report arrays, so same-account annotations outside those arrays remain report-visible.
+- The `annotation_applies_to_campaign` predicate supports only Campaign, action, and stock scopes. Campaign/action identity is exact; stock identity is normalized and applies the backend account, Campaign lifetime, report-as-of, explicit date/range, and same-symbol-cycle ambiguity rules. Period and unsupported scopes never enter the drawer. The store composes display-context visibility with Campaign applicability, matching the backend's two-stage pipeline.
 - `confirmOverride` adopts the command-returned `StockReviewReport` directly when no merge is needed and never reloads it. If an overlapping annotation has already completed, only currently visible authoritative annotations are merged by stable ID into the returned report; all returned metrics and other report fields remain authoritative.
 - Report, detail, annotation, and override command names and camel-case argument objects match the four Task 9 Tauri command signatures exactly.
 
@@ -90,7 +92,20 @@ invalid saved currency/non-custom civil dates partially restored saved filters
 exit code 1
 ```
 
-The focused GREEN suite covers 34 cases, including both report/Campaign race outcomes, stale Campaign loading/error, cross-account/future/unrelated/same-symbol-cycle annotation visibility, global/relevant scopes, both override/annotation completion orders, annotation error ordering, two overrides, filter invalidation, strict persisted v1 corruption, and Jan/Q1/leap/year-crossing/Shanghai UTC date boundaries.
+The first fix-round focused GREEN suite covered 34 cases, including report/Campaign races, mutation ordering, strict persisted v1 corruption, and date boundaries. Its annotation expectations were superseded by the backend-parity fixtures below.
+
+Backend-parity fix-round RED, before changing either visibility predicate:
+
+```text
+node --test src/pages/Review/stockReviewViewModel.test.ts src/stores/stockReviewStore.test.ts
+33 tests; 30 passed; 3 failed; exit code 1
+
+Failures: a scoped report accepted a null/global row; period scope applied to
+the Campaign drawer; the store rejected an out-of-period same-account Campaign
+annotation while retaining the global row.
+```
+
+Inspecting the exact Rust lifetime branch then added a future-Campaign fixture. It produced a second focused RED (`15 tests; 14 passed; 1 failed`) because an undated stock row incorrectly applied to a Campaign beginning after the report as-of date. The minimal lifetime guard made the unchanged fixture pass.
 
 One build-only RED was also captured after the first GREEN unit run:
 
@@ -106,10 +121,10 @@ The root cause was the new store following the two-argument initializer shape wh
 
 ```text
 node --test src/pages/Review/stockReviewViewModel.test.ts src/pages/Review/stockReviewDateBoundary.test.ts src/stores/stockReviewStore.test.ts
-34 passed; 0 failed
+35 passed; 0 failed
 
 node --test src/**/*.test.ts
-74 passed; 0 failed
+75 passed; 0 failed
 
 npm run build
 TypeScript and Vite production build passed; existing large-chunk warning only

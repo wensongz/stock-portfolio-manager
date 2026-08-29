@@ -19,7 +19,7 @@ use crate::services::stock_campaign_builder::build_stock_campaigns;
 use crate::services::stock_review_market_data::{
     default_benchmark_symbol, ensure_stock_price_cache, load_benchmark_series,
     load_market_sessions, load_stock_price_series, nth_market_session_after, DailyMarketPoint,
-    MarketReturnMode,
+    MarketCalendar, MarketReturnMode,
 };
 use crate::services::stock_review_metrics::*;
 use crate::services::stock_review_persistence::{
@@ -41,6 +41,7 @@ pub struct CachedCampaignData {
     pub account_id: Option<String>,
     pub symbol: String,
     pub cash_flows: Vec<CampaignCashFlow>,
+    pub position_events: Vec<CampaignPositionEvent>,
     pub daily_prices: Vec<CampaignPricePoint>,
     pub expected_session_dates: Vec<NaiveDate>,
     pub benchmark_prices: Vec<LocalPricePoint>,
@@ -89,6 +90,8 @@ struct RecordedSplit {
     ratio: f64,
 }
 
+type SplitMarketAuthority = BTreeMap<String, BTreeSet<String>>;
+
 pub fn build_stock_review_report_from_cached_data(
     input: &CachedStockReviewInput,
 ) -> Result<StockReviewReport, String> {
@@ -116,24 +119,8 @@ fn build_stock_review_artifacts(
         .any(|issue| issue.code == "opening_cash_incomplete");
 
     // 1. Pre-period transactions remain present for opening reconstruction.
-    let scoped_transactions = input
-        .transactions
-        .iter()
-        .filter(|transaction| {
-            input
-                .query
-                .account_id
-                .as_ref()
-                .is_none_or(|account| transaction.account_id == *account)
-                && input
-                    .query
-                    .market
-                    .as_ref()
-                    .is_none_or(|market| transaction.market == *market)
-                && transaction_date(transaction).is_some_and(|date| date <= input.query.end_date)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let scoped_transactions =
+        derivation_transactions(&input.transactions, &input.overrides, &input.query);
 
     // 2. Only active overrides reach replay. Stale rows are represented solely
     // by `persisted_override_issues` and therefore cannot affect calculations.
@@ -150,6 +137,7 @@ fn build_stock_review_artifacts(
         .actions
         .iter()
         .filter(|action| !action.fact_labels.iter().any(|label| label == "transfer"))
+        .filter(|action| action_is_in_query_scope(action, &input.query))
         .filter(|action| {
             action_date(action)
                 .is_some_and(|date| date >= input.query.start_date && date <= input.query.end_date)
@@ -355,7 +343,7 @@ fn build_stock_review_artifacts(
         risk_structure: risk_metric,
     };
 
-    let mut campaigns = campaign_build.campaigns;
+    let mut campaigns = project_campaigns(campaign_build.campaigns, &input.query);
     for campaign in &mut campaigns {
         campaign.contribution = campaign
             .action_ids
@@ -391,6 +379,9 @@ fn build_stock_review_artifacts(
                 summary: campaign.clone(),
                 cash_flows: cached
                     .map(|value| value.cash_flows.clone())
+                    .unwrap_or_default(),
+                position_events: cached
+                    .map(|value| value.position_events.clone())
                     .unwrap_or_default(),
                 daily_prices: cached
                     .map(|value| value.daily_prices.clone())
@@ -730,6 +721,120 @@ fn transaction_date(transaction: &Transaction) -> Option<NaiveDate> {
         .traded_at
         .get(..10)
         .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+}
+
+fn derivation_transactions(
+    transactions: &[Transaction],
+    overrides: &[StockReviewOverride],
+    query: &StockReviewQuery,
+) -> Vec<Transaction> {
+    let in_requested_scope = |transaction: &Transaction| {
+        query
+            .account_id
+            .as_ref()
+            .is_none_or(|account| transaction.account_id == *account)
+            && query
+                .market
+                .as_ref()
+                .is_none_or(|market| transaction.market == *market)
+            && transaction_date(transaction).is_some_and(|date| date <= query.end_date)
+    };
+    let base_ids = transactions
+        .iter()
+        .filter(|transaction| in_requested_scope(transaction))
+        .map(|transaction| transaction.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let referenced_transfer_ids = overrides
+        .iter()
+        .filter(|record| record.override_type == "transfer")
+        .filter_map(|record| serde_json::from_str::<Vec<String>>(&record.transaction_ids_json).ok())
+        .filter(|ids| ids.iter().any(|id| base_ids.contains(id.as_str())))
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    let referenced_position_keys = transactions
+        .iter()
+        .filter(|transaction| referenced_transfer_ids.contains(&transaction.id))
+        .map(|transaction| {
+            (
+                transaction.account_id.clone(),
+                normalized_stock_symbol(&transaction.symbol).unwrap_or_default(),
+                normalized_stock_market(&transaction.market).unwrap_or_default(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    transactions
+        .iter()
+        .filter(|transaction| {
+            in_requested_scope(transaction)
+                || (referenced_transfer_ids.contains(&transaction.id)
+                    && transaction_date(transaction).is_some_and(|date| date <= query.end_date))
+                || (referenced_position_keys.contains(&(
+                    transaction.account_id.clone(),
+                    normalized_stock_symbol(&transaction.symbol).unwrap_or_default(),
+                    normalized_stock_market(&transaction.market).unwrap_or_default(),
+                )) && transaction_date(transaction).is_some_and(|date| date <= query.end_date))
+        })
+        .cloned()
+        .collect()
+}
+
+fn action_is_in_query_scope(action: &StockActionReview, query: &StockReviewQuery) -> bool {
+    query
+        .account_id
+        .as_ref()
+        .is_none_or(|account| action.account_id == *account)
+        && query
+            .market
+            .as_ref()
+            .is_none_or(|market| action.market == *market)
+}
+
+fn transaction_is_in_query_scope(transaction: &Transaction, query: &StockReviewQuery) -> bool {
+    query
+        .account_id
+        .as_ref()
+        .is_none_or(|account| transaction.account_id == *account)
+        && query
+            .market
+            .as_ref()
+            .is_none_or(|market| transaction.market == *market)
+}
+
+fn project_campaigns(
+    campaigns: Vec<StockCampaignSummary>,
+    query: &StockReviewQuery,
+) -> Vec<StockCampaignSummary> {
+    campaigns
+        .into_iter()
+        .filter_map(|mut campaign| {
+            campaign.fragments.retain(|fragment| {
+                query
+                    .account_id
+                    .as_ref()
+                    .is_none_or(|account| fragment.account_id == *account)
+                    && query
+                        .market
+                        .as_ref()
+                        .is_none_or(|market| fragment.market == *market)
+            });
+            if campaign.fragments.is_empty() {
+                return None;
+            }
+            campaign.account_ids = campaign
+                .fragments
+                .iter()
+                .map(|fragment| fragment.account_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            campaign.action_ids = campaign
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.action_ids.iter().cloned())
+                .collect();
+            Some(campaign)
+        })
+        .collect()
 }
 
 pub fn validate_query(query: &StockReviewQuery) -> Result<(), String> {
@@ -1078,22 +1183,23 @@ where
         override_list.overrides.push(candidate);
     }
     let transactions = load_all_transactions_for_review_through(db, today)?;
-    let scoped = transactions
+    let discovered_split_market_authority = load_split_market_authority(db, &transactions)?;
+    let derivation_ledger =
+        derivation_transactions(&transactions, &override_list.overrides, &query);
+    let action_build = build_stock_actions(&derivation_ledger, &override_list.overrides);
+    let scoped_actions = action_build
+        .actions
         .iter()
-        .filter(|transaction| {
-            query
-                .account_id
-                .as_ref()
-                .is_none_or(|account| transaction.account_id == *account)
-                && query
-                    .market
-                    .as_ref()
-                    .is_none_or(|market| transaction.market == *market)
-        })
+        .filter(|action| action_is_in_query_scope(action, &query))
         .cloned()
         .collect::<Vec<_>>();
-    let action_build = build_stock_actions(&scoped, &override_list.overrides);
-    let corrected_transactions = &action_build.corrected_transactions;
+    let scoped_corrected_transactions = action_build
+        .corrected_transactions
+        .iter()
+        .filter(|corrected| transaction_is_in_query_scope(&corrected.transaction, &query))
+        .cloned()
+        .collect::<Vec<_>>();
+    let corrected_transactions = &scoped_corrected_transactions;
     let provider_config = crate::services::quote_provider_service::get_quote_provider_config(db)?;
     let mut security_keys = corrected_transactions
         .iter()
@@ -1131,8 +1237,7 @@ where
         .iter()
         .map(|(market, calendar)| (market.clone(), calendar.sessions.clone()))
         .collect::<BTreeMap<_, _>>();
-    let mut evaluation_end = action_build
-        .actions
+    let mut evaluation_end = scoped_actions
         .iter()
         .filter(|action| action_date(action).is_some_and(|date| date <= query.end_date))
         .filter_map(|action| {
@@ -1260,8 +1365,7 @@ where
         .iter()
         .map(|(market, calendar)| (market.clone(), calendar.sessions.clone()))
         .collect::<BTreeMap<_, _>>();
-    evaluation_end = action_build
-        .actions
+    evaluation_end = scoped_actions
         .iter()
         .filter(|action| action_date(action).is_some_and(|date| date <= query.end_date))
         .filter_map(|action| {
@@ -1316,28 +1420,51 @@ where
         override_list.overrides.push(candidate);
     }
     let transactions = load_all_transactions_for_review_through(db, today)?;
-    let scoped = transactions
+    let split_market_authority = load_split_market_authority(db, &transactions)?;
+    if split_market_authority != discovered_split_market_authority {
+        return Err(
+            "Security market identities changed during cache preparation; rebuild before confirming."
+                .to_string(),
+        );
+    }
+    let derivation_ledger =
+        derivation_transactions(&transactions, &override_list.overrides, &query);
+    let action_build = build_stock_actions(&derivation_ledger, &override_list.overrides);
+    let scoped_actions = action_build
+        .actions
         .iter()
-        .filter(|transaction| {
+        .filter(|action| action_is_in_query_scope(action, &query))
+        .cloned()
+        .collect::<Vec<_>>();
+    let scoped_position_events = action_build
+        .position_events
+        .iter()
+        .filter(|event| {
             query
                 .account_id
                 .as_ref()
-                .is_none_or(|account| transaction.account_id == *account)
+                .is_none_or(|account| event.account_id == *account)
                 && query
                     .market
                     .as_ref()
-                    .is_none_or(|market| transaction.market == *market)
+                    .is_none_or(|market| event.market == *market)
         })
         .cloned()
         .collect::<Vec<_>>();
-    let action_build = build_stock_actions(&scoped, &override_list.overrides);
-    let corrected_transactions = &action_build.corrected_transactions;
+    let scoped_corrected_transactions = action_build
+        .corrected_transactions
+        .iter()
+        .filter(|corrected| transaction_is_in_query_scope(&corrected.transaction, &query))
+        .cloned()
+        .collect::<Vec<_>>();
+    let corrected_transactions = &scoped_corrected_transactions;
     let prepared_campaigns = build_stock_campaigns(
         &action_build.position_events,
         &action_build.actions,
         &override_list.overrides,
         query.end_date,
     );
+    let prepared_campaign_summaries = project_campaigns(prepared_campaigns.campaigns, &query);
     let mut reloaded_security_keys = corrected_transactions
         .iter()
         .map(|corrected| &corrected.transaction)
@@ -1401,12 +1528,21 @@ where
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
 
+    let valuation_markets = security_keys
+        .iter()
+        .map(|(_, market)| market.clone())
+        .chain(query.market.clone())
+        .collect::<BTreeSet<_>>();
+    let (expected_actual_dates, expected_baseline_date) = portfolio_valuation_session_authority(
+        &query,
+        price_start,
+        &valuation_markets,
+        &market_calendars_by_market,
+    );
     let (baseline, actual_values, mut actual_availability, actual_nav_complete) =
-        load_actual_values(db, &query)?;
-    let actual_origin_date = baseline
-        .as_ref()
-        .map(|point| point.date)
-        .or_else(|| actual_values.first().map(|point| point.date))
+        load_actual_values(db, &query, expected_baseline_date)?;
+    let actual_origin_date = expected_baseline_date
+        .or_else(|| expected_actual_dates.first().copied())
         .unwrap_or(query.start_date);
     let (external_flows, external_flows_complete) =
         external_flows_base_from_db(db, corrected_transactions, &query, actual_origin_date);
@@ -1425,8 +1561,9 @@ where
     let opening_positions = opening_positions(
         db,
         &query,
-        &action_build.position_events,
+        &scoped_position_events,
         &recorded_splits,
+        &split_market_authority,
         actual_origin_date,
     )?;
     let (opening_cash, opening_cash_complete) =
@@ -1487,7 +1624,7 @@ where
         });
     }
     let valuation_dates = std::iter::once(actual_origin_date)
-        .chain(actual_values.iter().map(|point| point.date))
+        .chain(expected_actual_dates.iter().copied())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -1577,10 +1714,17 @@ where
     let split_events = load_split_events(
         &recorded_splits,
         &opening_positions,
-        &action_build.position_events,
+        &scoped_position_events,
+        &split_market_authority,
         actual_origin_date,
         query.end_date,
     );
+    preparation_issues.extend(ambiguous_split_issues(
+        &recorded_splits,
+        &opening_positions,
+        &scoped_position_events,
+        &split_market_authority,
+    ));
     let complete_shadow_dividends = complete_shadow_dividend_events(
         &opening_positions,
         &prices_by_security,
@@ -1674,8 +1818,7 @@ where
             })
         })
         .collect::<Vec<_>>();
-    let campaign_data = prepared_campaigns
-        .campaigns
+    let campaign_data = prepared_campaign_summaries
         .iter()
         .filter_map(|campaign| {
             let symbol = &campaign.symbol;
@@ -1767,6 +1910,12 @@ where
                 &query,
                 &fx_points,
             );
+            let position_events = campaign_position_events(
+                &action_build.position_events,
+                &split_events,
+                campaign,
+                query.account_id.as_deref(),
+            );
             if let Some(flow) = cash_flows.iter().find(|flow| flow.amount_base.is_none()) {
                 campaign_issues.push(StockReviewIssue {
                     code: "campaign_fx_unavailable".to_string(),
@@ -1784,6 +1933,7 @@ where
                 account_id: query.account_id.clone(),
                 symbol: symbol.clone(),
                 cash_flows,
+                position_events,
                 daily_prices: stock
                     .iter()
                     .filter(|point| point.date >= campaign_start && point.date <= campaign_end)
@@ -1879,7 +2029,7 @@ where
         db,
         &query,
         corrected_transactions,
-        &action_build.actions,
+        &scoped_actions,
         &opening_cash,
         &actual_values,
         &prices_by_security,
@@ -1891,7 +2041,7 @@ where
         actual_origin_date,
     )?;
     let (risk_input, action_fx_complete) =
-        load_risk_input(db, &query, &action_build.actions, average_nav, &fx_points)?;
+        load_risk_input(db, &query, &scoped_actions, average_nav, &fx_points)?;
     if !action_fx_complete {
         preparation_issues.push(StockReviewIssue {
             code: "action_fx_unavailable".to_string(),
@@ -1922,6 +2072,8 @@ where
             actual_origin_date,
             actual_values,
             baseline,
+            expected_actual_dates,
+            expected_baseline_date,
             external_flows_base: external_flows,
             actual_availability,
             opening_market_values_base,
@@ -2122,6 +2274,46 @@ fn benchmark_specs(query: &StockReviewQuery) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Derive the portfolio observation contract only from explicit exchange
+/// calendars. Price or snapshot rows are observations, never calendar
+/// authority. A multi-market portfolio is expected to have a valuation on
+/// every session where at least one scoped market is open.
+fn portfolio_valuation_session_authority(
+    query: &StockReviewQuery,
+    authority_start: NaiveDate,
+    markets: &BTreeSet<String>,
+    calendars: &BTreeMap<String, MarketCalendar>,
+) -> (Vec<NaiveDate>, Option<NaiveDate>) {
+    if markets.is_empty()
+        || markets.iter().any(|market| {
+            calendars
+                .get(market)
+                .is_none_or(|calendar| !calendar.covers(authority_start, query.end_date))
+        })
+    {
+        return (Vec::new(), None);
+    }
+
+    let all_sessions = markets
+        .iter()
+        .filter_map(|market| calendars.get(market))
+        .flat_map(|calendar| calendar.sessions.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let expected_baseline_date = all_sessions.range(..query.start_date).next_back().copied();
+    let expected_actual_dates = all_sessions
+        .range(query.start_date..=query.end_date)
+        .copied()
+        .collect::<Vec<_>>();
+
+    // Without a known prior session there is no authoritative pre-period
+    // baseline cutoff. An empty requested-session set likewise cannot define
+    // a terminal valuation.
+    if expected_baseline_date.is_none() || expected_actual_dates.is_empty() {
+        return (Vec::new(), None);
+    }
+    (expected_actual_dates, expected_baseline_date)
+}
+
 fn cached_point_availability(
     points: &[DailyMarketPoint],
     start: NaiveDate,
@@ -2148,6 +2340,7 @@ fn cached_point_availability(
 fn load_actual_values(
     db: &Database,
     query: &StockReviewQuery,
+    expected_baseline_date: Option<NaiveDate>,
 ) -> Result<
     (
         Option<PortfolioValuePoint>,
@@ -2159,11 +2352,11 @@ fn load_actual_values(
 > {
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
     if query.account_id.is_none() && query.market.is_none() {
-        let baseline = conn
-            .query_row(
+        let baseline = expected_baseline_date.and_then(|expected_date| {
+            conn.query_row(
                 "SELECT date, total_value, exchange_rates FROM daily_portfolio_values
-                 WHERE date < ?1 ORDER BY date DESC LIMIT 1",
-                params![query.start_date.format("%Y-%m-%d").to_string()],
+                 WHERE date = ?1",
+                params![expected_date.format("%Y-%m-%d").to_string()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -2182,7 +2375,8 @@ fn load_actual_values(
                         &query.base_currency,
                     ))
                     .map(|(date, value_base)| PortfolioValuePoint { date, value_base })
-            });
+            })
+        });
         let mut statement = conn
             .prepare(
                 "SELECT date, total_value, exchange_rates FROM daily_portfolio_values
@@ -2344,10 +2538,32 @@ fn opening_positions(
     query: &StockReviewQuery,
     position_events: &[crate::services::stock_action_builder::PositionEvent],
     recorded_splits: &[RecordedSplit],
+    split_market_authority: &SplitMarketAuthority,
     origin: NaiveDate,
 ) -> Result<Vec<OpeningPosition>, String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let mut statement = conn
+        .prepare(
+            "SELECT account_id, symbol, market, currency, shares FROM holdings
+             WHERE shares > 0 AND symbol NOT LIKE '$CASH-%'
+               AND (?1 IS NULL OR account_id = ?1) AND (?2 IS NULL OR market = ?2)",
+        )
+        .map_err(|error| error.to_string())?;
+    let legacy_positions = statement
+        .query_map(params![query.account_id, query.market], |row| {
+            Ok(OpeningPosition {
+                account_id: row.get(0)?,
+                symbol: row.get(1)?,
+                market: row.get(2)?,
+                currency: row.get(3)?,
+                quantity: row.get(4)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
     let mut quantities = BTreeMap::<
-        (String, String),
+        (String, String, String),
         (f64, &crate::services::stock_action_builder::PositionEvent),
     >::new();
     for event in position_events
@@ -2358,6 +2574,14 @@ fn opening_positions(
             .iter()
             .filter(|split| {
                 stock_symbols_equal(&split.symbol, &event.symbol)
+                    && split_market_authority
+                        .get(&normalized_stock_symbol(&split.symbol).unwrap_or_default())
+                        .is_some_and(|markets| {
+                            markets.len() == 1
+                                && markets.contains(
+                                    &normalized_stock_market(&event.market).unwrap_or_default(),
+                                )
+                        })
                     && split.date > event.trade_date
                     && split.date <= origin
             })
@@ -2367,6 +2591,7 @@ fn opening_positions(
             .entry((
                 event.account_id.clone(),
                 normalized_stock_symbol(&event.symbol).unwrap_or_default(),
+                normalized_stock_market(&event.market).unwrap_or_default(),
             ))
             .or_insert((0.0, event));
         entry.0 += event.shares_delta * split_factor;
@@ -2392,41 +2617,31 @@ fn opening_positions(
             (
                 event.account_id.clone(),
                 normalized_stock_symbol(&event.symbol).unwrap_or_default(),
+                normalized_stock_market(&event.market).unwrap_or_default(),
             )
         })
         .collect::<BTreeSet<_>>();
-    let conn = db.conn.lock().map_err(|error| error.to_string())?;
-    let mut statement = conn
-        .prepare(
-            "SELECT account_id, symbol, market, currency, shares FROM holdings
-             WHERE shares > 0 AND symbol NOT LIKE '$CASH-%'
-               AND (?1 IS NULL OR account_id = ?1) AND (?2 IS NULL OR market = ?2)",
-        )
-        .map_err(|error| error.to_string())?;
-    let legacy_positions = statement
-        .query_map(params![query.account_id, query.market], |row| {
-            Ok(OpeningPosition {
-                account_id: row.get(0)?,
-                symbol: row.get(1)?,
-                market: row.get(2)?,
-                currency: row.get(3)?,
-                quantity: row.get(4)?,
-            })
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
     positions.extend(legacy_positions.into_iter().filter_map(|mut position| {
         if ledger_keys.contains(&(
             position.account_id.clone(),
             normalized_stock_symbol(&position.symbol).unwrap_or_default(),
+            normalized_stock_market(&position.market).unwrap_or_default(),
         )) {
             return None;
         }
         let post_origin_factor = recorded_splits
             .iter()
             .filter(|split| {
-                stock_symbols_equal(&split.symbol, &position.symbol) && split.date > origin
+                stock_symbols_equal(&split.symbol, &position.symbol)
+                    && split_market_authority
+                        .get(&normalized_stock_symbol(&split.symbol).unwrap_or_default())
+                        .is_some_and(|markets| {
+                            markets.len() == 1
+                                && markets.contains(
+                                    &normalized_stock_market(&position.market).unwrap_or_default(),
+                                )
+                        })
+                    && split.date > origin
             })
             .map(|split| split.ratio)
             .product::<f64>();
@@ -2833,10 +3048,51 @@ fn load_recorded_splits(db: &Database, end: NaiveDate) -> Result<Vec<RecordedSpl
         .collect())
 }
 
+fn load_split_market_authority(
+    db: &Database,
+    transactions: &[Transaction],
+) -> Result<SplitMarketAuthority, String> {
+    let mut authority = SplitMarketAuthority::new();
+    let mut record = |symbol: &str, market: &str| {
+        let Some(symbol) = normalized_stock_symbol(symbol) else {
+            return;
+        };
+        let Some(market) = normalized_stock_market(market) else {
+            return;
+        };
+        authority.entry(symbol).or_default().insert(market);
+    };
+    for transaction in transactions
+        .iter()
+        .filter(|transaction| !crate::services::quote_service::is_cash_symbol(&transaction.symbol))
+    {
+        record(&transaction.symbol, &transaction.market);
+    }
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let mut statement = conn
+        .prepare(
+            "SELECT symbol, market FROM holdings
+             WHERE shares != 0 AND symbol NOT LIKE '$CASH-%'",
+        )
+        .map_err(|error| error.to_string())?;
+    let holdings = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for (symbol, market) in holdings {
+        record(&symbol, &market);
+    }
+    Ok(authority)
+}
+
 fn load_split_events(
     recorded_splits: &[RecordedSplit],
     opening_positions: &[OpeningPosition],
     position_events: &[crate::services::stock_action_builder::PositionEvent],
+    split_market_authority: &SplitMarketAuthority,
     origin: NaiveDate,
     end: NaiveDate,
 ) -> Vec<SplitEvent> {
@@ -2847,6 +3103,7 @@ fn load_split_events(
                 (
                     position.account_id.clone(),
                     normalized_stock_symbol(&position.symbol).unwrap_or_default(),
+                    normalized_stock_market(&position.market).unwrap_or_default(),
                 ),
                 (
                     position.quantity,
@@ -2862,6 +3119,15 @@ fn load_split_events(
         .iter()
         .filter(|split| split.date > origin && split.date <= end)
     {
+        let symbol_key = normalized_stock_symbol(&split.symbol).unwrap_or_default();
+        let Some(authoritative_market) = split_market_authority
+            .get(&symbol_key)
+            .filter(|markets| markets.len() == 1)
+            .and_then(|markets| markets.first())
+            .cloned()
+        else {
+            continue;
+        };
         for event in position_events
             .iter()
             .filter(|event| event.trade_date > origin && event.trade_date < split.date)
@@ -2871,12 +3137,16 @@ fn load_split_events(
                 .entry((
                     event.account_id.clone(),
                     normalized_stock_symbol(&event.symbol).unwrap_or_default(),
+                    normalized_stock_market(&event.market).unwrap_or_default(),
                 ))
                 .or_insert((0.0, event.symbol.clone(), event.market.clone()));
             entry.0 += event.shares_delta;
         }
-        for ((account_id, _), (quantity, symbol, market)) in &mut quantities {
-            if *quantity > 0.0 && stock_symbols_equal(symbol, &split.symbol) {
+        for ((account_id, _, market_key), (quantity, symbol, market)) in &mut quantities {
+            if *quantity > 0.0
+                && stock_symbols_equal(symbol, &split.symbol)
+                && *market_key == authoritative_market
+            {
                 events.push(SplitEvent {
                     date: split.date,
                     account_id: account_id.clone(),
@@ -2889,6 +3159,42 @@ fn load_split_events(
         }
     }
     events
+}
+
+fn ambiguous_split_issues(
+    recorded_splits: &[RecordedSplit],
+    opening_positions: &[OpeningPosition],
+    position_events: &[crate::services::stock_action_builder::PositionEvent],
+    split_market_authority: &SplitMarketAuthority,
+) -> Vec<StockReviewIssue> {
+    let relevant_symbols = opening_positions
+        .iter()
+        .filter_map(|position| normalized_stock_symbol(&position.symbol))
+        .chain(
+            position_events
+                .iter()
+                .filter_map(|event| normalized_stock_symbol(&event.symbol)),
+        )
+        .collect::<BTreeSet<_>>();
+    recorded_splits
+        .iter()
+        .filter(|split| {
+            normalized_stock_symbol(&split.symbol).is_some_and(|symbol| {
+                relevant_symbols.contains(&symbol)
+                    && split_market_authority
+                        .get(&symbol)
+                .is_some_and(|markets| markets.len() > 1)
+            })
+        })
+        .map(|split| StockReviewIssue {
+            code: "split_market_ambiguous".to_string(),
+            severity: StockReviewIssueSeverity::Error,
+            message: "A legacy split record has no market and the same code exists in multiple markets; the split is not applied until its market authority is resolved."
+                .to_string(),
+            affected_symbol: Some(split.symbol.clone()),
+            affected_date: Some(split.date),
+        })
+        .collect()
 }
 
 fn load_dividend_events(
@@ -3105,6 +3411,133 @@ fn campaign_cash_flows(
     }
     flows.sort_by_key(|flow| flow.date);
     flows
+}
+
+fn campaign_position_events(
+    source_events: &[crate::services::stock_action_builder::PositionEvent],
+    split_events: &[SplitEvent],
+    campaign: &StockCampaignSummary,
+    selected_account: Option<&str>,
+) -> Vec<CampaignPositionEvent> {
+    #[derive(Clone)]
+    enum RawPositionEvent<'a> {
+        Source(&'a crate::services::stock_action_builder::PositionEvent),
+        Split(&'a SplitEvent),
+    }
+
+    let visible_fragments = campaign
+        .fragments
+        .iter()
+        .filter(|fragment| selected_account.is_none_or(|id| fragment.account_id == id))
+        .collect::<Vec<_>>();
+    let belongs_to_visible_fragment = |account_id: &str, date: NaiveDate| {
+        visible_fragments.iter().any(|fragment| {
+            fragment.account_id == account_id
+                && fragment
+                    .started_at
+                    .get(..10)
+                    .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+                    .is_some_and(|start| start <= date)
+                && fragment
+                    .ended_at
+                    .as_deref()
+                    .and_then(|value| value.get(..10))
+                    .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+                    .is_none_or(|end| date <= end)
+        })
+    };
+    let mut raw = source_events
+        .iter()
+        .filter(|event| {
+            stock_securities_equal(
+                &event.symbol,
+                &event.market,
+                &campaign.symbol,
+                &campaign.market,
+            ) && belongs_to_visible_fragment(&event.account_id, event.trade_date)
+        })
+        .map(RawPositionEvent::Source)
+        .chain(
+            split_events
+                .iter()
+                .filter(|split| {
+                    stock_securities_equal(
+                        &split.symbol,
+                        &split.market,
+                        &campaign.symbol,
+                        &campaign.market,
+                    ) && selected_account.is_none_or(|id| split.account_id == id)
+                })
+                .filter(|split| {
+                    visible_fragments.iter().any(|fragment| {
+                        fragment
+                            .started_at
+                            .get(..10)
+                            .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+                            .is_some_and(|start| start <= split.date)
+                            && fragment
+                                .ended_at
+                                .as_deref()
+                                .and_then(|value| value.get(..10))
+                                .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+                                .is_none_or(|end| split.date <= end)
+                    })
+                })
+                .map(RawPositionEvent::Split),
+        )
+        .collect::<Vec<_>>();
+    raw.sort_by(|left, right| {
+        let key = |event: &RawPositionEvent<'_>| match event {
+            // Splits are applied before stock flows on the effective date, the
+            // same convention as the shadow and attribution engines.
+            RawPositionEvent::Split(split) => (split.date, 0_u8, String::new()),
+            RawPositionEvent::Source(event) => (event.trade_date, 1_u8, event.traded_at.clone()),
+        };
+        key(left).cmp(&key(right))
+    });
+
+    let mut quantities = BTreeMap::<String, f64>::new();
+    let mut output = Vec::new();
+    for raw_event in raw {
+        match raw_event {
+            RawPositionEvent::Source(event) => {
+                let quantity = quantities.entry(event.account_id.clone()).or_default();
+                *quantity += event.shares_delta;
+                output.push(CampaignPositionEvent {
+                    date: event.trade_date,
+                    sequence: output.len(),
+                    account_id: event.account_id.clone(),
+                    kind: if event.transaction_type == "OPEN" {
+                        CampaignPositionEventKind::Opening
+                    } else if event.is_transfer {
+                        CampaignPositionEventKind::Transfer
+                    } else {
+                        CampaignPositionEventKind::Trade
+                    },
+                    quantity_delta: event.shares_delta,
+                    cost_basis_known: event.transaction_type != "OPEN"
+                        && (!event.is_transfer || selected_account.is_none()),
+                });
+            }
+            RawPositionEvent::Split(split) => {
+                let quantity = quantities.entry(split.account_id.clone()).or_default();
+                if *quantity <= 0.0 {
+                    continue;
+                }
+                let delta = *quantity * (split.ratio - 1.0);
+                *quantity += delta;
+                output.push(CampaignPositionEvent {
+                    date: split.date,
+                    sequence: output.len(),
+                    account_id: split.account_id.clone(),
+                    kind: CampaignPositionEventKind::Split,
+                    quantity_delta: delta,
+                    cost_basis_known: true,
+                });
+            }
+        }
+    }
+    output
 }
 
 fn opening_market_values(
@@ -3563,6 +3996,7 @@ fn load_risk_input(
         conversion_complete.entry(date).or_insert(true);
         by_date.entry(date).or_default().push(StockValueBase {
             symbol,
+            market,
             value_base: value * fx,
         });
     }
@@ -3867,6 +4301,267 @@ mod tests {
         ).unwrap();
     }
 
+    fn stock_event(
+        id: &str,
+        account: &str,
+        symbol: &str,
+        market: &str,
+        transaction_type: &str,
+        shares: f64,
+        before: f64,
+        after: f64,
+        traded_at: &str,
+    ) -> crate::services::stock_action_builder::PositionEvent {
+        crate::services::stock_action_builder::PositionEvent {
+            transaction_id: id.to_string(),
+            account_id: account.to_string(),
+            symbol: symbol.to_string(),
+            market: market.to_string(),
+            transaction_type: transaction_type.to_string(),
+            traded_at: traded_at.to_string(),
+            trade_date: day(&traded_at[..10]),
+            shares_delta: shares,
+            shares_before: before,
+            shares_after: after,
+            is_date_precision: false,
+            is_transfer: false,
+        }
+    }
+
+    #[test]
+    fn opening_and_legacy_fallback_identity_include_market() {
+        // Collapsing (account, code, market) to (account, code) either merges
+        // these openings or lets a US ledger row suppress the CN fallback.
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "US");
+        insert_holding(&db, "cn-holding", "acct", "000001", "CN", "CNY", 20.0);
+        let query = live_query("2024-01-10", "2024-01-11", None);
+        let events = vec![stock_event(
+            "us-open",
+            "acct",
+            "000001",
+            "US",
+            "OPEN",
+            10.0,
+            0.0,
+            10.0,
+            "2024-01-01T09:30:00Z",
+        )];
+
+        let positions = opening_positions(
+            &db,
+            &query,
+            &events,
+            &[],
+            &BTreeMap::new(),
+            day("2024-01-09"),
+        )
+        .unwrap();
+        assert_eq!(positions.len(), 2);
+        assert!(positions
+            .iter()
+            .any(|position| position.market == "US" && position.quantity == 10.0));
+        assert!(positions
+            .iter()
+            .any(|position| position.market == "CN" && position.quantity == 20.0));
+
+        let price = |close: f64| DailyMarketPoint {
+            date: day("2024-01-09"),
+            open: Some(close),
+            high: Some(close),
+            low: Some(close),
+            close,
+            volume: Some(1.0),
+            adjusted_close: None,
+            dividend: None,
+        };
+        let prices = BTreeMap::from([
+            (("000001".to_string(), "US".to_string()), vec![price(10.0)]),
+            (("000001".to_string(), "CN".to_string()), vec![price(5.0)]),
+        ]);
+        let fx = vec![ShadowFxPoint {
+            date: day("2024-01-09"),
+            currency: "CNY".to_string(),
+            base_currency: "USD".to_string(),
+            rate: 0.2,
+        }];
+        let opening_values =
+            opening_market_values(&positions, &prices, &fx, "USD", day("2024-01-09"));
+        assert!(opening_values
+            .iter()
+            .any(|value| value.market == "US" && value.value_base == 100.0));
+        assert!(opening_values
+            .iter()
+            .any(|value| value.market == "CN" && value.value_base == 20.0));
+
+        let fixed = calculate_result_quality(&ResultQualityInput {
+            actual_origin_date: day("2024-01-09"),
+            actual_values: vec![PortfolioValuePoint {
+                date: day("2024-01-10"),
+                value_base: 120.0,
+            }],
+            baseline: Some(PortfolioValuePoint {
+                date: day("2024-01-09"),
+                value_base: 120.0,
+            }),
+            expected_actual_dates: vec![day("2024-01-10")],
+            expected_baseline_date: Some(day("2024-01-09")),
+            external_flows_base: vec![],
+            actual_availability: available(),
+            opening_market_values_base: opening_values,
+            opening_cash_value_base: 0.0,
+            benchmark_series: vec![
+                BenchmarkSeriesInput {
+                    market: "US".to_string(),
+                    availability: available(),
+                    points: vec![
+                        BenchmarkPoint {
+                            date: day("2024-01-09"),
+                            value: 100.0,
+                        },
+                        BenchmarkPoint {
+                            date: day("2024-01-10"),
+                            value: 100.0,
+                        },
+                    ],
+                },
+                BenchmarkSeriesInput {
+                    market: "CN".to_string(),
+                    availability: available(),
+                    points: vec![
+                        BenchmarkPoint {
+                            date: day("2024-01-09"),
+                            value: 100.0,
+                        },
+                        BenchmarkPoint {
+                            date: day("2024-01-10"),
+                            value: 100.0,
+                        },
+                    ],
+                },
+            ],
+            benchmark_selection: BenchmarkSelection::AutomaticMixed,
+            shadow_curve: vec![],
+        });
+        assert!((fixed.fixed_weights["US"] - 5.0 / 6.0).abs() < 1e-12);
+        assert!((fixed.fixed_weights["CN"] - 1.0 / 6.0).abs() < 1e-12);
+
+        let shadow = build_shadow_series(&ShadowPortfolioInput {
+            base_currency: "USD".to_string(),
+            return_method: ShadowReturnMethod::PriceOnly,
+            opening_positions: positions,
+            opening_cash: vec![],
+            valuation_dates: vec![day("2024-01-09"), day("2024-01-10")],
+            price_points: vec![
+                ShadowPricePoint {
+                    date: day("2024-01-09"),
+                    symbol: "000001".to_string(),
+                    market: "US".to_string(),
+                    currency: "USD".to_string(),
+                    close: 10.0,
+                    adjusted_close: None,
+                },
+                ShadowPricePoint {
+                    date: day("2024-01-10"),
+                    symbol: "000001".to_string(),
+                    market: "US".to_string(),
+                    currency: "USD".to_string(),
+                    close: 20.0,
+                    adjusted_close: None,
+                },
+                ShadowPricePoint {
+                    date: day("2024-01-09"),
+                    symbol: "000001".to_string(),
+                    market: "CN".to_string(),
+                    currency: "CNY".to_string(),
+                    close: 5.0,
+                    adjusted_close: None,
+                },
+                ShadowPricePoint {
+                    date: day("2024-01-10"),
+                    symbol: "000001".to_string(),
+                    market: "CN".to_string(),
+                    currency: "CNY".to_string(),
+                    close: 5.0,
+                    adjusted_close: None,
+                },
+            ],
+            fx_points: vec![
+                fx[0].clone(),
+                ShadowFxPoint {
+                    date: day("2024-01-10"),
+                    ..fx[0].clone()
+                },
+            ],
+            external_flows: vec![],
+            cash_income_events: vec![],
+            dividend_events: vec![],
+            split_events: vec![],
+        });
+        assert_eq!(shadow.ending_value, Some(220.0));
+    }
+
+    #[test]
+    fn marketless_split_is_skipped_when_equal_code_has_multiple_market_authorities() {
+        // The legacy stock_splits row has no market. Applying it to both
+        // listings is fabricated authority; ambiguity must degrade safely.
+        let openings = vec![
+            OpeningPosition {
+                account_id: "acct".to_string(),
+                symbol: "000001".to_string(),
+                market: "CN".to_string(),
+                currency: "CNY".to_string(),
+                quantity: 10.0,
+            },
+            OpeningPosition {
+                account_id: "acct".to_string(),
+                symbol: "000001".to_string(),
+                market: "HK".to_string(),
+                currency: "HKD".to_string(),
+                quantity: 10.0,
+            },
+        ];
+        let split = RecordedSplit {
+            symbol: "000001".to_string(),
+            date: day("2024-01-10"),
+            ratio: 2.0,
+        };
+        let ambiguous_authority = BTreeMap::from([(
+            "000001".to_string(),
+            BTreeSet::from(["CN".to_string(), "HK".to_string()]),
+        )]);
+
+        let ambiguous = load_split_events(
+            std::slice::from_ref(&split),
+            &openings[..1],
+            &[],
+            &ambiguous_authority,
+            day("2024-01-09"),
+            day("2024-01-11"),
+        );
+        assert!(ambiguous.is_empty());
+        let issues = ambiguous_split_issues(
+            std::slice::from_ref(&split),
+            &openings[..1],
+            &[],
+            &ambiguous_authority,
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, "split_market_ambiguous");
+        assert_eq!(issues[0].affected_symbol.as_deref(), Some("000001"));
+
+        let authoritative = load_split_events(
+            &[split],
+            &openings[..1],
+            &[],
+            &BTreeMap::from([("000001".to_string(), BTreeSet::from(["CN".to_string()]))]),
+            day("2024-01-09"),
+            day("2024-01-11"),
+        );
+        assert_eq!(authoritative.len(), 1);
+        assert_eq!(authoritative[0].market, "CN");
+    }
+
     fn insert_stock_price(db: &Database, symbol: &str, market: &str, date: NaiveDate, close: f64) {
         db.conn.lock().unwrap().execute(
             "INSERT OR REPLACE INTO stock_daily_prices
@@ -4043,6 +4738,8 @@ mod tests {
                     date: day("2023-12-31"),
                     value_base: 1_000.0,
                 }),
+                expected_actual_dates: vec![day("2024-01-01"), day("2024-01-02")],
+                expected_baseline_date: Some(day("2023-12-31")),
                 external_flows_base: vec![],
                 actual_availability: available(),
                 opening_market_values_base: vec![],
@@ -4135,6 +4832,7 @@ mod tests {
                         date: day("2024-01-01"),
                         stock_values_base: vec![StockValueBase {
                             symbol: "AAPL".to_string(),
+                            market: "US".to_string(),
                             value_base: 100.0,
                         }],
                         cash_value_base: Some(900.0),
@@ -4144,6 +4842,7 @@ mod tests {
                         date: day("2024-01-02"),
                         stock_values_base: vec![StockValueBase {
                             symbol: "AAPL".to_string(),
+                            market: "US".to_string(),
                             value_base: 110.0,
                         }],
                         cash_value_base: Some(900.0),
@@ -4226,6 +4925,14 @@ mod tests {
                     shares: 1.0,
                     account_id: "acct".to_string(),
                     action_id: Some(action_id.to_string()),
+                }],
+                position_events: vec![CampaignPositionEvent {
+                    date: day("2024-01-01"),
+                    sequence: 0,
+                    account_id: "acct".to_string(),
+                    kind: CampaignPositionEventKind::Trade,
+                    quantity_delta: 1.0,
+                    cost_basis_known: true,
                 }],
                 daily_prices: vec![
                     CampaignPricePoint::complete(day("2024-01-01"), 99.0, 101.0, 100.0),
@@ -4411,6 +5118,16 @@ mod tests {
                 account_id: "acct".to_string(),
                 action_id: Some(action_id.to_string()),
             });
+        input.campaign_data[0]
+            .position_events
+            .push(CampaignPositionEvent {
+                date: day("2024-01-01"),
+                sequence: 1,
+                account_id: "acct".to_string(),
+                kind: CampaignPositionEventKind::Trade,
+                quantity_delta: -1.0,
+                cost_basis_known: true,
+            });
         input.campaign_data[0].current_price_local = None;
         input.campaign_data[0].current_fx_to_base = None;
         input
@@ -4450,6 +5167,61 @@ mod tests {
         }];
         input.risk_input.stock_changes = vec![StockChangeBase::transfer(100.0)];
         input
+    }
+
+    #[test]
+    fn account_filtered_transfer_derives_with_both_legs_then_projects_only_local_fragment() {
+        // Filtering before transfer derivation drops the referenced opposite
+        // leg, while failing to project afterwards leaks the other account.
+        for (selected, expect_in, expect_out) in
+            [("source", false, true), ("destination", true, false)]
+        {
+            let mut input = transfer_fixture();
+            input.query.account_id = Some(selected.to_string());
+            let report = build_stock_review_report_from_cached_data(&input).unwrap();
+
+            assert!(report.actions.is_empty());
+            assert_eq!(report.campaigns.len(), 1);
+            let campaign = &report.campaigns[0];
+            assert_eq!(campaign.account_ids, vec![selected.to_string()]);
+            assert_eq!(campaign.fragments.len(), 1);
+            assert_eq!(campaign.fragments[0].account_id, selected);
+            assert_eq!(
+                campaign.fragments[0].transfer_in.is_some(),
+                expect_in,
+                "selected={selected}, issues={:?}",
+                report
+                    .data_quality
+                    .issues
+                    .iter()
+                    .map(|issue| issue.code.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                campaign.fragments[0].transfer_out.is_some(),
+                expect_out,
+                "selected={selected}"
+            );
+            assert!(report
+                .data_quality
+                .issues
+                .iter()
+                .all(|issue| issue.code != "invalid_transfer_override"));
+        }
+
+        let mut invalid = transfer_fixture();
+        invalid.query.account_id = Some("source".to_string());
+        invalid.overrides[0].transaction_ids_json = r#"["transfer-out","missing"]"#.to_string();
+        let report = build_stock_review_report_from_cached_data(&invalid).unwrap();
+        assert!(report.actions.is_empty());
+        assert_eq!(report.campaigns.len(), 1);
+        assert_eq!(report.campaigns[0].account_ids, vec!["source".to_string()]);
+        assert!(report.campaigns[0].fragments[0].transfer_out.is_none());
+        assert!(report
+            .data_quality
+            .issues
+            .iter()
+            .any(|issue| issue.code == "invalid_transfer_override"));
     }
 
     fn split_fixture() -> CachedStockReviewInput {
@@ -5135,6 +5907,23 @@ mod tests {
         );
         assert_eq!(prepared.shadow_input.opening_positions[0].quantity, 10.0);
         assert_eq!(prepared.shadow_input.split_events.len(), 1);
+        let campaign = prepared.campaign_data.first().unwrap();
+        assert_eq!(campaign.position_events.len(), 2);
+        assert_eq!(
+            campaign.position_events[0].kind,
+            CampaignPositionEventKind::Opening
+        );
+        assert_eq!(campaign.position_events[0].quantity_delta, 10.0);
+        assert_eq!(
+            campaign.position_events[1].kind,
+            CampaignPositionEventKind::Split
+        );
+        assert_eq!(campaign.position_events[1].quantity_delta, 10.0);
+        let detail =
+            build_stock_campaign_detail_from_cached_data(&prepared, &campaign.campaign_id).unwrap();
+        assert_eq!(detail.pnl.remaining_shares, 20.0);
+        assert_eq!(detail.pnl.total_pnl_base, None);
+        assert_eq!(detail.campaign_return, None);
         let shadow = build_shadow_series(&prepared.shadow_input);
         assert_eq!(shadow.ending_value, Some(1_000.0));
         assert_eq!(
@@ -6313,6 +7102,35 @@ mod tests {
         assert_eq!(report.actions.len(), 0);
         assert_eq!(report.campaigns.len(), 1);
         assert_eq!(report.summary.risk_structure.one_way_turnover, Some(0.0));
+
+        for (selected, fact) in [("source", "out"), ("destination", "in")] {
+            let mut query = live_query("2024-01-02", "2024-01-03", None);
+            query.account_id = Some(selected.to_string());
+            let filtered = prepare_cached_stock_review_input(&db, query).await.unwrap();
+            assert!(filtered
+                .attribution_input
+                .valuations
+                .iter()
+                .flat_map(|valuation| valuation.positions.iter())
+                .all(|position| position.account_id == selected));
+            assert!(filtered
+                .campaign_data
+                .iter()
+                .flat_map(|campaign| campaign.cash_flows.iter())
+                .all(|flow| flow.account_id == selected));
+            let report = build_stock_review_report_from_cached_data(&filtered).unwrap();
+            assert!(report.actions.is_empty());
+            assert_eq!(report.campaigns.len(), 1);
+            assert_eq!(report.campaigns[0].account_ids, vec![selected.to_string()]);
+            assert!(report.campaigns[0].fragments.iter().all(|fragment| {
+                fragment.account_id == selected
+                    && if fact == "in" {
+                        fragment.transfer_in.is_some()
+                    } else {
+                        fragment.transfer_out.is_some()
+                    }
+            }));
+        }
     }
 
     #[tokio::test]
@@ -7117,11 +7935,34 @@ mod tests {
         query.market = None;
         query.end_date = day("2024-01-01");
         let (baseline, values, availability, nav_complete) =
-            load_actual_values(&db, &query).unwrap();
+            load_actual_values(&db, &query, Some(day("2023-12-31"))).unwrap();
         assert!(nav_complete);
         assert_eq!(availability.status, MetricStatus::Available);
         assert_eq!(baseline.unwrap().value_base, 7_000.0);
         assert_eq!(values[0].value_base, 7_700.0);
+    }
+
+    #[test]
+    fn actual_snapshot_baseline_uses_the_exact_authoritative_cutoff() {
+        let db = Database::new(":memory:").unwrap();
+        for (date, value) in [
+            ("2024-01-05", 100.0),
+            ("2024-01-07", 999.0),
+            ("2024-01-08", 110.0),
+        ] {
+            insert_portfolio_value(&db, date, value, 7.0);
+        }
+        let mut query = complete_cached_fixture(false).query;
+        query.start_date = day("2024-01-08");
+        query.end_date = day("2024-01-08");
+        query.market = None;
+
+        let (baseline, values, availability, nav_complete) =
+            load_actual_values(&db, &query, Some(day("2024-01-05"))).unwrap();
+        assert!(nav_complete);
+        assert_eq!(availability.status, MetricStatus::Available);
+        assert_eq!(baseline.unwrap().date, day("2024-01-05"));
+        assert_eq!(values.last().unwrap().date, day("2024-01-08"));
     }
 
     #[tokio::test]
@@ -7424,6 +8265,14 @@ mod tests {
             prepared.forward_actions[0].availability.status,
             MetricStatus::Unavailable
         );
+        assert!(prepared
+            .result_quality_input
+            .expected_actual_dates
+            .is_empty());
+        let result = calculate_result_quality(&prepared.result_quality_input);
+        assert_eq!(result.metric.availability.status, MetricStatus::Unavailable);
+        assert_eq!(result.metric.portfolio_return, None);
+        assert_eq!(result.max_drawdown.max_drawdown, None);
         assert!(prepared
             .preparation_issues
             .iter()
@@ -7826,6 +8675,25 @@ mod tests {
         };
 
         assert!(!annotation_visible_as_of(&annotation, day("2024-03-01")));
+    }
+
+    #[test]
+    fn missing_actual_terminal_does_not_suppress_an_independent_shadow_result() {
+        let mut input = complete_cached_fixture(false);
+        input.result_quality_input.actual_values.pop();
+
+        let report = build_stock_review_report_from_cached_data(&input).unwrap();
+        assert_eq!(report.summary.result_quality.portfolio_return, None);
+        assert_eq!(report.summary.max_drawdown.max_drawdown, None);
+        assert_eq!(report.summary.result_quality.shadow_return, Some(0.0));
+        assert_eq!(
+            report.data_quality.actual_result_availability.status,
+            MetricStatus::Unavailable
+        );
+        assert_eq!(
+            report.data_quality.shadow_value_add_availability.status,
+            MetricStatus::Unavailable
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 - Implementation commit: `860a430578d627cd2b8e686b4c75dff819788594` (`feat: redesign stock operation review page`).
 - Review-remediation implementation commit: `ab76456c88dde0e177db7de7f7db5d71c9a0662d` (`fix: address stock review page findings`).
 - Second review-remediation implementation commit: `891e8dd7a59cff477f52e7243a42bff9d8cf5f3c` (`fix: close stock review race and persistence gaps`).
+- Third review-remediation implementation commit: `46f110c3ce29d032c44b897797e40e43d7fae7d2` (`fix: preserve host prefill provenance`).
 - No npm or Cargo dependency was added.
 - The pre-existing untracked `node_modules` symlink/directory was preserved and never staged.
 
@@ -135,7 +136,7 @@ The three follow-up findings are closed with scoped Store/view-model changes:
 
 1. Campaign requests now capture the exact source report identity (`generated_at` plus methodology query), reject filters that do not match that report, and verify the same identity again on response. A successful new report commit increments the Campaign request generation and clears detail/loading a second time. Therefore an old detail resolving either before or after the new report cannot remain attached. Campaign annotation and override callbacks carry the same identity and Campaign ID; the Store rejects them without invoking Tauri while a refresh is active or after either identity changes.
 2. The `non_trade` guidance and client validity rule now require exactly one transaction, matching Rust `validate_non_trade`; zero and multiple selections keep confirmation disabled.
-3. Completed host-prefilled tool calls are already persisted in assistant `tool_calls`. Session loading now reconstructs explicit context only when there is exactly one completed reserved `prefilled-stock-review` / `get_stock_review` record whose JSON arguments pass the same allowlist and required-field validation. It also restores the explicit `stock-review` skill. Live staging remains one-shot, and arbitrary tools, running/malformed/duplicate reserved records, and extra arguments are not elevated.
+3. Completed host-prefilled tool calls are already persisted in assistant `tool_calls`. Session loading reconstructs explicit context only from the sole reserved record when the Rust host explicitly marked its origin `host_prefill`, it is completed, its name is `get_stock_review`, and its JSON arguments pass the same allowlist and required-field validation. Model-origin events are host-marked and ID-namespaced before IPC, and the renderer also separates provenance during upsert. The `stock-review` skill is restored only with that validated context. Live staging remains one-shot, and arbitrary tools, running/malformed/duplicate reserved records, extra arguments, and model-origin lookalikes are not elevated.
 
 ### Second remediation TDD evidence
 
@@ -172,3 +173,52 @@ exit code 0
 ```
 
 No new dependency or database column was added. Regeneration restoration depends on the reserved completed tool-call record already written by successful chat persistence; older sessions created before tool-call persistence cannot reconstruct context and safely regenerate without the explicit scope.
+
+## Third review remediation
+
+The persisted-context provenance boundary no longer depends on provider-controlled lifecycle fields:
+
+- Rust assigns every lifecycle event an explicit `host_prefill` or `model` origin. Only `execute_prefilled_tool`, after validating the one-turn read-only `get_stock_review` context, constructs `host_prefill`; provider lifecycle paths construct `model` directly and cannot copy an origin from model output.
+- Every model lifecycle display ID is namespaced as `model:<provider-id>` before IPC, while provider protocol messages retain their original correlation ID. A provider-selected `prefilled-stock-review` ID therefore cannot occupy the renderer's reserved host ID.
+- The renderer defaults missing/unknown provenance to `model`, defensively remaps any model event that still arrives with the reserved ID, and upserts on origin plus ID. A model collision cannot overwrite a genuine host record.
+- Reload reconstruction first requires exactly one total reserved-ID record. It then requires `host_prefill`, a completed status, the exact read-only tool name, parseable JSON, and the existing strict argument allowlist. No persisted model lookalike can add a tool context or write capability.
+
+### Third remediation TDD evidence
+
+The adversarial tests were added before production changes. The initial focused Node run exited nonzero with four failures: a single model-origin forgery was accepted, running and wrong-name same-ID duplicates were ignored, and a same-ID model event overwrote the genuine host record. The Rust RED did not compile because the host namespace constant and model-ID remapper did not yet exist.
+
+After the boundary implementation, the focused suites passed:
+
+```text
+node --test --experimental-strip-types \
+  src/pages/AiAssistant/prefill.test.ts \
+  src/stores/chatStore.test.ts
+16 passed; 0 failed
+
+cargo test --manifest-path src-tauri/Cargo.toml \
+  --lib services::ai_chat_service::tests:: --quiet
+10 passed; 0 failed
+```
+
+Coverage includes a single forged model record; valid host plus running, wrong-name, or malformed same-ID records; collision-safe upsert; exact genuine send/persist/load/regenerate; a later live turn without inherited context; and rejection of write tools or extra scope.
+
+### Third remediation verification
+
+```text
+node --test --experimental-strip-types src/**/*.test.ts
+102 passed; 0 failed
+
+npm run build
+TypeScript and Vite production build passed; existing large-chunk warning only
+
+cargo test --lib --quiet
+540 passed; 0 failed; 8 ignored
+
+cargo check --lib
+passed
+
+git diff --check
+exit code 0
+```
+
+No dependency or schema change was added. Sessions persisted before origin markers existed remain visible, but are intentionally not trusted for scoped regeneration; they safely regenerate without explicit tool context.

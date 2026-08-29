@@ -4,6 +4,7 @@
 
 - Complete.
 - Implementation commit: `860a430578d627cd2b8e686b4c75dff819788594` (`feat: redesign stock operation review page`).
+- Review-remediation implementation commit: `ab76456c88dde0e177db7de7f7db5d71c9a0662d` (`fix: address stock review page findings`).
 - No npm or Cargo dependency was added.
 - The pre-existing untracked `node_modules` symlink/directory was preserved and never staged.
 
@@ -75,3 +76,54 @@ exit code 0
 - Visual testing with live deterministic report data still requires the Tauri desktop shell because the browser cannot invoke Rust commands. The production build, Store tests, command boundary tests, and browser failure-path smoke are green.
 - The backend contract limitation for Campaign maximum holding amount/weight and standalone market provider is surfaced honestly in the UI. Adding those fields belongs in the deterministic Rust report rather than a frontend calculation.
 - No full Rust regression was rerun because Task 12 changed no Rust source; the exact consumed command boundary was checked and `cargo check --lib` passed.
+
+## Review remediation
+
+The requested six findings are closed without changing the approved information architecture:
+
+1. The portfolio/Campaign route prefill now validates and stages the exact `get_stock_review` argument object independently of the visible approved prompt. `chatStore` consumes that object atomically on the next outbound turn, clears it, and sends it through `ChatRequest`; the Rust AI service permits only the read-only `get_stock_review` tool, executes that exact scope once before model reasoning, and exposes the normal tool lifecycle UI. A retry/regenerate of the same failed/completed turn retains its captured scope, while a later new turn does not inherit it.
+2. Campaign detail loads and override confirmations now use `StockReviewFilters` reconstructed from the retained report's `methodology.query`. A newer filter edit whose refresh failed can no longer mix its account/date/market/benchmark/currency with the visible older report.
+3. Correction candidates now come from every action in the retained report, not the open Campaign. Each row shows transaction, stock, account, Campaign, and date, so cross-account/cross-Campaign transfer pairs can be selected. Each correction type states cardinality and economic eligibility; transfer selection enforces exactly two rows and the other types enforce their minimums. `same_day_order` has explicit keyboard-labelled up/down controls, and that ordered state is serialized unchanged into both transaction IDs and the backend order value.
+4. Campaign detail now includes Campaign return, benchmark return, remaining shares, all five backend availability regions and notes, and the note attached to each 20/60/120-day forward window. The existing explicit maximum-holding contract limitation remains visible and no value is inferred.
+5. `comparable_price_only` changes the third summary title to `调仓价格增益`; missing recovery renders `—`; and the nested 120-day status/sample/note remains visible.
+6. Any non-null report is content, even when curves/actions/Campaigns are all empty. Summary, attribution, and risk remain rendered; curve, Campaign, and action collections show their own local empty states.
+
+### Remediation TDD evidence
+
+The focused behavior tests were extended first. Before production exports/wiring existed, the run failed nonzero with missing `consumeAiPrefillToolContext` and `buildStockReviewReportFilters` exports:
+
+```text
+node --test --experimental-strip-types \
+  src/pages/AiAssistant/prefill.test.ts \
+  src/pages/Review/stockReviewViewModel.test.ts
+
+2 test files failed; exit code 1
+```
+
+The unchanged focused behavior suite then passed `36/36`. It covers exact portfolio/Campaign scope, one-shot consumption, invalid structured context, retained-report identity, cross-Campaign/account candidates, explicit reordering, per-type cardinality, price-only naming, null recovery, 120-day notes, all five Campaign availability regions, and collection-empty report semantics. A focused Rust test also verifies that only the exact read-only stock-review scope is accepted.
+
+### Remediation verification
+
+```text
+node --test --experimental-strip-types src/**/*.test.ts
+92 passed; 0 failed
+
+npm run build
+TypeScript and Vite production build passed; existing large-chunk warning only
+
+cargo check --lib
+passed
+
+cargo test --lib services::ai_chat_service::prefilled_tool_tests --quiet
+1 passed; 0 failed
+
+cargo test --lib --quiet
+538 passed; 0 failed; 8 ignored
+
+git diff --check
+exit code 0
+```
+
+The new modal controls use explicit accessible labels, the selected transaction list is ordered and numbered, and all additions reuse Ant Design's responsive `Space`, `Descriptions`, `List`, `Card`, and `Drawer` primitives. The prior desktop/narrow browser smoke remains applicable to the unchanged page architecture; live Campaign data and its Tauri-only drawer still require the desktop shell.
+
+Remaining explicit backend contract limitations are unchanged: the report does not expose standalone Campaign peak-holding amount/weight or a standalone market-provider name, so the UI continues to show `—`/backend-managed explanatory text. Correction candidates intentionally include every eligible transaction ID exposed by report actions; dividend/fee timeline records and already-confirmed transfers are not offered as new trade-classification corrections.

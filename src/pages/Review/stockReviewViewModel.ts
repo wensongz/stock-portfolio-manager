@@ -1,11 +1,13 @@
 import type {
   Currency,
+  ForwardEffectWindow,
   Market,
   MetricAvailability,
   MetricStatus,
   ReviewCurvePoint,
   StockActionReview,
   StockReviewAnnotation,
+  StockCampaignDetail,
   StockReviewFilters,
   StockReviewIssue,
   StockReviewPeriodPreset,
@@ -164,11 +166,143 @@ export function getStockReviewPageState(
   error: string | null,
 ): { kind: StockReviewPageKind; canRetry: true } {
   if (!report) return { kind: error ? "error" : "empty", canRetry: true };
-  const empty =
-    report.curves.length === 0 &&
-    report.actions.length === 0 &&
-    report.campaigns.length === 0;
-  return { kind: empty ? "empty" : "content", canRetry: true };
+  return { kind: "content", canRetry: true };
+}
+
+export function buildStockReviewReportFilters(
+  report: Pick<StockReviewReport, "methodology">,
+  periodPreset: StockReviewPeriodPreset,
+): StockReviewFilters {
+  const query = report.methodology.query;
+  return {
+    accountId: query.account_id,
+    periodPreset,
+    startDate: query.start_date,
+    endDate: query.end_date,
+    market: query.market as Market | null,
+    benchmarkSymbol: query.benchmark_symbol,
+    baseCurrency: query.base_currency as Currency,
+  };
+}
+
+export interface StockReviewTransactionCandidate {
+  transactionId: string;
+  actionId: string;
+  campaignId: string | null;
+  accountId: string;
+  symbol: string;
+  market: string;
+  tradedAt: string;
+  actionType: StockActionReview["action_type"];
+}
+
+type CorrectionCandidateSource = {
+  actions: Array<Pick<StockActionReview, "action_id" | "transaction_ids" | "account_id" | "symbol" | "market" | "traded_at" | "action_type">>;
+  campaigns: Array<Pick<StockReviewReport["campaigns"][number], "campaign_id" | "action_ids">>;
+};
+
+export function buildStockReviewTransactionCandidates(
+  report: CorrectionCandidateSource,
+): StockReviewTransactionCandidate[] {
+  const campaignByAction = new Map<string, string>();
+  for (const campaign of report.campaigns) {
+    for (const actionId of campaign.action_ids) {
+      if (!campaignByAction.has(actionId)) campaignByAction.set(actionId, campaign.campaign_id);
+    }
+  }
+  const seen = new Set<string>();
+  return report.actions.flatMap((action) =>
+    action.transaction_ids.flatMap((transactionId) => {
+      if (seen.has(transactionId)) return [];
+      seen.add(transactionId);
+      return [{
+        transactionId,
+        actionId: action.action_id,
+        campaignId: campaignByAction.get(action.action_id) ?? null,
+        accountId: action.account_id,
+        symbol: action.symbol,
+        market: action.market,
+        tradedAt: action.traded_at,
+        actionType: action.action_type,
+      }];
+    }),
+  );
+}
+
+export type StockReviewOverrideType = "transfer" | "duplicate" | "same_day_order" | "non_trade";
+
+const OVERRIDE_GUIDANCE: Record<StockReviewOverrideType, { selection: string; eligibility: string }> = {
+  transfer: {
+    selection: "恰好 2 笔交易。",
+    eligibility: "应为同一股票、不同账户的一转出一转入；后端会校验数量和经济事实。",
+  },
+  duplicate: {
+    selection: "至少 2 笔交易。",
+    eligibility: "仅选择代表同一经济交易的重复记录；后端保留最终资格判断。",
+  },
+  same_day_order: {
+    selection: "至少 2 笔交易，并用下方按钮明确重放顺序。",
+    eligibility: "应为同一账户、股票和交易日的反向交易；列表顺序会原样提交后端。",
+  },
+  non_trade: {
+    selection: "至少 1 笔交易。",
+    eligibility: "仅选择实际代表非交易持仓变化的记录；后端会重新生成报告。",
+  },
+};
+
+export function getStockReviewOverrideGuidance(type: StockReviewOverrideType) {
+  return OVERRIDE_GUIDANCE[type];
+}
+
+export function isStockReviewOverrideSelectionValid(
+  type: StockReviewOverrideType,
+  transactionIds: string[],
+): boolean {
+  return type === "transfer" ? transactionIds.length === 2 : transactionIds.length >= (type === "non_trade" ? 1 : 2);
+}
+
+export function moveStockReviewTransaction(
+  transactionIds: string[],
+  transactionId: string,
+  direction: "up" | "down",
+): string[] {
+  const index = transactionIds.indexOf(transactionId);
+  const target = direction === "up" ? index - 1 : index + 1;
+  if (index < 0 || target < 0 || target >= transactionIds.length) return [...transactionIds];
+  const reordered = [...transactionIds];
+  [reordered[index], reordered[target]] = [reordered[target], reordered[index]];
+  return reordered;
+}
+
+export function getRebalanceValueAddTitle(shadowReturnMethod: string): string {
+  return shadowReturnMethod === "comparable_price_only" ? "调仓价格增益" : "调仓增益";
+}
+
+export function formatStockReviewRecovery(
+  drawdown: Pick<StockReviewReport["summary"]["max_drawdown"], "recovery_date" | "recovery_duration_days">,
+): string {
+  if (drawdown.recovery_date == null) return "—";
+  return drawdown.recovery_duration_days == null
+    ? drawdown.recovery_date
+    : `${drawdown.recovery_date} / ${drawdown.recovery_duration_days} 天`;
+}
+
+export function formatStockReviewForwardWindowNote(
+  window: ForwardEffectWindow,
+): string {
+  return `${window.matured_actions} 成熟 / ${window.pending_actions} 观察中${window.status.note ? ` · ${window.status.note}` : ""}`;
+}
+
+export function buildStockCampaignAvailabilityRows(
+  detail: Pick<StockCampaignDetail, "availability" | "pnl_availability" | "excursion_availability" | "drawdown_availability" | "benchmark_availability">,
+) {
+  return [
+    { key: "availability", label: "Campaign 总体", availability: detail.availability },
+    { key: "pnl_availability", label: "盈亏", availability: detail.pnl_availability },
+    { key: "excursion_availability", label: "MAE / MFE", availability: detail.excursion_availability },
+    { key: "drawdown_availability", label: "持有期回撤", availability: detail.drawdown_availability },
+    { key: "benchmark_availability", label: "基准与超额", availability: detail.benchmark_availability },
+  ];
 }
 
 type SortableStockAction = Pick<

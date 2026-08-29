@@ -8,7 +8,9 @@ import type {
   ChatMessageWithMeta,
   ChatUsage,
   ToolCallInfo,
+  AiToolContext,
 } from "../types";
+import { consumeAiPrefillToolContext } from "../pages/AiAssistant/prefill";
 
 interface ChatState {
   messages: ChatMessageWithMeta[];
@@ -88,12 +90,15 @@ interface ChatState {
    * Pass an empty array to fall back to automatic trigger-based activation.
    */
   setActiveSkillsForNextTurn: (skillIds: string[]) => void;
+  /** Stage an exact host-approved read-tool scope for the next outbound turn. */
+  setToolContextForNextTurn: (context: AiToolContext | null) => void;
   /**
    * Skill ids currently staged for the next send (set via `/` / `@` / quick
    * chip). Read by the Composer to render "待激活" chips with a remove (×)
    * button. Cleared on send (sendMessage / editAndResend).
    */
   pendingActiveSkills: string[];
+  pendingToolContext: AiToolContext | null;
 }
 
 // Module-scope guards so the streaming listeners are registered at most once.
@@ -370,6 +375,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   streamingSessionIdState: null,
   viewSessionId: null,
   pendingActiveSkills: [],
+  pendingToolContext: null,
 
   init: () => {
     if (listenersBound) return;
@@ -677,7 +683,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // `/`, `@`, or a quick chip) BEFORE building the placeholder, so it can
     // be stamped onto the assistant row and later re-applied by retryLastTurn.
     const activeSkills = get().pendingActiveSkills;
-    set({ pendingActiveSkills: [] });
+    const consumedToolContext = consumeAiPrefillToolContext(get().pendingToolContext);
+    const toolContext = consumedToolContext.current;
+    set({ pendingActiveSkills: [], pendingToolContext: consumedToolContext.next });
     const assistantMsg: ChatMessageWithMeta = {
       id: newId(),
       role: "assistant",
@@ -686,6 +694,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Remember the explicit selection so a retry of this turn re-sends the
       // same skills instead of dropping them (see retryLastTurn).
       ...(activeSkills.length > 0 ? { explicitSkillIds: activeSkills } : {}),
+      ...(toolContext ? { explicitToolContext: toolContext } : {}),
     };
     streamingId = assistantMsg.id;
     streamingSessionId = sessionId;
@@ -725,6 +734,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           messages: history,
           includeContext: get().contextEnabled,
           activeSkills,
+          toolContext,
         },
       });
     } catch (err) {
@@ -749,13 +759,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Consume any staged explicit selection here too (a `/`-pick made just
     // before editing should still apply to the edited turn).
     const activeSkills = get().pendingActiveSkills;
-    set({ pendingActiveSkills: [] });
+    const consumedToolContext = consumeAiPrefillToolContext(get().pendingToolContext);
+    const toolContext = consumedToolContext.current;
+    set({ pendingActiveSkills: [], pendingToolContext: consumedToolContext.next });
     const assistantMsg: ChatMessageWithMeta = {
       id: newId(),
       role: "assistant",
       content: "",
       createdAt: Date.now() + 1,
       ...(activeSkills.length > 0 ? { explicitSkillIds: activeSkills } : {}),
+      ...(toolContext ? { explicitToolContext: toolContext } : {}),
     };
     streamingId = assistantMsg.id;
     streamingSessionId = sessionId;
@@ -784,6 +797,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           messages: history,
           includeContext: get().contextEnabled,
           activeSkills,
+          toolContext,
         },
       });
     } catch (err) {
@@ -814,6 +828,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // matching. When none was set, an empty array preserves the original
     // behaviour (auto-match from the latest user message).
     const activeSkills = failedMsg.explicitSkillIds ?? [];
+    const toolContext = failedMsg.explicitToolContext ?? null;
 
     // Reset the placeholder: clear error, wipe any partial content, and mark
     // it as the active streaming target so delta/usage/done listeners fill it.
@@ -836,6 +851,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           messages: history,
           includeContext: get().contextEnabled,
           activeSkills,
+          toolContext,
         },
       });
     } catch (err) {
@@ -860,6 +876,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Re-apply the explicit skill selection captured on the original turn so
     // regenerate preserves a `/`-picked skill. Fall back to auto-match otherwise.
     const activeSkills = target.explicitSkillIds ?? [];
+    const toolContext = target.explicitToolContext ?? null;
 
     // New placeholder so React sees a distinct key (the old row is dropped).
     const assistantMsg: ChatMessageWithMeta = {
@@ -868,6 +885,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       content: "",
       createdAt: Date.now() + 1,
       ...(activeSkills.length > 0 ? { explicitSkillIds: activeSkills } : {}),
+      ...(toolContext ? { explicitToolContext: toolContext } : {}),
     };
     streamingId = assistantMsg.id;
     streamingSessionId = sessionId;
@@ -889,6 +907,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           messages: history,
           includeContext: get().contextEnabled,
           activeSkills,
+          toolContext,
         },
       });
     } catch (err) {
@@ -1000,6 +1019,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setActiveSkillsForNextTurn: (skillIds) => {
     set({ pendingActiveSkills: skillIds.slice() });
+  },
+
+  setToolContextForNextTurn: (context) => {
+    set({
+      pendingToolContext: context
+        ? { name: context.name, arguments: { ...context.arguments } }
+        : null,
+    });
   },
 }));
 

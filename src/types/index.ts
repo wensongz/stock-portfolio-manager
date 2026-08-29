@@ -1178,6 +1178,13 @@ export interface ChatMessageWithMeta {
    * of silently dropping it (see chatStore.retryLastTurn).
    */
   explicitSkillIds?: string[];
+  /** Exact host-approved read-tool scope captured for retry/regenerate. */
+  explicitToolContext?: AiToolContext;
+}
+
+export interface AiToolContext {
+  name: "get_stock_review";
+  arguments: Record<string, string>;
 }
 
 /**

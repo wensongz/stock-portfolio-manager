@@ -1,6 +1,6 @@
 import { Card, Col, Row, Space, Statistic, Tag, Typography } from "antd";
-import type { Currency, MetricAvailability, StockReviewSummary } from "../../types";
-import { formatStockReviewPercent, getStockReviewStatusDisplay } from "./stockReviewViewModel";
+import type { Currency, MetricAvailability, StockReviewMethodology, StockReviewSummary } from "../../types";
+import { formatStockReviewForwardWindowNote, formatStockReviewPercent, formatStockReviewRecovery, getRebalanceValueAddTitle, getStockReviewStatusDisplay } from "./stockReviewViewModel";
 
 const { Text } = Typography;
 
@@ -29,7 +29,7 @@ function ReviewCard({ title, availability, main, loading, children }: { title: s
   );
 }
 
-export default function StockReviewSummaryCards({ summary, currency, loading }: { summary: StockReviewSummary; currency: Currency; loading: boolean }) {
+export default function StockReviewSummaryCards({ summary, methodology, currency, loading }: { summary: StockReviewSummary; methodology: StockReviewMethodology; currency: Currency; loading: boolean }) {
   const result = summary.result_quality;
   const drawdown = summary.max_drawdown;
   const valueAdd = summary.rebalance_value_add;
@@ -48,11 +48,11 @@ export default function StockReviewSummaryCards({ summary, currency, loading }: 
       <Col xs={24} md={12} xl={5}>
         <ReviewCard loading={loading} title="最大回撤" availability={drawdown.availability} main={formatStockReviewPercent(drawdown.max_drawdown)}>
           <MetricLine label="峰值 / 谷值" value={`${drawdown.peak_date ?? "—"} / ${drawdown.trough_date ?? "—"}`} />
-          <MetricLine label="持续 / 恢复" value={`${drawdown.duration_days ?? "—"} 天 / ${drawdown.recovery_date ?? "未恢复"}`} />
+          <MetricLine label="持续 / 恢复" value={`${drawdown.duration_days == null ? "—" : `${drawdown.duration_days} 天`} / ${formatStockReviewRecovery(drawdown)}`} />
         </ReviewCard>
       </Col>
       <Col xs={24} md={12} xl={5}>
-        <ReviewCard loading={loading} title="调仓增益" availability={valueAdd.availability} main={formatStockReviewPercent(valueAdd.value_add)}>
+        <ReviewCard loading={loading} title={getRebalanceValueAddTitle(methodology.shadow_return_method)} availability={valueAdd.availability} main={formatStockReviewPercent(valueAdd.value_add)}>
           <MetricLine label="实际 / 影子" value={`${formatStockReviewPercent(valueAdd.actual_return)} / ${formatStockReviewPercent(valueAdd.shadow_return)}`} />
           <MetricLine label="期末价值差" value={amount(valueAdd.ending_value_difference_base, currency)} />
         </ReviewCard>
@@ -62,7 +62,7 @@ export default function StockReviewSummaryCards({ summary, currency, loading }: 
           <MetricLine label="60 日状态" value={`${forward60Status.label}${forward.day_60.status.note ? ` · ${forward.day_60.status.note}` : ""}`} />
           <MetricLine label="60 日成熟 / 观察中" value={`${forward.day_60.matured_actions} / ${forward.day_60.pending_actions}`} />
           <MetricLine label="60 日正向金额占比" value={formatStockReviewPercent(forward.day_60.positive_notional_ratio)} />
-          <MetricLine label={`120 日验证 · ${forward120Status.label}`} value={`${formatStockReviewPercent(forward.day_120.amount_weighted_excess_return)}（${forward.day_120.matured_actions} 成熟 / ${forward.day_120.pending_actions} 观察中）`} />
+          <MetricLine label={`120 日验证 · ${forward120Status.label}`} value={`${formatStockReviewPercent(forward.day_120.amount_weighted_excess_return)}（${formatStockReviewForwardWindowNote(forward.day_120)}）`} />
         </ReviewCard>
       </Col>
       <Col xs={24} md={12} xl={4}>

@@ -34,6 +34,7 @@ import type { AiModelInfo, ChatMessageWithMeta, ChatSession, ChatUsage, Skill } 
 import {
   readAiPrefill,
   readAiPrefillActiveSkill,
+  readAiPrefillToolContext,
   resolveAiPrefillSessionId,
 } from "./prefill";
 import {
@@ -149,12 +150,18 @@ export default function AiAssistantPage() {
   const [initialActiveSkill] = useState(() =>
     readAiPrefillActiveSkill(location.state),
   );
+  const [initialToolContext] = useState(() =>
+    readAiPrefillToolContext(location.state),
+  );
   const [initialSessionId] = useState(() =>
     resolveAiPrefillSessionId(initialPrompt, currentSessionId),
   );
   const { init } = useChatStore();
   const setActiveSkillsForNextTurn = useChatStore(
     (state) => state.setActiveSkillsForNextTurn,
+  );
+  const setToolContextForNextTurn = useChatStore(
+    (state) => state.setToolContextForNextTurn,
   );
   // Subscribe to the streaming session id so the sidebar can highlight which
   // session is actively generating (foreground or background). Selector form
@@ -171,14 +178,19 @@ export default function AiAssistantPage() {
     if (initialActiveSkill) {
       setActiveSkillsForNextTurn([initialActiveSkill]);
     }
+    if (initialToolContext) {
+      setToolContextForNextTurn(initialToolContext);
+    }
     navigate(location.pathname, { replace: true, state: null });
   }, [
     initialPrompt,
     initialActiveSkill,
     initialSessionId,
+    initialToolContext,
     location.pathname,
     navigate,
     setActiveSkillsForNextTurn,
+    setToolContextForNextTurn,
     setCurrentSession,
   ]);
 

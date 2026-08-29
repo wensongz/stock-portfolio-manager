@@ -8,17 +8,26 @@ import {
   buildStockReviewCurveSeries,
   buildStockCampaignAiPrefill,
   buildStockReviewAiPrefill,
+  buildStockReviewReportFilters,
+  buildStockReviewTransactionCandidates,
+  buildStockCampaignAvailabilityRows,
   createStockReviewAnnotationDisplayContext,
   createDefaultStockReviewFilters,
   doesStockReviewAnnotationApplyToCampaign,
+  formatStockReviewRecovery,
+  formatStockReviewForwardWindowNote,
   formatStockReviewPercent,
+  getRebalanceValueAddTitle,
   getStockActionTypeDisplay,
+  getStockReviewOverrideGuidance,
+  isStockReviewOverrideSelectionValid,
   getStockReviewDateRange,
   getStockReviewPageState,
   getStockReviewStatusDisplay,
   isStockReviewAnnotationInDisplayContext,
   loadStockReviewFilters,
   mapStockReviewMetricForDisplay,
+  moveStockReviewTransaction,
   saveStockReviewFilters,
   sortStockReviewActions,
   sortStockReviewIssues,
@@ -415,7 +424,7 @@ test("page state distinguishes empty, partial content, and full command failure"
   });
   assert.deepEqual(
     getStockReviewPageState({ curves: [], actions: [], campaigns: [] }, null),
-    { kind: "empty", canRetry: true },
+    { kind: "content", canRetry: true },
   );
   assert.deepEqual(
     getStockReviewPageState(
@@ -428,6 +437,110 @@ test("page state distinguishes empty, partial content, and full command failure"
     ),
     { kind: "content", canRetry: true },
   );
+});
+
+test("retained report interactions keep the successful query after a newer refresh fails", () => {
+  const retainedReport = {
+    methodology: {
+      query: {
+        account_id: "old-account",
+        start_date: "2026-01-01",
+        end_date: "2026-03-31",
+        market: "US",
+        benchmark_symbol: "SPY",
+        base_currency: "USD",
+      },
+    },
+  };
+  assert.deepEqual(buildStockReviewReportFilters(retainedReport, "CUSTOM"), {
+    accountId: "old-account",
+    periodPreset: "CUSTOM",
+    startDate: "2026-01-01",
+    endDate: "2026-03-31",
+    market: "US",
+    benchmarkSymbol: "SPY",
+    baseCurrency: "USD",
+  });
+});
+
+test("query-wide correction candidates include transactions from other Campaigns and accounts", () => {
+  const candidates = buildStockReviewTransactionCandidates({
+    actions: [
+      {
+        action_id: "source-action",
+        transaction_ids: ["transfer-out"],
+        account_id: "broker-a",
+        symbol: "AAPL",
+        market: "US",
+        traded_at: "2026-03-01T09:30:00Z",
+        action_type: "close",
+      },
+      {
+        action_id: "target-action",
+        transaction_ids: ["transfer-in", "transfer-out"],
+        account_id: "broker-b",
+        symbol: "AAPL",
+        market: "US",
+        traded_at: "2026-03-01T09:31:00Z",
+        action_type: "open",
+      },
+    ],
+    campaigns: [
+      { campaign_id: "source-campaign", action_ids: ["source-action"] },
+      { campaign_id: "target-campaign", action_ids: ["target-action"] },
+    ],
+  });
+  assert.deepEqual(candidates.map((item) => ({
+    id: item.transactionId,
+    account: item.accountId,
+    campaign: item.campaignId,
+  })), [
+    { id: "transfer-out", account: "broker-a", campaign: "source-campaign" },
+    { id: "transfer-in", account: "broker-b", campaign: "target-campaign" },
+  ]);
+});
+
+test("same-day correction has a real explicit order independent of selection order", () => {
+  const selected = ["tx-a", "tx-b", "tx-c"];
+  assert.deepEqual(moveStockReviewTransaction(selected, "tx-c", "up"), ["tx-a", "tx-c", "tx-b"]);
+  assert.deepEqual(moveStockReviewTransaction(selected, "tx-a", "down"), ["tx-b", "tx-a", "tx-c"]);
+  assert.deepEqual(moveStockReviewTransaction(selected, "tx-a", "up"), selected);
+  assert.match(getStockReviewOverrideGuidance("transfer").selection, /恰好 2 笔/);
+  assert.match(getStockReviewOverrideGuidance("duplicate").eligibility, /同一经济交易/);
+  assert.match(getStockReviewOverrideGuidance("same_day_order").selection, /至少 2 笔/);
+  assert.match(getStockReviewOverrideGuidance("non_trade").selection, /至少 1 笔/);
+  assert.equal(isStockReviewOverrideSelectionValid("transfer", ["out", "in"]), true);
+  assert.equal(isStockReviewOverrideSelectionValid("transfer", ["out", "in", "extra"]), false);
+});
+
+test("summary display follows backend return mode and never invents recovery text", () => {
+  assert.equal(getRebalanceValueAddTitle("comparable_price_only"), "调仓价格增益");
+  assert.equal(getRebalanceValueAddTitle("modified_dietz"), "调仓增益");
+  assert.equal(formatStockReviewRecovery({ recovery_date: null, recovery_duration_days: null }), "—");
+  assert.equal(formatStockReviewRecovery({ recovery_date: "2026-05-01", recovery_duration_days: 21 }), "2026-05-01 / 21 天");
+  assert.equal(formatStockReviewForwardWindowNote({
+    matured_actions: 2,
+    pending_actions: 1,
+    status: { status: "pending", note: "120 日样本仍在成熟" },
+  }), "2 成熟 / 1 观察中 · 120 日样本仍在成熟");
+});
+
+test("Campaign availability model preserves all five backend regions and their notes", () => {
+  const status = (note) => ({ status: "degraded", note });
+  const rows = buildStockCampaignAvailabilityRows({
+    availability: status("overall"),
+    pnl_availability: status("pnl"),
+    excursion_availability: status("excursion"),
+    drawdown_availability: status("drawdown"),
+    benchmark_availability: status("benchmark"),
+  });
+  assert.deepEqual(rows.map((row) => [row.key, row.availability.note]), [
+    ["availability", "overall"],
+    ["pnl_availability", "pnl"],
+    ["excursion_availability", "excursion"],
+    ["drawdown_availability", "drawdown"],
+    ["benchmark_availability", "benchmark"],
+  ]);
 });
 
 test("action sorting uses only backend date, amount, contribution, and 60-day effect", () => {

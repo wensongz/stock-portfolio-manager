@@ -47,6 +47,89 @@ pub struct ChatParams {
     /// automatic trigger-based activation.
     #[allow(dead_code)] // read via resolve_active_skills
     pub active_skills: Vec<String>,
+    /// Trusted one-turn read-tool context supplied by the host UI.
+    pub tool_context: Option<PrefilledToolContext>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrefilledToolContext {
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+fn validated_prefilled_tool(context: &PrefilledToolContext) -> Result<String, String> {
+    if context.name != "get_stock_review" {
+        return Err("只允许预填只读股票复盘工具".to_string());
+    }
+    let args = context
+        .arguments
+        .as_object()
+        .ok_or_else(|| "股票复盘工具参数必须是对象".to_string())?;
+    const ALLOWED: &[&str] = &[
+        "start_date",
+        "end_date",
+        "base_currency",
+        "account_id",
+        "market",
+        "benchmark_symbol",
+        "symbol",
+        "campaign_id",
+    ];
+    if args.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+        return Err("股票复盘工具参数包含未支持字段".to_string());
+    }
+    for required in ["start_date", "end_date", "base_currency"] {
+        if args
+            .get(required)
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            return Err(format!("股票复盘工具缺少必填参数：{required}"));
+        }
+    }
+    if args
+        .values()
+        .any(|value| value.as_str().map(str::trim).unwrap_or("").is_empty())
+    {
+        return Err("股票复盘工具参数必须是非空字符串".to_string());
+    }
+    serde_json::to_string(&context.arguments).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod prefilled_tool_tests {
+    use super::{validated_prefilled_tool, PrefilledToolContext};
+    use serde_json::json;
+
+    #[test]
+    fn accepts_exact_stock_review_scope_and_rejects_other_tools_or_extra_fields() {
+        let campaign = PrefilledToolContext {
+            name: "get_stock_review".to_string(),
+            arguments: json!({
+                "start_date": "2026-01-01",
+                "end_date": "2026-03-31",
+                "base_currency": "USD",
+                "account_id": "account-a",
+                "market": "US",
+                "benchmark_symbol": "SPY",
+                "symbol": "AAPL",
+                "campaign_id": "campaign-7"
+            }),
+        };
+        let serialized = validated_prefilled_tool(&campaign).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed, campaign.arguments);
+
+        let mut wrong_tool = campaign.clone();
+        wrong_tool.name = "save_stock_review_annotation".to_string();
+        assert!(validated_prefilled_tool(&wrong_tool).is_err());
+
+        let mut extra = campaign;
+        extra.arguments["unexpected"] = json!(true);
+        assert!(validated_prefilled_tool(&extra).is_err());
+    }
 }
 
 /// Token-usage accounting for a single chat completion. Emitted to the
@@ -544,6 +627,57 @@ fn truncate_for_display(s: &str) -> String {
     }
 }
 
+async fn execute_prefilled_tool(
+    app: &AppHandle,
+    tool_ctx: &crate::services::ai_tools::ToolCtx<'_>,
+    context: &PrefilledToolContext,
+) -> Result<(String, String, bool), String> {
+    let arguments = validated_prefilled_tool(context)?;
+    let id = "prefilled-stock-review".to_string();
+    let _ = app.emit("ai-chat-tool", vec![context.name.clone()]);
+    let _ = app.emit(
+        "ai-chat-tool-call",
+        ToolCallEvent {
+            id: id.clone(),
+            name: context.name.clone(),
+            arguments: Some(arguments.clone()),
+            status: ToolCallStatus::Running,
+            result: None,
+            error: None,
+            duration_ms: None,
+        },
+    );
+    let started = std::time::Instant::now();
+    let result = crate::services::ai_tools::execute_tool(tool_ctx, &context.name, &arguments).await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let ok = result.ok;
+    let _ = app.emit(
+        "ai-chat-tool-call",
+        ToolCallEvent {
+            id,
+            name: context.name.clone(),
+            arguments: Some(arguments.clone()),
+            status: if ok {
+                ToolCallStatus::Success
+            } else {
+                ToolCallStatus::Error
+            },
+            result: if ok {
+                Some(truncate_for_display(&result.content))
+            } else {
+                None
+            },
+            error: if ok {
+                None
+            } else {
+                Some(result.content.clone())
+            },
+            duration_ms: Some(duration_ms),
+        },
+    );
+    Ok((arguments, result.content, ok))
+}
+
 /// Merge streaming tool-call deltas (keyed by `index`) into a list of complete
 /// calls. Pure function so it can be unit-tested in isolation.
 ///
@@ -936,6 +1070,27 @@ pub async fn chat_stream(
         quote_cache,
         latest_user_message(&params),
     );
+    if let Some(context) = &params.tool_context {
+        let (arguments, content, _) = execute_prefilled_tool(&app, &tool_ctx, context)
+            .await
+            .map_err(|error| {
+                emit_error(&app, error.clone());
+                error
+            })?;
+        messages.push(json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "prefilled-stock-review",
+                "type": "function",
+                "function": { "name": context.name, "arguments": arguments },
+            }],
+        }));
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": "prefilled-stock-review",
+            "content": content,
+        }));
+    }
 
     // ── Agentic tool-calling loop ──────────────────────────────────────────
     //
@@ -1663,6 +1818,27 @@ async fn chat_stream_anthropic(
         quote_cache,
         latest_user_message(&params),
     );
+    if let Some(context) = &params.tool_context {
+        let parsed_arguments = context.arguments.clone();
+        let (_, content, _) = execute_prefilled_tool(&app, &tool_ctx, context).await?;
+        messages.push(json!({
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "prefilled-stock-review",
+                "name": context.name,
+                "input": parsed_arguments,
+            }],
+        }));
+        messages.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "prefilled-stock-review",
+                "content": content,
+            }],
+        }));
+    }
 
     STOP_REQUESTED.store(false, Ordering::SeqCst);
     let client = http_client::ai_client();

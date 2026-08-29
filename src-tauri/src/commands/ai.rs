@@ -1,6 +1,6 @@
 use crate::db::Database;
 use crate::models::ai_config::{AiConfig, AiModelInfo, ChatMessage, DEFAULT_SYSTEM_PROMPT};
-use crate::services::ai_chat_service::{self, ChatParams};
+use crate::services::ai_chat_service::{self, ChatParams, PrefilledToolContext};
 use crate::services::ai_config_service;
 use crate::services::ai_models_service::{self, FetchModelsParams};
 use crate::services::exchange_rate_service::ExchangeRateCache;
@@ -63,6 +63,10 @@ pub struct ChatRequest {
     /// chip). Empty means "auto-activate based on the latest user message".
     #[serde(default)]
     pub active_skills: Vec<String>,
+    /// Exact read-only tool scope staged by a trusted app navigation. It is
+    /// consumed by this single command invocation and never inferred from text.
+    #[serde(default)]
+    pub tool_context: Option<PrefilledToolContext>,
 }
 
 /// Stream an AI chat completion to the frontend via Tauri events
@@ -86,6 +90,7 @@ pub async fn chat_with_ai(
             messages: req.messages,
             include_context: req.include_context,
             active_skills: req.active_skills,
+            tool_context: req.tool_context,
         },
     )
     .await

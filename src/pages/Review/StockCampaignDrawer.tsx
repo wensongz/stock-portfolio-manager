@@ -17,7 +17,7 @@ import {
   Typography,
   message,
 } from "antd";
-import { RobotOutlined, SaveOutlined, ToolOutlined } from "@ant-design/icons";
+import { ArrowDownOutlined, ArrowUpOutlined, RobotOutlined, SaveOutlined, ToolOutlined } from "@ant-design/icons";
 import { useEffect, useMemo, useState } from "react";
 import type {
   Currency,
@@ -25,11 +25,23 @@ import type {
   StockReviewAnnotationInput,
   StockReviewOverrideInput,
 } from "../../types";
-import { formatStockReviewPercent, getStockActionTypeDisplay, getStockReviewStatusDisplay, sortStockReviewIssues } from "./stockReviewViewModel";
+import {
+  formatStockReviewPercent,
+  formatStockReviewForwardWindowNote,
+  buildStockCampaignAvailabilityRows,
+  getStockActionTypeDisplay,
+  getStockReviewOverrideGuidance,
+  getStockReviewStatusDisplay,
+  isStockReviewOverrideSelectionValid,
+  moveStockReviewTransaction,
+  sortStockReviewIssues,
+  type StockReviewOverrideType,
+  type StockReviewTransactionCandidate,
+} from "./stockReviewViewModel";
 
 const { Text, Title, Paragraph } = Typography;
 const { TextArea } = Input;
-type OverrideType = "transfer" | "duplicate" | "same_day_order" | "non_trade";
+type OverrideType = StockReviewOverrideType;
 
 const OVERRIDE_LABELS: Record<OverrideType, string> = {
   transfer: "跨账户转仓",
@@ -64,7 +76,7 @@ function forwardWindow(detail: StockCampaignDetail, days: 20 | 60 | 120) {
 
 export default function StockCampaignDrawer({
   open, loading, mutating, detail, currency, reportEndDate, onClose, onAskAi,
-  onSaveAnnotation, onConfirmOverride,
+  transactionCandidates, onSaveAnnotation, onConfirmOverride,
 }: {
   open: boolean;
   loading: boolean;
@@ -72,6 +84,7 @@ export default function StockCampaignDrawer({
   detail: StockCampaignDetail | null;
   currency: Currency;
   reportEndDate: string;
+  transactionCandidates: StockReviewTransactionCandidate[];
   onClose: () => void;
   onAskAi: (detail: StockCampaignDetail) => void;
   onSaveAnnotation: (input: StockReviewAnnotationInput) => Promise<unknown>;
@@ -81,8 +94,13 @@ export default function StockCampaignDrawer({
   const [overrideOpen, setOverrideOpen] = useState(false);
   const [overrideType, setOverrideType] = useState<OverrideType>("non_trade");
   const [transactionIds, setTransactionIds] = useState<string[]>([]);
-  const allTransactionIds = useMemo(() => [...new Set(detail?.actions.flatMap((action) => action.transaction_ids) ?? [])], [detail]);
   useEffect(() => { setNote(""); setOverrideOpen(false); setTransactionIds([]); }, [detail?.summary.campaign_id]);
+  const candidateById = useMemo(
+    () => new Map(transactionCandidates.map((candidate) => [candidate.transactionId, candidate])),
+    [transactionCandidates],
+  );
+  const guidance = getStockReviewOverrideGuidance(overrideType);
+  const validSelection = isStockReviewOverrideSelectionValid(overrideType, transactionIds);
 
   const saveNote = async () => {
     if (!detail || !note.trim()) return;
@@ -99,7 +117,7 @@ export default function StockCampaignDrawer({
     if (saved) { setNote(""); message.success("复盘注释已保存"); }
   };
   const confirmOverride = async () => {
-    if (!detail || transactionIds.length === 0) return;
+    if (!detail || !validSelection) return;
     const report = await onConfirmOverride({
       id: `campaign-override:${detail.summary.campaign_id}:${Date.now()}`,
       override_type: overrideType,
@@ -127,9 +145,12 @@ export default function StockCampaignDrawer({
               <Descriptions.Item label="开始 / 结束">{detail.summary.started_at.slice(0, 10)} / {detail.summary.ended_at?.slice(0, 10) ?? "进行中"}</Descriptions.Item>
               <Descriptions.Item label="Campaign 总盈亏">{money(detail.pnl.total_pnl_base, currency)}</Descriptions.Item>
               <Descriptions.Item label="超额收益">{formatStockReviewPercent(detail.excess_return)}</Descriptions.Item>
+              <Descriptions.Item label="Campaign 收益">{formatStockReviewPercent(detail.campaign_return)}</Descriptions.Item>
+              <Descriptions.Item label="基准收益">{formatStockReviewPercent(detail.benchmark_return)}</Descriptions.Item>
               <Descriptions.Item label="买入支出">{money(detail.pnl.buy_outlays_base, currency)}</Descriptions.Item>
               <Descriptions.Item label="卖出收入">{money(detail.pnl.sell_proceeds_base, currency)}</Descriptions.Item>
               <Descriptions.Item label="剩余持仓市值">{money(detail.pnl.remaining_market_value_base, currency)}</Descriptions.Item>
+              <Descriptions.Item label="剩余股数">{detail.pnl.remaining_shares}</Descriptions.Item>
               <Descriptions.Item label="分红 / 费用">{money(detail.pnl.dividends_base, currency)} / {money(detail.pnl.trading_fees_base, currency)}</Descriptions.Item>
               <Descriptions.Item label="最大投入资本">{money(detail.pnl.max_invested_capital_base, currency)}</Descriptions.Item>
               <Descriptions.Item label="最大持仓金额 / 权重">— / —</Descriptions.Item>
@@ -141,12 +162,23 @@ export default function StockCampaignDrawer({
             </Descriptions>
             <Text type="secondary">{detail.pnl.label}。后端当前契约未提供单 Campaign 峰值持仓金额与权重，因此该项显示为 —，不从动作记录推算。</Text>
 
+            <Card size="small" title="Campaign 指标可用性">
+              <List
+                size="small"
+                dataSource={buildStockCampaignAvailabilityRows(detail)}
+                renderItem={(row) => {
+                  const display = getStockReviewStatusDisplay(row.availability.status);
+                  return <List.Item><Space wrap><Text strong>{row.label}</Text><Tag color={display.color}>{display.label}</Tag><Text type="secondary">{row.availability.note ?? "—"}</Text></Space></List.Item>;
+                }}
+              />
+            </Card>
+
             <Card size="small" title="20 / 60 / 120 个交易日后续效果">
               <Descriptions size="small" column={{ xs: 1, sm: 3 }}>
                 {([20, 60, 120] as const).map((days) => {
                   const window = forwardWindow(detail, days);
                   const display = getStockReviewStatusDisplay(window.status.status);
-                  return <Descriptions.Item key={days} label={`${days} 日`}><Space wrap><Text>{formatStockReviewPercent(window.amount_weighted_excess_return)}</Text><Tag color={display.color}>{display.label}</Tag><Text type="secondary">{window.matured_actions} 成熟 / {window.pending_actions} 观察中</Text></Space></Descriptions.Item>;
+                  return <Descriptions.Item key={days} label={`${days} 日`}><Space wrap><Text>{formatStockReviewPercent(window.amount_weighted_excess_return)}</Text><Tag color={display.color}>{display.label}</Tag><Text type="secondary">{formatStockReviewForwardWindowNote(window)}</Text></Space></Descriptions.Item>;
                 })}
               </Descriptions>
             </Card>
@@ -167,13 +199,43 @@ export default function StockCampaignDrawer({
           </Space>
         )}
       </Drawer>
-      <Modal open={overrideOpen} title="确认股票复盘计算纠正" okText="确认并重新生成报告" cancelText="取消" confirmLoading={mutating} okButtonProps={{ disabled: transactionIds.length === 0 }} onCancel={() => setOverrideOpen(false)} onOk={confirmOverride}>
+      <Modal open={overrideOpen} title="确认股票复盘计算纠正" okText="确认并重新生成报告" cancelText="取消" confirmLoading={mutating} okButtonProps={{ disabled: !validSelection }} onCancel={() => setOverrideOpen(false)} onOk={confirmOverride}>
         <Space orientation="vertical" size="middle" style={{ width: "100%" }}>
           <Alert type="warning" showIcon message="纠正只改变复盘分类与计算覆盖，不会删除或改写原始交易。只有点击下方确认按钮后才会保存。" />
           <Select aria-label="纠正类型" value={overrideType} onChange={setOverrideType} style={{ width: "100%" }} options={(Object.keys(OVERRIDE_LABELS) as OverrideType[]).map((value) => ({ value, label: OVERRIDE_LABELS[value] }))} />
           <Text strong>预期影响</Text><Paragraph>{OVERRIDE_IMPACTS[overrideType]}</Paragraph><Text strong>受影响交易</Text>
-          {allTransactionIds.length ? <Checkbox.Group aria-label="选择受影响交易" value={transactionIds} onChange={(values) => setTransactionIds(values as string[])} style={{ display: "flex", flexDirection: "column", gap: 8 }} options={allTransactionIds.map((id) => ({ value: id, label: id }))} /> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前 Campaign 没有可引用的交易记录" />}
-          {overrideType === "same_day_order" && transactionIds.length > 0 && <Alert type="info" message={`确认顺序：${transactionIds.join(" → ")}（可按勾选顺序重新选择）`} />}
+          <Alert type="info" showIcon message={guidance.selection} description={guidance.eligibility} />
+          {transactionCandidates.length ? <Checkbox.Group
+            aria-label="选择报告范围内受影响交易"
+            value={transactionIds}
+            onChange={(values) => {
+              const selected = new Set(values as string[]);
+              setTransactionIds((current) => [
+                ...current.filter((id) => selected.has(id)),
+                ...(values as string[]).filter((id) => !current.includes(id)),
+              ]);
+            }}
+            style={{ display: "flex", flexDirection: "column", gap: 8 }}
+            options={transactionCandidates.map((candidate) => ({
+              value: candidate.transactionId,
+              label: `${candidate.transactionId} · ${candidate.symbol} · ${candidate.accountId} · ${candidate.campaignId ?? "未归属 Campaign"} · ${candidate.tradedAt.slice(0, 10)}`,
+            }))}
+          /> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前报告范围没有可引用的交易记录" />}
+          {transactionIds.length > 0 && <Card size="small" title={overrideType === "same_day_order" ? "明确重放顺序（提交顺序）" : "确认受影响交易"}>
+            <List
+              size="small"
+              dataSource={transactionIds}
+              renderItem={(id, index) => {
+                const candidate = candidateById.get(id);
+                return <List.Item actions={overrideType === "same_day_order" ? [
+                  <Button key="up" aria-label={`上移交易 ${id}`} icon={<ArrowUpOutlined />} disabled={index === 0} onClick={() => setTransactionIds((current) => moveStockReviewTransaction(current, id, "up"))} />,
+                  <Button key="down" aria-label={`下移交易 ${id}`} icon={<ArrowDownOutlined />} disabled={index === transactionIds.length - 1} onClick={() => setTransactionIds((current) => moveStockReviewTransaction(current, id, "down"))} />,
+                ] : undefined}>
+                  <Text>{index + 1}. {id}{candidate ? ` · ${candidate.accountId} · ${candidate.campaignId ?? "未归属 Campaign"}` : ""}</Text>
+                </List.Item>;
+              }}
+            />
+          </Card>}
         </Space>
       </Modal>
     </>

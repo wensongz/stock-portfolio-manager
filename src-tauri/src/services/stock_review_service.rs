@@ -1668,6 +1668,8 @@ where
         &market_calendars_by_market,
         &calendar_terminal_by_market,
     );
+    let authoritative_valuation_interval =
+        expected_baseline_date.zip(expected_actual_dates.last().copied());
     let (baseline, actual_values, mut actual_availability, actual_nav_complete) =
         load_actual_values(db, &query, expected_baseline_date, &expected_actual_dates)?;
     let actual_origin_date = expected_baseline_date
@@ -2208,15 +2210,21 @@ where
         });
     }
     let annotations = load_display_context(db, &query)?;
-    let valuation_end = valuation_dates
-        .last()
-        .copied()
-        .unwrap_or(actual_origin_date);
-    let market_coverage = assess_market_coverage(
-        &prices_by_security,
-        &market_calendars_by_market,
-        actual_origin_date,
-        valuation_end,
+    let market_coverage = authoritative_valuation_interval.map_or_else(
+        || MarketCoverageAssessment {
+            coverage_ratio: None,
+            issues: vec![],
+            total_gaps: 0,
+            omitted_gaps: 0,
+        },
+        |(valuation_start, valuation_end)| {
+            assess_market_coverage(
+                &prices_by_security,
+                &market_calendars_by_market,
+                valuation_start,
+                valuation_end,
+            )
+        },
     );
     preparation_issues.extend(market_coverage.issues.clone());
     let market_data_coverage = market_coverage.coverage_ratio;
@@ -4426,21 +4434,29 @@ fn assess_market_coverage(
         };
     }
 
+    let mut securities_by_identity =
+        BTreeMap::<(String, String), (String, BTreeSet<NaiveDate>)>::new();
+    for ((symbol, market), points) in prices {
+        let normalized_symbol = normalized_stock_symbol(symbol).unwrap_or_else(|| symbol.clone());
+        let (display_symbol, present_dates) = securities_by_identity
+            .entry((market.clone(), normalized_symbol))
+            .or_insert_with(|| (symbol.clone(), BTreeSet::new()));
+        if symbol < display_symbol {
+            *display_symbol = symbol.clone();
+        }
+        present_dates.extend(points.iter().map(|point| point.date));
+    }
+
     let mut required = 0usize;
     let mut present = 0usize;
     let mut gaps = Vec::new();
-    for ((symbol, market), points) in prices {
+    for ((market, normalized_symbol), (symbol, present_dates)) in securities_by_identity {
         let Some(calendar) = calendars
-            .get(market)
+            .get(&market)
             .filter(|calendar| calendar.covers(start, end))
         else {
             continue;
         };
-        let present_dates = points
-            .iter()
-            .map(|point| point.date)
-            .collect::<BTreeSet<_>>();
-        let normalized_symbol = normalized_stock_symbol(symbol).unwrap_or_else(|| symbol.clone());
         for date in calendar
             .sessions
             .iter()
@@ -4724,6 +4740,44 @@ mod tests {
             issue_sort_keys.last(),
             Some(&("US".to_string(), day("2026-01-07"), "ZETA".to_string()))
         );
+    }
+
+    #[test]
+    fn market_coverage_duplicate_identity_aliases_count_once() {
+        // Break caught: raw symbol aliases must merge into the documented
+        // normalized security identity before denominator and gap construction.
+        let sessions = ["2026-01-02", "2026-01-05", "2026-01-06"]
+            .into_iter()
+            .map(day)
+            .collect::<Vec<_>>();
+        let prices = BTreeMap::from([
+            (
+                ("AAPL".to_string(), "US".to_string()),
+                vec![daily_market_point(day("2026-01-02"))],
+            ),
+            (
+                ("aapl".to_string(), "US".to_string()),
+                vec![daily_market_point(day("2026-01-05"))],
+            ),
+        ]);
+        let calendars = BTreeMap::from([(
+            "US".to_string(),
+            authoritative_calendar(day("2026-01-02"), day("2026-01-06"), sessions),
+        )]);
+
+        let assessment =
+            assess_market_coverage(&prices, &calendars, day("2026-01-02"), day("2026-01-06"));
+
+        assert!((assessment.coverage_ratio.unwrap() - 2.0 / 3.0).abs() < 1e-12);
+        assert_eq!(assessment.total_gaps, 1);
+        assert_eq!(assessment.omitted_gaps, 0);
+        assert_eq!(assessment.issues.len(), 1);
+        assert_eq!(assessment.issues[0].affected_market.as_deref(), Some("US"));
+        assert_eq!(
+            assessment.issues[0].affected_symbol.as_deref(),
+            Some("AAPL")
+        );
+        assert_eq!(assessment.issues[0].affected_date, Some(day("2026-01-06")));
     }
 
     fn live_query(start: &str, end: &str, market: Option<&str>) -> StockReviewQuery {
@@ -7705,6 +7759,47 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == "market_calendar_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_calendar_authority_has_no_market_coverage_or_price_gaps() {
+        // Break caught: the calculation fallback date is not an authoritative
+        // valuation interval and must not permit a one-day coverage assessment.
+        let db = complete_live_review_db_without_calendars("US");
+        let start = day("2025-12-23");
+        let through = day("2026-02-01");
+        install_market_sessions(
+            &db,
+            "US",
+            &calendar_dates(start, (through - start).num_days() as usize + 1),
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM stock_daily_prices
+                 WHERE symbol = 'AAPL' AND market = 'US' AND date = '2026-01-02'",
+                [],
+            )
+            .unwrap();
+
+        let report = get_stock_review_report_with_calendar_sources(
+            &db,
+            live_query("2026-01-02", "2026-08-28", Some("US")),
+            &conflicting_sources(),
+            fixed_now("2026-08-28T22:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.data_quality.market_data_coverage, None);
+        assert_eq!(report.data_quality.market_price_gap_total, 0);
+        assert_eq!(report.data_quality.market_price_gap_omitted, 0);
+        assert!(!report
+            .data_quality
+            .issues
+            .iter()
+            .any(|issue| issue.code == "market_price_gap"));
     }
 
     #[tokio::test]

@@ -684,6 +684,377 @@ export interface OptionReviewDataQuality {
 }
 
 // Phase 6: Review types
+export type MetricStatus = "available" | "degraded" | "pending" | "unavailable";
+export type StockActionType = "open" | "add" | "reduce" | "close";
+export type StockReviewPeriodPreset =
+  | "QTD"
+  | "PREV_QUARTER"
+  | "YTD"
+  | "1Y"
+  | "CUSTOM";
+export type StockCampaignStatus = "active" | "completed";
+export type CampaignCashFlowKind = "buy" | "sell" | "dividend" | "fee";
+export type StockReviewIssueSeverity = "info" | "warning" | "error";
+
+/** Frontend filter state. Tauri invocation arguments are derived from this. */
+export interface StockReviewFilters {
+  accountId: string | null;
+  periodPreset: StockReviewPeriodPreset;
+  startDate: string;
+  endDate: string;
+  market: Market | null;
+  benchmarkSymbol: string | null;
+  baseCurrency: Currency;
+}
+
+export interface MetricAvailability {
+  status: MetricStatus;
+  note: string | null;
+}
+
+export interface StockReviewQuery {
+  start_date: string;
+  end_date: string;
+  account_id: string | null;
+  market: string | null;
+  benchmark_symbol: string | null;
+  base_currency: string;
+}
+
+export interface StockReviewMethodology {
+  query: StockReviewQuery;
+  actual_return_method: string;
+  shadow_return_method: string;
+  benchmark_return_method: string;
+  fixed_weights: FixedWeight[];
+  benchmark_symbol: string | null;
+  market_data_coverage: DataCoverage;
+  exchange_rate_coverage: DataCoverage;
+  algorithm_version: string;
+}
+
+export interface FixedWeight {
+  key: string;
+  weight: number | null;
+}
+
+export interface DataCoverage {
+  availability: MetricAvailability;
+  covered_days: number | null;
+  expected_days: number | null;
+  coverage_ratio: number | null;
+}
+
+export interface StockReviewReport {
+  methodology: StockReviewMethodology;
+  summary: StockReviewSummary;
+  curves: ReviewCurvePoint[];
+  attribution: RebalanceAttributionSummary;
+  risk_structure: RiskStructureDetail;
+  actions: StockActionReview[];
+  campaigns: StockCampaignSummary[];
+  data_quality: StockReviewDataQuality;
+  annotations: StockReviewAnnotation[];
+  generated_at: string;
+}
+
+export interface StockReviewSummary {
+  result_quality: ResultQualityMetric;
+  max_drawdown: MaxDrawdownMetric;
+  rebalance_value_add: RebalanceValueAddMetric;
+  forward_effect: ForwardEffectMetric;
+  risk_structure: RiskStructureMetric;
+}
+
+export interface ResultQualityMetric {
+  availability: MetricAvailability;
+  portfolio_return: number | null;
+  shadow_return: number | null;
+  benchmark_return: number | null;
+  excess_return: number | null;
+  active_return: number | null;
+}
+
+export interface MaxDrawdownMetric {
+  availability: MetricAvailability;
+  max_drawdown: number | null;
+  peak_date: string | null;
+  trough_date: string | null;
+  duration_days: number | null;
+  recovery_date: string | null;
+  recovery_duration_days: number | null;
+}
+
+export interface RebalanceValueAddMetric {
+  availability: MetricAvailability;
+  value_add: number | null;
+  actual_return: number | null;
+  shadow_return: number | null;
+  ending_value_difference_base: number | null;
+}
+
+export interface ForwardEffectMetric {
+  availability: MetricAvailability;
+  day_60: ForwardEffectWindow;
+  day_120: ForwardEffectWindow;
+}
+
+export interface ForwardEffectWindow {
+  trading_days: number;
+  status: MetricAvailability;
+  matured_actions: number;
+  pending_actions: number;
+  amount_weighted_excess_return: number | null;
+  positive_notional_ratio: number | null;
+}
+
+export interface RiskStructureMetric {
+  availability: MetricAvailability;
+  opening_max_stock_weight: number | null;
+  ending_max_stock_weight: number | null;
+  opening_cr5: number | null;
+  ending_cr5: number | null;
+  opening_cash_ratio: number | null;
+  ending_cash_ratio: number | null;
+  one_way_turnover: number | null;
+  fee_drag: number | null;
+}
+
+export interface ReviewCurvePoint {
+  date: string;
+  portfolio_return: number | null;
+  shadow_return: number | null;
+  benchmark_return: number | null;
+}
+
+export interface RebalanceAttributionSummary {
+  availability: MetricAvailability;
+  total_value_add: number | null;
+  buy_value_add: number | null;
+  sell_value_add: number | null;
+  fees: number | null;
+  action_contributions: RebalanceAttributionItem[];
+  contributors: RebalanceAttributionItem[];
+  detractors: RebalanceAttributionItem[];
+  dividend_contribution: number | null;
+  fee_contribution: number | null;
+  currency_contribution: number | null;
+  cash_contribution: number | null;
+  explained_value_difference: number | null;
+  ending_value_difference: number | null;
+  residual: number | null;
+  residual_to_average_nav: number | null;
+  percentage_basis_label: string;
+}
+
+export interface RebalanceAttributionItem {
+  market: string;
+  symbol: string;
+  action_type: StockActionType;
+  action_id: string;
+  amount: number;
+  percentage_of_average_nav: number | null;
+}
+
+export interface RiskStructureDetail {
+  availability: MetricAvailability;
+  concentration_availability: MetricAvailability;
+  turnover_availability: MetricAvailability;
+  fee_availability: MetricAvailability;
+  opening: ConcentrationSnapshot;
+  ending: ConcentrationSnapshot;
+  peak: ConcentrationSnapshot;
+  one_way_turnover: number | null;
+  fee_drag: number | null;
+  data_hints: string[];
+  fact_labels: string[];
+  market_weights: RiskStructureWeight[];
+  category_weights: RiskStructureWeight[];
+  top_position_weights: RiskStructureWeight[];
+  concentration: number | null;
+  diversification_score: number | null;
+}
+
+export interface ConcentrationSnapshot {
+  date: string | null;
+  max_stock_weight: number | null;
+  cr5: number | null;
+  hhi: number | null;
+  cash_ratio: number | null;
+}
+
+export interface RiskStructureWeight {
+  key: string;
+  weight: number | null;
+}
+
+export interface StockActionReview {
+  action_id: string;
+  transaction_ids: string[];
+  account_id: string;
+  symbol: string;
+  market: string;
+  action_type: StockActionType;
+  traded_at: string;
+  weighted_average_price: number | null;
+  gross_amount: number | null;
+  currency: string | null;
+  shares_before: number | null;
+  shares_after: number | null;
+  portfolio_weight_before: number | null;
+  portfolio_weight_after: number | null;
+  fees: number | null;
+  contribution: number | null;
+  observation_windows: ForwardEffectWindow[];
+  status: MetricStatus;
+  fact_labels: string[];
+}
+
+export interface StockCampaignSummary {
+  campaign_id: string;
+  account_ids: string[];
+  action_ids: string[];
+  fragments: AccountCampaignFragment[];
+  campaign_status: StockCampaignStatus;
+  availability: MetricAvailability;
+  symbol: string;
+  market: string;
+  started_at: string;
+  ended_at: string | null;
+  contribution: number | null;
+}
+
+export interface StockCampaignTransferFact {
+  transaction_id: string;
+  action_id: string | null;
+  traded_at: string;
+}
+
+export interface AccountCampaignFragment {
+  fragment_id: string;
+  logical_campaign_id: string;
+  account_id: string;
+  symbol: string;
+  market: string;
+  started_at: string;
+  ended_at: string | null;
+  status: StockCampaignStatus;
+  action_ids: string[];
+  transfer_in: StockCampaignTransferFact | null;
+  transfer_out: StockCampaignTransferFact | null;
+}
+
+export interface StockCampaignDetail {
+  availability: MetricAvailability;
+  pnl_availability: MetricAvailability;
+  excursion_availability: MetricAvailability;
+  drawdown_availability: MetricAvailability;
+  benchmark_availability: MetricAvailability;
+  summary: StockCampaignSummary;
+  actions: StockActionReview[];
+  forward_effect_20d: ForwardEffectWindow;
+  forward_effect_60d: ForwardEffectWindow;
+  forward_effect_120d: ForwardEffectWindow;
+  pnl: CampaignPnl;
+  campaign_return: number | null;
+  benchmark_return: number | null;
+  excess_return: number | null;
+  mae_base: number | null;
+  mfe_base: number | null;
+  mae_percent: number | null;
+  mfe_percent: number | null;
+  holding_period_drawdown: number | null;
+  timeline: CampaignTimelineItem[];
+  fact_labels: string[];
+  completed_sample_count: number;
+  active_sample_count: number;
+  annotations: StockReviewAnnotation[];
+  issues: StockReviewIssue[];
+}
+
+export interface CampaignPnl {
+  buy_outlays_base: number | null;
+  sell_proceeds_base: number | null;
+  dividends_base: number | null;
+  trading_fees_base: number | null;
+  remaining_shares: number;
+  remaining_market_value_base: number | null;
+  total_pnl_base: number | null;
+  max_invested_capital_base: number | null;
+  label: string;
+}
+
+export interface CampaignTimelineItem {
+  date: string;
+  kind: CampaignCashFlowKind;
+  amount_base: number | null;
+  amount_local: number;
+  currency: string;
+  shares: number;
+  account_id: string;
+  action_id: string | null;
+}
+
+export interface StockReviewDataQuality {
+  availability: MetricAvailability;
+  actual_result_availability: MetricAvailability;
+  shadow_value_add_availability: MetricAvailability;
+  attribution_availability: MetricAvailability;
+  forward_effect_availability: MetricAvailability;
+  issues: StockReviewIssue[];
+  market_data_coverage: number | null;
+  exchange_rate_coverage: number | null;
+  interval_drawdown_only: boolean;
+}
+
+export interface StockReviewIssue {
+  code: string;
+  severity: StockReviewIssueSeverity;
+  message: string;
+  affected_symbol: string | null;
+  affected_date: string | null;
+}
+
+export interface StockReviewAnnotation {
+  id: string;
+  scope_type: string;
+  scope_key: string;
+  account_id: string | null;
+  symbol: string | null;
+  annotation_type: string;
+  value_json: string;
+  source: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StockReviewAnnotationInput {
+  id: string;
+  scope_type: string;
+  scope_key: string;
+  account_id: string | null;
+  symbol: string | null;
+  annotation_type: string;
+  value_json: string;
+  source: string;
+}
+
+export interface StockReviewOverride {
+  id: string;
+  override_type: string;
+  transaction_ids_json: string;
+  value_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StockReviewOverrideInput {
+  id: string;
+  override_type: string;
+  transaction_ids_json: string;
+  value_json: string;
+}
+
 export interface QuarterlyHoldingStatus {
   snapshot_id: string;
   quarter: string;

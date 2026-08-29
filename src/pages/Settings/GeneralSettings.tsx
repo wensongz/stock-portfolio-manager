@@ -55,6 +55,7 @@ const LOCAL_STORAGE_KEYS = [
   "options_selected_account_id",
   "review_option_period_days",
   "review_active_tab",
+  "review_stock_filters_v1",
   "ai_assistant_sidebar_collapsed",
 ] as const;
 

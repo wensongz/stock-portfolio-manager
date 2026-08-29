@@ -1,5 +1,5 @@
 {
-  "revision": "exchange-holidays-v1-2025-2026",
+  "revision": "exchange-holidays-v2-2025-2026",
   "entries": [
     {
       "market": "CN",
@@ -42,10 +42,10 @@
     {
       "market": "US",
       "year": 2025,
-      "source_urls": ["https://www.nyse.com/trade/hours-calendars", "https://www.nasdaqtrader.com/trader.aspx?id=calendar"],
-      "notice_versions": ["NYSE 2025", "Nasdaq 2025"],
+      "source_urls": ["https://www.nyse.com/trade/hours-calendars", "https://www.nasdaqtrader.com/trader.aspx?id=calendar", "https://www.nasdaqtrader.com/TraderNews.aspx?id=ETA2024-87", "https://www.nyse.com/publicdocs/nyse/markets/american-options/rule-interpretations/2025/National_Day_of_Mourning_20250102.pdf"],
+      "notice_versions": ["NYSE 2025", "Nasdaq 2025", "Nasdaq Equity Trader Alert #2024-86 (2024-12-30)", "NYSE American/Arca Options RM-25-01 (2025-01-02)"],
       "closed_weekdays": ["2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26", "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25"],
-      "exceptional_closures": []
+      "exceptional_closures": ["2025-01-09"]
     },
     {
       "market": "US",

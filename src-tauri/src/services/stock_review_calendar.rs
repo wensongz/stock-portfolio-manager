@@ -1818,6 +1818,28 @@ mod tests {
     }
 
     #[test]
+    fn embedded_us_rules_include_the_2025_carter_mourning_closure_and_dated_notices() {
+        let rules =
+            load_market_holiday_rules("US", day("2025-01-01"), day("2026-12-31")).unwrap();
+
+        assert_eq!(
+            rules.resource_revision,
+            "exchange-holidays-v2-2025-2026"
+        );
+        assert!(rules.weekday_closures.contains(&day("2025-01-09")));
+        assert!(rules.source_urls.contains(
+            &"https://www.nasdaqtrader.com/TraderNews.aspx?id=ETA2024-87".to_string()
+        ));
+        assert!(rules.source_urls.contains(&"https://www.nyse.com/publicdocs/nyse/markets/american-options/rule-interpretations/2025/National_Day_of_Mourning_20250102.pdf".to_string()));
+        assert!(rules
+            .notice_versions
+            .contains(&"Nasdaq Equity Trader Alert #2024-86 (2024-12-30)".to_string()));
+        assert!(rules
+            .notice_versions
+            .contains(&"NYSE American/Arca Options RM-25-01 (2025-01-02)".to_string()));
+    }
+
+    #[test]
     fn embedded_rules_reject_duplicates_weekends_and_wrong_years() {
         let duplicate = r#"{"revision":"bad","entries":[{"market":"US","year":2026,"source_urls":["https://www.nyse.com/trade/hours-calendars"],"notice_versions":["bad"],"closed_weekdays":["2026-01-01","2026-01-01","2026-01-03"]}]}"#;
         let error = parse_market_holiday_bundle(duplicate).unwrap_err();
@@ -1949,6 +1971,22 @@ mod tests {
             stable_calendar_revision(&validated),
             stable_calendar_revision(&reordered)
         );
+    }
+
+    #[tokio::test]
+    async fn carter_mourning_week_validates_without_a_january_ninth_bar() {
+        let request = fixture_request("US", "2025-01-06", "2025-01-10");
+        let expected = ["2025-01-06", "2025-01-07", "2025-01-08", "2025-01-10"];
+        let sources = vec![us_source(
+            CalendarProvider::EastMoney,
+            success(&expected),
+            success(&expected),
+        )];
+
+        let validated = validate_market_calendar(&request, &sources).await.unwrap();
+
+        assert_eq!(validated.rows.len(), 5);
+        assert_eq!(validated.rows[3], (day("2025-01-09"), false));
     }
 
     #[tokio::test]

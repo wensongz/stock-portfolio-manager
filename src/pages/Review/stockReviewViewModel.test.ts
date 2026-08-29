@@ -6,8 +6,11 @@ import {
   STOCK_REVIEW_FILTERS_STORAGE_KEY,
   buildStockCampaignAiPrefill,
   buildStockReviewAiPrefill,
+  createStockReviewAnnotationDisplayContext,
   createDefaultStockReviewFilters,
   getStockReviewDateRange,
+  isStockReviewAnnotationVisibleInCampaign,
+  isStockReviewAnnotationVisibleInReport,
   loadStockReviewFilters,
   mapStockReviewMetricForDisplay,
   saveStockReviewFilters,
@@ -43,6 +46,42 @@ test("date presets use Shanghai calendar dates without a UTC day shift", () => {
   assert.deepEqual(getStockReviewDateRange("1Y", now), {
     startDate: "2025-08-29",
     endDate: "2026-08-28",
+  });
+});
+
+test("date presets handle Q1 and a previous quarter crossing the year boundary", () => {
+  const january = new Date("2026-01-01T00:15:00+08:00");
+  assert.deepEqual(getStockReviewDateRange("QTD", january), {
+    startDate: "2026-01-01",
+    endDate: "2026-01-01",
+  });
+  assert.deepEqual(getStockReviewDateRange("PREV_QUARTER", january), {
+    startDate: "2025-10-01",
+    endDate: "2025-12-31",
+  });
+  assert.deepEqual(getStockReviewDateRange("YTD", january), {
+    startDate: "2026-01-01",
+    endDate: "2026-01-01",
+  });
+});
+
+test("1Y uses an anniversary-exclusive inclusive range across leap day", () => {
+  const leapDay = new Date("2024-02-29T23:30:00+08:00");
+  assert.deepEqual(getStockReviewDateRange("1Y", leapDay), {
+    startDate: "2023-03-01",
+    endDate: "2024-02-29",
+  });
+  assert.deepEqual(
+    getStockReviewDateRange("1Y", new Date("2024-03-01T00:15:00+08:00")),
+    { startDate: "2023-03-02", endDate: "2024-03-01" },
+  );
+});
+
+test("Shanghai date extraction stays on the local day near the UTC boundary", () => {
+  const shanghaiNewYear = new Date("2026-01-01T00:05:00+08:00");
+  assert.deepEqual(getStockReviewDateRange("YTD", shanghaiNewYear), {
+    startDate: "2026-01-01",
+    endDate: "2026-01-01",
   });
 });
 
@@ -102,6 +141,35 @@ test("valid persisted filters are restored while the current app base currency w
     benchmarkSymbol: "QQQ",
     baseCurrency: "HKD",
   });
+});
+
+test("persisted v1 validates every field before ignoring preset-derived dates", () => {
+  const valid = {
+    accountId: "account-a",
+    periodPreset: "YTD",
+    startDate: "2026-01-01",
+    endDate: "2026-08-28",
+    market: "US",
+    benchmarkSymbol: "QQQ",
+    baseCurrency: "USD",
+  };
+  const corrupt = [
+    { ...valid, baseCurrency: "EUR" },
+    { ...valid, startDate: "2026-02-30" },
+    { ...valid, startDate: "2026-09-01", endDate: "2026-08-28" },
+    { ...valid, accountId: 42 },
+    { ...valid, benchmarkSymbol: false },
+    { ...valid, market: "EU" },
+    { ...valid, unknownFutureField: "value" },
+  ];
+  const expected = createDefaultStockReviewFilters(now, "HKD");
+
+  for (const value of corrupt) {
+    const storage = memoryStorage({
+      [STOCK_REVIEW_FILTERS_STORAGE_KEY]: JSON.stringify(value),
+    });
+    assert.deepEqual(loadStockReviewFilters(storage, now, "HKD"), expected);
+  }
 });
 
 test("custom ranges reject impossible or reversed dates before persistence", () => {
@@ -228,5 +296,148 @@ test("display mapping preserves backend status and never fills a missing value w
       note: "无效展示值",
       displayValue: "—",
     },
+  );
+});
+
+const displayContext = createStockReviewAnnotationDisplayContext({
+  endDate: "2026-08-28",
+  accountId: "account-a",
+  actions: [
+    { actionId: "action-a", accountId: "account-a", symbol: "AAPL" },
+    { actionId: "action-msft", accountId: "account-a", symbol: "MSFT" },
+  ],
+  campaigns: [
+    {
+      campaignId: "campaign-old",
+      accountIds: ["account-a"],
+      actionIds: ["action-old"],
+      symbol: "AAPL",
+      startedAt: "2025-01-01T09:30:00Z",
+      endedAt: "2025-06-30T16:00:00Z",
+    },
+    {
+      campaignId: "campaign-current",
+      accountIds: ["account-a"],
+      actionIds: ["action-a"],
+      symbol: "AAPL",
+      startedAt: "2026-01-01T09:30:00Z",
+      endedAt: null,
+    },
+  ],
+});
+
+function annotation(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "annotation",
+    scope_type: "period",
+    scope_key: "2026-01-01:2026-08-28",
+    account_id: null,
+    symbol: null,
+    annotation_type: "note",
+    value_json: "{}",
+    source: "user",
+    created_at: "2026-08-29T00:00:00Z",
+    updated_at: "2026-08-29T00:00:00Z",
+    ...overrides,
+  };
+}
+
+test("report annotation visibility rejects cross-account, future, malformed, and unknown scopes", () => {
+  const invisible = [
+    annotation({ account_id: "account-b" }),
+    annotation({ value_json: '{"effective_date":"2026-08-29"}' }),
+    annotation({ value_json: '{"effective_start":"2026-09-01"}' }),
+    annotation({ value_json: '{"effective_date":"2026-02-30"}' }),
+    annotation({ scope_type: "action", scope_key: "unrelated-action" }),
+    annotation({ scope_type: "campaign", scope_key: "unrelated-campaign" }),
+    annotation({ scope_type: "stock", scope_key: "NVDA", symbol: "NVDA" }),
+  ];
+
+  for (const item of invisible) {
+    assert.equal(isStockReviewAnnotationVisibleInReport(item, displayContext), false);
+  }
+});
+
+test("report annotation visibility accepts global and actual action, Campaign, and stock scopes", () => {
+  const visible = [
+    annotation(),
+    annotation({ account_id: "account-a" }),
+    annotation({ scope_type: "action", scope_key: "action-a", symbol: " aapl " }),
+    annotation({ scope_type: "campaign", scope_key: "campaign-current", symbol: "AAPL" }),
+    annotation({
+      scope_type: "stock",
+      scope_key: " aapl ",
+      symbol: "AAPL",
+      account_id: "account-a",
+      value_json: '{"effective_date":"2026-02-01"}',
+    }),
+  ];
+
+  for (const item of visible) {
+    assert.equal(isStockReviewAnnotationVisibleInReport(item, displayContext), true);
+  }
+});
+
+test("Campaign annotation visibility uses exact scopes and prevents same-symbol cycle leakage", () => {
+  assert.equal(
+    isStockReviewAnnotationVisibleInCampaign(annotation(), displayContext, "campaign-current"),
+    true,
+  );
+  assert.equal(
+    isStockReviewAnnotationVisibleInCampaign(
+      annotation({ scope_type: "action", scope_key: "action-a" }),
+      displayContext,
+      "campaign-current",
+    ),
+    true,
+  );
+  assert.equal(
+    isStockReviewAnnotationVisibleInCampaign(
+      annotation({ scope_type: "campaign", scope_key: "campaign-old" }),
+      displayContext,
+      "campaign-current",
+    ),
+    false,
+  );
+  assert.equal(
+    isStockReviewAnnotationVisibleInCampaign(
+      annotation({
+        scope_type: "stock",
+        scope_key: "AAPL",
+        symbol: "AAPL",
+        account_id: "account-a",
+      }),
+      displayContext,
+      "campaign-current",
+    ),
+    false,
+  );
+  assert.equal(
+    isStockReviewAnnotationVisibleInCampaign(
+      annotation({
+        scope_type: "stock",
+        scope_key: "AAPL",
+        symbol: "AAPL",
+        account_id: "account-a",
+        value_json: '{"effective_start":"2026-02-01","effective_end":"2026-03-01"}',
+      }),
+      displayContext,
+      "campaign-current",
+    ),
+    true,
+  );
+  assert.equal(
+    isStockReviewAnnotationVisibleInCampaign(
+      annotation({
+        scope_type: "stock",
+        scope_key: "AAPL",
+        symbol: "AAPL",
+        account_id: "account-a",
+        value_json: '{"effective_date":"2025-03-01"}',
+      }),
+      displayContext,
+      "campaign-current",
+    ),
+    false,
   );
 });

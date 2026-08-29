@@ -267,6 +267,59 @@ const filters = (accountId: string | null = null) => ({
   baseCurrency: "USD",
 });
 
+function reportWithReviewScopes(id: string, accountId = "account-a") {
+  const value = report(id);
+  value.methodology.query.account_id = accountId;
+  const oldCampaign = campaignDetail("campaign-old").summary;
+  oldCampaign.started_at = "2025-01-01T09:30:00Z";
+  oldCampaign.ended_at = "2025-06-30T16:00:00Z";
+  oldCampaign.campaign_status = "completed";
+  oldCampaign.action_ids = ["action-old"];
+  const currentCampaign = campaignDetail("campaign-current").summary;
+  currentCampaign.action_ids = ["action-a"];
+  value.campaigns = [oldCampaign, currentCampaign];
+  value.actions = [
+    {
+      action_id: "action-a",
+      transaction_ids: ["tx-a"],
+      account_id: accountId,
+      symbol: "AAPL",
+      market: "US",
+      action_type: "open",
+      traded_at: "2026-01-02T09:30:00Z",
+      weighted_average_price: 100,
+      gross_amount: 1000,
+      currency: "USD",
+      shares_before: 0,
+      shares_after: 10,
+      portfolio_weight_before: 0,
+      portfolio_weight_after: 0.1,
+      fees: 1,
+      contribution: 20,
+      observation_windows: [windowMetric(60), windowMetric(120)],
+      status: "available",
+      fact_labels: [],
+    },
+  ];
+  return value;
+}
+
+function savedAnnotation(overrides = {}) {
+  return {
+    id: "annotation-1",
+    scope_type: "period",
+    scope_key: "2026-01-01:2026-08-28",
+    account_id: null,
+    symbol: null,
+    annotation_type: "note",
+    value_json: "{}",
+    source: "user",
+    created_at: "2026-08-29T01:02:03Z",
+    updated_at: "2026-08-29T01:02:03Z",
+    ...overrides,
+  };
+}
+
 let invokeImpl = () => Promise.reject(new Error("invoke not configured"));
 globalThis.window = {
   __TAURI_INTERNALS__: {
@@ -376,7 +429,7 @@ test("Campaign requests are independently race-safe and never clear the report",
   assert.equal(useStockReviewStore.getState().campaignLoading, false);
 });
 
-test("latest load errors keep the last successful report and Campaign detail", async () => {
+test("latest load errors keep the last successful report while a new report generation clears the drawer", async () => {
   const existingReport = report("retained");
   const existingCampaign = campaignDetail("retained-campaign");
   useStockReviewStore.setState({
@@ -389,17 +442,19 @@ test("latest load errors keep the last successful report and Campaign detail", a
 
   await useStockReviewStore.getState().loadReport(filters());
   assert.equal(useStockReviewStore.getState().report, existingReport);
+  assert.equal(useStockReviewStore.getState().selectedCampaign, null);
   assert.match(useStockReviewStore.getState().error, /report unavailable/);
 
   await useStockReviewStore.getState().loadCampaignDetail(filters(), "campaign-new");
   assert.equal(useStockReviewStore.getState().report, existingReport);
-  assert.equal(useStockReviewStore.getState().selectedCampaign, existingCampaign);
+  assert.equal(useStockReviewStore.getState().selectedCampaign, null);
   assert.match(useStockReviewStore.getState().error, /detail unavailable/);
 });
 
 test("saveAnnotation applies the authoritative annotation to matching current scopes only", async () => {
   const existingReport = report("annotation");
   const existingCampaign = campaignDetail("campaign-7");
+  existingReport.campaigns = [existingCampaign.summary];
   const returned = {
     id: "annotation-1",
     scope_type: "campaign",
@@ -586,4 +641,303 @@ test("an annotation response from an old report scope is not attached to a newer
 
   assert.equal(useStockReviewStore.getState().report, latest);
   assert.deepEqual(useStockReviewStore.getState().report.annotations, []);
+});
+
+test("a new report generation invalidates a pending Campaign success", async () => {
+  const detailRequest = deferred();
+  const reportRequest = deferred();
+  const accountAReport = reportWithReviewScopes("account-a-report", "account-a");
+  useStockReviewStore.setState({
+    filters: filters("account-a"),
+    report: accountAReport,
+    selectedCampaign: campaignDetail("campaign-old"),
+  });
+  invokeImpl = (command) =>
+    command === "get_stock_campaign_detail" ? detailRequest.promise : reportRequest.promise;
+
+  const detailLoad = useStockReviewStore
+    .getState()
+    .loadCampaignDetail(filters("account-a"), "campaign-current");
+  const reportLoad = useStockReviewStore.getState().loadReport(filters("account-b"));
+  assert.equal(useStockReviewStore.getState().selectedCampaign, null);
+  assert.equal(useStockReviewStore.getState().campaignLoading, false);
+
+  const accountBReport = reportWithReviewScopes("account-b-report", "account-b");
+  reportRequest.resolve(accountBReport);
+  await reportLoad;
+  detailRequest.resolve(campaignDetail("campaign-current"));
+  await detailLoad;
+
+  assert.equal(useStockReviewStore.getState().report, accountBReport);
+  assert.equal(useStockReviewStore.getState().selectedCampaign, null);
+  assert.equal(useStockReviewStore.getState().campaignLoading, false);
+  assert.equal(useStockReviewStore.getState().error, null);
+});
+
+test("a new report generation ignores a pending Campaign error", async () => {
+  const detailRequest = deferred();
+  const accountBReport = reportWithReviewScopes("account-b-report", "account-b");
+  useStockReviewStore.setState({
+    filters: filters("account-a"),
+    report: reportWithReviewScopes("account-a-report", "account-a"),
+  });
+  invokeImpl = (command) =>
+    command === "get_stock_campaign_detail"
+      ? detailRequest.promise
+      : Promise.resolve(accountBReport);
+
+  const detailLoad = useStockReviewStore
+    .getState()
+    .loadCampaignDetail(filters("account-a"), "campaign-current");
+  await useStockReviewStore.getState().loadReport(filters("account-b"));
+  detailRequest.reject(new Error("stale Campaign error"));
+  await detailLoad;
+
+  assert.equal(useStockReviewStore.getState().report, accountBReport);
+  assert.equal(useStockReviewStore.getState().selectedCampaign, null);
+  assert.equal(useStockReviewStore.getState().campaignLoading, false);
+  assert.equal(useStockReviewStore.getState().error, null);
+});
+
+test("saveAnnotation appends only rows visible to the current report and drawer", async () => {
+  const currentReport = reportWithReviewScopes("visibility");
+  const currentDetail = campaignDetail("campaign-current");
+  currentDetail.summary.action_ids = ["action-a"];
+  useStockReviewStore.setState({
+    filters: filters("account-a"),
+    report: currentReport,
+    selectedCampaign: currentDetail,
+  });
+  const responses = [
+    savedAnnotation({ id: "cross-account", account_id: "account-b" }),
+    savedAnnotation({
+      id: "future",
+      account_id: "account-a",
+      value_json: '{"effective_date":"2026-08-29"}',
+    }),
+    savedAnnotation({
+      id: "other-campaign",
+      scope_type: "campaign",
+      scope_key: "campaign-old",
+      account_id: "account-a",
+      symbol: "AAPL",
+    }),
+    savedAnnotation({
+      id: "current-campaign",
+      scope_type: "campaign",
+      scope_key: "campaign-current",
+      account_id: "account-a",
+      symbol: "AAPL",
+    }),
+    savedAnnotation({ id: "global" }),
+  ];
+  invokeImpl = async (command) => {
+    assert.equal(command, "save_stock_review_annotation");
+    return responses.shift();
+  };
+
+  for (const response of [...responses]) {
+    await useStockReviewStore.getState().saveAnnotation({
+      id: response.id,
+      scope_type: response.scope_type,
+      scope_key: response.scope_key,
+      account_id: response.account_id,
+      symbol: response.symbol,
+      annotation_type: response.annotation_type,
+      value_json: response.value_json,
+      source: "user",
+    });
+  }
+
+  assert.deepEqual(
+    useStockReviewStore.getState().report.annotations.map((item) => item.id),
+    ["other-campaign", "current-campaign", "global"],
+  );
+  assert.deepEqual(
+    useStockReviewStore.getState().selectedCampaign.annotations.map((item) => item.id),
+    ["current-campaign", "global"],
+  );
+  assert.equal(useStockReviewStore.getState().report.summary, currentReport.summary);
+});
+
+test("override result preserves a visible annotation that completes before it", async () => {
+  const overrideRequest = deferred();
+  const annotationRequest = deferred();
+  const before = reportWithReviewScopes("before");
+  const overridden = reportWithReviewScopes("overridden");
+  useStockReviewStore.setState({ filters: filters("account-a"), report: before });
+  invokeImpl = (command) =>
+    command === "confirm_stock_review_override"
+      ? overrideRequest.promise
+      : annotationRequest.promise;
+
+  const overrideSave = useStockReviewStore.getState().confirmOverride(filters("account-a"), {
+    id: "override-1",
+    override_type: "non_trade",
+    transaction_ids_json: '["tx-1"]',
+    value_json: "{}",
+  });
+  const annotationSave = useStockReviewStore.getState().saveAnnotation({
+    id: "during-override",
+    scope_type: "period",
+    scope_key: "2026-01-01:2026-08-28",
+    account_id: null,
+    symbol: null,
+    annotation_type: "note",
+    value_json: "{}",
+    source: "user",
+  });
+  annotationRequest.resolve(savedAnnotation({ id: "during-override" }));
+  await annotationSave;
+  overrideRequest.resolve(overridden);
+  await overrideSave;
+
+  assert.equal(useStockReviewStore.getState().report.methodology, overridden.methodology);
+  assert.deepEqual(
+    useStockReviewStore.getState().report.annotations.map((item) => item.id),
+    ["during-override"],
+  );
+});
+
+test("annotation completion after override resolution applies to the returned report", async () => {
+  const overrideRequest = deferred();
+  const annotationRequest = deferred();
+  const overridden = reportWithReviewScopes("overridden-first");
+  useStockReviewStore.setState({
+    filters: filters("account-a"),
+    report: reportWithReviewScopes("before"),
+  });
+  invokeImpl = (command) =>
+    command === "confirm_stock_review_override"
+      ? overrideRequest.promise
+      : annotationRequest.promise;
+
+  const overrideSave = useStockReviewStore.getState().confirmOverride(filters("account-a"), {
+    id: "override-1",
+    override_type: "non_trade",
+    transaction_ids_json: '["tx-1"]',
+    value_json: "{}",
+  });
+  const annotationSave = useStockReviewStore.getState().saveAnnotation({
+    id: "after-override",
+    scope_type: "period",
+    scope_key: "2026-01-01:2026-08-28",
+    account_id: null,
+    symbol: null,
+    annotation_type: "note",
+    value_json: "{}",
+    source: "user",
+  });
+  overrideRequest.resolve(overridden);
+  await overrideSave;
+  annotationRequest.resolve(savedAnnotation({ id: "after-override" }));
+  await annotationSave;
+
+  assert.equal(useStockReviewStore.getState().report.methodology, overridden.methodology);
+  assert.deepEqual(
+    useStockReviewStore.getState().report.annotations.map((item) => item.id),
+    ["after-override"],
+  );
+});
+
+test("an annotation error remains displayable when an overlapping override succeeds", async () => {
+  const overrideRequest = deferred();
+  const annotationRequest = deferred();
+  useStockReviewStore.setState({
+    filters: filters("account-a"),
+    report: reportWithReviewScopes("before"),
+  });
+  invokeImpl = (command) =>
+    command === "confirm_stock_review_override"
+      ? overrideRequest.promise
+      : annotationRequest.promise;
+
+  const overrideSave = useStockReviewStore.getState().confirmOverride(filters("account-a"), {
+    id: "override-1",
+    override_type: "non_trade",
+    transaction_ids_json: '["tx-1"]',
+    value_json: "{}",
+  });
+  const annotationSave = useStockReviewStore.getState().saveAnnotation({
+    id: "failed-note",
+    scope_type: "period",
+    scope_key: "2026-01-01:2026-08-28",
+    account_id: null,
+    symbol: null,
+    annotation_type: "note",
+    value_json: "{}",
+    source: "user",
+  });
+  annotationRequest.reject(new Error("annotation failed"));
+  await annotationSave;
+  overrideRequest.resolve(reportWithReviewScopes("override-success"));
+  await overrideSave;
+
+  assert.match(useStockReviewStore.getState().error, /annotation failed/);
+  assert.equal(useStockReviewStore.getState().errorSource, "annotation");
+});
+
+test("two overrides remain latest-wins independently of annotation sequencing", async () => {
+  const first = deferred();
+  const second = deferred();
+  invokeImpl = (_command, args) =>
+    args.input.id === "override-first" ? first.promise : second.promise;
+  useStockReviewStore.setState({
+    filters: filters("account-a"),
+    report: reportWithReviewScopes("before"),
+  });
+
+  const firstSave = useStockReviewStore.getState().confirmOverride(filters("account-a"), {
+    id: "override-first",
+    override_type: "non_trade",
+    transaction_ids_json: '["tx-1"]',
+    value_json: "{}",
+  });
+  const secondSave = useStockReviewStore.getState().confirmOverride(filters("account-a"), {
+    id: "override-second",
+    override_type: "non_trade",
+    transaction_ids_json: '["tx-2"]',
+    value_json: "{}",
+  });
+  const latest = reportWithReviewScopes("latest-override");
+  second.resolve(latest);
+  await secondSave;
+  first.resolve(reportWithReviewScopes("stale-override"));
+  await firstSave;
+
+  assert.equal(useStockReviewStore.getState().report, latest);
+});
+
+test("filter change invalidates all pending overrides", async () => {
+  const first = deferred();
+  const second = deferred();
+  const latestReport = reportWithReviewScopes("account-b", "account-b");
+  invokeImpl = (command, args) => {
+    if (command === "get_stock_review_report") return Promise.resolve(latestReport);
+    return args.input.id === "override-first" ? first.promise : second.promise;
+  };
+  useStockReviewStore.setState({
+    filters: filters("account-a"),
+    report: reportWithReviewScopes("account-a", "account-a"),
+  });
+
+  const firstSave = useStockReviewStore.getState().confirmOverride(filters("account-a"), {
+    id: "override-first",
+    override_type: "non_trade",
+    transaction_ids_json: '["tx-1"]',
+    value_json: "{}",
+  });
+  const secondSave = useStockReviewStore.getState().confirmOverride(filters("account-a"), {
+    id: "override-second",
+    override_type: "non_trade",
+    transaction_ids_json: '["tx-2"]',
+    value_json: "{}",
+  });
+  await useStockReviewStore.getState().loadReport(filters("account-b"));
+  second.resolve(reportWithReviewScopes("stale-second"));
+  first.resolve(reportWithReviewScopes("stale-first"));
+  await Promise.all([firstSave, secondSave]);
+
+  assert.equal(useStockReviewStore.getState().report, latestReport);
+  assert.deepEqual(useStockReviewStore.getState().filters, filters("account-b"));
 });

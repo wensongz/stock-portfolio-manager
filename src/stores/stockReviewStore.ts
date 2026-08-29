@@ -8,8 +8,13 @@ import type {
   StockReviewOverrideInput,
   StockReviewReport,
 } from "../types";
+import {
+  createStockReviewAnnotationDisplayContext,
+  isStockReviewAnnotationVisibleInCampaign,
+  isStockReviewAnnotationVisibleInReport,
+} from "../pages/Review/stockReviewViewModel.ts";
 
-type StockReviewErrorSource = "report" | "campaign" | "mutation";
+type StockReviewErrorSource = "report" | "campaign" | "annotation" | "override";
 
 interface StockReviewState {
   filters: StockReviewFilters | null;
@@ -38,8 +43,11 @@ interface StockReviewState {
 
 let latestReportRequestId = 0;
 let latestCampaignRequestId = 0;
-let latestMutationRequestId = 0;
+let latestAnnotationRequestId = 0;
+let latestOverrideRequestId = 0;
+let latestFilterGeneration = 0;
 let pendingMutations = 0;
+const latestAnnotationRequestById = new Map<string, number>();
 
 function queryArguments(filters: StockReviewFilters) {
   return {
@@ -63,42 +71,53 @@ function replaceAnnotation(
   );
 }
 
-function normalizedIdentity(value: string | null): string | null {
-  const normalized = value?.trim().toUpperCase() ?? "";
-  return normalized || null;
-}
-
-function annotationAppliesToCampaign(
-  annotation: StockReviewAnnotation,
-  campaign: StockCampaignDetail,
+function filtersEqual(
+  left: StockReviewFilters | null,
+  right: StockReviewFilters,
 ): boolean {
-  const { summary } = campaign;
-  if (annotation.scope_type === "period") return true;
-  if (annotation.scope_type === "campaign") {
-    return annotation.scope_key === summary.campaign_id;
-  }
-  if (annotation.scope_type === "action") {
-    return summary.action_ids.includes(annotation.scope_key);
-  }
-  if (annotation.scope_type !== "stock") return false;
-
-  const annotationSymbol = normalizedIdentity(annotation.symbol ?? annotation.scope_key);
-  if (annotationSymbol !== normalizedIdentity(summary.symbol)) return false;
   return (
-    annotation.account_id == null || summary.account_ids.includes(annotation.account_id)
+    left != null &&
+    left.accountId === right.accountId &&
+    left.periodPreset === right.periodPreset &&
+    left.startDate === right.startDate &&
+    left.endDate === right.endDate &&
+    left.market === right.market &&
+    left.benchmarkSymbol === right.benchmarkSymbol &&
+    left.baseCurrency === right.baseCurrency
   );
 }
 
-function clearMatchingError(
+function mergeVisibleAnnotations(
+  report: StockReviewReport,
+  currentAnnotations: StockReviewAnnotation[],
+): StockReviewReport {
+  if (currentAnnotations.length === 0) {
+    return report;
+  }
+
+  const context = createStockReviewAnnotationDisplayContext(report);
+  let annotations = [...report.annotations];
+  for (const annotation of currentAnnotations) {
+    if (isStockReviewAnnotationVisibleInReport(annotation, context)) {
+      annotations = replaceAnnotation(annotations, annotation);
+    }
+  }
+  return annotations.length === report.annotations.length &&
+    annotations.every((annotation, index) => annotation === report.annotations[index])
+    ? report
+    : { ...report, annotations };
+}
+
+function clearRelevantError(
   state: Pick<StockReviewState, "error" | "errorSource">,
-  source: StockReviewErrorSource,
+  sources: StockReviewErrorSource[],
 ) {
-  return state.errorSource === source
+  return state.errorSource != null && sources.includes(state.errorSource)
     ? { error: null, errorSource: null }
     : { error: state.error, errorSource: state.errorSource };
 }
 
-export const useStockReviewStore = create<StockReviewState>((set) => ({
+export const useStockReviewStore = create<StockReviewState>((set, get) => ({
   filters: null,
   reportLoading: false,
   campaignLoading: false,
@@ -109,25 +128,40 @@ export const useStockReviewStore = create<StockReviewState>((set) => ({
   errorSource: null,
 
   loadReport: async (filters) => {
+    if (!filtersEqual(get().filters, filters)) latestFilterGeneration += 1;
+    const filterGeneration = latestFilterGeneration;
     const requestId = ++latestReportRequestId;
+    latestCampaignRequestId += 1;
     set((state) => ({
       filters,
       reportLoading: true,
-      ...clearMatchingError(state, "report"),
+      campaignLoading: false,
+      selectedCampaign: null,
+      ...clearRelevantError(state, ["report", "campaign"]),
     }));
     try {
       const report = await invoke<StockReviewReport>(
         "get_stock_review_report",
         queryArguments(filters),
       );
-      if (requestId !== latestReportRequestId) return;
+      if (
+        requestId !== latestReportRequestId ||
+        filterGeneration !== latestFilterGeneration
+      ) {
+        return;
+      }
       set((state) => ({
         report,
         reportLoading: false,
-        ...clearMatchingError(state, "report"),
+        ...clearRelevantError(state, ["report"]),
       }));
     } catch (error) {
-      if (requestId !== latestReportRequestId) return;
+      if (
+        requestId !== latestReportRequestId ||
+        filterGeneration !== latestFilterGeneration
+      ) {
+        return;
+      }
       set({
         reportLoading: false,
         error: String(error),
@@ -138,9 +172,11 @@ export const useStockReviewStore = create<StockReviewState>((set) => ({
 
   loadCampaignDetail: async (filters, campaignId) => {
     const requestId = ++latestCampaignRequestId;
+    const reportRequestId = latestReportRequestId;
+    const filterGeneration = latestFilterGeneration;
     set((state) => ({
       campaignLoading: true,
-      ...clearMatchingError(state, "campaign"),
+      ...clearRelevantError(state, ["campaign"]),
     }));
     try {
       const detail = await invoke<StockCampaignDetail>(
@@ -150,14 +186,26 @@ export const useStockReviewStore = create<StockReviewState>((set) => ({
           campaignId,
         },
       );
-      if (requestId !== latestCampaignRequestId) return;
+      if (
+        requestId !== latestCampaignRequestId ||
+        reportRequestId !== latestReportRequestId ||
+        filterGeneration !== latestFilterGeneration
+      ) {
+        return;
+      }
       set((state) => ({
         selectedCampaign: detail,
         campaignLoading: false,
-        ...clearMatchingError(state, "campaign"),
+        ...clearRelevantError(state, ["campaign"]),
       }));
     } catch (error) {
-      if (requestId !== latestCampaignRequestId) return;
+      if (
+        requestId !== latestCampaignRequestId ||
+        reportRequestId !== latestReportRequestId ||
+        filterGeneration !== latestFilterGeneration
+      ) {
+        return;
+      }
       set({
         campaignLoading: false,
         error: String(error),
@@ -167,13 +215,13 @@ export const useStockReviewStore = create<StockReviewState>((set) => ({
   },
 
   saveAnnotation: async (input) => {
-    const requestId = ++latestMutationRequestId;
-    const reportContextId = latestReportRequestId;
-    const campaignContextId = latestCampaignRequestId;
+    const requestId = ++latestAnnotationRequestId;
+    latestAnnotationRequestById.set(input.id, requestId);
+    const filterGeneration = latestFilterGeneration;
     pendingMutations += 1;
     set((state) => ({
       mutating: true,
-      ...clearMatchingError(state, "mutation"),
+      ...clearRelevantError(state, ["annotation"]),
     }));
     try {
       const annotation = await invoke<StockReviewAnnotation>(
@@ -181,54 +229,84 @@ export const useStockReviewStore = create<StockReviewState>((set) => ({
         { input },
       );
       if (
-        requestId === latestMutationRequestId &&
-        reportContextId === latestReportRequestId
+        latestAnnotationRequestById.get(input.id) === requestId &&
+        filterGeneration === latestFilterGeneration
       ) {
-        set((state) => ({
-          report: state.report
-            ? {
-                ...state.report,
-                annotations: replaceAnnotation(state.report.annotations, annotation),
-              }
-            : null,
-          selectedCampaign:
-            campaignContextId === latestCampaignRequestId &&
-            state.selectedCampaign &&
-            annotationAppliesToCampaign(annotation, state.selectedCampaign)
-              ? {
-                  ...state.selectedCampaign,
-                  annotations: replaceAnnotation(
-                    state.selectedCampaign.annotations,
-                    annotation,
-                  ),
-                }
-              : state.selectedCampaign,
-          ...clearMatchingError(state, "mutation"),
-        }));
+        set((state) => {
+          const context = state.report
+            ? createStockReviewAnnotationDisplayContext(state.report)
+            : null;
+          const reportVisible = Boolean(
+            context && isStockReviewAnnotationVisibleInReport(annotation, context),
+          );
+          const campaignVisible = Boolean(
+            context &&
+              state.selectedCampaign &&
+              isStockReviewAnnotationVisibleInCampaign(
+                annotation,
+                context,
+                state.selectedCampaign.summary.campaign_id,
+              ),
+          );
+          return {
+            report:
+              state.report && reportVisible
+                ? {
+                    ...state.report,
+                    annotations: replaceAnnotation(
+                      state.report.annotations,
+                      annotation,
+                    ),
+                  }
+                : state.report,
+            selectedCampaign:
+              state.selectedCampaign && campaignVisible
+                ? {
+                    ...state.selectedCampaign,
+                    annotations: replaceAnnotation(
+                      state.selectedCampaign.annotations,
+                      annotation,
+                    ),
+                  }
+                : state.selectedCampaign,
+            ...(requestId === latestAnnotationRequestId
+              ? clearRelevantError(state, ["annotation"])
+              : { error: state.error, errorSource: state.errorSource }),
+          };
+        });
       }
       return annotation;
     } catch (error) {
       if (
-        requestId === latestMutationRequestId &&
-        reportContextId === latestReportRequestId
+        requestId === latestAnnotationRequestId &&
+        filterGeneration === latestFilterGeneration
       ) {
-        set({ error: String(error), errorSource: "mutation" });
+        set({ error: String(error), errorSource: "annotation" });
       }
       return null;
     } finally {
+      if (latestAnnotationRequestById.get(input.id) === requestId) {
+        latestAnnotationRequestById.delete(input.id);
+      }
       pendingMutations = Math.max(0, pendingMutations - 1);
       set({ mutating: pendingMutations > 0 });
     }
   },
 
   confirmOverride: async (filters, input) => {
-    const requestId = ++latestMutationRequestId;
+    if (!filtersEqual(get().filters, filters)) latestFilterGeneration += 1;
+    const filterGeneration = latestFilterGeneration;
+    const requestId = ++latestOverrideRequestId;
     const reportRequestId = ++latestReportRequestId;
+    latestCampaignRequestId += 1;
     pendingMutations += 1;
     set((state) => ({
+      filters,
       mutating: true,
       reportLoading: false,
-      ...clearMatchingError(state, "mutation"),
+      campaignLoading: false,
+      selectedCampaign: null,
+      ...clearRelevantError(state, ["override", "campaign"]),
     }));
     try {
       const report = await invoke<StockReviewReport>(
@@ -239,25 +317,27 @@ export const useStockReviewStore = create<StockReviewState>((set) => ({
         },
       );
       if (
-        requestId === latestMutationRequestId &&
-        reportRequestId === latestReportRequestId
+        requestId === latestOverrideRequestId &&
+        reportRequestId === latestReportRequestId &&
+        filterGeneration === latestFilterGeneration
       ) {
-        latestCampaignRequestId += 1;
         set((state) => ({
           filters,
-          report,
-          selectedCampaign: null,
-          campaignLoading: false,
-          ...clearMatchingError(state, "mutation"),
+          report: mergeVisibleAnnotations(
+            report,
+            state.report?.annotations ?? [],
+          ),
+          ...clearRelevantError(state, ["override"]),
         }));
       }
       return report;
     } catch (error) {
       if (
-        requestId === latestMutationRequestId &&
-        reportRequestId === latestReportRequestId
+        requestId === latestOverrideRequestId &&
+        reportRequestId === latestReportRequestId &&
+        filterGeneration === latestFilterGeneration
       ) {
-        set({ error: String(error), errorSource: "mutation" });
+        set({ error: String(error), errorSource: "override" });
       }
       return null;
     } finally {
@@ -271,7 +351,7 @@ export const useStockReviewStore = create<StockReviewState>((set) => ({
     set((state) => ({
       selectedCampaign: null,
       campaignLoading: false,
-      ...clearMatchingError(state, "campaign"),
+      ...clearRelevantError(state, ["campaign"]),
     }));
   },
 

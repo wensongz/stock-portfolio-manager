@@ -3,8 +3,10 @@ import type {
   Market,
   MetricAvailability,
   MetricStatus,
+  StockReviewAnnotation,
   StockReviewFilters,
   StockReviewPeriodPreset,
+  StockReviewReport,
 } from "../../types";
 
 export const STOCK_REVIEW_FILTERS_STORAGE_KEY = "review_stock_filters_v1";
@@ -17,6 +19,7 @@ const PERIOD_PRESETS: StockReviewPeriodPreset[] = [
   "CUSTOM",
 ];
 const MARKETS: Market[] = ["US", "CN", "HK"];
+const CURRENCIES: Currency[] = ["USD", "CNY", "HKD"];
 
 const PORTFOLIO_PROMPT =
   "请基于本期确定性股票复盘报告，分析整体调仓是否创造价值、收益是否依赖少数操作、风险结构是否改善，以及最值得进一步复盘的三项操作。请严格区分确定性事实、事后结果和缺失的决策背景。";
@@ -59,6 +62,28 @@ export interface StockReviewMetricDisplay {
   displayValue: string;
 }
 
+export interface StockReviewAnnotationActionContext {
+  actionId: string;
+  accountId: string;
+  symbol: string;
+}
+
+export interface StockReviewAnnotationCampaignContext {
+  campaignId: string;
+  accountIds: string[];
+  actionIds: string[];
+  symbol: string;
+  startedAt: string;
+  endedAt: string | null;
+}
+
+export interface StockReviewAnnotationDisplayContext {
+  endDate: string;
+  accountId: string | null;
+  actions: StockReviewAnnotationActionContext[];
+  campaigns: StockReviewAnnotationCampaignContext[];
+}
+
 interface CalendarDate {
   year: number;
   month: number;
@@ -91,6 +116,10 @@ function shiftCalendarDays(date: CalendarDate, days: number): CalendarDate {
   };
 }
 
+function daysInCalendarMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
 function isValidDateOnly(value: unknown): value is string {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const [year, month, day] = value.split("-").map(Number);
@@ -107,6 +136,210 @@ function validateDateRange(range: StockReviewDateRange): StockReviewDateRange {
     throw new RangeError("开始日期不能晚于结束日期");
   }
   return range;
+}
+
+interface AnnotationEconomicDates {
+  effectiveDate: string | null;
+  effectiveStart: string | null;
+  effectiveEnd: string | null;
+  snapshotDate: string | null;
+}
+
+function annotationEconomicDates(valueJson: string): AnnotationEconomicDates | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(valueJson);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const object = value as Record<string, unknown>;
+  const date = (key: string): string | null | undefined => {
+    if (!(key in object)) return null;
+    return isValidDateOnly(object[key]) ? object[key] : undefined;
+  };
+  const effectiveDate = date("effective_date");
+  const effectiveStart = date("effective_start");
+  const effectiveEnd = date("effective_end");
+  const snapshotDate = date("snapshot_date");
+  if (
+    effectiveDate === undefined ||
+    effectiveStart === undefined ||
+    effectiveEnd === undefined ||
+    snapshotDate === undefined ||
+    (effectiveStart != null && effectiveEnd != null && effectiveStart > effectiveEnd)
+  ) {
+    return null;
+  }
+  return { effectiveDate, effectiveStart, effectiveEnd, snapshotDate };
+}
+
+function normalizedStockIdentity(value: string | null): string | null {
+  const normalized = value?.trim().toUpperCase() ?? "";
+  return normalized || null;
+}
+
+function annotationVisibleAsOf(
+  annotation: StockReviewAnnotation,
+  context: StockReviewAnnotationDisplayContext,
+): AnnotationEconomicDates | null {
+  const dates = annotationEconomicDates(annotation.value_json);
+  if (!dates) return null;
+  const explicitDate = dates.effectiveDate ?? dates.snapshotDate;
+  if (explicitDate != null && explicitDate > context.endDate) return null;
+  if (dates.effectiveStart != null && dates.effectiveStart > context.endDate) return null;
+  if (
+    annotation.account_id != null &&
+    context.accountId != null &&
+    annotation.account_id !== context.accountId
+  ) {
+    return null;
+  }
+  return dates;
+}
+
+export function createStockReviewAnnotationDisplayContext(
+  source:
+    | StockReviewReport
+    | StockReviewAnnotationDisplayContext,
+): StockReviewAnnotationDisplayContext {
+  if ("methodology" in source) {
+    return {
+      endDate: source.methodology.query.end_date,
+      accountId: source.methodology.query.account_id,
+      actions: source.actions.map((action) => ({
+        actionId: action.action_id,
+        accountId: action.account_id,
+        symbol: action.symbol,
+      })),
+      campaigns: source.campaigns.map((campaign) => ({
+        campaignId: campaign.campaign_id,
+        accountIds: [...campaign.account_ids],
+        actionIds: [...campaign.action_ids],
+        symbol: campaign.symbol,
+        startedAt: campaign.started_at,
+        endedAt: campaign.ended_at,
+      })),
+    };
+  }
+  return {
+    endDate: source.endDate,
+    accountId: source.accountId,
+    actions: source.actions.map((action) => ({ ...action })),
+    campaigns: source.campaigns.map((campaign) => ({
+      ...campaign,
+      accountIds: [...campaign.accountIds],
+      actionIds: [...campaign.actionIds],
+    })),
+  };
+}
+
+export function isStockReviewAnnotationVisibleInReport(
+  annotation: StockReviewAnnotation,
+  context: StockReviewAnnotationDisplayContext,
+): boolean {
+  if (!annotationVisibleAsOf(annotation, context)) return false;
+  const annotationSymbol = normalizedStockIdentity(annotation.symbol);
+  if (annotation.scope_type === "period") return annotationSymbol == null;
+  if (annotation.scope_type === "action") {
+    const action = context.actions.find(
+      (candidate) => candidate.actionId === annotation.scope_key,
+    );
+    return Boolean(
+      action &&
+        (annotation.account_id == null || annotation.account_id === action.accountId) &&
+        (annotationSymbol == null ||
+          annotationSymbol === normalizedStockIdentity(action.symbol)),
+    );
+  }
+  if (annotation.scope_type === "campaign") {
+    const campaign = context.campaigns.find(
+      (candidate) => candidate.campaignId === annotation.scope_key,
+    );
+    return Boolean(
+      campaign &&
+        (annotation.account_id == null ||
+          campaign.accountIds.includes(annotation.account_id)) &&
+        (annotationSymbol == null ||
+          annotationSymbol === normalizedStockIdentity(campaign.symbol)),
+    );
+  }
+  if (annotation.scope_type !== "stock") return false;
+  const scopeSymbol = normalizedStockIdentity(annotation.scope_key);
+  if (scopeSymbol == null || (annotationSymbol != null && annotationSymbol !== scopeSymbol)) {
+    return false;
+  }
+  return (
+    context.actions.some(
+      (action) =>
+        normalizedStockIdentity(action.symbol) === scopeSymbol &&
+        (annotation.account_id == null || annotation.account_id === action.accountId),
+    ) ||
+    context.campaigns.some(
+      (campaign) =>
+        normalizedStockIdentity(campaign.symbol) === scopeSymbol &&
+        (annotation.account_id == null || campaign.accountIds.includes(annotation.account_id)),
+    )
+  );
+}
+
+export function isStockReviewAnnotationVisibleInCampaign(
+  annotation: StockReviewAnnotation,
+  context: StockReviewAnnotationDisplayContext,
+  campaignId: string,
+): boolean {
+  if (!isStockReviewAnnotationVisibleInReport(annotation, context)) return false;
+  const campaign = context.campaigns.find(
+    (candidate) => candidate.campaignId === campaignId,
+  );
+  if (!campaign) return false;
+  if (annotation.scope_type === "period") {
+    return annotation.account_id == null && annotation.symbol == null;
+  }
+  if (annotation.scope_type === "campaign") return annotation.scope_key === campaignId;
+  if (annotation.scope_type === "action") {
+    return campaign.actionIds.includes(annotation.scope_key);
+  }
+  if (annotation.scope_type !== "stock") return false;
+  if (
+    normalizedStockIdentity(annotation.scope_key) !==
+      normalizedStockIdentity(campaign.symbol) ||
+    (annotation.symbol != null &&
+      normalizedStockIdentity(annotation.symbol) !==
+        normalizedStockIdentity(campaign.symbol)) ||
+    (annotation.account_id != null &&
+      !campaign.accountIds.includes(annotation.account_id))
+  ) {
+    return false;
+  }
+
+  const dates = annotationVisibleAsOf(annotation, context);
+  if (!dates || !isValidDateOnly(campaign.startedAt.slice(0, 10))) return false;
+  const campaignStart = campaign.startedAt.slice(0, 10);
+  const campaignEnd =
+    campaign.endedAt != null && isValidDateOnly(campaign.endedAt.slice(0, 10))
+      ? campaign.endedAt.slice(0, 10) < context.endDate
+        ? campaign.endedAt.slice(0, 10)
+        : context.endDate
+      : context.endDate;
+  const explicitDate = dates.effectiveDate ?? dates.snapshotDate;
+  if (explicitDate != null) {
+    return explicitDate >= campaignStart && explicitDate <= campaignEnd;
+  }
+  if (dates.effectiveStart != null || dates.effectiveEnd != null) {
+    const annotationStart = dates.effectiveStart ?? "0000-01-01";
+    const annotationEnd = dates.effectiveEnd ?? "9999-12-31";
+    return annotationStart <= campaignEnd && annotationEnd >= campaignStart;
+  }
+  return (
+    context.campaigns.filter(
+      (candidate) =>
+        normalizedStockIdentity(candidate.symbol) ===
+          normalizedStockIdentity(campaign.symbol) &&
+        (annotation.account_id == null ||
+          candidate.accountIds.includes(annotation.account_id)),
+    ).length === 1
+  );
 }
 
 /**
@@ -141,8 +374,13 @@ export function getStockReviewDateRange(
     return { startDate: `${end.year}-01-01`, endDate: formatCalendarDate(end) };
   }
   if (preset === "1Y") {
+    const priorAnniversary = {
+      year: end.year - 1,
+      month: end.month,
+      day: Math.min(end.day, daysInCalendarMonth(end.year - 1, end.month)),
+    };
     return {
-      startDate: formatCalendarDate(shiftCalendarDays(end, -364)),
+      startDate: formatCalendarDate(shiftCalendarDays(priorAnniversary, 1)),
       endDate: formatCalendarDate(end),
     };
   }
@@ -211,13 +449,29 @@ function parseStoredFilters(
     "benchmarkSymbol",
     "baseCurrency",
   ]);
-  if (Object.keys(record).some((key) => !allowedKeys.has(key))) return null;
+  if (
+    Object.keys(record).length !== allowedKeys.size ||
+    Object.keys(record).some((key) => !allowedKeys.has(key))
+  ) {
+    return null;
+  }
   if (!PERIOD_PRESETS.includes(record.periodPreset as StockReviewPeriodPreset)) return null;
+  if (!CURRENCIES.includes(record.baseCurrency as Currency)) return null;
 
   const accountId = normalizedNullableString(record.accountId);
   const benchmarkSymbol = normalizedNullableString(record.benchmarkSymbol);
   if (accountId === undefined || benchmarkSymbol === undefined) return null;
   if (record.market !== null && !MARKETS.includes(record.market as Market)) return null;
+
+  let storedRange: StockReviewDateRange;
+  try {
+    storedRange = validateDateRange({
+      startDate: record.startDate as string,
+      endDate: record.endDate as string,
+    });
+  } catch {
+    return null;
+  }
 
   const periodPreset = record.periodPreset as StockReviewPeriodPreset;
   let range: StockReviewDateRange;
@@ -225,9 +479,7 @@ function parseStoredFilters(
     range = getStockReviewDateRange(
       periodPreset,
       now,
-      periodPreset === "CUSTOM"
-        ? { startDate: record.startDate as string, endDate: record.endDate as string }
-        : undefined,
+      periodPreset === "CUSTOM" ? storedRange : undefined,
     );
   } catch {
     return null;

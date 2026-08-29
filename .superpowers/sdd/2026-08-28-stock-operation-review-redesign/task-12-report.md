@@ -5,6 +5,7 @@
 - Complete.
 - Implementation commit: `860a430578d627cd2b8e686b4c75dff819788594` (`feat: redesign stock operation review page`).
 - Review-remediation implementation commit: `ab76456c88dde0e177db7de7f7db5d71c9a0662d` (`fix: address stock review page findings`).
+- Second review-remediation implementation commit: `891e8dd7a59cff477f52e7243a42bff9d8cf5f3c` (`fix: close stock review race and persistence gaps`).
 - No npm or Cargo dependency was added.
 - The pre-existing untracked `node_modules` symlink/directory was preserved and never staged.
 
@@ -81,9 +82,9 @@ exit code 0
 
 The requested six findings are closed without changing the approved information architecture:
 
-1. The portfolio/Campaign route prefill now validates and stages the exact `get_stock_review` argument object independently of the visible approved prompt. `chatStore` consumes that object atomically on the next outbound turn, clears it, and sends it through `ChatRequest`; the Rust AI service permits only the read-only `get_stock_review` tool, executes that exact scope once before model reasoning, and exposes the normal tool lifecycle UI. A retry/regenerate of the same failed/completed turn retains its captured scope, while a later new turn does not inherit it.
+1. The portfolio/Campaign route prefill now validates and stages the exact `get_stock_review` argument object independently of the visible approved prompt. `chatStore` consumes that object atomically on the next outbound turn, clears it, and sends it through `ChatRequest`; the Rust AI service permits only the read-only `get_stock_review` tool, executes that exact scope once before model reasoning, and exposes the normal tool lifecycle UI. A retry/regenerate in memory retains its captured scope; after persistence and reload, regeneration reconstructs the scope only from exactly one completed reserved `prefilled-stock-review` read-tool record, revalidates every field, and restores the `stock-review` skill. A later unrelated turn does not inherit it.
 2. Campaign detail loads and override confirmations now use `StockReviewFilters` reconstructed from the retained report's `methodology.query`. A newer filter edit whose refresh failed can no longer mix its account/date/market/benchmark/currency with the visible older report.
-3. Correction candidates now come from every action in the retained report, not the open Campaign. Each row shows transaction, stock, account, Campaign, and date, so cross-account/cross-Campaign transfer pairs can be selected. Each correction type states cardinality and economic eligibility; transfer selection enforces exactly two rows and the other types enforce their minimums. `same_day_order` has explicit keyboard-labelled up/down controls, and that ordered state is serialized unchanged into both transaction IDs and the backend order value.
+3. Correction candidates now come from every action in the retained report, not the open Campaign. Each row shows transaction, stock, account, Campaign, and date, so cross-account/cross-Campaign transfer pairs can be selected. Each correction type states cardinality and economic eligibility: transfer requires exactly two rows, duplicate/same-day order require at least two, and non-trade requires exactly one, matching `stock_review_persistence`. `same_day_order` has explicit keyboard-labelled up/down controls, and that ordered state is serialized unchanged into both transaction IDs and the backend order value.
 4. Campaign detail now includes Campaign return, benchmark return, remaining shares, all five backend availability regions and notes, and the note attached to each 20/60/120-day forward window. The existing explicit maximum-holding contract limitation remains visible and no value is inferred.
 5. `comparable_price_only` changes the third summary title to `调仓价格增益`; missing recovery renders `—`; and the nested 120-day status/sample/note remains visible.
 6. Any non-null report is content, even when curves/actions/Campaigns are all empty. Summary, attribution, and risk remain rendered; curve, Campaign, and action collections show their own local empty states.
@@ -127,3 +128,47 @@ exit code 0
 The new modal controls use explicit accessible labels, the selected transaction list is ordered and numbered, and all additions reuse Ant Design's responsive `Space`, `Descriptions`, `List`, `Card`, and `Drawer` primitives. The prior desktop/narrow browser smoke remains applicable to the unchanged page architecture; live Campaign data and its Tauri-only drawer still require the desktop shell.
 
 Remaining explicit backend contract limitations are unchanged: the report does not expose standalone Campaign peak-holding amount/weight or a standalone market-provider name, so the UI continues to show `—`/backend-managed explanatory text. Correction candidates intentionally include every eligible transaction ID exposed by report actions; dividend/fee timeline records and already-confirmed transfers are not offered as new trade-classification corrections.
+
+## Second review remediation
+
+The three follow-up findings are closed with scoped Store/view-model changes:
+
+1. Campaign requests now capture the exact source report identity (`generated_at` plus methodology query), reject filters that do not match that report, and verify the same identity again on response. A successful new report commit increments the Campaign request generation and clears detail/loading a second time. Therefore an old detail resolving either before or after the new report cannot remain attached. Campaign annotation and override callbacks carry the same identity and Campaign ID; the Store rejects them without invoking Tauri while a refresh is active or after either identity changes.
+2. The `non_trade` guidance and client validity rule now require exactly one transaction, matching Rust `validate_non_trade`; zero and multiple selections keep confirmation disabled.
+3. Completed host-prefilled tool calls are already persisted in assistant `tool_calls`. Session loading now reconstructs explicit context only when there is exactly one completed reserved `prefilled-stock-review` / `get_stock_review` record whose JSON arguments pass the same allowlist and required-field validation. It also restores the explicit `stock-review` skill. Live staging remains one-shot, and arbitrary tools, running/malformed/duplicate reserved records, and extra arguments are not elevated.
+
+### Second remediation TDD evidence
+
+Tests were written before the production fixes. The first focused run exited nonzero with four failures:
+
+```text
+- non_trade guidance still said “at least one”
+- both Campaign response-order tests left the old detail attached
+- the chat Store reload had no explicitToolContext
+```
+
+After fixing the Node test harness's extension resolution, the chat Store assertion failed with `actual: undefined` for the restored context. A further trust-boundary RED proved that a reserved record missing a completed status was incorrectly accepted. The final focused suite passed `58/58`, including the full Store path `send → tool event → persistence snapshot → load → regenerate`.
+
+### Second remediation verification
+
+```text
+node --test --experimental-strip-types src/**/*.test.ts
+96 passed; 0 failed
+
+npm run build
+TypeScript and Vite production build passed; existing large-chunk warning only
+
+cargo test --lib services::stock_review_persistence::tests::validate_override_checks_all_types_without_writing_and_save_is_idempotent --quiet
+1 passed; 0 failed
+
+cargo test --lib --quiet
+538 passed; 0 failed; 8 ignored
+
+cargo check --lib
+passed
+
+git diff --check
+exit code 0
+```
+
+No new dependency or database column was added. Regeneration restoration depends on the reserved completed tool-call record already written by successful chat persistence; older sessions created before tool-call persistence cannot reconstruct context and safely regenerate without the explicit scope.

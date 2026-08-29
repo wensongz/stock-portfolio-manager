@@ -188,13 +188,6 @@ function annotationVisibleAsOf(
   const explicitDate = dates.effectiveDate ?? dates.snapshotDate;
   if (explicitDate != null && explicitDate > context.endDate) return null;
   if (dates.effectiveStart != null && dates.effectiveStart > context.endDate) return null;
-  if (
-    annotation.account_id != null &&
-    context.accountId != null &&
-    annotation.account_id !== context.accountId
-  ) {
-    return null;
-  }
   return dates;
 }
 
@@ -234,67 +227,37 @@ export function createStockReviewAnnotationDisplayContext(
   };
 }
 
-export function isStockReviewAnnotationVisibleInReport(
+/**
+ * Mirrors Rust `load_display_context`: the backend is authoritative for this
+ * filter. Scope membership is deliberately not inferred from period arrays.
+ */
+export function isStockReviewAnnotationInDisplayContext(
   annotation: StockReviewAnnotation,
   context: StockReviewAnnotationDisplayContext,
 ): boolean {
   if (!annotationVisibleAsOf(annotation, context)) return false;
-  const annotationSymbol = normalizedStockIdentity(annotation.symbol);
-  if (annotation.scope_type === "period") return annotationSymbol == null;
-  if (annotation.scope_type === "action") {
-    const action = context.actions.find(
-      (candidate) => candidate.actionId === annotation.scope_key,
-    );
-    return Boolean(
-      action &&
-        (annotation.account_id == null || annotation.account_id === action.accountId) &&
-        (annotationSymbol == null ||
-          annotationSymbol === normalizedStockIdentity(action.symbol)),
-    );
-  }
-  if (annotation.scope_type === "campaign") {
-    const campaign = context.campaigns.find(
-      (candidate) => candidate.campaignId === annotation.scope_key,
-    );
-    return Boolean(
-      campaign &&
-        (annotation.account_id == null ||
-          campaign.accountIds.includes(annotation.account_id)) &&
-        (annotationSymbol == null ||
-          annotationSymbol === normalizedStockIdentity(campaign.symbol)),
-    );
-  }
-  if (annotation.scope_type !== "stock") return false;
-  const scopeSymbol = normalizedStockIdentity(annotation.scope_key);
-  if (scopeSymbol == null || (annotationSymbol != null && annotationSymbol !== scopeSymbol)) {
-    return false;
-  }
-  return (
-    context.actions.some(
-      (action) =>
-        normalizedStockIdentity(action.symbol) === scopeSymbol &&
-        (annotation.account_id == null || annotation.account_id === action.accountId),
-    ) ||
-    context.campaigns.some(
-      (campaign) =>
-        normalizedStockIdentity(campaign.symbol) === scopeSymbol &&
-        (annotation.account_id == null || campaign.accountIds.includes(annotation.account_id)),
-    )
-  );
+  return context.accountId == null || annotation.account_id === context.accountId;
 }
 
-export function isStockReviewAnnotationVisibleInCampaign(
+/**
+ * Mirrors Rust `annotation_applies_to_campaign`: the backend is authoritative
+ * for supported scopes, account matching, and Campaign lifetime semantics.
+ */
+export function doesStockReviewAnnotationApplyToCampaign(
   annotation: StockReviewAnnotation,
   context: StockReviewAnnotationDisplayContext,
   campaignId: string,
 ): boolean {
-  if (!isStockReviewAnnotationVisibleInReport(annotation, context)) return false;
+  if (!annotationVisibleAsOf(annotation, context)) return false;
   const campaign = context.campaigns.find(
     (candidate) => candidate.campaignId === campaignId,
   );
   if (!campaign) return false;
-  if (annotation.scope_type === "period") {
-    return annotation.account_id == null && annotation.symbol == null;
+  if (
+    annotation.account_id != null &&
+    !campaign.accountIds.includes(annotation.account_id)
+  ) {
+    return false;
   }
   if (annotation.scope_type === "campaign") return annotation.scope_key === campaignId;
   if (annotation.scope_type === "action") {
@@ -316,6 +279,7 @@ export function isStockReviewAnnotationVisibleInCampaign(
   const dates = annotationVisibleAsOf(annotation, context);
   if (!dates || !isValidDateOnly(campaign.startedAt.slice(0, 10))) return false;
   const campaignStart = campaign.startedAt.slice(0, 10);
+  if (campaignStart > context.endDate) return false;
   const campaignEnd =
     campaign.endedAt != null && isValidDateOnly(campaign.endedAt.slice(0, 10))
       ? campaign.endedAt.slice(0, 10) < context.endDate

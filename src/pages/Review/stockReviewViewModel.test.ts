@@ -8,9 +8,9 @@ import {
   buildStockReviewAiPrefill,
   createStockReviewAnnotationDisplayContext,
   createDefaultStockReviewFilters,
+  doesStockReviewAnnotationApplyToCampaign,
   getStockReviewDateRange,
-  isStockReviewAnnotationVisibleInCampaign,
-  isStockReviewAnnotationVisibleInReport,
+  isStockReviewAnnotationInDisplayContext,
   loadStockReviewFilters,
   mapStockReviewMetricForDisplay,
   saveStockReviewFilters,
@@ -342,49 +342,68 @@ function annotation(overrides: Record<string, unknown> = {}) {
   };
 }
 
-test("report annotation visibility rejects cross-account, future, malformed, and unknown scopes", () => {
+test("display context uses exact scoped account and as-of rules without period-array membership", () => {
   const invisible = [
+    annotation(),
     annotation({ account_id: "account-b" }),
     annotation({ value_json: '{"effective_date":"2026-08-29"}' }),
     annotation({ value_json: '{"effective_start":"2026-09-01"}' }),
     annotation({ value_json: '{"effective_date":"2026-02-30"}' }),
-    annotation({ scope_type: "action", scope_key: "unrelated-action" }),
-    annotation({ scope_type: "campaign", scope_key: "unrelated-campaign" }),
-    annotation({ scope_type: "stock", scope_key: "NVDA", symbol: "NVDA" }),
   ];
 
   for (const item of invisible) {
-    assert.equal(isStockReviewAnnotationVisibleInReport(item, displayContext), false);
+    assert.equal(isStockReviewAnnotationInDisplayContext(item, displayContext), false);
   }
-});
-
-test("report annotation visibility accepts global and actual action, Campaign, and stock scopes", () => {
   const visible = [
-    annotation(),
     annotation({ account_id: "account-a" }),
-    annotation({ scope_type: "action", scope_key: "action-a", symbol: " aapl " }),
-    annotation({ scope_type: "campaign", scope_key: "campaign-current", symbol: "AAPL" }),
+    annotation({
+      scope_type: "action",
+      scope_key: "action-outside-filtered-report",
+      account_id: "account-a",
+      symbol: "NVDA",
+    }),
+    annotation({
+      scope_type: "campaign",
+      scope_key: "campaign-outside-filtered-report",
+      account_id: "account-a",
+      symbol: "NVDA",
+    }),
     annotation({
       scope_type: "stock",
-      scope_key: " aapl ",
-      symbol: "AAPL",
+      scope_key: "NVDA",
+      symbol: "NVDA",
       account_id: "account-a",
       value_json: '{"effective_date":"2026-02-01"}',
     }),
   ];
 
   for (const item of visible) {
-    assert.equal(isStockReviewAnnotationVisibleInReport(item, displayContext), true);
+    assert.equal(isStockReviewAnnotationInDisplayContext(item, displayContext), true);
   }
 });
 
-test("Campaign annotation visibility uses exact scopes and prevents same-symbol cycle leakage", () => {
+test("all-account display context includes global and every account like the backend query", () => {
+  const allAccounts = createStockReviewAnnotationDisplayContext({
+    ...displayContext,
+    accountId: null,
+  });
+  assert.equal(isStockReviewAnnotationInDisplayContext(annotation(), allAccounts), true);
   assert.equal(
-    isStockReviewAnnotationVisibleInCampaign(annotation(), displayContext, "campaign-current"),
+    isStockReviewAnnotationInDisplayContext(
+      annotation({ account_id: "account-b" }),
+      allAccounts,
+    ),
     true,
   );
+});
+
+test("Campaign applicability excludes period and matches exact Campaign and action scopes", () => {
   assert.equal(
-    isStockReviewAnnotationVisibleInCampaign(
+    doesStockReviewAnnotationApplyToCampaign(annotation(), displayContext, "campaign-current"),
+    false,
+  );
+  assert.equal(
+    doesStockReviewAnnotationApplyToCampaign(
       annotation({ scope_type: "action", scope_key: "action-a" }),
       displayContext,
       "campaign-current",
@@ -392,7 +411,23 @@ test("Campaign annotation visibility uses exact scopes and prevents same-symbol 
     true,
   );
   assert.equal(
-    isStockReviewAnnotationVisibleInCampaign(
+    doesStockReviewAnnotationApplyToCampaign(
+      annotation({ scope_type: "action", scope_key: "action-old" }),
+      displayContext,
+      "campaign-current",
+    ),
+    false,
+  );
+  assert.equal(
+    doesStockReviewAnnotationApplyToCampaign(
+      annotation({ scope_type: "campaign", scope_key: "campaign-current" }),
+      displayContext,
+      "campaign-current",
+    ),
+    true,
+  );
+  assert.equal(
+    doesStockReviewAnnotationApplyToCampaign(
       annotation({ scope_type: "campaign", scope_key: "campaign-old" }),
       displayContext,
       "campaign-current",
@@ -400,7 +435,22 @@ test("Campaign annotation visibility uses exact scopes and prevents same-symbol 
     false,
   );
   assert.equal(
-    isStockReviewAnnotationVisibleInCampaign(
+    doesStockReviewAnnotationApplyToCampaign(
+      annotation({
+        scope_type: "campaign",
+        scope_key: "campaign-current",
+        account_id: "account-b",
+      }),
+      displayContext,
+      "campaign-current",
+    ),
+    false,
+  );
+});
+
+test("Campaign stock applicability respects lifetime and prevents same-symbol cycle leakage", () => {
+  assert.equal(
+    doesStockReviewAnnotationApplyToCampaign(
       annotation({
         scope_type: "stock",
         scope_key: "AAPL",
@@ -413,7 +463,7 @@ test("Campaign annotation visibility uses exact scopes and prevents same-symbol 
     false,
   );
   assert.equal(
-    isStockReviewAnnotationVisibleInCampaign(
+    doesStockReviewAnnotationApplyToCampaign(
       annotation({
         scope_type: "stock",
         scope_key: "AAPL",
@@ -427,7 +477,7 @@ test("Campaign annotation visibility uses exact scopes and prevents same-symbol 
     true,
   );
   assert.equal(
-    isStockReviewAnnotationVisibleInCampaign(
+    doesStockReviewAnnotationApplyToCampaign(
       annotation({
         scope_type: "stock",
         scope_key: "AAPL",
@@ -437,6 +487,44 @@ test("Campaign annotation visibility uses exact scopes and prevents same-symbol 
       }),
       displayContext,
       "campaign-current",
+    ),
+    false,
+  );
+  assert.equal(
+    doesStockReviewAnnotationApplyToCampaign(
+      annotation({
+        scope_type: "stock",
+        scope_key: "AAPL",
+        symbol: "AAPL",
+        account_id: "account-a",
+        value_json: '{"effective_date":"2026-09-01"}',
+      }),
+      displayContext,
+      "campaign-current",
+    ),
+    false,
+  );
+
+  const futureCampaign = createStockReviewAnnotationDisplayContext({
+    ...displayContext,
+    campaigns: [
+      {
+        ...displayContext.campaigns[1],
+        campaignId: "campaign-future",
+        startedAt: "2026-09-01T09:30:00Z",
+      },
+    ],
+  });
+  assert.equal(
+    doesStockReviewAnnotationApplyToCampaign(
+      annotation({
+        scope_type: "stock",
+        scope_key: "AAPL",
+        symbol: "AAPL",
+        account_id: "account-a",
+      }),
+      futureCampaign,
+      "campaign-future",
     ),
     false,
   );

@@ -716,11 +716,11 @@ test("saveAnnotation appends only rows visible to the current report and drawer"
       value_json: '{"effective_date":"2026-08-29"}',
     }),
     savedAnnotation({
-      id: "other-campaign",
+      id: "out-of-period-campaign",
       scope_type: "campaign",
-      scope_key: "campaign-old",
+      scope_key: "campaign-outside-filtered-report",
       account_id: "account-a",
-      symbol: "AAPL",
+      symbol: "NVDA",
     }),
     savedAnnotation({
       id: "current-campaign",
@@ -730,6 +730,7 @@ test("saveAnnotation appends only rows visible to the current report and drawer"
       symbol: "AAPL",
     }),
     savedAnnotation({ id: "global" }),
+    savedAnnotation({ id: "scoped-period", account_id: "account-a" }),
   ];
   invokeImpl = async (command) => {
     assert.equal(command, "save_stock_review_annotation");
@@ -751,11 +752,11 @@ test("saveAnnotation appends only rows visible to the current report and drawer"
 
   assert.deepEqual(
     useStockReviewStore.getState().report.annotations.map((item) => item.id),
-    ["other-campaign", "current-campaign", "global"],
+    ["out-of-period-campaign", "current-campaign", "scoped-period"],
   );
   assert.deepEqual(
     useStockReviewStore.getState().selectedCampaign.annotations.map((item) => item.id),
-    ["current-campaign", "global"],
+    ["current-campaign"],
   );
   assert.equal(useStockReviewStore.getState().report.summary, currentReport.summary);
 });
@@ -781,13 +782,15 @@ test("override result preserves a visible annotation that completes before it", 
     id: "during-override",
     scope_type: "period",
     scope_key: "2026-01-01:2026-08-28",
-    account_id: null,
+    account_id: "account-a",
     symbol: null,
     annotation_type: "note",
     value_json: "{}",
     source: "user",
   });
-  annotationRequest.resolve(savedAnnotation({ id: "during-override" }));
+  annotationRequest.resolve(
+    savedAnnotation({ id: "during-override", account_id: "account-a" }),
+  );
   await annotationSave;
   overrideRequest.resolve(overridden);
   await overrideSave;
@@ -822,7 +825,7 @@ test("annotation completion after override resolution applies to the returned re
     id: "after-override",
     scope_type: "period",
     scope_key: "2026-01-01:2026-08-28",
-    account_id: null,
+    account_id: "account-a",
     symbol: null,
     annotation_type: "note",
     value_json: "{}",
@@ -830,7 +833,9 @@ test("annotation completion after override resolution applies to the returned re
   });
   overrideRequest.resolve(overridden);
   await overrideSave;
-  annotationRequest.resolve(savedAnnotation({ id: "after-override" }));
+  annotationRequest.resolve(
+    savedAnnotation({ id: "after-override", account_id: "account-a" }),
+  );
   await annotationSave;
 
   assert.equal(useStockReviewStore.getState().report.methodology, overridden.methodology);

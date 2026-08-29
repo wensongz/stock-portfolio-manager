@@ -10,8 +10,8 @@ import type {
 } from "../types";
 import {
   createStockReviewAnnotationDisplayContext,
-  isStockReviewAnnotationVisibleInCampaign,
-  isStockReviewAnnotationVisibleInReport,
+  doesStockReviewAnnotationApplyToCampaign,
+  isStockReviewAnnotationInDisplayContext,
 } from "../pages/Review/stockReviewViewModel.ts";
 
 type StockReviewErrorSource = "report" | "campaign" | "annotation" | "override";
@@ -98,7 +98,7 @@ function mergeVisibleAnnotations(
   const context = createStockReviewAnnotationDisplayContext(report);
   let annotations = [...report.annotations];
   for (const annotation of currentAnnotations) {
-    if (isStockReviewAnnotationVisibleInReport(annotation, context)) {
+    if (isStockReviewAnnotationInDisplayContext(annotation, context)) {
       annotations = replaceAnnotation(annotations, annotation);
     }
   }
@@ -237,12 +237,13 @@ export const useStockReviewStore = create<StockReviewState>((set, get) => ({
             ? createStockReviewAnnotationDisplayContext(state.report)
             : null;
           const reportVisible = Boolean(
-            context && isStockReviewAnnotationVisibleInReport(annotation, context),
+            context && isStockReviewAnnotationInDisplayContext(annotation, context),
           );
           const campaignVisible = Boolean(
             context &&
+              reportVisible &&
               state.selectedCampaign &&
-              isStockReviewAnnotationVisibleInCampaign(
+              doesStockReviewAnnotationApplyToCampaign(
                 annotation,
                 context,
                 state.selectedCampaign.summary.campaign_id,

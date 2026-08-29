@@ -109,7 +109,8 @@ pub struct ResultQualityOutput {
 }
 
 pub fn calculate_result_quality(input: &ResultQualityInput) -> ResultQualityOutput {
-    let valuation_coverage = actual_valuation_coverage(input);
+    let actual_values = authoritative_actual_values(input);
+    let valuation_coverage = actual_valuation_coverage(input, &actual_values);
     let effective_actual_availability = MetricAvailability {
         status: merge_metric_statuses(&[
             input.actual_availability.status.clone(),
@@ -125,11 +126,11 @@ pub fn calculate_result_quality(input: &ResultQualityInput) -> ResultQualityOutp
         .baseline
         .as_ref()
         .map(|point| point.date)
-        .or_else(|| input.actual_values.first().map(|point| point.date))
+        .or_else(|| actual_values.first().map(|point| point.date))
         == Some(input.actual_origin_date);
     let actual_twr = if actual_origin_matches_twr {
         validated_actual_twr(
-            &input.actual_values,
+            &actual_values,
             input.baseline.as_ref(),
             &input.external_flows_base,
             &effective_actual_availability,
@@ -144,9 +145,8 @@ pub fn calculate_result_quality(input: &ResultQualityInput) -> ResultQualityOutp
         .map(|point| point.cumulative_return / 100.0);
 
     let fixed_weights = opening_weights(input);
-    let benchmark_by_date = benchmark_returns_by_date(input, &fixed_weights);
-    let benchmark_return = input
-        .actual_values
+    let benchmark_by_date = benchmark_returns_by_date(input, &fixed_weights, &actual_values);
+    let benchmark_return = actual_values
         .last()
         .and_then(|point| benchmark_by_date.get(&point.date).copied().flatten());
     let benchmark_status = benchmark_status(input, &fixed_weights);
@@ -196,7 +196,12 @@ pub fn calculate_result_quality(input: &ResultQualityInput) -> ResultQualityOutp
             .zip(benchmark_return)
             .map(|(actual, benchmark)| actual - benchmark),
     };
-    let normalized_curve = normalized_review_curve(input, &actual_twr_series, &benchmark_by_date);
+    let normalized_curve = normalized_review_curve(
+        input,
+        &actual_values,
+        &actual_twr_series,
+        &benchmark_by_date,
+    );
     let max_drawdown = if valuation_coverage.status == MetricStatus::Available {
         actual_twr
             .as_ref()
@@ -221,15 +226,26 @@ pub fn calculate_result_quality(input: &ResultQualityInput) -> ResultQualityOutp
     }
 }
 
-fn actual_valuation_coverage(input: &ResultQualityInput) -> MetricAvailability {
+fn authoritative_actual_values(input: &ResultQualityInput) -> Vec<PortfolioValuePoint> {
+    input
+        .actual_values
+        .iter()
+        .filter(|point| {
+            input
+                .expected_actual_dates
+                .binary_search(&point.date)
+                .is_ok()
+        })
+        .cloned()
+        .collect()
+}
+
+fn actual_valuation_coverage(
+    input: &ResultQualityInput,
+    actual_values: &[PortfolioValuePoint],
+) -> MetricAvailability {
     let expected = &input.expected_actual_dates;
-    if expected.is_empty()
-        || expected.windows(2).any(|pair| pair[0] >= pair[1])
-        || input
-            .actual_values
-            .iter()
-            .any(|point| expected.binary_search(&point.date).is_err())
-    {
+    if expected.is_empty() || expected.windows(2).any(|pair| pair[0] >= pair[1]) {
         return availability(
             MetricStatus::Unavailable,
             Some(
@@ -252,18 +268,13 @@ fn actual_valuation_coverage(input: &ResultQualityInput) -> MetricAvailability {
         );
     }
     let terminal = *expected.last().expect("non-empty checked above");
-    if !input
-        .actual_values
-        .iter()
-        .any(|point| point.date == terminal)
-    {
+    if !actual_values.iter().any(|point| point.date == terminal) {
         return availability(
             MetricStatus::Unavailable,
             Some("The requested period has no exact terminal portfolio valuation.".to_string()),
         );
     }
-    let present = input
-        .actual_values
+    let present = actual_values
         .iter()
         .map(|point| point.date)
         .collect::<BTreeSet<_>>()
@@ -369,9 +380,9 @@ fn benchmark_status(input: &ResultQualityInput, weights: &BTreeMap<String, f64>)
 fn benchmark_returns_by_date(
     input: &ResultQualityInput,
     weights: &BTreeMap<String, f64>,
+    actual_values: &[PortfolioValuePoint],
 ) -> BTreeMap<NaiveDate, Option<f64>> {
-    let dates = input
-        .actual_values
+    let dates = actual_values
         .iter()
         .map(|point| point.date)
         .chain(std::iter::once(input.actual_origin_date))
@@ -505,6 +516,7 @@ fn validated_actual_twr(
 
 fn normalized_review_curve(
     input: &ResultQualityInput,
+    actual_values: &[PortfolioValuePoint],
     actual_twr_series: &[ReturnDataPoint],
     benchmark_by_date: &BTreeMap<NaiveDate, Option<f64>>,
 ) -> Vec<NormalizedReviewCurvePoint> {
@@ -526,7 +538,7 @@ fn normalized_review_curve(
         .map(|value| 1.0 + value)
         .filter(|value| value.is_finite() && *value > 0.0);
     let dates = std::iter::once(origin)
-        .chain(input.actual_values.iter().map(|point| point.date))
+        .chain(actual_values.iter().map(|point| point.date))
         .collect::<BTreeSet<_>>();
     dates
         .into_iter()
@@ -2188,6 +2200,89 @@ mod tests {
         assert_eq!(complete.metric.availability.status, MetricStatus::Available);
         assert!(complete.metric.portfolio_return.is_some());
         assert!(complete.max_drawdown.max_drawdown.is_some());
+    }
+
+    #[test]
+    fn actual_metrics_project_observations_onto_authoritative_sessions() {
+        // 2024-01-06 is Saturday. If it enters the path, its value of 1 would
+        // fabricate a severe drawdown; if it invalidates coverage, the valid
+        // Friday/Monday series disappears entirely.
+        let mut input = result_input(BenchmarkSelection::SingleMarket("US".to_string()));
+        input.actual_origin_date = date(4);
+        input.baseline = Some(PortfolioValuePoint {
+            date: date(4),
+            value_base: 100.0,
+        });
+        input.expected_baseline_date = Some(date(4));
+        input.expected_actual_dates = vec![date(5), date(8)];
+        input.actual_values = vec![
+            PortfolioValuePoint {
+                date: date(5),
+                value_base: 110.0,
+            },
+            PortfolioValuePoint {
+                date: date(6),
+                value_base: 1.0,
+            },
+            PortfolioValuePoint {
+                date: date(8),
+                value_base: 121.0,
+            },
+        ];
+        input.benchmark_series[0].points = vec![
+            BenchmarkPoint {
+                date: date(4),
+                value: 100.0,
+            },
+            BenchmarkPoint {
+                date: date(5),
+                value: 100.0,
+            },
+            BenchmarkPoint {
+                date: date(8),
+                value: 100.0,
+            },
+        ];
+
+        let result = calculate_result_quality(&input);
+        assert_eq!(result.metric.availability.status, MetricStatus::Available);
+        assert!((result.metric.portfolio_return.unwrap() - 0.21).abs() < 1e-12);
+        assert_eq!(result.max_drawdown.max_drawdown, Some(0.0));
+        assert_eq!(
+            result
+                .actual_twr_series
+                .iter()
+                .map(|point| point.date.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2024-01-05", "2024-01-08"]
+        );
+        assert!(result
+            .normalized_curve
+            .iter()
+            .all(|point| point.date != date(6)));
+    }
+
+    #[test]
+    fn non_session_only_actual_data_cannot_satisfy_coverage_or_terminal() {
+        let mut input = result_input(BenchmarkSelection::SingleMarket("US".to_string()));
+        input.actual_origin_date = date(4);
+        input.baseline = Some(PortfolioValuePoint {
+            date: date(4),
+            value_base: 100.0,
+        });
+        input.expected_baseline_date = Some(date(4));
+        input.expected_actual_dates = vec![date(5), date(8)];
+        input.actual_values = vec![PortfolioValuePoint {
+            date: date(6),
+            value_base: 121.0,
+        }];
+
+        let result = calculate_result_quality(&input);
+        assert_eq!(result.metric.availability.status, MetricStatus::Unavailable);
+        assert_eq!(result.metric.portfolio_return, None);
+        assert!(result.actual_twr_series.is_empty());
+        assert!(result.normalized_curve.is_empty());
+        assert_eq!(result.max_drawdown.max_drawdown, None);
     }
 
     #[test]

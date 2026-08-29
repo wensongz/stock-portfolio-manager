@@ -1540,7 +1540,7 @@ where
         &market_calendars_by_market,
     );
     let (baseline, actual_values, mut actual_availability, actual_nav_complete) =
-        load_actual_values(db, &query, expected_baseline_date)?;
+        load_actual_values(db, &query, expected_baseline_date, &expected_actual_dates)?;
     let actual_origin_date = expected_baseline_date
         .or_else(|| expected_actual_dates.first().copied())
         .unwrap_or(query.start_date);
@@ -2341,6 +2341,7 @@ fn load_actual_values(
     db: &Database,
     query: &StockReviewQuery,
     expected_baseline_date: Option<NaiveDate>,
+    expected_actual_dates: &[NaiveDate],
 ) -> Result<
     (
         Option<PortfolioValuePoint>,
@@ -2351,6 +2352,10 @@ fn load_actual_values(
     String,
 > {
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let expected_actual_dates = expected_actual_dates
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
     if query.account_id.is_none() && query.market.is_none() {
         let baseline = expected_baseline_date.and_then(|expected_date| {
             conn.query_row(
@@ -2400,20 +2405,28 @@ fn load_actual_values(
             .map_err(|error| error.to_string())?
             .filter_map(|row| row.ok())
             .collect::<Vec<_>>();
-        let values = rows
-            .iter()
+        let projected_rows = rows
+            .into_iter()
             .filter_map(|(date, value, rates_json)| {
                 NaiveDate::parse_from_str(&date, "%Y-%m-%d")
                     .ok()
-                    .zip(convert_snapshot_value(
-                        *value,
-                        rates_json,
-                        &query.base_currency,
-                    ))
-                    .map(|(date, value_base)| PortfolioValuePoint { date, value_base })
+                    .filter(|date| expected_actual_dates.contains(date))
+                    .map(|date| (date, value, rates_json))
             })
             .collect::<Vec<_>>();
-        let nav_complete = baseline.is_some() && !values.is_empty() && values.len() == rows.len();
+        let values = projected_rows
+            .iter()
+            .filter_map(|(date, value, rates_json)| {
+                convert_snapshot_value(*value, rates_json, &query.base_currency).map(|value_base| {
+                    PortfolioValuePoint {
+                        date: *date,
+                        value_base,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let nav_complete =
+            baseline.is_some() && !values.is_empty() && values.len() == projected_rows.len();
         let availability = if nav_complete {
             MetricAvailability {
                 status: MetricStatus::Available,
@@ -2470,6 +2483,9 @@ fn load_actual_values(
         let Some(date) = NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok() else {
             continue;
         };
+        if !expected_actual_dates.contains(&date) {
+            continue;
+        }
         let currency = market_currency(&market);
         let converted = if currency == query.base_currency {
             value.is_finite().then_some(value)
@@ -7935,7 +7951,7 @@ mod tests {
         query.market = None;
         query.end_date = day("2024-01-01");
         let (baseline, values, availability, nav_complete) =
-            load_actual_values(&db, &query, Some(day("2023-12-31"))).unwrap();
+            load_actual_values(&db, &query, Some(day("2023-12-31")), &[day("2024-01-01")]).unwrap();
         assert!(nav_complete);
         assert_eq!(availability.status, MetricStatus::Available);
         assert_eq!(baseline.unwrap().value_base, 7_000.0);
@@ -7958,11 +7974,64 @@ mod tests {
         query.market = None;
 
         let (baseline, values, availability, nav_complete) =
-            load_actual_values(&db, &query, Some(day("2024-01-05"))).unwrap();
+            load_actual_values(&db, &query, Some(day("2024-01-05")), &[day("2024-01-08")]).unwrap();
         assert!(nav_complete);
         assert_eq!(availability.status, MetricStatus::Available);
         assert_eq!(baseline.unwrap().date, day("2024-01-05"));
         assert_eq!(values.last().unwrap().date, day("2024-01-08"));
+    }
+
+    #[test]
+    fn actual_snapshot_loading_excludes_non_sessions_before_completeness() {
+        let db = Database::new(":memory:").unwrap();
+        for (date, value) in [
+            ("2024-01-04", 100.0),
+            ("2024-01-05", 110.0),
+            ("2024-01-06", 1.0),
+            ("2024-01-08", 121.0),
+        ] {
+            insert_portfolio_value(&db, date, value, 7.0);
+        }
+        let mut query = complete_cached_fixture(false).query;
+        query.start_date = day("2024-01-05");
+        query.end_date = day("2024-01-08");
+        query.market = None;
+
+        let (_, values, availability, nav_complete) = load_actual_values(
+            &db,
+            &query,
+            Some(day("2024-01-04")),
+            &[day("2024-01-05"), day("2024-01-08")],
+        )
+        .unwrap();
+        assert!(nav_complete);
+        assert_eq!(availability.status, MetricStatus::Available);
+        assert_eq!(
+            values.iter().map(|point| point.date).collect::<Vec<_>>(),
+            vec![day("2024-01-05"), day("2024-01-08")]
+        );
+    }
+
+    #[test]
+    fn non_session_only_snapshot_loading_is_not_complete() {
+        let db = Database::new(":memory:").unwrap();
+        insert_portfolio_value(&db, "2024-01-04", 100.0, 7.0);
+        insert_portfolio_value(&db, "2024-01-06", 121.0, 7.0);
+        let mut query = complete_cached_fixture(false).query;
+        query.start_date = day("2024-01-05");
+        query.end_date = day("2024-01-08");
+        query.market = None;
+
+        let (_, values, availability, nav_complete) = load_actual_values(
+            &db,
+            &query,
+            Some(day("2024-01-04")),
+            &[day("2024-01-05"), day("2024-01-08")],
+        )
+        .unwrap();
+        assert!(!nav_complete);
+        assert_eq!(availability.status, MetricStatus::Unavailable);
+        assert!(values.is_empty());
     }
 
     #[tokio::test]

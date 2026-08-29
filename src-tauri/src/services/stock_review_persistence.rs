@@ -2156,8 +2156,8 @@ mod tests {
 
     #[test]
     fn prepared_override_rejects_a_changed_full_review_source_revision() {
-        // A split, price, session, FX, annotation, or other report source
-        // changing after candidate materialization must prevent a stale save.
+        // A calendar revision changing after candidate materialization must
+        // prevent a stale save just like any other full-review dependency.
         let db = database();
         insert_transaction(
             &db,
@@ -2169,6 +2169,18 @@ mod tests {
             100.0,
             "2024-02-01",
         );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO stock_market_calendar_coverage
+                    (market, source, complete_start, complete_through, revision,
+                     encodes_closed_dates, updated_at)
+                 VALUES ('US', 'fixture', '2024-01-01', '2026-12-31',
+                         'calendar-v1', 1, '2024-02-01')",
+                [],
+            )
+            .unwrap();
         let candidate = prepare_override_candidate(
             &db,
             override_input("candidate", "non_trade", &["buy"], "{}"),
@@ -2178,8 +2190,9 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO stock_splits (stock_code, split_date, ratio_from, ratio_to, created_at)
-                 VALUES ('AAPL', '2024-02-02', 1, 2, '2024-02-01')",
+                "UPDATE stock_market_calendar_coverage
+                 SET revision = 'calendar-v2'
+                 WHERE market = 'US'",
                 [],
             )
             .unwrap();

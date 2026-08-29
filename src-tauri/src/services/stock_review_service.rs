@@ -16,6 +16,9 @@ use crate::services::shadow_portfolio_engine::{
 };
 use crate::services::stock_action_builder::{build_stock_actions, CorrectedTransaction};
 use crate::services::stock_campaign_builder::build_stock_campaigns;
+use crate::services::stock_review_calendar::{
+    self, CalendarSyncOutcome, CalendarSyncStatus, IndexHistorySource,
+};
 use crate::services::stock_review_market_data::{
     default_benchmark_symbol, ensure_stock_price_cache, load_benchmark_series,
     load_market_sessions, load_stock_price_series, nth_market_session_after, DailyMarketPoint,
@@ -28,10 +31,11 @@ use crate::services::stock_review_persistence::{
 use crate::services::stock_review_quality::{
     build_stock_review_quality, ObservationWindowMaturity, QualityInput,
 };
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use rusqlite::params;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 const ALGORITHM_VERSION: &str = "stock-review-v1";
 
@@ -912,6 +916,26 @@ pub async fn get_stock_review_report(
     build_stock_review_report_from_cached_data(&input)
 }
 
+#[cfg(test)]
+async fn get_stock_review_report_with_calendar_sources(
+    db: &Database,
+    query: StockReviewQuery,
+    sources: &[Arc<dyn IndexHistorySource>],
+    now: DateTime<Utc>,
+) -> Result<StockReviewReport, String> {
+    let input = prepare_cached_stock_review_input_with_calendar_sources(
+        db,
+        query,
+        None,
+        None,
+        sources,
+        now,
+        |_| Ok(()),
+    )
+    .await?;
+    build_stock_review_report_from_cached_data(&input)
+}
+
 pub async fn get_stock_campaign_detail(
     db: &Database,
     query: StockReviewQuery,
@@ -1143,21 +1167,50 @@ async fn prepare_cached_stock_review_input_with_candidate(
     candidate: Option<StockReviewOverride>,
     candidate_revision: Option<&mut stock_review_persistence::ValidatedOverrideCandidate>,
 ) -> Result<CachedStockReviewInput, String> {
-    prepare_cached_stock_review_input_with_candidate_and_cache_hook(
+    let sources = stock_review_calendar::live_index_history_sources();
+    prepare_cached_stock_review_input_with_calendar_sources(
         db,
         query,
         candidate,
         candidate_revision,
+        &sources,
+        Utc::now(),
         |_| Ok(()),
     )
     .await
 }
 
+#[cfg(test)]
 async fn prepare_cached_stock_review_input_with_candidate_and_cache_hook<F>(
     db: &Database,
     query: StockReviewQuery,
     candidate: Option<StockReviewOverride>,
+    candidate_revision: Option<&mut stock_review_persistence::ValidatedOverrideCandidate>,
+    after_cache_fill: F,
+) -> Result<CachedStockReviewInput, String>
+where
+    F: FnOnce(&Database) -> Result<(), String>,
+{
+    let sources = Vec::<Arc<dyn IndexHistorySource>>::new();
+    prepare_cached_stock_review_input_with_calendar_sources(
+        db,
+        query,
+        candidate,
+        candidate_revision,
+        &sources,
+        Utc::now(),
+        after_cache_fill,
+    )
+    .await
+}
+
+async fn prepare_cached_stock_review_input_with_calendar_sources<F>(
+    db: &Database,
+    query: StockReviewQuery,
+    candidate: Option<StockReviewOverride>,
     mut candidate_revision: Option<&mut stock_review_persistence::ValidatedOverrideCandidate>,
+    sources: &[Arc<dyn IndexHistorySource>],
+    now: DateTime<Utc>,
     after_cache_fill: F,
 ) -> Result<CachedStockReviewInput, String>
 where
@@ -1165,7 +1218,7 @@ where
 {
     validate_query(&query)?;
     validate_account_exists(db, query.account_id.as_deref())?;
-    let today = Utc::now().date_naive();
+    let today = now.date_naive();
     let candidate_record = candidate.clone();
     let mut override_list = stock_review_persistence::list_overrides_for_query(db, &query, today)?;
     if let Some(candidate) = candidate.clone() {
@@ -1222,15 +1275,41 @@ where
         .map_or(query.start_date - Duration::days(10), |date| {
             date.min(query.start_date - Duration::days(10))
         });
-    let mut local_markets = security_keys
+    let review_markets = required_review_markets(&query, &security_keys);
+    let calendar_outcomes = stock_review_calendar::sync_market_calendars_with_sources(
+        db,
+        &review_markets,
+        price_start,
+        now,
+        sources,
+    )
+    .await;
+    let calendar_terminal_by_market = calendar_outcomes
         .iter()
-        .map(|(_, market)| market.clone())
-        .collect::<BTreeSet<_>>();
+        .map(|outcome| (outcome.market.clone(), outcome.requested_through))
+        .collect::<BTreeMap<_, _>>();
+    let calendar_load_through_by_market = calendar_outcomes
+        .iter()
+        .map(|outcome| {
+            (
+                outcome.market.clone(),
+                outcome
+                    .available_through
+                    .filter(|through| *through >= price_start)
+                    .unwrap_or(outcome.requested_through),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let local_markets = review_markets.clone();
     let mut market_calendars_by_market = BTreeMap::new();
     for market in &local_markets {
+        let required_through = calendar_load_through_by_market
+            .get(market)
+            .copied()
+            .unwrap_or(today);
         market_calendars_by_market.insert(
             market.clone(),
-            load_market_sessions(db, market, price_start, today)?,
+            load_market_sessions(db, market, price_start, required_through)?,
         );
     }
     let market_sessions_by_market = market_calendars_by_market
@@ -1246,12 +1325,31 @@ where
                 market_sessions_by_market
                     .get(&action.market)
                     .and_then(|sessions| nth_market_session_after(sessions, action_date, 120))
-                    .unwrap_or(today),
+                    .unwrap_or_else(|| {
+                        calendar_terminal_by_market
+                            .get(&action.market)
+                            .copied()
+                            .unwrap_or(today)
+                    }),
             )
         })
         .max()
-        .unwrap_or(query.end_date.min(today))
-        .max(query.end_date.min(today));
+        .unwrap_or_else(|| {
+            local_markets
+                .iter()
+                .filter_map(|market| calendar_terminal_by_market.get(market).copied())
+                .map(|terminal| query.end_date.min(terminal))
+                .max()
+                .unwrap_or(query.end_date.min(today))
+        })
+        .max(
+            local_markets
+                .iter()
+                .filter_map(|market| calendar_terminal_by_market.get(market).copied())
+                .map(|terminal| query.end_date.min(terminal))
+                .max()
+                .unwrap_or(query.end_date.min(today)),
+        );
     let mut price_end = evaluation_end;
     let mut prices_by_security = BTreeMap::new();
     for (symbol, market) in &security_keys {
@@ -1271,7 +1369,7 @@ where
         );
     }
 
-    let benchmark_specs = benchmark_specs(&query);
+    let benchmark_specs = benchmark_specs(&query, &review_markets);
     let mut benchmark_series = Vec::new();
     let mut benchmark_points_by_market = BTreeMap::new();
     for (market, symbol) in &benchmark_specs {
@@ -1315,11 +1413,6 @@ where
         );
     }
 
-    for (market, _) in &benchmark_specs {
-        if market != "CUSTOM" {
-            local_markets.insert(market.clone());
-        }
-    }
     let benchmark_symbols = benchmark_specs
         .iter()
         .map(|(_, symbol)| symbol.clone())
@@ -1357,7 +1450,11 @@ where
     let refreshed_calendars = local_markets
         .iter()
         .map(|market| {
-            load_market_sessions(db, market, price_start, today)
+            let required_through = calendar_load_through_by_market
+                .get(market)
+                .copied()
+                .unwrap_or(today);
+            load_market_sessions(db, market, price_start, required_through)
                 .map(|calendar| (market.clone(), calendar))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -1374,12 +1471,31 @@ where
                 refreshed_sessions
                     .get(&action.market)
                     .and_then(|sessions| nth_market_session_after(sessions, action_date, 120))
-                    .unwrap_or(today),
+                    .unwrap_or_else(|| {
+                        calendar_terminal_by_market
+                            .get(&action.market)
+                            .copied()
+                            .unwrap_or(today)
+                    }),
             )
         })
         .max()
-        .unwrap_or(query.end_date.min(today))
-        .max(query.end_date.min(today));
+        .unwrap_or_else(|| {
+            local_markets
+                .iter()
+                .filter_map(|market| calendar_terminal_by_market.get(market).copied())
+                .map(|terminal| query.end_date.min(terminal))
+                .max()
+                .unwrap_or(query.end_date.min(today))
+        })
+        .max(
+            local_markets
+                .iter()
+                .filter_map(|market| calendar_terminal_by_market.get(market).copied())
+                .map(|terminal| query.end_date.min(terminal))
+                .max()
+                .unwrap_or(query.end_date.min(today)),
+        );
     price_end = evaluation_end;
     if let Some(candidate) = candidate_revision.as_deref_mut() {
         stock_review_persistence::set_candidate_revision_scope(
@@ -1487,7 +1603,12 @@ where
     let market_calendars_by_market = local_markets
         .iter()
         .map(|market| {
-            load_market_sessions(db, market, price_start, evaluation_end)
+            let required_through = calendar_load_through_by_market
+                .get(market)
+                .copied()
+                .unwrap_or(evaluation_end)
+                .min(evaluation_end);
+            load_market_sessions(db, market, price_start, required_through)
                 .map(|calendar| (market.clone(), calendar))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -1538,6 +1659,7 @@ where
         price_start,
         &valuation_markets,
         &market_calendars_by_market,
+        &calendar_terminal_by_market,
     );
     let (baseline, actual_values, mut actual_availability, actual_nav_complete) =
         load_actual_values(db, &query, expected_baseline_date, &expected_actual_dates)?;
@@ -1568,7 +1690,7 @@ where
     )?;
     let (opening_cash, opening_cash_complete) =
         opening_cash(db, corrected_transactions, &query, actual_origin_date)?;
-    let mut preparation_issues = Vec::new();
+    let mut preparation_issues = calendar_sync_issues(&calendar_outcomes);
     if actual_availability
         .note
         .as_deref()
@@ -1601,12 +1723,20 @@ where
         });
     }
     for (market, calendar) in &market_calendars_by_market {
-        preparation_issues.push(if calendar.availability.status == MetricStatus::Unavailable {
+        let required_through = query.end_date.min(
+            calendar_terminal_by_market
+                .get(market)
+                .copied()
+                .unwrap_or(today),
+        );
+        preparation_issues.push(if !calendar.covers(price_start, required_through) {
             StockReviewIssue {
                 code: "market_calendar_unavailable".to_string(),
                 severity: StockReviewIssueSeverity::Error,
                 message: format!(
-                    "No authoritative {market} exchange-session calendar is cached; exact forward and Campaign session metrics are unavailable."
+                    "Authoritative {market} exchange-session coverage is {} through {}; {price_start} through {required_through} is required, so exact forward and Campaign session metrics are unavailable.",
+                    calendar.complete_start.map_or_else(|| "unavailable".to_string(), |date| date.to_string()),
+                    calendar.complete_through.map_or_else(|| "unavailable".to_string(), |date| date.to_string()),
                 ),
                 affected_symbol: None,
                 affected_date: None,
@@ -1769,12 +1899,13 @@ where
             let benchmark = local_benchmark_points_by_market.get(&action.market)?;
             let sessions = market_sessions_by_market.get(&action.market)?;
             let calendar = market_calendars_by_market.get(&action.market)?;
+            let requested_through = calendar_terminal_by_market
+                .get(&action.market)
+                .copied()
+                .unwrap_or(today);
             let target_120 = nth_market_session_after(sessions, date, 120);
             let calendar_covers_window = calendar.complete_start.is_some_and(|start| start <= date)
-                && (target_120.is_some()
-                    || calendar
-                        .complete_through
-                        .is_some_and(|through| through >= today));
+                && (target_120.is_some() || calendar.covers(date, requested_through));
             let fx = exact_fx_on(
                 market_currency(&action.market),
                 &query.base_currency,
@@ -1838,12 +1969,19 @@ where
             let benchmark = local_benchmark_points_by_market.get(market)?;
             let sessions = market_sessions_by_market.get(market)?;
             let calendar = market_calendars_by_market.get(market)?;
-            let calendar_covers_campaign = calendar.covers(campaign_start, campaign_end);
+            let required_campaign_end = campaign_end.min(
+                calendar_terminal_by_market
+                    .get(market)
+                    .copied()
+                    .unwrap_or(today),
+            );
+            let calendar_covers_campaign =
+                calendar.covers(campaign_start, required_campaign_end);
             let currency = market_currency(market);
             let expected_session_dates = if calendar_covers_campaign {
                 sessions
                     .iter()
-                    .filter(|date| **date >= campaign_start && **date <= campaign_end)
+                    .filter(|date| **date >= campaign_start && **date <= required_campaign_end)
                     .copied()
                     .collect::<Vec<_>>()
             } else {
@@ -2103,7 +2241,7 @@ where
                 .and_then(default_benchmark_symbol)
                 .map(str::to_string)
         }),
-        generated_at: Utc::now().to_rfc3339(),
+        generated_at: now.to_rfc3339(),
     };
     if let Some(candidate) = candidate_revision.as_deref() {
         stock_review_persistence::verify_candidate_source_revision(db, candidate)?;
@@ -2254,22 +2392,78 @@ fn load_current_holding_currencies(
     Ok(currencies)
 }
 
-fn benchmark_specs(query: &StockReviewQuery) -> Vec<(String, String)> {
+fn required_review_markets(
+    query: &StockReviewQuery,
+    security_keys: &BTreeSet<(String, String)>,
+) -> BTreeSet<String> {
+    security_keys
+        .iter()
+        .map(|(_, market)| market.clone())
+        .chain(query.market.clone())
+        .collect()
+}
+
+fn calendar_sync_issues(outcomes: &[CalendarSyncOutcome]) -> Vec<StockReviewIssue> {
+    let mut issues = Vec::new();
+    for outcome in outcomes {
+        if !outcome.status.is_success() {
+            issues.push(StockReviewIssue {
+                code: "market_calendar_sync_failed".to_string(),
+                severity: StockReviewIssueSeverity::Warning,
+                message: outcome.message.clone().unwrap_or_else(|| {
+                    format!("{} market calendar synchronization failed.", outcome.market)
+                }),
+                affected_symbol: None,
+                affected_date: None,
+            });
+        } else if outcome.status == CalendarSyncStatus::StaleCacheUsed {
+            issues.push(StockReviewIssue {
+                code: "market_calendar_refresh_failed".to_string(),
+                severity: StockReviewIssueSeverity::Warning,
+                message: outcome.message.clone().unwrap_or_else(|| {
+                    format!("{} market calendar refresh failed.", outcome.market)
+                }),
+                affected_symbol: None,
+                affected_date: outcome.available_through,
+            });
+        }
+        issues.extend(outcome.warnings.iter().map(|warning| StockReviewIssue {
+            code: warning.code.clone(),
+            severity: StockReviewIssueSeverity::Warning,
+            message: if warning.message.contains(&outcome.market) {
+                warning.message.clone()
+            } else {
+                format!("{}: {}", outcome.market, warning.message)
+            },
+            affected_symbol: None,
+            affected_date: None,
+        }));
+    }
+    issues
+}
+
+fn benchmark_specs(
+    query: &StockReviewQuery,
+    review_markets: &BTreeSet<String>,
+) -> Vec<(String, String)> {
     if let Some(symbol) = &query.benchmark_symbol {
         return vec![(
-            query.market.clone().unwrap_or_else(|| "CUSTOM".to_string()),
+            query
+                .market
+                .clone()
+                .or_else(|| {
+                    (review_markets.len() == 1)
+                        .then(|| review_markets.iter().next().cloned())
+                        .flatten()
+                })
+                .unwrap_or_else(|| "CUSTOM".to_string()),
             symbol.clone(),
         )];
     }
-    if let Some(market) = &query.market {
-        return default_benchmark_symbol(market)
-            .map(|symbol| vec![(market.clone(), symbol.to_string())])
-            .unwrap_or_default();
-    }
-    ["US", "CN", "HK"]
-        .into_iter()
+    review_markets
+        .iter()
         .filter_map(|market| {
-            default_benchmark_symbol(market).map(|symbol| (market.to_string(), symbol.to_string()))
+            default_benchmark_symbol(market).map(|symbol| (market.clone(), symbol.to_string()))
         })
         .collect()
 }
@@ -2283,22 +2477,39 @@ fn portfolio_valuation_session_authority(
     authority_start: NaiveDate,
     markets: &BTreeSet<String>,
     calendars: &BTreeMap<String, MarketCalendar>,
+    terminal_by_market: &BTreeMap<String, NaiveDate>,
 ) -> (Vec<NaiveDate>, Option<NaiveDate>) {
     if markets.is_empty()
         || markets.iter().any(|market| {
-            calendars
+            let Some(required_through) = terminal_by_market
                 .get(market)
-                .is_none_or(|calendar| !calendar.covers(authority_start, query.end_date))
+                .copied()
+                .map(|terminal| query.end_date.min(terminal))
+            else {
+                return true;
+            };
+            authority_start > required_through
+                || calendars
+                    .get(market)
+                    .is_none_or(|calendar| !calendar.covers(authority_start, required_through))
         })
     {
         return (Vec::new(), None);
     }
 
-    let all_sessions = markets
-        .iter()
-        .filter_map(|market| calendars.get(market))
-        .flat_map(|calendar| calendar.sessions.iter().copied())
-        .collect::<BTreeSet<_>>();
+    let mut all_sessions = BTreeSet::new();
+    for market in markets {
+        let required_through = query.end_date.min(terminal_by_market[market]);
+        if let Some(calendar) = calendars.get(market) {
+            all_sessions.extend(
+                calendar
+                    .sessions
+                    .iter()
+                    .copied()
+                    .filter(|date| *date <= required_through),
+            );
+        }
+    }
     let expected_baseline_date = all_sessions.range(..query.start_date).next_back().copied();
     let expected_actual_dates = all_sessions
         .range(query.start_date..=query.end_date)
@@ -4210,6 +4421,14 @@ mod tests {
         AttributionBatch, AttributionCashBalance, AttributionCashReturn,
         AttributionPositionBalance, AttributionPricePoint, AttributionValuationPoint,
     };
+    use crate::services::stock_review_calendar::{
+        load_market_holiday_rules, CalendarProvider, IndexHistoryEvidence, IndexHistorySource,
+        ReferenceIndex,
+    };
+    use chrono::{DateTime, Datelike, Weekday};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
 
     fn day(value: &str) -> NaiveDate {
         NaiveDate::parse_from_str(value, "%Y-%m-%d").unwrap()
@@ -4231,6 +4450,196 @@ mod tests {
             benchmark_symbol: None,
             base_currency: "USD".to_string(),
         }
+    }
+
+    fn fixed_now(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    struct CompleteFakeCalendarSource;
+
+    impl IndexHistorySource for CompleteFakeCalendarSource {
+        fn provider(&self) -> CalendarProvider {
+            CalendarProvider::EastMoney
+        }
+
+        fn fetch<'a>(
+            &'a self,
+            market: &'a str,
+            reference: &'a ReferenceIndex,
+            start: NaiveDate,
+            end: NaiveDate,
+        ) -> Pin<Box<dyn Future<Output = Result<IndexHistoryEvidence, String>> + Send + 'a>>
+        {
+            let provider = self.provider();
+            let logical_index = reference.logical_name.to_string();
+            Box::pin(async move {
+                let rules = load_market_holiday_rules(market, start, end)?;
+                let mut date = start;
+                let mut session_dates = Vec::new();
+                while date <= end {
+                    if !matches!(date.weekday(), Weekday::Sat | Weekday::Sun)
+                        && !rules.weekday_closures.contains(&date)
+                    {
+                        session_dates.push(date);
+                    }
+                    date += Duration::days(1);
+                }
+                Ok(IndexHistoryEvidence {
+                    provider,
+                    logical_index,
+                    request_start: start,
+                    request_end: end,
+                    session_dates,
+                    complete_response: true,
+                })
+            })
+        }
+    }
+
+    fn complete_fake_sources() -> Vec<Arc<dyn IndexHistorySource>> {
+        vec![Arc::new(CompleteFakeCalendarSource)]
+    }
+
+    struct FailedFakeCalendarSource;
+
+    impl IndexHistorySource for FailedFakeCalendarSource {
+        fn provider(&self) -> CalendarProvider {
+            CalendarProvider::EastMoney
+        }
+
+        fn fetch<'a>(
+            &'a self,
+            _market: &'a str,
+            _reference: &'a ReferenceIndex,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Pin<Box<dyn Future<Output = Result<IndexHistoryEvidence, String>> + Send + 'a>>
+        {
+            Box::pin(async { Err("calendar provider unavailable".to_string()) })
+        }
+    }
+
+    fn all_sources_failed() -> Vec<Arc<dyn IndexHistorySource>> {
+        vec![Arc::new(FailedFakeCalendarSource)]
+    }
+
+    struct ConflictingFakeCalendarSource;
+
+    impl IndexHistorySource for ConflictingFakeCalendarSource {
+        fn provider(&self) -> CalendarProvider {
+            CalendarProvider::EastMoney
+        }
+
+        fn fetch<'a>(
+            &'a self,
+            market: &'a str,
+            reference: &'a ReferenceIndex,
+            start: NaiveDate,
+            end: NaiveDate,
+        ) -> Pin<Box<dyn Future<Output = Result<IndexHistoryEvidence, String>> + Send + 'a>>
+        {
+            let provider = self.provider();
+            let logical_index = reference.logical_name.to_string();
+            Box::pin(async move {
+                let rules = load_market_holiday_rules(market, start, end)?;
+                let mut date = start;
+                let mut session_dates = Vec::new();
+                while date <= end {
+                    if !matches!(date.weekday(), Weekday::Sat | Weekday::Sun)
+                        && !rules.weekday_closures.contains(&date)
+                    {
+                        session_dates.push(date);
+                    }
+                    date += Duration::days(1);
+                }
+                if reference.logical_name.ends_with("composite") {
+                    session_dates.pop();
+                }
+                Ok(IndexHistoryEvidence {
+                    provider,
+                    logical_index,
+                    request_start: start,
+                    request_end: end,
+                    session_dates,
+                    complete_response: true,
+                })
+            })
+        }
+    }
+
+    fn conflicting_sources() -> Vec<Arc<dyn IndexHistorySource>> {
+        vec![Arc::new(ConflictingFakeCalendarSource)]
+    }
+
+    fn calendar_markets(db: &Database) -> Vec<String> {
+        let conn = db.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare("SELECT market FROM stock_market_calendar_coverage ORDER BY market")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn complete_live_review_db_without_calendars(market: &str) -> Database {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", market);
+        insert_live_transaction(
+            &db,
+            "cash",
+            "acct",
+            "$CASH-USD",
+            market,
+            "BUY",
+            10_000.0,
+            1.0,
+            10_000.0,
+            0.0,
+            "USD",
+            "2025-12-01T08:00:00Z",
+        );
+        insert_live_transaction(
+            &db,
+            "buy",
+            "acct",
+            "AAPL",
+            market,
+            "BUY",
+            1.0,
+            100.0,
+            100.0,
+            0.0,
+            "USD",
+            "2026-01-02T15:00:00Z",
+        );
+        for date in ["2026-01-01", "2026-01-02", "2026-08-28"] {
+            insert_portfolio_value(&db, date, 10_000.0, 7.0);
+        }
+        let cache_start = day("2025-12-23");
+        let prices = calendar_dates(day("2026-01-02"), 239)
+            .into_iter()
+            .map(|date| (date, 100.0))
+            .collect::<Vec<_>>();
+        seed_stock_cache_bounds(&db, "AAPL", market, cache_start, &prices);
+        seed_benchmark_cache(&db, "^GSPC", cache_start, None, 100.0);
+        db
+    }
+
+    fn complete_live_review_db_with_old_valid_calendar(market: &str) -> Database {
+        let db = complete_live_review_db_without_calendars(market);
+        let start = day("2025-12-23");
+        let through = day("2026-08-28");
+        install_market_sessions(
+            &db,
+            market,
+            &calendar_dates(start, (through - start).num_days() as usize + 1),
+        );
+        db
     }
 
     fn insert_account(db: &Database, id: &str, market: &str) {
@@ -6891,51 +7300,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_authoritative_calendar_suppresses_exact_session_metrics() {
-        let db = Database::new(":memory:").unwrap();
-        insert_account(&db, "acct", "US");
-        insert_live_transaction(
+    async fn empty_calendar_first_report_syncs_only_scoped_us_and_unlocks_session_metrics() {
+        let db = complete_live_review_db_without_calendars("US");
+        let sources = complete_fake_sources();
+        let report = get_stock_review_report_with_calendar_sources(
             &db,
-            "cash",
-            "acct",
-            "$CASH-USD",
-            "US",
-            "BUY",
-            1_000.0,
-            1.0,
-            1_000.0,
-            0.0,
-            "USD",
-            "2023-12-01T08:00:00Z",
-        );
-        insert_live_transaction(
-            &db,
-            "buy",
-            "acct",
-            "AAPL",
-            "US",
-            "BUY",
-            1.0,
-            100.0,
-            100.0,
-            0.0,
-            "USD",
-            "2024-01-01T09:30:00Z",
-        );
-        for date in ["2023-12-31", "2024-01-01", "2024-05-01"] {
-            insert_portfolio_value(&db, date, 1_000.0, 7.0);
-        }
-        let points = calendar_dates(day("2024-01-01"), 121)
-            .into_iter()
-            .map(|date| (date, 100.0))
-            .collect::<Vec<_>>();
-        seed_stock_cache_bounds(&db, "AAPL", "US", day("2023-12-20"), &points);
-        seed_benchmark_cache(&db, "^GSPC", day("2023-12-20"), None, 100.0);
+            live_query("2026-01-02", "2026-08-28", Some("US")),
+            &sources,
+            fixed_now("2026-08-28T22:00:00Z"),
+        )
+        .await
+        .unwrap();
 
-        let report =
-            get_stock_review_report(&db, live_query("2024-01-01", "2024-05-01", Some("US")))
-                .await
-                .unwrap();
+        assert!(!report
+            .data_quality
+            .issues
+            .iter()
+            .any(|issue| issue.code == "market_calendar_unavailable"));
+        assert_ne!(
+            report.summary.forward_effect.day_60.status.status,
+            MetricStatus::Unavailable
+        );
+        let single_provider = report
+            .data_quality
+            .issues
+            .iter()
+            .find(|issue| issue.code == "market_calendar_single_provider")
+            .unwrap();
+        assert!(single_provider.message.contains("US"));
+        assert_eq!(calendar_markets(&db), vec!["US"]);
+    }
+
+    #[tokio::test]
+    async fn unavailable_source_without_old_cache_keeps_exact_metrics_blocked() {
+        let db = complete_live_review_db_without_calendars("US");
+        let sources = all_sources_failed();
+        let report = get_stock_review_report_with_calendar_sources(
+            &db,
+            live_query("2026-01-02", "2026-08-28", Some("US")),
+            &sources,
+            fixed_now("2026-08-28T22:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            report.summary.forward_effect.day_60.status.status,
+            MetricStatus::Unavailable
+        );
+        assert!(report
+            .data_quality
+            .issues
+            .iter()
+            .any(|issue| issue.code == "market_calendar_sync_failed"));
+        assert!(report
+            .data_quality
+            .issues
+            .iter()
+            .any(|issue| issue.code == "market_calendar_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn stale_complete_cache_remains_usable_and_reports_refresh_warning() {
+        let db = complete_live_review_db_with_old_valid_calendar("US");
+        let sources = conflicting_sources();
+        let report = get_stock_review_report_with_calendar_sources(
+            &db,
+            live_query("2026-01-02", "2026-08-28", Some("US")),
+            &sources,
+            fixed_now("2026-08-28T22:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        assert!(report
+            .data_quality
+            .issues
+            .iter()
+            .any(|issue| issue.code == "market_calendar_refresh_failed"));
+        assert!(!report
+            .data_quality
+            .issues
+            .iter()
+            .any(|issue| issue.code == "market_calendar_unavailable"));
+        assert_ne!(
+            report.summary.forward_effect.day_60.status.status,
+            MetricStatus::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_partial_cache_cannot_claim_an_incomplete_forward_window_is_pending() {
+        let db = complete_live_review_db_without_calendars("US");
+        let start = day("2025-12-23");
+        let through = day("2026-02-01");
+        install_market_sessions(
+            &db,
+            "US",
+            &calendar_dates(start, (through - start).num_days() as usize + 1),
+        );
+        let sources = conflicting_sources();
+        let report = get_stock_review_report_with_calendar_sources(
+            &db,
+            live_query("2026-01-02", "2026-08-28", Some("US")),
+            &sources,
+            fixed_now("2026-08-28T22:00:00Z"),
+        )
+        .await
+        .unwrap();
+
         assert_eq!(
             report.summary.forward_effect.day_60.status.status,
             MetricStatus::Unavailable
@@ -6945,6 +7418,94 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == "market_calendar_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn unfiltered_single_market_holding_does_not_sync_default_benchmark_markets() {
+        let db = complete_live_review_db_without_calendars("US");
+        insert_holding(&db, "holding", "acct", "AAPL", "US", "USD", 1.0);
+        let sources = complete_fake_sources();
+        let input = prepare_cached_stock_review_input_with_calendar_sources(
+            &db,
+            live_query("2026-01-02", "2026-08-28", None),
+            None,
+            None,
+            &sources,
+            fixed_now("2026-08-28T22:00:00Z"),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calendar_markets(&db), vec!["US"]);
+        assert_eq!(input.result_quality_input.benchmark_series.len(), 1);
+        assert_eq!(input.result_quality_input.benchmark_series[0].market, "US");
+    }
+
+    #[tokio::test]
+    async fn missing_individual_stock_quote_does_not_change_exchange_session_table() {
+        let db = complete_live_review_db_without_calendars("US");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM stock_daily_prices WHERE symbol = 'AAPL' AND market = 'US' AND date = '2026-02-03'",
+                [],
+            )
+            .unwrap();
+        let sources = complete_fake_sources();
+        get_stock_review_report_with_calendar_sources(
+            &db,
+            live_query("2026-01-02", "2026-08-28", Some("US")),
+            &sources,
+            fixed_now("2026-08-28T22:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        let is_session = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT is_session FROM stock_market_sessions WHERE market = 'US' AND date = '2026-02-03'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(is_session, 1);
+    }
+
+    #[tokio::test]
+    async fn in_progress_local_market_day_is_not_required_for_calendar_completeness() {
+        let db = complete_live_review_db_without_calendars("US");
+        let sources = complete_fake_sources();
+        let report = get_stock_review_report_with_calendar_sources(
+            &db,
+            live_query("2026-01-02", "2026-08-28", Some("US")),
+            &sources,
+            fixed_now("2026-08-28T15:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        assert!(!report
+            .data_quality
+            .issues
+            .iter()
+            .any(|issue| issue.code == "market_calendar_unavailable"));
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT complete_through FROM stock_market_calendar_coverage WHERE market = 'US'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "2026-08-27"
+        );
     }
 
     #[tokio::test]
@@ -7387,6 +7948,69 @@ mod tests {
         assert_eq!(report.actions, rebuilt.actions);
         assert_eq!(report.campaigns, rebuilt.campaigns);
         assert_eq!(report.summary, rebuilt.summary);
+    }
+
+    #[tokio::test]
+    async fn idempotent_calendar_sync_keeps_candidate_revision_but_changed_revision_invalidates_it()
+    {
+        let db = complete_live_review_db_without_calendars("US");
+        let query = live_query("2026-01-02", "2026-08-28", Some("US"));
+        let mut candidate = stock_review_persistence::prepare_override_candidate(
+            &db,
+            StockReviewOverrideInput {
+                id: "calendar-revision".to_string(),
+                override_type: "non_trade".to_string(),
+                transaction_ids_json: r#"["buy"]"#.to_string(),
+                value_json: "{}".to_string(),
+            },
+        )
+        .unwrap();
+        stock_review_persistence::scope_candidate_to_query(&db, &mut candidate, &query).unwrap();
+        let canonical = candidate.input.clone();
+        let candidate_record = StockReviewOverride {
+            id: canonical.id,
+            override_type: canonical.override_type,
+            transaction_ids_json: canonical.transaction_ids_json,
+            value_json: canonical.value_json,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let sources = complete_fake_sources();
+        let now = fixed_now("2026-08-28T22:00:00Z");
+        prepare_cached_stock_review_input_with_calendar_sources(
+            &db,
+            query,
+            Some(candidate_record),
+            Some(&mut candidate),
+            &sources,
+            now,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let outcomes = stock_review_calendar::sync_market_calendars_with_sources(
+            &db,
+            &BTreeSet::from(["US".to_string()]),
+            day("2025-12-23"),
+            now,
+            &sources,
+        )
+        .await;
+        assert_eq!(outcomes[0].status, CalendarSyncStatus::Reused);
+        stock_review_persistence::verify_candidate_source_revision(&db, &candidate).unwrap();
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE stock_market_calendar_coverage SET revision = 'changed-after-pin' WHERE market = 'US'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            stock_review_persistence::verify_candidate_source_revision(&db, &candidate).is_err()
+        );
     }
 
     #[tokio::test]

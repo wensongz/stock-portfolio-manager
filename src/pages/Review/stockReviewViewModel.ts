@@ -3,8 +3,11 @@ import type {
   Market,
   MetricAvailability,
   MetricStatus,
+  ReviewCurvePoint,
+  StockActionReview,
   StockReviewAnnotation,
   StockReviewFilters,
+  StockReviewIssue,
   StockReviewPeriodPreset,
   StockReviewReport,
 } from "../../types";
@@ -60,6 +63,155 @@ export interface StockReviewMetricDisplay {
   status: MetricStatus;
   note: string | null;
   displayValue: string;
+}
+
+export interface StockReviewStatusDisplay {
+  label: string;
+  color: "green" | "gold" | "blue" | "default";
+}
+
+export type StockReviewActionSortKey =
+  | "date"
+  | "amount"
+  | "contribution"
+  | "forward_effect";
+
+export type StockReviewSortOrder = "ascend" | "descend";
+
+export type StockReviewPageKind = "error" | "empty" | "content";
+
+export const STOCK_REVIEW_SUMMARY_CARD_ORDER = [
+  "result_quality",
+  "max_drawdown",
+  "rebalance_value_add",
+  "forward_effect",
+  "risk_structure",
+] as const;
+
+const STATUS_DISPLAY: Record<MetricStatus, StockReviewStatusDisplay> = {
+  available: { label: "正常", color: "green" },
+  degraded: { label: "降级", color: "gold" },
+  pending: { label: "观察中", color: "blue" },
+  unavailable: { label: "不可用", color: "default" },
+};
+
+const ACTION_TYPE_DISPLAY = {
+  open: "建仓",
+  add: "加仓",
+  reduce: "减仓",
+  close: "清仓",
+} as const;
+
+export function getStockReviewStatusDisplay(
+  status: MetricStatus,
+): StockReviewStatusDisplay {
+  return STATUS_DISPLAY[status];
+}
+
+export function getStockActionTypeDisplay(
+  actionType: StockActionReview["action_type"],
+): string {
+  return ACTION_TYPE_DISPLAY[actionType];
+}
+
+export function formatStockReviewPercent(value: number | null): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  const percent = value * 100;
+  return `${percent > 0 ? "+" : ""}${percent.toFixed(2)}%`;
+}
+
+export interface StockReviewCurveSeries {
+  key: "actual" | "shadow" | "benchmark";
+  name: string;
+  connectNulls: false;
+  data: [string, number | null][];
+}
+
+export function buildStockReviewCurveSeries(
+  curves: ReviewCurvePoint[],
+  enabled: Record<StockReviewCurveSeries["key"], boolean>,
+): StockReviewCurveSeries[] {
+  const definitions = [
+    { key: "actual", name: "实际组合", field: "portfolio_return" },
+    { key: "shadow", name: "不调仓影子组合", field: "shadow_return" },
+    { key: "benchmark", name: "市场基准", field: "benchmark_return" },
+  ] as const;
+  return definitions.flatMap(({ key, name, field }) => {
+    const data: [string, number | null][] = curves.map((point) => [
+      point.date,
+      point[field],
+    ]);
+    if (!enabled[key] || !data.some(([, value]) => value != null)) return [];
+    return [{ key, name, connectNulls: false as const, data }];
+  });
+}
+
+export function sortStockReviewIssues(
+  issues: StockReviewIssue[],
+): StockReviewIssue[] {
+  const priority: Record<StockReviewIssue["severity"], number> = {
+    error: 0,
+    warning: 1,
+    info: 2,
+  };
+  return [...issues].sort(
+    (left, right) => priority[left.severity] - priority[right.severity],
+  );
+}
+
+export function getStockReviewPageState(
+  report: Pick<StockReviewReport, "curves" | "actions" | "campaigns"> | null,
+  error: string | null,
+): { kind: StockReviewPageKind; canRetry: true } {
+  if (!report) return { kind: error ? "error" : "empty", canRetry: true };
+  const empty =
+    report.curves.length === 0 &&
+    report.actions.length === 0 &&
+    report.campaigns.length === 0;
+  return { kind: empty ? "empty" : "content", canRetry: true };
+}
+
+type SortableStockAction = Pick<
+  StockActionReview,
+  | "action_id"
+  | "traded_at"
+  | "gross_amount"
+  | "contribution"
+  | "observation_windows"
+>;
+
+function actionSortValue(
+  action: SortableStockAction,
+  key: StockReviewActionSortKey,
+): number | string | null {
+  if (key === "date") return action.traded_at;
+  if (key === "amount") return action.gross_amount;
+  if (key === "contribution") return action.contribution;
+  return (
+    action.observation_windows.find((window) => window.trading_days === 60)
+      ?.amount_weighted_excess_return ?? null
+  );
+}
+
+export function sortStockReviewActions<T extends SortableStockAction>(
+  actions: T[],
+  key: StockReviewActionSortKey = "date",
+  order: StockReviewSortOrder = "descend",
+): T[] {
+  return [...actions].sort((left, right) => {
+    const leftValue = actionSortValue(left, key);
+    const rightValue = actionSortValue(right, key);
+    if (leftValue == null && rightValue == null) {
+      return left.action_id.localeCompare(right.action_id);
+    }
+    if (leftValue == null) return 1;
+    if (rightValue == null) return -1;
+    const compared =
+      typeof leftValue === "string" && typeof rightValue === "string"
+        ? leftValue.localeCompare(rightValue)
+        : Number(leftValue) - Number(rightValue);
+    return order === "ascend" ? compared : -compared;
+  });
 }
 
 export interface StockReviewAnnotationActionContext {

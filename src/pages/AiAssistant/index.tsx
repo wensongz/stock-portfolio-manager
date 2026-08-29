@@ -31,7 +31,11 @@ import { ReasoningBlock } from "../../components/ai/ReasoningBlock";
 import { ToolCallList } from "../../components/ai/ToolCallCard";
 import { MarkdownRenderer } from "../../components/ai/MarkdownRenderer";
 import type { AiModelInfo, ChatMessageWithMeta, ChatSession, ChatUsage, Skill } from "../../types";
-import { readAiPrefill, resolveAiPrefillSessionId } from "./prefill";
+import {
+  readAiPrefill,
+  readAiPrefillActiveSkill,
+  resolveAiPrefillSessionId,
+} from "./prefill";
 import {
   loadAiSidebarCollapsed,
   saveAiSidebarCollapsed,
@@ -126,6 +130,8 @@ const TOOL_LABELS: Record<string, string> = {
   check_price_alerts: "价格提醒",
   get_option_positions: "期权持仓",
   get_option_review: "期权操作复盘",
+  get_stock_review: "股票操作复盘",
+  save_stock_review_annotation: "保存股票复盘注释",
 };
 
 export default function AiAssistantPage() {
@@ -140,10 +146,16 @@ export default function AiAssistantPage() {
     setCurrentSession,
   } = useChatSessionStore();
   const [initialPrompt] = useState(() => readAiPrefill(location.state));
+  const [initialActiveSkill] = useState(() =>
+    readAiPrefillActiveSkill(location.state),
+  );
   const [initialSessionId] = useState(() =>
     resolveAiPrefillSessionId(initialPrompt, currentSessionId),
   );
   const { init } = useChatStore();
+  const setActiveSkillsForNextTurn = useChatStore(
+    (state) => state.setActiveSkillsForNextTurn,
+  );
   // Subscribe to the streaming session id so the sidebar can highlight which
   // session is actively generating (foreground or background). Selector form
   // avoids re-rendering the whole page on every unrelated chatStore change.
@@ -156,8 +168,19 @@ export default function AiAssistantPage() {
   useEffect(() => {
     if (!initialPrompt) return;
     setCurrentSession(initialSessionId);
+    if (initialActiveSkill) {
+      setActiveSkillsForNextTurn([initialActiveSkill]);
+    }
     navigate(location.pathname, { replace: true, state: null });
-  }, [initialPrompt, initialSessionId, location.pathname, navigate, setCurrentSession]);
+  }, [
+    initialPrompt,
+    initialActiveSkill,
+    initialSessionId,
+    location.pathname,
+    navigate,
+    setActiveSkillsForNextTurn,
+    setCurrentSession,
+  ]);
 
   // One-time bootstrap: bind streaming listeners, load AI config, load the
   // session list. We deliberately leave currentSessionId null so the page

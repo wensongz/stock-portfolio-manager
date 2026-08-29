@@ -39,6 +39,8 @@ export const TOOL_LABELS: Record<string, string> = {
   check_price_alerts: "价格提醒",
   get_option_positions: "期权持仓",
   get_option_review: "期权操作复盘",
+  get_stock_review: "股票操作复盘",
+  save_stock_review_annotation: "保存股票复盘注释",
 };
 
 /** Pick an icon for a tool based on its category, inferred from the name. */
@@ -59,6 +61,7 @@ function toolIcon(name: string) {
   if (name.startsWith("check_price_alerts")) return <BellOutlined />;
   if (name.startsWith("search_stock")) return <DatabaseOutlined />;
   if (name.startsWith("get_option")) return <TableOutlined />;
+  if (name.startsWith("get_stock_review") || name.startsWith("save_stock_review")) return <TableOutlined />;
   return <DatabaseOutlined />;
 }
 

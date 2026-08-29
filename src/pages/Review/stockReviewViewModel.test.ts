@@ -4,16 +4,24 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   STOCK_REVIEW_FILTERS_STORAGE_KEY,
+  STOCK_REVIEW_SUMMARY_CARD_ORDER,
+  buildStockReviewCurveSeries,
   buildStockCampaignAiPrefill,
   buildStockReviewAiPrefill,
   createStockReviewAnnotationDisplayContext,
   createDefaultStockReviewFilters,
   doesStockReviewAnnotationApplyToCampaign,
+  formatStockReviewPercent,
+  getStockActionTypeDisplay,
   getStockReviewDateRange,
+  getStockReviewPageState,
+  getStockReviewStatusDisplay,
   isStockReviewAnnotationInDisplayContext,
   loadStockReviewFilters,
   mapStockReviewMetricForDisplay,
   saveStockReviewFilters,
+  sortStockReviewActions,
+  sortStockReviewIssues,
 } from "./stockReviewViewModel.ts";
 
 const now = new Date("2026-08-28T00:00:00+08:00");
@@ -297,6 +305,160 @@ test("display mapping preserves backend status and never fills a missing value w
       displayValue: "—",
     },
   );
+});
+
+test("all four backend statuses have stable Chinese labels and semantic colors", () => {
+  assert.deepEqual(getStockReviewStatusDisplay("available"), {
+    label: "正常",
+    color: "green",
+  });
+  assert.deepEqual(getStockReviewStatusDisplay("degraded"), {
+    label: "降级",
+    color: "gold",
+  });
+  assert.deepEqual(getStockReviewStatusDisplay("pending"), {
+    label: "观察中",
+    color: "blue",
+  });
+  assert.deepEqual(getStockReviewStatusDisplay("unavailable"), {
+    label: "不可用",
+    color: "default",
+  });
+});
+
+test("display formatters keep null unavailable and preserve a real zero", () => {
+  assert.equal(formatStockReviewPercent(null), "—");
+  assert.equal(formatStockReviewPercent(0), "0.00%");
+  assert.equal(formatStockReviewPercent(0.01234), "+1.23%");
+  assert.equal(formatStockReviewPercent(-0.01234), "-1.23%");
+});
+
+test("stock action labels are factual and cover the four backend action types", () => {
+  assert.equal(getStockActionTypeDisplay("open"), "建仓");
+  assert.equal(getStockActionTypeDisplay("add"), "加仓");
+  assert.equal(getStockActionTypeDisplay("reduce"), "减仓");
+  assert.equal(getStockActionTypeDisplay("close"), "清仓");
+});
+
+test("comparison series keep backend gaps and never connect or fill missing points", () => {
+  const series = buildStockReviewCurveSeries(
+    [
+      {
+        date: "2026-01-01",
+        portfolio_return: 100,
+        shadow_return: 100,
+        benchmark_return: null,
+      },
+      {
+        date: "2026-01-02",
+        portfolio_return: null,
+        shadow_return: 101,
+        benchmark_return: 99,
+      },
+    ],
+    { actual: true, shadow: true, benchmark: true },
+  );
+
+  assert.deepEqual(series, [
+    {
+      key: "actual",
+      name: "实际组合",
+      connectNulls: false,
+      data: [["2026-01-01", 100], ["2026-01-02", null]],
+    },
+    {
+      key: "shadow",
+      name: "不调仓影子组合",
+      connectNulls: false,
+      data: [["2026-01-01", 100], ["2026-01-02", 101]],
+    },
+    {
+      key: "benchmark",
+      name: "市场基准",
+      connectNulls: false,
+      data: [["2026-01-01", null], ["2026-01-02", 99]],
+    },
+  ]);
+  assert.deepEqual(
+    buildStockReviewCurveSeries(
+      [{ date: "2026-01-01", portfolio_return: 100, shadow_return: null, benchmark_return: 100 }],
+      { actual: true, shadow: false, benchmark: true },
+    ).map((item) => item.key),
+    ["actual", "benchmark"],
+  );
+});
+
+test("data-quality issues sort blocker before warning before info", () => {
+  const issues = [
+    { code: "i", severity: "info", message: "info", affected_symbol: null, affected_date: null },
+    { code: "w", severity: "warning", message: "warning", affected_symbol: null, affected_date: null },
+    { code: "b", severity: "error", message: "blocker", affected_symbol: null, affected_date: null },
+  ];
+  assert.deepEqual(sortStockReviewIssues(issues).map((issue) => issue.code), ["b", "w", "i"]);
+  assert.deepEqual(issues.map((issue) => issue.code), ["i", "w", "b"]);
+});
+
+test("summary cards stay in the approved five-card order", () => {
+  assert.deepEqual(STOCK_REVIEW_SUMMARY_CARD_ORDER, [
+    "result_quality",
+    "max_drawdown",
+    "rebalance_value_add",
+    "forward_effect",
+    "risk_structure",
+  ]);
+});
+
+test("page state distinguishes empty, partial content, and full command failure", () => {
+  assert.deepEqual(getStockReviewPageState(null, "command failed"), {
+    kind: "error",
+    canRetry: true,
+  });
+  assert.deepEqual(
+    getStockReviewPageState({ curves: [], actions: [], campaigns: [] }, null),
+    { kind: "empty", canRetry: true },
+  );
+  assert.deepEqual(
+    getStockReviewPageState(
+      {
+        curves: [{ date: "2026-01-01", portfolio_return: 100, shadow_return: null, benchmark_return: null }],
+        actions: [],
+        campaigns: [],
+      },
+      "a later refresh failed",
+    ),
+    { kind: "content", canRetry: true },
+  );
+});
+
+test("action sorting uses only backend date, amount, contribution, and 60-day effect", () => {
+  const actions = [
+    {
+      action_id: "older",
+      traded_at: "2026-01-01T09:30:00Z",
+      gross_amount: 500,
+      contribution: null,
+      observation_windows: [{ trading_days: 60, amount_weighted_excess_return: 0.1 }],
+    },
+    {
+      action_id: "newer",
+      traded_at: "2026-02-01T09:30:00Z",
+      gross_amount: 100,
+      contribution: -20,
+      observation_windows: [{ trading_days: 60, amount_weighted_excess_return: null }],
+    },
+    {
+      action_id: "middle",
+      traded_at: "2026-01-15T09:30:00Z",
+      gross_amount: null,
+      contribution: 30,
+      observation_windows: [{ trading_days: 120, amount_weighted_excess_return: 0.9 }, { trading_days: 60, amount_weighted_excess_return: -0.2 }],
+    },
+  ];
+
+  assert.deepEqual(sortStockReviewActions(actions, "date", "descend").map((item) => item.action_id), ["newer", "middle", "older"]);
+  assert.deepEqual(sortStockReviewActions(actions, "amount", "ascend").map((item) => item.action_id), ["newer", "older", "middle"]);
+  assert.deepEqual(sortStockReviewActions(actions, "contribution", "descend").map((item) => item.action_id), ["middle", "newer", "older"]);
+  assert.deepEqual(sortStockReviewActions(actions, "forward_effect", "ascend").map((item) => item.action_id), ["middle", "older", "newer"]);
 });
 
 const displayContext = createStockReviewAnnotationDisplayContext({

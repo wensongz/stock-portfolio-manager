@@ -1,268 +1,177 @@
-import { useEffect, useState } from "react";
+import { Alert, Button, Card, Empty, Space, Spin, Typography } from "antd";
+import { ReloadOutlined } from "@ant-design/icons";
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { useAccountStore } from "../../stores/accountStore";
+import { useExchangeRateStore } from "../../stores/exchangeRateStore";
+import { useStockReviewStore } from "../../stores/stockReviewStore";
+import type { Currency, Market, StockCampaignDetail, StockReviewFilters as Filters, StockReviewOverrideInput } from "../../types";
 import {
-  Card,
-  Select,
-  Space,
-  Typography,
-  Tag,
-  Timeline,
-  Statistic,
-  Row,
-  Col,
-  Empty,
-  Progress,
-} from "antd";
-import {
-  CheckCircleOutlined,
-  CloseCircleOutlined,
-} from "@ant-design/icons";
-import { useReviewStore } from "../../stores/reviewStore";
-import type { QuarterlyHoldingStatus } from "../../types";
-import { usePnlColor } from "../../hooks/usePnlColor";
+  buildStockCampaignAiPrefill,
+  buildStockReviewAiPrefill,
+  getStockReviewPageState,
+  loadStockReviewFilters,
+  saveStockReviewFilters,
+} from "./stockReviewViewModel";
+import LegacyStockReviewPanel from "./LegacyStockReviewPanel";
+import PortfolioComparisonChart from "./PortfolioComparisonChart";
+import RebalanceAttributionPanel from "./RebalanceAttributionPanel";
+import RiskStructurePanel from "./RiskStructurePanel";
+import StockActionsTable from "./StockActionsTable";
+import StockCampaignDrawer from "./StockCampaignDrawer";
+import StockReviewDataQuality from "./StockReviewDataQuality";
+import StockReviewFilters from "./StockReviewFilters";
+import StockReviewSummaryCards from "./StockReviewSummaryCards";
 
 const { Text } = Typography;
 
-function DecisionQualityTag({
-  quality,
-  snapshotId,
-  symbol,
-}: {
-  quality: string | null;
-  snapshotId: string;
-  symbol: string;
-}) {
-  const { updateDecisionQuality } = useReviewStore();
-
-  const handleChange = (v: string) => {
-    updateDecisionQuality(snapshotId, symbol, v);
-  };
-
-  return (
-    <Select
-      size="small"
-      allowClear
-      placeholder="设置决策质量"
-      value={quality || undefined}
-      onChange={handleChange}
-      style={{ width: 140 }}
-      options={[
-        { value: "correct", label: "✅ 正确决策" },
-        { value: "wrong", label: "❌ 错误决策" },
-        { value: "pending", label: "⚠️ 待定" },
-      ]}
-    />
-  );
-}
-
-function HoldingTimeline({
-  timeline,
-  symbol,
-}: {
-  timeline: QuarterlyHoldingStatus[];
-  symbol: string;
-}) {
-  const { pnlColorAnt, pnlTag } = usePnlColor();
-  if (!timeline.length) return <Empty description="暂无季度记录" />;
-
-  return (
-    <Timeline
-      items={timeline.map((item) => ({
-        dot:
-          item.pnl_percent != null && item.pnl_percent >= 0 ? (
-            <CheckCircleOutlined style={{ color: pnlColorAnt(1) }} />
-          ) : (
-            <CloseCircleOutlined style={{ color: pnlColorAnt(-1) }} />
-          ),
-        children: (
-          <Card size="small" style={{ marginBottom: 8 }}>
-            <Space orientation="vertical" style={{ width: "100%" }}>
-              <Space>
-                <Tag color="blue">{item.quarter}</Tag>
-                <Text>持仓：{item.shares} 股</Text>
-                <Text>均价：{item.avg_cost.toFixed(2)}</Text>
-                <Text>现价：{item.close_price.toFixed(2)}</Text>
-                <Tag color={item.pnl_percent != null ? pnlTag(item.pnl_percent) : "default"}>
-                  {item.pnl_percent != null
-                    ? `${item.pnl_percent >= 0 ? "+" : ""}${item.pnl_percent.toFixed(2)}%`
-                    : "-"}
-                </Tag>
-              </Space>
-              {item.notes && (
-                <Text type="secondary" style={{ fontSize: 12 }}>
-                  思考：{item.notes}
-                </Text>
-              )}
-              <DecisionQualityTag
-                quality={item.decision_quality}
-                snapshotId={item.snapshot_id}
-                symbol={symbol}
-              />
-            </Space>
-          </Card>
-        ),
-      }))}
-    />
-  );
-}
-
 export default function StockReviewTab() {
+  const navigate = useNavigate();
+  const { accounts, fetchAccounts } = useAccountStore();
+  const baseCurrency = useExchangeRateStore((state) => state.baseCurrency);
+  const setBaseCurrency = useExchangeRateStore((state) => state.setBaseCurrency);
   const {
-    reviewedSymbols,
-    currentReview,
-    decisionStats,
-    loading,
-    fetchReviewedSymbols,
-    fetchHoldingReview,
-    fetchDecisionStatistics,
-  } = useReviewStore();
+    report,
+    reportLoading,
+    campaignLoading,
+    mutating,
+    selectedCampaign,
+    error,
+    loadReport,
+    loadCampaignDetail,
+    saveAnnotation,
+    confirmOverride,
+    clearSelectedCampaign,
+    clearError,
+  } = useStockReviewStore();
+  const [filters, setFilters] = useState<Filters>(() =>
+    loadStockReviewFilters(localStorage, new Date(), baseCurrency),
+  );
 
-  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
-
+  useEffect(() => { void fetchAccounts(); }, [fetchAccounts]);
   useEffect(() => {
-    fetchReviewedSymbols();
-    fetchDecisionStatistics();
-  }, [fetchReviewedSymbols, fetchDecisionStatistics]);
+    if (filters.baseCurrency !== baseCurrency) {
+      setFilters((current) => ({ ...current, baseCurrency }));
+    }
+  }, [baseCurrency, filters.baseCurrency]);
+  useEffect(() => {
+    saveStockReviewFilters(localStorage, filters);
+    void loadReport(filters);
+  }, [filters, loadReport]);
 
-  const handleSelectSymbol = (symbol: string) => {
-    setSelectedSymbol(symbol);
-    fetchHoldingReview(symbol);
+  const pageState = getStockReviewPageState(report, error);
+  const reportFilters = useMemo<Filters | null>(() => report ? {
+    accountId: report.methodology.query.account_id,
+    periodPreset: filters.periodPreset,
+    startDate: report.methodology.query.start_date,
+    endDate: report.methodology.query.end_date,
+    market: report.methodology.query.market as Market | null,
+    benchmarkSymbol: report.methodology.query.benchmark_symbol,
+    baseCurrency: report.methodology.query.base_currency as Currency,
+  } : null, [report, filters.periodPreset]);
+
+  const changeFilters = (next: Filters) => {
+    clearError();
+    if (next.baseCurrency !== baseCurrency) setBaseCurrency(next.baseCurrency);
+    setFilters(next);
   };
+  const openCampaign = (campaignId: string) => void loadCampaignDetail(filters, campaignId);
+  const navigateWithPrefill = (prefill: ReturnType<typeof buildStockReviewAiPrefill>) => {
+    navigate("/ai-assistant", {
+      state: {
+        prefillPrompt: prefill.prompt,
+        prefillActiveSkill: prefill.activeSkill,
+        prefillAutoSend: prefill.autoSend,
+        prefillToolName: prefill.toolName,
+        prefillToolArguments: prefill.toolArguments,
+      },
+    });
+  };
+  const askPortfolioAi = () => {
+    if (reportFilters) navigateWithPrefill(buildStockReviewAiPrefill(reportFilters));
+  };
+  const askCampaignAi = (detail: StockCampaignDetail) => {
+    if (reportFilters) {
+      navigateWithPrefill(
+        buildStockCampaignAiPrefill(
+          reportFilters,
+          detail.summary.symbol,
+          detail.summary.campaign_id,
+        ),
+      );
+    }
+  };
+  const applyOverride = (input: StockReviewOverrideInput) => confirmOverride(filters, input);
 
   return (
-    <div className="space-y-6">
-      {/* Decision Statistics */}
-      {decisionStats && (
-        <Card title="决策统计">
-          <Row gutter={16}>
-            <Col span={6}>
-              <Statistic
-                title="总决策数"
-                value={decisionStats.total_decisions}
-              />
-            </Col>
-            <Col span={6}>
-              <Statistic
-                title="正确决策"
-                value={decisionStats.correct_count}
-                styles={{ content: {  color: "var(--color-success)"  } }}
-              />
-            </Col>
-            <Col span={6}>
-              <Statistic
-                title="错误决策"
-                value={decisionStats.wrong_count}
-                styles={{ content: {  color: "var(--color-error)"  } }}
-              />
-            </Col>
-            <Col span={6}>
-              <Statistic
-                title="决策准确率"
-                value={(decisionStats.accuracy_rate * 100).toFixed(1)}
-                suffix="%"
-                styles={{
-                  content: {
-                    color:
-                      decisionStats.accuracy_rate >= 0.6 ? "#52c41a" : "#ff4d4f",
-                  },
-                }}
-              />
-            </Col>
-          </Row>
-          {decisionStats.total_decisions > 0 && (
-            <Progress
-              percent={Math.round(decisionStats.accuracy_rate * 100)}
-              style={{ marginTop: 16 }}
-            />
-          )}
-        </Card>
+    <div className="space-y-5">
+      <Card>
+        <StockReviewFilters
+          filters={filters}
+          accounts={accounts}
+          loading={reportLoading}
+          canAskAi={Boolean(reportFilters)}
+          onChange={changeFilters}
+          onRefresh={() => void loadReport(filters)}
+          onAskAi={askPortfolioAi}
+        />
+      </Card>
+
+      {error && report && (
+        <Alert
+          type="warning"
+          showIcon
+          closable
+          onClose={clearError}
+          message="最近一次操作未完成，仍保留上一次成功报告"
+          description={error}
+          action={<Button size="small" icon={<ReloadOutlined />} onClick={() => void loadReport(filters)}>重试</Button>}
+        />
       )}
 
-      <Row gutter={16}>
-        {/* Symbol Selector */}
-        <Col span={6}>
-          <Card title="选择股票">
-            <Select
-              showSearch
-              placeholder="搜索或选择股票"
-              style={{ width: "100%", marginBottom: 16 }}
-              value={selectedSymbol || undefined}
-              onChange={handleSelectSymbol}
-              optionFilterProp="label"
-              options={reviewedSymbols.map(([sym, name]) => ({
-                value: sym,
-                label: `${sym} ${name}`,
-              }))}
-            />
-            {reviewedSymbols.map(([sym, name, market]) => (
-              <div
-                key={sym}
-                className="cursor-pointer p-2 rounded"
-                style={{
-                  backgroundColor: selectedSymbol === sym ? "color-mix(in srgb, var(--color-info) 15%, transparent)" : "transparent",
-                  borderLeft:
-                    selectedSymbol === sym ? "3px solid var(--color-info)" : "3px solid transparent",
-                }}
-                onClick={() => handleSelectSymbol(sym)}
-                onMouseEnter={(e) => {
-                  if (selectedSymbol !== sym) e.currentTarget.style.backgroundColor = "color-mix(in srgb, var(--color-text) 8%, transparent)";
-                }}
-                onMouseLeave={(e) => {
-                  if (selectedSymbol !== sym) e.currentTarget.style.backgroundColor = "transparent";
-                }}
-              >
-                <Space>
-                  <Text strong>{sym}</Text>
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    {name}
-                  </Text>
-                  <Tag color="default" style={{ fontSize: 10 }}>
-                    {market}
-                  </Tag>
-                </Space>
-              </div>
-            ))}
-            {!reviewedSymbols.length && (
-              <Empty
-                description="暂无复盘数据，请先创建季度快照"
-                image={Empty.PRESENTED_IMAGE_SIMPLE}
-              />
-            )}
-          </Card>
-        </Col>
+      {pageState.kind === "error" ? (
+        <Card>
+          <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description={
+              <Space orientation="vertical">
+                <Text>股票复盘报告加载失败：{error}</Text>
+                <Button type="primary" icon={<ReloadOutlined />} onClick={() => void loadReport(filters)}>重试</Button>
+              </Space>
+            }
+          />
+        </Card>
+      ) : reportLoading && !report ? (
+        <Card><div style={{ padding: 64, textAlign: "center" }}><Spin description="正在加载持久化筛选对应的组合复盘…" /></div></Card>
+      ) : report && pageState.kind === "empty" ? (
+        <Space orientation="vertical" size="middle" style={{ width: "100%" }}>
+          <StockReviewDataQuality report={report} />
+          <Card><Empty description="所选范围没有可展示的持仓曲线、调仓动作或 Campaign。无需填写表单；可调整筛选或刷新数据。" /></Card>
+        </Space>
+      ) : report ? (
+        <Space orientation="vertical" size="large" style={{ width: "100%" }}>
+          <StockReviewDataQuality report={report} />
+          <StockReviewSummaryCards summary={report.summary} currency={report.methodology.query.base_currency as Currency} loading={reportLoading} />
+          <PortfolioComparisonChart report={report} onOpenCampaign={openCampaign} />
+          <RebalanceAttributionPanel report={report} />
+          <RiskStructurePanel report={report} />
+          <StockActionsTable actions={report.actions} campaigns={report.campaigns} baseCurrency={report.methodology.query.base_currency as Currency} onOpenCampaign={openCampaign} />
+        </Space>
+      ) : null}
 
-        {/* Review Timeline */}
-        <Col span={18}>
-          {currentReview ? (
-            <Card
-              title={
-                <Space>
-                  <Text strong>{currentReview.symbol}</Text>
-                  <Text>{currentReview.name}</Text>
-                  <Tag color="blue">{currentReview.market}</Tag>
-                  {currentReview.is_current_holding ? (
-                    <Tag color="green">持仓中</Tag>
-                  ) : (
-                    <Tag color="default">已清仓</Tag>
-                  )}
-                </Space>
-              }
-              loading={loading}
-            >
-              <HoldingTimeline
-                timeline={currentReview.quarterly_timeline}
-                symbol={currentReview.symbol}
-              />
-            </Card>
-          ) : (
-            <Card>
-              <Empty
-                description="请从左侧选择一只股票查看复盘"
-                image={Empty.PRESENTED_IMAGE_SIMPLE}
-              />
-            </Card>
-          )}
-        </Col>
-      </Row>
+      <LegacyStockReviewPanel />
+      <StockCampaignDrawer
+        open={campaignLoading || Boolean(selectedCampaign)}
+        loading={campaignLoading}
+        mutating={mutating}
+        detail={selectedCampaign}
+        currency={(report?.methodology.query.base_currency ?? filters.baseCurrency) as Currency}
+        reportEndDate={report?.methodology.query.end_date ?? filters.endDate}
+        onClose={clearSelectedCampaign}
+        onAskAi={askCampaignAi}
+        onSaveAnnotation={saveAnnotation}
+        onConfirmOverride={applyOverride}
+      />
     </div>
   );
 }

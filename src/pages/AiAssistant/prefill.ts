@@ -6,6 +6,23 @@ export function readAiPrefill(state: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+export function readAiPrefillActiveSkill(state: unknown): string | null {
+  if (!state || typeof state !== "object") return null;
+  const candidate = state as {
+    prefillPrompt?: unknown;
+    prefillActiveSkill?: unknown;
+    prefillAutoSend?: unknown;
+  };
+  if (
+    readAiPrefill(state) == null ||
+    candidate.prefillAutoSend !== false ||
+    candidate.prefillActiveSkill !== "stock-review"
+  ) {
+    return null;
+  }
+  return "stock-review";
+}
+
 export function resolveAiPrefillSessionId(
   prefillPrompt: string | null,
   currentSessionId: string | null,

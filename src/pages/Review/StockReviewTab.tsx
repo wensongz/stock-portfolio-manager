@@ -156,7 +156,7 @@ export default function StockReviewTab() {
           />
         </Card>
       ) : reportLoading && !report ? (
-        <Card><div style={{ padding: 64, textAlign: "center" }}><Spin description="正在加载持久化筛选对应的组合复盘…" /></div></Card>
+        <Card><div style={{ padding: 64, textAlign: "center" }}><Spin description="正在同步交易日历并生成股票操作复盘…" /></div></Card>
       ) : report ? (
         <Space orientation="vertical" size="large" style={{ width: "100%" }}>
           <StockReviewDataQuality report={report} />

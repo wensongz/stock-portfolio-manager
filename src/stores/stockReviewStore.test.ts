@@ -173,6 +173,8 @@ function report(id: string) {
       market_data_coverage: 1,
       exchange_rate_coverage: 1,
       interval_drawdown_only: false,
+      market_price_gap_total: 0,
+      market_price_gap_omitted: 0,
     },
     annotations: [],
     generated_at: `2026-08-28T00:00:00Z:${id}`,

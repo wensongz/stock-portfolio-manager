@@ -27,7 +27,9 @@ import {
   isStockReviewAnnotationInDisplayContext,
   loadStockReviewFilters,
   mapStockReviewMetricForDisplay,
+  marketPriceGapLabel,
   moveStockReviewTransaction,
+  partitionStockReviewIssues,
   saveStockReviewFilters,
   sortStockReviewActions,
   sortStockReviewIssues,
@@ -399,12 +401,28 @@ test("comparison series keep backend gaps and never connect or fill missing poin
 
 test("data-quality issues sort blocker before warning before info", () => {
   const issues = [
-    { code: "i", severity: "info", message: "info", affected_symbol: null, affected_date: null },
-    { code: "w", severity: "warning", message: "warning", affected_symbol: null, affected_date: null },
-    { code: "b", severity: "error", message: "blocker", affected_symbol: null, affected_date: null },
+    { code: "i", severity: "info", message: "info", affected_market: null, affected_symbol: null, affected_date: null },
+    { code: "w", severity: "warning", message: "warning", affected_market: null, affected_symbol: null, affected_date: null },
+    { code: "b", severity: "error", message: "blocker", affected_market: null, affected_symbol: null, affected_date: null },
   ];
   assert.deepEqual(sortStockReviewIssues(issues).map((issue) => issue.code), ["b", "w", "i"]);
   assert.deepEqual(issues.map((issue) => issue.code), ["i", "w", "b"]);
+});
+
+test("market price gaps are separated and preserve stable backend order", () => {
+  const issues = [
+    { code: "market_calendar_authority", severity: "info", message: "calendar", affected_market: "US", affected_symbol: null, affected_date: null },
+    { code: "market_price_gap", severity: "warning", message: "gap", affected_market: "US", affected_symbol: "MSFT", affected_date: "2026-01-08" },
+  ];
+  assert.deepEqual(partitionStockReviewIssues(issues), {
+    gapIssues: [issues[1]],
+    otherIssues: [issues[0]],
+  });
+});
+
+test("market gap label exposes shown total and omitted counts", () => {
+  assert.equal(marketPriceGapLabel({ total: 25, omitted: 5 }), "查看 20 / 25 项行情缺口（另 5 项未展示）");
+  assert.equal(marketPriceGapLabel({ total: 1, omitted: 0 }), "查看 1 项行情缺口");
 });
 
 test("summary cards stay in the approved five-card order", () => {

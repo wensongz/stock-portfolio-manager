@@ -1005,12 +1005,15 @@ export interface StockReviewDataQuality {
   market_data_coverage: number | null;
   exchange_rate_coverage: number | null;
   interval_drawdown_only: boolean;
+  market_price_gap_total: number;
+  market_price_gap_omitted: number;
 }
 
 export interface StockReviewIssue {
   code: string;
   severity: StockReviewIssueSeverity;
   message: string;
+  affected_market: string | null;
   affected_symbol: string | null;
   affected_date: string | null;
 }

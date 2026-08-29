@@ -161,6 +161,20 @@ export function sortStockReviewIssues(
   );
 }
 
+export function partitionStockReviewIssues(issues: StockReviewIssue[]) {
+  return {
+    gapIssues: issues.filter((issue) => issue.code === "market_price_gap"),
+    otherIssues: issues.filter((issue) => issue.code !== "market_price_gap"),
+  };
+}
+
+export function marketPriceGapLabel(input: { total: number; omitted: number }): string {
+  const shown = input.total - input.omitted;
+  return input.omitted > 0
+    ? `查看 ${shown} / ${input.total} 项行情缺口（另 ${input.omitted} 项未展示）`
+    : `查看 ${input.total} 项行情缺口`;
+}
+
 export function getStockReviewPageState(
   report: Pick<StockReviewReport, "curves" | "actions" | "campaigns"> | null,
   error: string | null,

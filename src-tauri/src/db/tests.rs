@@ -186,6 +186,19 @@ mod tests {
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO stock_market_calendar_coverage
+                (market, source, complete_start, complete_through, revision, encodes_closed_dates, updated_at)
+             VALUES ('US', 'fixture', '2024-01-16', '2024-01-16', 'fixture-v1', 1, '2024-01-16T16:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stock_market_sessions (market, date, is_session, source, updated_at)
+             VALUES ('US', '2024-01-16', 1, 'fixture', '2024-01-16T16:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO stock_review_annotations (id, scope_type, scope_key, annotation_type, value_json, source, created_at, updated_at)
              VALUES ('annotation-reset', 'stock', 'MSFT', 'thesis', '{}', 'user', '2024-01-16T16:00:00Z', '2024-01-16T16:00:00Z')",
             [],

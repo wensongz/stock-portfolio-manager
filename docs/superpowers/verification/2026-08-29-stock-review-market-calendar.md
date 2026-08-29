@@ -15,12 +15,12 @@
 | 命令 | 结果 |
 | --- | --- |
 | `cd src-tauri && cargo fmt --check` | **FAIL（既有基线例外）**：仅报告未被本分支修改的 `commands/dividends.rs`、`commands/options.rs`、`commands/quotes.rs`、`commands/transactions.rs`。四个文件均不在 `git diff 97e77a3..HEAD --name-only` 中。 |
-| `rustfmt --check --edition 2021`（本分支 10 个变更 Rust 文件） | PASS。 |
+| `rustfmt --check --edition 2021 src-tauri/src/db/tests.rs src-tauri/src/models/stock_review.rs src-tauri/src/services/mod.rs src-tauri/src/services/quote_service.rs src-tauri/src/services/stock_action_builder.rs src-tauri/src/services/stock_campaign_builder.rs src-tauri/src/services/stock_review_calendar.rs src-tauri/src/services/stock_review_persistence.rs src-tauri/src/services/stock_review_quality.rs src-tauri/src/services/stock_review_service.rs` | PASS。 |
 | `cd src-tauri && cargo test --lib stock_review_calendar::tests -- --nocapture` | PASS：24 passed，0 failed。 |
 | `cd src-tauri && cargo test --lib stock_review_service::tests -- --nocapture` | PASS：70 passed，0 failed。 |
 | `cd src-tauri && cargo test --lib` | PASS：594 passed，0 failed，8 ignored。 |
 | `cd src-tauri && cargo check` | PASS。 |
-| brief 中的完整 15 文件 `node --test ...` 命令 | PASS：106 passed，0 failed，0 skipped。 |
+| `node --test src/hooks/tablePageSize.test.ts src/pages/AiAssistant/prefill.test.ts src/pages/AiAssistant/sidebarPreference.test.ts src/pages/Options/expiredOptionsViewModel.test.ts src/pages/Quarterly/aggregateSnapshotHoldings.test.mjs src/pages/Review/optionReviewViewModel.test.ts src/pages/Review/reviewTabPreference.test.ts src/pages/Review/stockReviewDateBoundary.test.ts src/pages/Review/stockReviewViewModel.test.ts src/pages/Statistics/categoryHoldings.test.ts src/stores/chatStore.test.ts src/stores/optionReviewStore.test.ts src/stores/optionStore.test.ts src/stores/quoteErrors.test.ts src/stores/stockReviewStore.test.ts` | PASS：106 passed，0 failed，0 skipped。 |
 | `npm run build` | PASS：TypeScript 与 Vite 生产构建成功。 |
 
 生产构建保留了既有 Vite 警告：压缩后主 JS chunk 约 4,249.05 kB，超过 500 kB；未隐藏或改写该警告。

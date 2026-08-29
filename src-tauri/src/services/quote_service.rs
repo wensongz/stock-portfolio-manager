@@ -856,8 +856,9 @@ pub fn resolve_index_secid(symbol: &str) -> Option<(&'static str, &'static str)>
         "IXIC" | "NDX" | "NASDAQ" | "COMP" => Some(("100.NDX", "纳斯达克")),
         "DJI" | "DJIA" | "DOW" => Some(("100.DJIA", "道琼斯")),
         "HSI" | "HANGSENG" => Some(("100.HSI", "恒生指数")),
+        "HSCE" | "HSCEI" => Some(("100.HSCEI", "恒生中国企业指数")),
         "000300" | "CSI300" | "HS300" => Some(("1.000300", "沪深300")),
-        "000001" | "SSE" | "SHCOMP" => Some(("1.000001", "上证综指")),
+        "000001" | "SSE" | "SSEC" | "SHCOMP" => Some(("1.000001", "上证综指")),
         "399001" | "SZCOMP" => Some(("0.399001", "深证成指")),
         "399006" | "CHINEXT" | "CYB" => Some(("0.399006", "创业板指")),
         "N225" | "NIKKEI" => Some(("100.N225", "日经225")),
@@ -2355,6 +2356,26 @@ async fn fetch_stock_history_xueqiu_outcome(
         _ => to_xueqiu_us_symbol(symbol),
     };
 
+    fetch_history_xueqiu_api_symbol(&xueqiu_symbol, symbol, market, start_date, end_date).await
+}
+
+#[allow(dead_code)] // Called by the Task 2 live calendar adapter, wired by Task 3.
+pub(crate) async fn fetch_index_history_xueqiu(
+    api_symbol: &str,
+    market: &str,
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+) -> Result<XueqiuHistoryOutcome, String> {
+    fetch_history_xueqiu_api_symbol(api_symbol, api_symbol, market, start_date, end_date).await
+}
+
+async fn fetch_history_xueqiu_api_symbol(
+    api_symbol: &str,
+    display_symbol: &str,
+    market: &str,
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+) -> Result<XueqiuHistoryOutcome, String> {
     // Xueqiu returns trading days going backwards from begin.
     // Calendar days in range is a safe upper bound (there are fewer
     // trading days than calendar days), with a minimum of 2.
@@ -2375,10 +2396,10 @@ async fn fetch_stock_history_xueqiu_outcome(
 
     let url = format!(
         "https://stock.xueqiu.com/v5/stock/chart/kline.json?symbol={}&begin={}&period=day&type=before&count=-{}&indicator=kline",
-        xueqiu_symbol, begin_ts, count
+        api_symbol, begin_ts, count
     );
 
-    let response = send_xueqiu_request(&url, symbol).await?;
+    let response = send_xueqiu_request(&url, display_symbol).await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -2391,18 +2412,18 @@ async fn fetch_stock_history_xueqiu_outcome(
             .collect::<String>();
         return Err(format!(
             "fetch_stock_history_xueqiu: HTTP {} for {}. Response: {}",
-            status, symbol, body_preview
+            status, display_symbol, body_preview
         ));
     }
 
     let body = response.text().await.map_err(|e| {
         format!(
             "fetch_stock_history_xueqiu: read error for {}: {}",
-            symbol, e
+            display_symbol, e
         )
     })?;
 
-    parse_xueqiu_history_response(&body, symbol, market, start_date, end_date, &url)
+    parse_xueqiu_history_response(&body, display_symbol, market, start_date, end_date, &url)
 }
 
 pub(crate) async fn resolve_xueqiu_history_outcome<EastMoney, EastMoneyFuture, Yahoo, YahooFuture>(
@@ -2525,8 +2546,10 @@ mod tests {
         // HK.
         assert_eq!(resolve_index_secid("^HSI").unwrap().0, "100.HSI");
         assert_eq!(resolve_index_secid("HSI").unwrap().0, "100.HSI");
+        assert_eq!(resolve_index_secid("^HSCEI").unwrap().0, "100.HSCEI");
         // CN — with and without .SS suffix.
         assert_eq!(resolve_index_secid("000300.SS").unwrap().0, "1.000300");
+        assert_eq!(resolve_index_secid("^SSEC").unwrap().0, "1.000001");
         assert_eq!(resolve_index_secid("000001.SS").unwrap().0, "1.000001");
         assert_eq!(resolve_index_secid("000300").unwrap().0, "1.000300");
         // Non-index symbols return None.

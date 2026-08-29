@@ -1,0 +1,59 @@
+{
+  "revision": "exchange-holidays-v1-2025-2026",
+  "entries": [
+    {
+      "market": "CN",
+      "year": 2025,
+      "source_urls": [
+        "https://big5.sse.com.cn/site/cht/www.sse.com.cn/disclosure/announcement/general/c/c_20241223_10767108.shtml",
+        "https://www.szse.cn/disclosure/notice/general/t20241223_611283.html"
+      ],
+      "notice_versions": ["SSE 上证公告〔2024〕38号", "SZSE 深证会〔2024〕413号"],
+      "closed_weekdays": ["2025-01-01", "2025-01-28", "2025-01-29", "2025-01-30", "2025-01-31", "2025-02-03", "2025-02-04", "2025-04-04", "2025-05-01", "2025-05-02", "2025-05-05", "2025-06-02", "2025-10-01", "2025-10-02", "2025-10-03", "2025-10-06", "2025-10-07", "2025-10-08"],
+      "exceptional_closures": []
+    },
+    {
+      "market": "CN",
+      "year": 2026,
+      "source_urls": [
+        "https://www.sse.com.cn/disclosure/announcement/general/c/c_20251222_10802507.shtml",
+        "https://investor.szse.cn/disclosure/notice/general/t20251222_618087.html"
+      ],
+      "notice_versions": ["SSE 上证公告〔2025〕45号", "SZSE 深证会〔2025〕481号"],
+      "closed_weekdays": ["2026-01-01", "2026-01-02", "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-23", "2026-04-06", "2026-05-01", "2026-05-04", "2026-05-05", "2026-06-19", "2026-09-25", "2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06", "2026-10-07"],
+      "exceptional_closures": []
+    },
+    {
+      "market": "HK",
+      "year": 2025,
+      "source_urls": ["https://www.hkex.com.hk/-/media/HKEX-Market/News/HKEX-Calendar/2025-HKEX-Calendar_r.pdf"],
+      "notice_versions": ["HKEX 2025 Calendar"],
+      "closed_weekdays": ["2025-01-01", "2025-01-29", "2025-01-30", "2025-01-31", "2025-04-04", "2025-04-18", "2025-04-21", "2025-05-01", "2025-05-05", "2025-07-01", "2025-10-01", "2025-10-07", "2025-10-29", "2025-12-25", "2025-12-26"],
+      "exceptional_closures": []
+    },
+    {
+      "market": "HK",
+      "year": 2026,
+      "source_urls": ["https://www.hkex.com.hk/-/media/HKEX-Market/Services/Market-Data-Services/Infrastructure/Index-Feed-Calendar-2026-%28English-%2C-a-%2C-Chinese%29.pdf"],
+      "notice_versions": ["HKEX 2026 Index Feed Calendar"],
+      "closed_weekdays": ["2026-01-01", "2026-02-17", "2026-02-18", "2026-02-19", "2026-04-03", "2026-04-06", "2026-04-07", "2026-05-01", "2026-05-25", "2026-06-19", "2026-07-01", "2026-10-01", "2026-10-19", "2026-12-25"],
+      "exceptional_closures": []
+    },
+    {
+      "market": "US",
+      "year": 2025,
+      "source_urls": ["https://www.nyse.com/trade/hours-calendars", "https://www.nasdaqtrader.com/trader.aspx?id=calendar"],
+      "notice_versions": ["NYSE 2025", "Nasdaq 2025"],
+      "closed_weekdays": ["2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26", "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25"],
+      "exceptional_closures": []
+    },
+    {
+      "market": "US",
+      "year": 2026,
+      "source_urls": ["https://www.nyse.com/trade/hours-calendars", "https://www.nasdaqtrader.com/trader.aspx?id=calendar"],
+      "notice_versions": ["NYSE 2026", "Nasdaq 2026"],
+      "closed_weekdays": ["2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25"],
+      "exceptional_closures": []
+    }
+  ]
+}

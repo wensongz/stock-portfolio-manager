@@ -1,11 +1,15 @@
+use crate::db::Database;
 use crate::services::quote_service::{self, XueqiuHistoryOutcome};
-use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc, Weekday};
+use crate::services::stock_review_market_data::load_market_sessions;
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, SecondsFormat, Utc, Weekday};
 use chrono_tz::{America::New_York, Asia::Hong_Kong, Asia::Shanghai, Tz};
+use rusqlite::{params, OptionalExtension, Transaction};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Mutex as AsyncMutex;
 
 const HOLIDAY_RESOURCE: &str = include_str!("../../resources/stock_review_market_holidays.v1.json");
 
@@ -81,6 +85,41 @@ pub struct CalendarValidationRequest {
 pub struct CalendarSyncWarning {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalendarSyncStatus {
+    Reused,
+    Published,
+    StaleCacheUsed,
+    Unavailable,
+}
+
+impl CalendarSyncStatus {
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Reused | Self::Published | Self::StaleCacheUsed)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CalendarSyncRequest {
+    pub market: String,
+    pub required_start: NaiveDate,
+    pub required_through: NaiveDate,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Read by the Task 4 report-integration consumer.
+pub struct CalendarSyncOutcome {
+    pub market: String,
+    pub requested_start: NaiveDate,
+    pub requested_through: NaiveDate,
+    pub available_start: Option<NaiveDate>,
+    pub available_through: Option<NaiveDate>,
+    pub status: CalendarSyncStatus,
+    pub issue_code: Option<String>,
+    pub message: Option<String>,
+    pub warnings: Vec<CalendarSyncWarning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -717,19 +756,661 @@ pub fn load_market_holiday_rules(
     })
 }
 
+const COVERAGE_REVISION_MISMATCH: &str = "calendar coverage revision changed";
+
+#[derive(Debug, Clone)]
+struct CalendarCoverageSnapshot {
+    source: String,
+    complete_start: NaiveDate,
+    complete_through: NaiveDate,
+    revision: String,
+    rows: Vec<(NaiveDate, bool)>,
+    valid: bool,
+}
+
+fn market_sync_locks() -> &'static BTreeMap<&'static str, AsyncMutex<()>> {
+    static LOCKS: OnceLock<BTreeMap<&'static str, AsyncMutex<()>>> = OnceLock::new();
+    LOCKS.get_or_init(|| {
+        BTreeMap::from([
+            ("CN", AsyncMutex::new(())),
+            ("HK", AsyncMutex::new(())),
+            ("US", AsyncMutex::new(())),
+        ])
+    })
+}
+
+fn date_text(date: NaiveDate) -> String {
+    date.format("%Y-%m-%d").to_string()
+}
+
+fn rows_are_complete(rows: &[(NaiveDate, bool)], start: NaiveDate, end: NaiveDate) -> bool {
+    start <= end
+        && rows.len() == (end - start).num_days() as usize + 1
+        && rows
+            .iter()
+            .enumerate()
+            .all(|(offset, (date, _))| *date == start + chrono::Duration::days(offset as i64))
+}
+
+fn read_calendar_coverage(
+    db: &Database,
+    market: &str,
+) -> Result<Option<CalendarCoverageSnapshot>, String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let coverage = conn
+        .query_row(
+            "SELECT source, complete_start, complete_through, revision, encodes_closed_dates
+             FROM stock_market_calendar_coverage WHERE market = ?1",
+            [market],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((source, complete_start, complete_through, revision, closed_flag)) = coverage else {
+        return Ok(None);
+    };
+    let complete_start = NaiveDate::parse_from_str(&complete_start, "%Y-%m-%d")
+        .map_err(|error| format!("Invalid calendar coverage start: {error}"))?;
+    let complete_through = NaiveDate::parse_from_str(&complete_through, "%Y-%m-%d")
+        .map_err(|error| format!("Invalid calendar coverage end: {error}"))?;
+
+    let mut statement = conn
+        .prepare(
+            "SELECT date, is_session FROM stock_market_sessions
+             WHERE market = ?1 AND date BETWEEN ?2 AND ?3 ORDER BY date",
+        )
+        .map_err(|error| error.to_string())?;
+    let stored_rows = statement
+        .query_map(
+            params![
+                market,
+                date_text(complete_start),
+                date_text(complete_through)
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let flags_valid = stored_rows
+        .iter()
+        .all(|(_, is_session)| matches!(*is_session, 0 | 1));
+    let rows = stored_rows
+        .into_iter()
+        .map(|(date, is_session)| {
+            NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .map(|date| (date, is_session == 1))
+                .map_err(|error| format!("Invalid cached market-session date '{date}': {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let valid = closed_flag == 1
+        && flags_valid
+        && rows_are_complete(&rows, complete_start, complete_through);
+    Ok(Some(CalendarCoverageSnapshot {
+        source,
+        complete_start,
+        complete_through,
+        revision,
+        rows,
+        valid,
+    }))
+}
+
+fn revision_uses_resource(revision: &str, resource_revision: &str) -> bool {
+    revision
+        .strip_prefix(resource_revision)
+        .is_some_and(|suffix| suffix.starts_with(':'))
+}
+
+fn canonical_calendar_source(providers: &[String]) -> String {
+    let mut providers = providers.to_vec();
+    providers.sort();
+    providers.dedup();
+    if providers.is_empty() {
+        "validated_index_history".to_owned()
+    } else {
+        providers.join("+")
+    }
+}
+
+fn providers_from_source(source: &str) -> Vec<String> {
+    source
+        .split('+')
+        .filter(|provider| matches!(*provider, "eastmoney" | "xueqiu"))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn validation_failure_outcome(
+    request: &CalendarSyncRequest,
+    old_coverage: Option<&CalendarCoverageSnapshot>,
+    message: String,
+) -> CalendarSyncOutcome {
+    let old_coverage = old_coverage.filter(|coverage| coverage.valid);
+    CalendarSyncOutcome {
+        market: request.market.clone(),
+        requested_start: request.required_start,
+        requested_through: request.required_through,
+        available_start: old_coverage.map(|coverage| coverage.complete_start),
+        available_through: old_coverage.map(|coverage| coverage.complete_through),
+        status: if old_coverage.is_some() {
+            CalendarSyncStatus::StaleCacheUsed
+        } else {
+            CalendarSyncStatus::Unavailable
+        },
+        issue_code: Some(
+            if old_coverage.is_some() {
+                "market_calendar_refresh_failed"
+            } else {
+                "market_calendar_sync_failed"
+            }
+            .to_owned(),
+        ),
+        message: Some(message),
+        warnings: Vec::new(),
+    }
+}
+
+fn successful_outcome(
+    request: &CalendarSyncRequest,
+    status: CalendarSyncStatus,
+    available_start: NaiveDate,
+    available_through: NaiveDate,
+    warnings: Vec<CalendarSyncWarning>,
+) -> CalendarSyncOutcome {
+    CalendarSyncOutcome {
+        market: request.market.clone(),
+        requested_start: request.required_start,
+        requested_through: request.required_through,
+        available_start: Some(available_start),
+        available_through: Some(available_through),
+        status,
+        issue_code: None,
+        message: None,
+        warnings,
+    }
+}
+
+fn transaction_calendar_rows(
+    transaction: &Transaction<'_>,
+    market: &str,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Result<Vec<(NaiveDate, bool)>, String> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT date, is_session FROM stock_market_sessions
+             WHERE market = ?1 AND date BETWEEN ?2 AND ?3 ORDER BY date",
+        )
+        .map_err(|error| error.to_string())?;
+    let stored = statement
+        .query_map(params![market, date_text(start), date_text(end)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    stored
+        .into_iter()
+        .map(|(date, is_session)| {
+            if !matches!(is_session, 0 | 1) {
+                return Err(format!(
+                    "Calendar row {market} {date} has invalid session flag {is_session}."
+                ));
+            }
+            NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .map(|date| (date, is_session == 1))
+                .map_err(|error| format!("Invalid cached market-session date '{date}': {error}"))
+        })
+        .collect()
+}
+
+fn publish_validated_segments(
+    db: &Database,
+    segments: &[ValidatedMarketCalendar],
+    final_calendar: &ValidatedMarketCalendar,
+    expected_coverage_revision: Option<&str>,
+) -> Result<CalendarSyncStatus, String> {
+    if !rows_are_complete(
+        &final_calendar.rows,
+        final_calendar.start,
+        final_calendar.end,
+    ) {
+        return Err(
+            "Final market calendar does not contain every natural day exactly once.".to_owned(),
+        );
+    }
+    for segment in segments {
+        if segment.market != final_calendar.market
+            || segment.resource_revision != final_calendar.resource_revision
+            || segment.start < final_calendar.start
+            || segment.end > final_calendar.end
+            || !rows_are_complete(&segment.rows, segment.start, segment.end)
+        {
+            return Err("Validated calendar segment is incomplete or inconsistent.".to_owned());
+        }
+    }
+
+    let revision = stable_calendar_revision(final_calendar);
+    let source = canonical_calendar_source(&final_calendar.providers);
+    let updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let current_revision = transaction
+        .query_row(
+            "SELECT revision FROM stock_market_calendar_coverage WHERE market = ?1",
+            [&final_calendar.market],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if current_revision.as_deref() != expected_coverage_revision {
+        let message = format!(
+            "{COVERAGE_REVISION_MISMATCH}: expected {:?}, found {:?}",
+            expected_coverage_revision, current_revision
+        );
+        transaction.rollback().map_err(|error| error.to_string())?;
+        return Err(message);
+    }
+    if current_revision.as_deref() == Some(revision.as_str()) {
+        return Ok(CalendarSyncStatus::Reused);
+    }
+
+    for segment in segments {
+        transaction
+            .execute(
+                "DELETE FROM stock_market_sessions
+                 WHERE market = ?1 AND date BETWEEN ?2 AND ?3",
+                params![
+                    segment.market,
+                    date_text(segment.start),
+                    date_text(segment.end)
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        for (date, is_session) in &segment.rows {
+            transaction
+                .execute(
+                    "INSERT INTO stock_market_sessions
+                        (market, date, is_session, source, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        segment.market,
+                        date_text(*date),
+                        i64::from(*is_session),
+                        source,
+                        updated_at
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    let stored_rows = transaction_calendar_rows(
+        &transaction,
+        &final_calendar.market,
+        final_calendar.start,
+        final_calendar.end,
+    )?;
+    if !rows_are_complete(&stored_rows, final_calendar.start, final_calendar.end)
+        || stored_rows != final_calendar.rows
+    {
+        return Err(
+            "Published market-calendar rows do not form the validated continuous range.".to_owned(),
+        );
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO stock_market_calendar_coverage
+                (market, source, complete_start, complete_through, revision,
+                 encodes_closed_dates, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+             ON CONFLICT(market) DO UPDATE SET
+               source = excluded.source,
+               complete_start = excluded.complete_start,
+               complete_through = excluded.complete_through,
+               revision = excluded.revision,
+               encodes_closed_dates = 0,
+               updated_at = excluded.updated_at",
+            params![
+                final_calendar.market,
+                source,
+                date_text(final_calendar.start),
+                date_text(final_calendar.end),
+                revision,
+                updated_at
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    let updated = transaction
+        .execute(
+            "UPDATE stock_market_calendar_coverage
+             SET encodes_closed_dates = 1 WHERE market = ?1",
+            [&final_calendar.market],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated != 1 {
+        return Err("Calendar coverage finalization did not update exactly one row.".to_owned());
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    drop(conn);
+
+    let reloaded = load_market_sessions(
+        db,
+        &final_calendar.market,
+        final_calendar.start,
+        final_calendar.end,
+    )?;
+    if !reloaded.covers(final_calendar.start, final_calendar.end) {
+        return Err("Committed market calendar failed its coverage reload check.".to_owned());
+    }
+    Ok(CalendarSyncStatus::Published)
+}
+
+#[allow(dead_code)] // Kept as the single-calendar publication seam required by the sync contract.
+fn publish_validated_calendar(
+    db: &Database,
+    calendar: &ValidatedMarketCalendar,
+    expected_coverage_revision: Option<&str>,
+) -> Result<CalendarSyncStatus, String> {
+    publish_validated_segments(
+        db,
+        std::slice::from_ref(calendar),
+        calendar,
+        expected_coverage_revision,
+    )
+}
+
+fn merge_validated_calendar(
+    request: &CalendarSyncRequest,
+    resource_revision: &str,
+    old_coverage: Option<&CalendarCoverageSnapshot>,
+    keep_old_rows: bool,
+    segments: &[ValidatedMarketCalendar],
+) -> Result<ValidatedMarketCalendar, String> {
+    let final_start = segments
+        .iter()
+        .map(|segment| segment.start)
+        .chain(
+            old_coverage
+                .filter(|_| keep_old_rows)
+                .map(|coverage| coverage.complete_start),
+        )
+        .min()
+        .unwrap_or(request.required_start)
+        .min(request.required_start);
+    let final_end = segments
+        .iter()
+        .map(|segment| segment.end)
+        .chain(
+            old_coverage
+                .filter(|_| keep_old_rows)
+                .map(|coverage| coverage.complete_through),
+        )
+        .max()
+        .unwrap_or(request.required_through)
+        .max(request.required_through);
+    let mut rows = BTreeMap::new();
+    let mut providers = Vec::new();
+    let mut references = Vec::new();
+    let mut warnings = Vec::new();
+    if keep_old_rows {
+        if let Some(coverage) = old_coverage {
+            rows.extend(coverage.rows.iter().copied());
+            providers.extend(providers_from_source(&coverage.source));
+        }
+    }
+    for segment in segments {
+        rows.extend(segment.rows.iter().copied());
+        providers.extend(segment.providers.iter().cloned());
+        references.extend(segment.references.iter().cloned());
+        warnings.extend(segment.warnings.iter().cloned());
+    }
+    if references.is_empty() {
+        references.extend(
+            reference_indices(&request.market)?
+                .into_iter()
+                .map(|reference| reference.logical_name.to_owned()),
+        );
+    }
+    providers.sort();
+    providers.dedup();
+    references.sort();
+    references.dedup();
+    warnings.sort_by(|left, right| (&left.code, &left.message).cmp(&(&right.code, &right.message)));
+    warnings.dedup();
+    let rows: Vec<_> = rows.into_iter().collect();
+    if !rows_are_complete(&rows, final_start, final_end) {
+        return Err(
+            "Validated segments are not adjacent to the existing calendar coverage.".to_owned(),
+        );
+    }
+    Ok(ValidatedMarketCalendar {
+        market: request.market.clone(),
+        start: final_start,
+        end: final_end,
+        resource_revision: resource_revision.to_owned(),
+        rows,
+        providers,
+        references,
+        warnings,
+    })
+}
+
+pub async fn sync_market_calendar_with_sources(
+    db: &Database,
+    request: CalendarSyncRequest,
+    sources: &[Arc<dyn IndexHistorySource>],
+) -> CalendarSyncOutcome {
+    let Some(market_lock) = market_sync_locks().get(request.market.as_str()) else {
+        return validation_failure_outcome(
+            &request,
+            None,
+            format!("Unsupported stock-review market '{}'.", request.market),
+        );
+    };
+    let _market_guard = market_lock.lock().await;
+
+    for attempt in 0..=1 {
+        let coverage = match read_calendar_coverage(db, &request.market) {
+            Ok(coverage) => coverage,
+            Err(message) => return validation_failure_outcome(&request, None, message),
+        };
+        let old_coverage = coverage.as_ref().filter(|coverage| coverage.valid);
+        let request_rules = match load_market_holiday_rules(
+            &request.market,
+            request.required_start,
+            request.required_through,
+        ) {
+            Ok(rules) => rules,
+            Err(message) => {
+                return validation_failure_outcome(&request, old_coverage, message);
+            }
+        };
+        let resource_matches = old_coverage.is_some_and(|coverage| {
+            revision_uses_resource(&coverage.revision, &request_rules.resource_revision)
+        });
+        if let Some(coverage) = old_coverage.filter(|coverage| {
+            resource_matches
+                && coverage.complete_start <= request.required_start
+                && coverage.complete_through >= request.required_through
+        }) {
+            return successful_outcome(
+                &request,
+                CalendarSyncStatus::Reused,
+                coverage.complete_start,
+                coverage.complete_through,
+                Vec::new(),
+            );
+        }
+
+        let union_start = old_coverage
+            .map(|coverage| coverage.complete_start.min(request.required_start))
+            .unwrap_or(request.required_start);
+        let union_end = old_coverage
+            .map(|coverage| coverage.complete_through.max(request.required_through))
+            .unwrap_or(request.required_through);
+        let ranges = if old_coverage.is_none() || !resource_matches {
+            vec![(union_start, union_end)]
+        } else {
+            let coverage = old_coverage.expect("matching coverage exists");
+            let mut ranges = Vec::new();
+            if request.required_start < coverage.complete_start {
+                let Some(end) = coverage.complete_start.pred_opt() else {
+                    return validation_failure_outcome(
+                        &request,
+                        old_coverage,
+                        "Calendar front-extension date underflow.".to_owned(),
+                    );
+                };
+                ranges.push((request.required_start, end));
+            }
+            if request.required_through > coverage.complete_through {
+                let Some(start) = coverage.complete_through.succ_opt() else {
+                    return validation_failure_outcome(
+                        &request,
+                        old_coverage,
+                        "Calendar back-extension date overflow.".to_owned(),
+                    );
+                };
+                ranges.push((start, request.required_through));
+            }
+            ranges
+        };
+
+        let mut segments = Vec::new();
+        let mut validation_error = None;
+        for (start, end) in ranges {
+            let rules = match load_market_holiday_rules(&request.market, start, end) {
+                Ok(rules) => rules,
+                Err(message) => {
+                    validation_error = Some(message);
+                    break;
+                }
+            };
+            let validation_request = CalendarValidationRequest {
+                market: request.market.clone(),
+                start,
+                end,
+                rules,
+            };
+            match validate_market_calendar(&validation_request, sources).await {
+                Ok(calendar) => segments.push(calendar),
+                Err(error) => {
+                    validation_error = Some(error.message);
+                    break;
+                }
+            }
+        }
+        if let Some(message) = validation_error {
+            return validation_failure_outcome(&request, old_coverage, message);
+        }
+
+        let keep_old_rows = old_coverage.is_some() && resource_matches;
+        let final_calendar = match merge_validated_calendar(
+            &request,
+            &request_rules.resource_revision,
+            old_coverage,
+            keep_old_rows,
+            &segments,
+        ) {
+            Ok(calendar) => calendar,
+            Err(message) => return validation_failure_outcome(&request, old_coverage, message),
+        };
+        let expected_revision = coverage.as_ref().map(|coverage| coverage.revision.as_str());
+        match publish_validated_segments(db, &segments, &final_calendar, expected_revision) {
+            Ok(status) => {
+                return successful_outcome(
+                    &request,
+                    status,
+                    final_calendar.start,
+                    final_calendar.end,
+                    final_calendar.warnings,
+                );
+            }
+            Err(message) if attempt == 0 && message.starts_with(COVERAGE_REVISION_MISMATCH) => {
+                continue;
+            }
+            Err(message) => return validation_failure_outcome(&request, old_coverage, message),
+        }
+    }
+    unreachable!("calendar publication attempts are bounded by the loop")
+}
+
+#[allow(dead_code)] // Consumed by the Task 4 report-integration entry point.
+pub async fn sync_market_calendars_with_sources(
+    db: &Database,
+    markets: &BTreeSet<String>,
+    required_start: NaiveDate,
+    now: DateTime<Utc>,
+    sources: &[Arc<dyn IndexHistorySource>],
+) -> Vec<CalendarSyncOutcome> {
+    let mut outcomes = Vec::with_capacity(markets.len());
+    for market in markets {
+        let required_through = match latest_fully_closed_date(market, now) {
+            Ok(date) => date,
+            Err(message) => {
+                let request = CalendarSyncRequest {
+                    market: market.clone(),
+                    required_start,
+                    required_through: required_start,
+                };
+                outcomes.push(validation_failure_outcome(&request, None, message));
+                continue;
+            }
+        };
+        outcomes.push(
+            sync_market_calendar_with_sources(
+                db,
+                CalendarSyncRequest {
+                    market: market.clone(),
+                    required_start,
+                    required_through,
+                },
+                sources,
+            )
+            .await,
+        );
+    }
+    outcomes
+}
+
+#[allow(dead_code)] // Production wrapper consumed by Task 4.
+pub async fn sync_market_calendars(
+    db: &Database,
+    markets: &BTreeSet<String>,
+    required_start: NaiveDate,
+    now: DateTime<Utc>,
+) -> Vec<CalendarSyncOutcome> {
+    let sources = live_index_history_sources();
+    sync_market_calendars_with_sources(db, markets, required_start, now, &sources).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         latest_fully_closed_date, load_market_holiday_rules, parse_market_holiday_bundle,
-        stable_calendar_revision, validate_market_calendar, CalendarProvider,
+        publish_validated_calendar, stable_calendar_revision, sync_market_calendar_with_sources,
+        validate_market_calendar, CalendarProvider, CalendarSyncRequest, CalendarSyncStatus,
         CalendarValidationErrorKind, CalendarValidationRequest, IndexHistoryEvidence,
         IndexHistorySource, ReferenceIndex, ValidatedMarketCalendar,
     };
+    use crate::db::Database;
     use chrono::{NaiveDate, TimeZone, Utc};
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     fn day(value: &str) -> NaiveDate {
         NaiveDate::parse_from_str(value, "%Y-%m-%d").unwrap()
@@ -832,6 +1513,297 @@ mod tests {
             end,
             rules: load_market_holiday_rules(market, start, end).unwrap(),
         }
+    }
+
+    fn fixture_sync_request(market: &str, start: &str, end: &str) -> CalendarSyncRequest {
+        CalendarSyncRequest {
+            market: market.to_owned(),
+            required_start: day(start),
+            required_through: day(end),
+        }
+    }
+
+    fn fixture_request_a() -> CalendarSyncRequest {
+        fixture_sync_request("US", "2026-01-01", "2026-01-09")
+    }
+
+    fn extended_request() -> CalendarSyncRequest {
+        fixture_sync_request("US", "2026-01-01", "2026-01-09")
+    }
+
+    fn fixture_validated_range(
+        start: &str,
+        end: &str,
+        resource_revision: &str,
+    ) -> ValidatedMarketCalendar {
+        let start = day(start);
+        let end = day(end);
+        let rules = load_market_holiday_rules("US", start, end).unwrap();
+        ValidatedMarketCalendar {
+            market: "US".to_owned(),
+            start,
+            end,
+            resource_revision: resource_revision.to_owned(),
+            rows: super::dates_inclusive(start, end)
+                .into_iter()
+                .map(|date| {
+                    let is_session = super::is_expected_session(&rules, date);
+                    (date, is_session)
+                })
+                .collect(),
+            providers: vec!["eastmoney".to_owned()],
+            references: vec!["nasdaq_composite".to_owned(), "sp500".to_owned()],
+            warnings: Vec::new(),
+        }
+    }
+
+    fn fixture_validated_a() -> ValidatedMarketCalendar {
+        let rules = load_market_holiday_rules("US", day("2026-01-01"), day("2026-01-07")).unwrap();
+        fixture_validated_range("2026-01-01", "2026-01-07", &rules.resource_revision)
+    }
+
+    struct CountingFakeSource {
+        calls: Mutex<Vec<(String, NaiveDate, NaiveDate)>>,
+        conflict: bool,
+    }
+
+    impl CountingFakeSource {
+        fn complete() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                conflict: false,
+            }
+        }
+
+        fn conflicting() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                conflict: true,
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, NaiveDate, NaiveDate)> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn clear_calls(&self) {
+            self.calls.lock().unwrap().clear();
+        }
+    }
+
+    impl IndexHistorySource for CountingFakeSource {
+        fn provider(&self) -> CalendarProvider {
+            CalendarProvider::EastMoney
+        }
+
+        fn fetch<'a>(
+            &'a self,
+            market: &'a str,
+            reference: &'a ReferenceIndex,
+            start: NaiveDate,
+            end: NaiveDate,
+        ) -> Pin<Box<dyn Future<Output = Result<IndexHistoryEvidence, String>> + Send + 'a>>
+        {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((reference.logical_name.to_owned(), start, end));
+            let provider = self.provider();
+            let logical_index = reference.logical_name.to_owned();
+            let conflict = self.conflict && reference.logical_name == "nasdaq_composite";
+            Box::pin(async move {
+                let rules = load_market_holiday_rules(market, start, end)?;
+                let mut session_dates: Vec<_> = super::dates_inclusive(start, end)
+                    .into_iter()
+                    .filter(|date| super::is_expected_session(&rules, *date))
+                    .collect();
+                if conflict {
+                    session_dates.pop();
+                }
+                Ok(IndexHistoryEvidence {
+                    provider,
+                    logical_index,
+                    request_start: start,
+                    request_end: end,
+                    session_dates,
+                    complete_response: true,
+                })
+            })
+        }
+    }
+
+    fn complete_fake_sources() -> Vec<Arc<dyn IndexHistorySource>> {
+        vec![Arc::new(CountingFakeSource::complete())]
+    }
+
+    fn conflicting_sources() -> Vec<Arc<dyn IndexHistorySource>> {
+        vec![Arc::new(CountingFakeSource::conflicting())]
+    }
+
+    struct RevisionThrashingSource {
+        db: Arc<Database>,
+        fetch_count: AtomicUsize,
+    }
+
+    impl IndexHistorySource for RevisionThrashingSource {
+        fn provider(&self) -> CalendarProvider {
+            CalendarProvider::EastMoney
+        }
+
+        fn fetch<'a>(
+            &'a self,
+            market: &'a str,
+            reference: &'a ReferenceIndex,
+            start: NaiveDate,
+            end: NaiveDate,
+        ) -> Pin<Box<dyn Future<Output = Result<IndexHistoryEvidence, String>> + Send + 'a>>
+        {
+            let fetch_number = self.fetch_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let db = self.db.clone();
+            let provider = self.provider();
+            let logical_index = reference.logical_name.to_owned();
+            let market = market.to_owned();
+            Box::pin(async move {
+                db.conn
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE stock_market_calendar_coverage SET revision = ?1 WHERE market = ?2",
+                        rusqlite::params![format!("external-{fetch_number}"), market],
+                    )
+                    .unwrap();
+                let rules = load_market_holiday_rules(&market, start, end)?;
+                let session_dates = super::dates_inclusive(start, end)
+                    .into_iter()
+                    .filter(|date| super::is_expected_session(&rules, *date))
+                    .collect();
+                Ok(IndexHistoryEvidence {
+                    provider,
+                    logical_index,
+                    request_start: start,
+                    request_end: end,
+                    session_dates,
+                    complete_response: true,
+                })
+            })
+        }
+    }
+
+    fn row_count(db: &Database, table: &str, market: &str) -> i64 {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE market = ?1"),
+                [market],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn coverage_flag(db: &Database, market: &str) -> i64 {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT encodes_closed_dates FROM stock_market_calendar_coverage WHERE market = ?1",
+                [market],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn coverage_revision(db: &Database, market: &str) -> String {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM stock_market_calendar_coverage WHERE market = ?1",
+                [market],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn coverage_bounds(db: &Database, market: &str) -> (String, String) {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT complete_start, complete_through FROM stock_market_calendar_coverage WHERE market = ?1",
+                [market],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn calendar_timestamps(db: &Database, market: &str) -> (String, String) {
+        let conn = db.conn.lock().unwrap();
+        let coverage_updated_at = conn
+            .query_row(
+                "SELECT updated_at FROM stock_market_calendar_coverage WHERE market = ?1",
+                [market],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let session_updated_at = conn
+            .query_row(
+                "SELECT GROUP_CONCAT(updated_at, '|') FROM (
+                    SELECT updated_at FROM stock_market_sessions WHERE market = ?1 ORDER BY date
+                 )",
+                [market],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (coverage_updated_at, session_updated_at)
+    }
+
+    fn install_coverage_abort_trigger(db: &Database) {
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER abort_calendar_coverage_insert
+                 BEFORE INSERT ON stock_market_calendar_coverage
+                 BEGIN
+                   SELECT RAISE(ABORT, 'fixture coverage failure');
+                 END;",
+            )
+            .unwrap();
+    }
+
+    fn assert_calendar_rows_match_coverage(db: &Database, market: &str) {
+        let (start, end) = coverage_bounds(db, market);
+        let start = day(&start);
+        let end = day(&end);
+        assert_eq!(
+            row_count(db, "stock_market_sessions", market),
+            (end - start).num_days() + 1
+        );
+        let invalid_rows: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM stock_market_sessions
+                 WHERE market = ?1 AND is_session NOT IN (0, 1)",
+                [market],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(invalid_rows, 0);
+    }
+
+    fn distinct_calendar_revisions(db: &Database, market: &str) -> i64 {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(DISTINCT revision) FROM stock_market_calendar_coverage WHERE market = ?1",
+                [market],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -1198,6 +2170,237 @@ mod tests {
             error.kind,
             CalendarValidationErrorKind::MissingAnchorSession
         ));
+    }
+
+    #[tokio::test]
+    async fn first_sync_writes_every_natural_day_and_complete_coverage() {
+        let db = Database::new(":memory:").unwrap();
+        let sources = complete_fake_sources();
+        let outcome = sync_market_calendar_with_sources(
+            &db,
+            fixture_sync_request("US", "2026-01-01", "2026-01-09"),
+            &sources,
+        )
+        .await;
+        assert_eq!(outcome.status, CalendarSyncStatus::Published);
+        assert_eq!(row_count(&db, "stock_market_sessions", "US"), 9);
+        assert_eq!(coverage_flag(&db, "US"), 1);
+    }
+
+    #[tokio::test]
+    async fn coverage_write_failure_rolls_back_session_rows() {
+        let db = Database::new(":memory:").unwrap();
+        install_coverage_abort_trigger(&db);
+        let result = publish_validated_calendar(&db, &fixture_validated_a(), None);
+        assert!(result.is_err());
+        assert_eq!(row_count(&db, "stock_market_sessions", "US"), 0);
+        assert_eq!(row_count(&db, "stock_market_calendar_coverage", "US"), 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_preserves_last_complete_revision() {
+        let db = Database::new(":memory:").unwrap();
+        publish_validated_calendar(&db, &fixture_validated_a(), None).unwrap();
+        let before = coverage_revision(&db, "US");
+        let sources = conflicting_sources();
+        let outcome = sync_market_calendar_with_sources(&db, extended_request(), &sources).await;
+        assert_eq!(outcome.status, CalendarSyncStatus::StaleCacheUsed);
+        assert_eq!(
+            outcome.issue_code.as_deref(),
+            Some("market_calendar_refresh_failed")
+        );
+        assert_eq!(coverage_revision(&db, "US"), before);
+        assert_eq!(row_count(&db, "stock_market_sessions", "US"), 7);
+    }
+
+    #[tokio::test]
+    async fn same_market_concurrent_syncs_publish_one_coherent_revision() {
+        let db = Arc::new(Database::new(":memory:").unwrap());
+        let source = Arc::new(CountingFakeSource::complete());
+        let sources: Vec<Arc<dyn IndexHistorySource>> = vec![source.clone()];
+        let (left, right) = tokio::join!(
+            sync_market_calendar_with_sources(&db, fixture_request_a(), &sources),
+            sync_market_calendar_with_sources(&db, fixture_request_a(), &sources),
+        );
+        assert!(left.status.is_success());
+        assert!(right.status.is_success());
+        assert_calendar_rows_match_coverage(&db, "US");
+        assert_eq!(distinct_calendar_revisions(&db, "US"), 1);
+        assert_eq!(source.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn matching_resource_revision_extends_only_missing_back_segment() {
+        let db = Database::new(":memory:").unwrap();
+        let source = Arc::new(CountingFakeSource::complete());
+        let sources: Vec<Arc<dyn IndexHistorySource>> = vec![source.clone()];
+        let first = sync_market_calendar_with_sources(
+            &db,
+            fixture_sync_request("US", "2026-01-05", "2026-01-07"),
+            &sources,
+        )
+        .await;
+        assert_eq!(first.status, CalendarSyncStatus::Published);
+        source.clear_calls();
+
+        let second = sync_market_calendar_with_sources(
+            &db,
+            fixture_sync_request("US", "2026-01-05", "2026-01-09"),
+            &sources,
+        )
+        .await;
+
+        assert_eq!(second.status, CalendarSyncStatus::Published);
+        assert_eq!(
+            coverage_bounds(&db, "US"),
+            ("2026-01-05".into(), "2026-01-09".into())
+        );
+        assert_eq!(row_count(&db, "stock_market_sessions", "US"), 5);
+        assert!(source
+            .calls()
+            .iter()
+            .all(|(_, start, end)| { *start == day("2026-01-08") && *end == day("2026-01-09") }));
+        let combined = fixture_validated_range(
+            "2026-01-05",
+            "2026-01-09",
+            &load_market_holiday_rules("US", day("2026-01-05"), day("2026-01-09"))
+                .unwrap()
+                .resource_revision,
+        );
+        assert_eq!(
+            coverage_revision(&db, "US"),
+            stable_calendar_revision(&combined)
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_resource_revision_extends_only_missing_front_segment() {
+        let db = Database::new(":memory:").unwrap();
+        let source = Arc::new(CountingFakeSource::complete());
+        let sources: Vec<Arc<dyn IndexHistorySource>> = vec![source.clone()];
+        sync_market_calendar_with_sources(
+            &db,
+            fixture_sync_request("US", "2026-01-05", "2026-01-09"),
+            &sources,
+        )
+        .await;
+        source.clear_calls();
+
+        let outcome = sync_market_calendar_with_sources(
+            &db,
+            fixture_sync_request("US", "2026-01-01", "2026-01-09"),
+            &sources,
+        )
+        .await;
+
+        assert_eq!(outcome.status, CalendarSyncStatus::Published);
+        assert_eq!(
+            coverage_bounds(&db, "US"),
+            ("2026-01-01".into(), "2026-01-09".into())
+        );
+        assert!(source
+            .calls()
+            .iter()
+            .all(|(_, start, end)| { *start == day("2026-01-01") && *end == day("2026-01-04") }));
+    }
+
+    #[tokio::test]
+    async fn resource_revision_change_revalidates_the_full_union() {
+        let db = Database::new(":memory:").unwrap();
+        let old = fixture_validated_range("2026-01-03", "2026-01-07", "old-rules");
+        publish_validated_calendar(&db, &old, None).unwrap();
+        let source = Arc::new(CountingFakeSource::complete());
+        let sources: Vec<Arc<dyn IndexHistorySource>> = vec![source.clone()];
+
+        let outcome = sync_market_calendar_with_sources(
+            &db,
+            fixture_sync_request("US", "2026-01-05", "2026-01-09"),
+            &sources,
+        )
+        .await;
+
+        assert_eq!(outcome.status, CalendarSyncStatus::Published);
+        assert_eq!(
+            coverage_bounds(&db, "US"),
+            ("2026-01-03".into(), "2026-01-09".into())
+        );
+        assert!(source
+            .calls()
+            .iter()
+            .all(|(_, start, end)| { *start == day("2026-01-03") && *end == day("2026-01-09") }));
+    }
+
+    #[tokio::test]
+    async fn same_revision_reuses_without_updating_calendar_timestamps() {
+        let db = Database::new(":memory:").unwrap();
+        let source = Arc::new(CountingFakeSource::complete());
+        let sources: Vec<Arc<dyn IndexHistorySource>> = vec![source.clone()];
+        let first = sync_market_calendar_with_sources(&db, fixture_request_a(), &sources).await;
+        assert_eq!(first.status, CalendarSyncStatus::Published);
+        let before = calendar_timestamps(&db, "US");
+
+        let second = sync_market_calendar_with_sources(&db, fixture_request_a(), &sources).await;
+
+        assert_eq!(second.status, CalendarSyncStatus::Reused);
+        assert_eq!(calendar_timestamps(&db, "US"), before);
+        assert_eq!(source.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn request_outside_resource_range_preserves_old_cache_with_structured_reason() {
+        let db = Database::new(":memory:").unwrap();
+        publish_validated_calendar(&db, &fixture_validated_a(), None).unwrap();
+        let revision = coverage_revision(&db, "US");
+        let sources = complete_fake_sources();
+
+        let stale = sync_market_calendar_with_sources(
+            &db,
+            fixture_sync_request("US", "2026-01-01", "2027-01-02"),
+            &sources,
+        )
+        .await;
+
+        assert_eq!(stale.status, CalendarSyncStatus::StaleCacheUsed);
+        assert_eq!(
+            stale.issue_code.as_deref(),
+            Some("market_calendar_refresh_failed")
+        );
+        assert!(stale.message.as_deref().unwrap().contains("outside"));
+        assert_eq!(coverage_revision(&db, "US"), revision);
+
+        let empty = Database::new(":memory:").unwrap();
+        let unavailable = sync_market_calendar_with_sources(
+            &empty,
+            fixture_sync_request("US", "2026-01-01", "2027-01-02"),
+            &sources,
+        )
+        .await;
+        assert_eq!(unavailable.status, CalendarSyncStatus::Unavailable);
+        assert_eq!(
+            unavailable.issue_code.as_deref(),
+            Some("market_calendar_sync_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn optimistic_revision_mismatch_retries_at_most_once_and_preserves_old_rows() {
+        let db = Arc::new(Database::new(":memory:").unwrap());
+        publish_validated_calendar(&db, &fixture_validated_a(), None).unwrap();
+        let source = Arc::new(RevisionThrashingSource {
+            db: db.clone(),
+            fetch_count: AtomicUsize::new(0),
+        });
+        let sources: Vec<Arc<dyn IndexHistorySource>> = vec![source.clone()];
+
+        let outcome = sync_market_calendar_with_sources(&db, extended_request(), &sources).await;
+
+        assert_eq!(outcome.status, CalendarSyncStatus::StaleCacheUsed);
+        assert_eq!(
+            outcome.issue_code.as_deref(),
+            Some("market_calendar_refresh_failed")
+        );
+        assert_eq!(source.fetch_count.load(Ordering::SeqCst), 4);
+        assert_eq!(row_count(&db, "stock_market_sessions", "US"), 7);
     }
 
     #[test]

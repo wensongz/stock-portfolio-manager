@@ -42,7 +42,8 @@ pub struct MarketCalendar {
 
 impl MarketCalendar {
     pub fn covers(&self, start: NaiveDate, end: NaiveDate) -> bool {
-        self.availability.status == MetricStatus::Available
+        start <= end
+            && self.availability.status == MetricStatus::Available
             && self.complete_start.is_some_and(|date| date <= start)
             && self.complete_through.is_some_and(|date| date >= end)
     }
@@ -513,7 +514,7 @@ mod tests {
         cache_fill_ranges, classify_coverage, classify_return_mode, default_benchmark_symbol,
         evaluation_cache_end, load_benchmark_series, load_stock_price_series,
         market_point_on_session, nth_market_session_after, upsert_stock_candles, DailyMarketPoint,
-        MarketReturnMode,
+        MarketCalendar, MarketReturnMode,
     };
     use crate::db::Database;
     use crate::models::stock_review::MetricStatus;
@@ -546,6 +547,18 @@ mod tests {
             adjusted_close: None,
             dividend: None,
         }
+    }
+
+    #[test]
+    fn market_calendar_never_covers_an_inverted_interval() {
+        let calendar = MarketCalendar {
+            sessions: vec![date("2026-08-27")],
+            complete_start: Some(date("2026-08-01")),
+            complete_through: Some(date("2026-08-27")),
+            availability: super::available(),
+        };
+
+        assert!(!calendar.covers(date("2026-08-28"), date("2026-08-27")));
     }
 
     #[test]

@@ -9,7 +9,7 @@ Date: 2026-08-29 (Asia/Shanghai)
 - Merge base: `547571d`
 - Verified implementation HEAD before this report: `7e7e3881085bf4986d0e802ad4b3646e146b3ef8`
 - No implementation or contract-document correction was required by this verification pass.
-- The ignored, untracked `node_modules` symlink was used for the existing dependency tree and was not touched or staged.
+- The deliberately untracked and unstaged `node_modules` symlink was used for the existing dependency tree and was not touched or staged. It is not covered by a Git ignore rule.
 
 ## Rust format and focused verification
 
@@ -151,7 +151,7 @@ lsof -nP -iTCP:1420 -sTCP:LISTEN
 
 Result: exit 1 with no output — no listener remained on TCP 1420.
 
-Per the binding ledger ruling, this is a bounded startup smoke only. Deterministic Rust and TypeScript tests cover the functional paths; this automation pass did not mutate a real user database or exercise live provider data in an inspectable desktop session.
+Per the binding ledger ruling, this is a bounded startup smoke only. `tauri dev` used the application's normal development data directory; application startup performed its idempotent database migrations and materialized the built-in stock-review Skill. No interactive trading or review write action was intentionally executed. Deterministic Rust and TypeScript tests cover the functional paths; this automation pass did not exercise live provider data or the complete interactive workflow in an inspectable desktop session.
 
 ## Placeholder/debug scan and attribution
 
@@ -179,13 +179,15 @@ Commands:
 git diff --check 547571d..HEAD
 git diff --check
 git status --short
+git check-ignore -v node_modules
 ```
 
 Results:
 
 - Branch diff check: clean.
 - Working-tree diff check: clean.
-- Status before adding this report: only `?? node_modules` (the deliberate ignored dependency symlink); no cache行情, build output, implementation change, or user data was present.
+- Status before adding this report: only `?? node_modules` (the deliberately untracked and unstaged dependency symlink); no cache行情, build output, implementation change, database file, or other application-data artifact appeared in the worktree.
+- `git check-ignore -v node_modules` exited 1 with no output, confirming that no ignore rule applies to the symlink.
 
 ## Changes and commits
 
@@ -200,5 +202,5 @@ Results:
 - Repository-wide `cargo fmt --check` remains non-zero solely because of four pre-existing, merge-base-identical command files listed above. Fixing them would be an unrelated formatting change.
 - Eight network-dependent quote integration tests remain ignored by the test suite configuration.
 - The production bundle still emits the pre-existing large-chunk warning.
-- The desktop smoke proves bounded startup, compilation, and process cleanup. It is not a live-data, real-user-database end-to-end acceptance run.
+- The desktop smoke proves bounded startup, compilation, and process cleanup. It is not a live-provider or complete interactive end-to-end acceptance run; startup still used the normal development app data directory and performed the idempotent initialization described above.
 - Exact 20/60/120-session metrics still require authoritative market-session coverage, and AI-confirmed annotation persistence remains production-closed until a trusted host approval event is wired, as already documented in the binding rulings.

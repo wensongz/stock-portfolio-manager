@@ -77,6 +77,8 @@ pub struct CachedStockReviewInput {
     pub campaign_data: Vec<CachedCampaignData>,
     pub annotations: Vec<StockReviewAnnotation>,
     pub market_data_coverage: Option<f64>,
+    pub market_price_gap_total: u32,
+    pub market_price_gap_omitted: u32,
     pub exchange_rate_coverage: Option<f64>,
     pub benchmark_symbol: Option<String>,
     pub generated_at: String,
@@ -297,6 +299,7 @@ fn build_stock_review_artifacts(
                 "{} FX on {} uses the explicitly resolved prior observation from {} ({} calendar days).",
                 fill.currency, fill.date, fill.source_date, fill.forward_fill_days
             ),
+            affected_market: None,
             affected_symbol: None,
             affected_date: Some(fill.date),
         });
@@ -306,6 +309,7 @@ fn build_stock_review_artifacts(
             code: "no_evaluable_actions".to_string(),
             severity: StockReviewIssueSeverity::Info,
             message: "本期无可评价操作。".to_string(),
+            affected_market: None,
             affected_symbol: None,
             affected_date: None,
         });
@@ -314,6 +318,8 @@ fn build_stock_review_artifacts(
     let forward_120 = aggregate_window(&forward, 120);
     let quality = build_stock_review_quality(&QualityInput {
         market_data_coverage: input.market_data_coverage,
+        market_price_gap_total: input.market_price_gap_total,
+        market_price_gap_omitted: input.market_price_gap_omitted,
         exchange_rate_coverage,
         attribution_residual: attribution.residual,
         average_portfolio_nav: input.attribution_input.average_portfolio_nav,
@@ -610,6 +616,7 @@ fn shadow_issue(issue: &ShadowDataIssue) -> StockReviewIssue {
         code: format!("shadow_{:?}", issue.kind).to_ascii_lowercase(),
         severity: StockReviewIssueSeverity::Warning,
         message: issue.message.clone(),
+        affected_market: None,
         affected_symbol: issue.symbol.clone(),
         affected_date: issue.date,
     }
@@ -1700,6 +1707,7 @@ where
             code: "snapshot_fx_unavailable".to_string(),
             severity: StockReviewIssueSeverity::Error,
             message: "Filtered snapshot NAV, turnover, and fee drag are unavailable because at least one local market value lacks exact daily FX to the requested base currency.".to_string(),
+            affected_market: None,
             affected_symbol: None,
             affected_date: None,
         });
@@ -1709,6 +1717,7 @@ where
             code: "filtered_nav_cash_unavailable".to_string(),
             severity: StockReviewIssueSeverity::Error,
             message: "Filtered holding snapshots contain stock value but no authoritative account/market cash total; average NAV, turnover, and fee drag are unavailable.".to_string(),
+            affected_market: None,
             affected_symbol: None,
             affected_date: None,
         });
@@ -1718,6 +1727,7 @@ where
             code: "opening_cash_incomplete".to_string(),
             severity: StockReviewIssueSeverity::Error,
             message: "Opening cash cannot be reconstructed from a complete cash ledger or an authoritative current cash balance; shadow and fixed-weight benchmark outputs are unavailable.".to_string(),
+            affected_market: None,
             affected_symbol: None,
             affected_date: Some(actual_origin_date),
         });
@@ -1738,6 +1748,7 @@ where
                     calendar.complete_start.map_or_else(|| "unavailable".to_string(), |date| date.to_string()),
                     calendar.complete_through.map_or_else(|| "unavailable".to_string(), |date| date.to_string()),
                 ),
+                affected_market: Some(market.clone()),
                 affected_symbol: None,
                 affected_date: None,
             }
@@ -1748,6 +1759,7 @@ where
                 message: format!(
                     "{market} sessions use the explicit exchange-session calendar cache; quote rows are prices only."
                 ),
+                affected_market: Some(market.clone()),
                 affected_symbol: None,
                 affected_date: None,
             }
@@ -1879,6 +1891,7 @@ where
             code: "shadow_dividend_source_incomplete".to_string(),
             severity: StockReviewIssueSeverity::Warning,
             message: "A complete adjusted-close or per-session corporate-action dividend source is unavailable; shadow returns are price-only. Account PAY rows remain actual cash income and do not certify shadow dividends.".to_string(),
+            affected_market: None,
             affected_symbol: None,
             affected_date: None,
         });
@@ -2006,6 +2019,7 @@ where
                 } else {
                     format!("Campaign sessions use the explicit {market} exchange calendar.")
                 },
+                affected_market: Some(market.clone()),
                 affected_symbol: Some(symbol.clone()),
                 affected_date: None,
             });
@@ -2019,6 +2033,7 @@ where
                     severity: StockReviewIssueSeverity::Error,
                     message: "No authoritative market sessions cover this Campaign lifetime."
                         .to_string(),
+                    affected_market: Some(market.clone()),
                     affected_symbol: Some(symbol.clone()),
                     affected_date: Some(campaign_start),
                 });
@@ -2031,6 +2046,7 @@ where
                     severity: StockReviewIssueSeverity::Warning,
                     message: "An expected Campaign market session has no exact stock close; path-dependent metrics are degraded."
                         .to_string(),
+                    affected_market: Some(market.clone()),
                     affected_symbol: Some(symbol.clone()),
                     affected_date: Some(*missing_date),
                 });
@@ -2062,6 +2078,7 @@ where
                         "Campaign P&L and excursion metrics are unavailable because {} on {} lacks exact daily FX.",
                         flow.currency, flow.date
                     ),
+                    affected_market: None,
                     affected_symbol: Some(symbol.clone()),
                     affected_date: Some(flow.date),
                 });
@@ -2185,12 +2202,24 @@ where
             code: "action_fx_unavailable".to_string(),
             severity: StockReviewIssueSeverity::Error,
             message: "Turnover and fee drag are unavailable because at least one scoped stock action lacks exact action-date FX.".to_string(),
+            affected_market: None,
             affected_symbol: None,
             affected_date: None,
         });
     }
     let annotations = load_display_context(db, &query)?;
-    let market_data_coverage = aggregate_market_coverage(&prices_by_security, &valuation_dates);
+    let valuation_end = valuation_dates
+        .last()
+        .copied()
+        .unwrap_or(actual_origin_date);
+    let market_coverage = assess_market_coverage(
+        &prices_by_security,
+        &market_calendars_by_market,
+        actual_origin_date,
+        valuation_end,
+    );
+    preparation_issues.extend(market_coverage.issues.clone());
+    let market_data_coverage = market_coverage.coverage_ratio;
     let exchange_rate_coverage = fx_coverage_for_openings(
         &opening_positions,
         &opening_cash,
@@ -2233,6 +2262,8 @@ where
         campaign_data,
         annotations,
         market_data_coverage,
+        market_price_gap_total: market_coverage.total_gaps,
+        market_price_gap_omitted: market_coverage.omitted_gaps,
         exchange_rate_coverage,
         benchmark_symbol: query.benchmark_symbol.clone().or_else(|| {
             query
@@ -2413,6 +2444,7 @@ fn calendar_sync_issues(outcomes: &[CalendarSyncOutcome]) -> Vec<StockReviewIssu
                 message: outcome.message.clone().unwrap_or_else(|| {
                     format!("{} market calendar synchronization failed.", outcome.market)
                 }),
+                affected_market: Some(outcome.market.clone()),
                 affected_symbol: None,
                 affected_date: None,
             });
@@ -2423,6 +2455,7 @@ fn calendar_sync_issues(outcomes: &[CalendarSyncOutcome]) -> Vec<StockReviewIssu
                 message: outcome.message.clone().unwrap_or_else(|| {
                     format!("{} market calendar refresh failed.", outcome.market)
                 }),
+                affected_market: Some(outcome.market.clone()),
                 affected_symbol: None,
                 affected_date: outcome.available_through,
             });
@@ -2435,6 +2468,7 @@ fn calendar_sync_issues(outcomes: &[CalendarSyncOutcome]) -> Vec<StockReviewIssu
             } else {
                 format!("{}: {}", outcome.market, warning.message)
             },
+            affected_market: Some(outcome.market.clone()),
             affected_symbol: None,
             affected_date: None,
         }));
@@ -3418,6 +3452,7 @@ fn ambiguous_split_issues(
             severity: StockReviewIssueSeverity::Error,
             message: "A legacy split record has no market and the same code exists in multiple markets; the split is not applied until its market authority is resolved."
                 .to_string(),
+            affected_market: None,
             affected_symbol: Some(split.symbol.clone()),
             affected_date: Some(split.date),
         })
@@ -4366,24 +4401,88 @@ fn load_display_context(
     Ok(annotations)
 }
 
-fn aggregate_market_coverage(
+#[derive(Debug, Clone)]
+struct MarketCoverageAssessment {
+    coverage_ratio: Option<f64>,
+    issues: Vec<StockReviewIssue>,
+    total_gaps: u32,
+    omitted_gaps: u32,
+}
+
+fn assess_market_coverage(
     prices: &BTreeMap<(String, String), Vec<DailyMarketPoint>>,
-    dates: &[NaiveDate],
-) -> Option<f64> {
-    if prices.is_empty() || dates.is_empty() {
-        return None;
+    calendars: &BTreeMap<String, MarketCalendar>,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> MarketCoverageAssessment {
+    const DISPLAY_LIMIT: usize = 20;
+
+    if prices.is_empty() || start > end {
+        return MarketCoverageAssessment {
+            coverage_ratio: None,
+            issues: vec![],
+            total_gaps: 0,
+            omitted_gaps: 0,
+        };
     }
-    let required = prices.len() * dates.len();
-    let present = prices
-        .values()
-        .map(|points| {
-            dates
-                .iter()
-                .filter(|date| points.iter().any(|point| point.date == **date))
-                .count()
+
+    let mut required = 0usize;
+    let mut present = 0usize;
+    let mut gaps = Vec::new();
+    for ((symbol, market), points) in prices {
+        let Some(calendar) = calendars
+            .get(market)
+            .filter(|calendar| calendar.covers(start, end))
+        else {
+            continue;
+        };
+        let present_dates = points
+            .iter()
+            .map(|point| point.date)
+            .collect::<BTreeSet<_>>();
+        let normalized_symbol = normalized_stock_symbol(symbol).unwrap_or_else(|| symbol.clone());
+        for date in calendar
+            .sessions
+            .iter()
+            .copied()
+            .filter(|date| *date >= start && *date <= end)
+        {
+            required += 1;
+            if present_dates.contains(&date) {
+                present += 1;
+            } else {
+                gaps.push((
+                    market.clone(),
+                    date,
+                    normalized_symbol.clone(),
+                    symbol.clone(),
+                ));
+            }
+        }
+    }
+    gaps.sort_by(|left, right| (&left.0, left.1, &left.2).cmp(&(&right.0, right.1, &right.2)));
+
+    let total_gaps = u32::try_from(gaps.len()).unwrap_or(u32::MAX);
+    let issues = gaps
+        .into_iter()
+        .take(DISPLAY_LIMIT)
+        .map(|(market, date, _, symbol)| StockReviewIssue {
+            code: "market_price_gap".to_string(),
+            severity: StockReviewIssueSeverity::Warning,
+            message: format!("{market} 行情缓存缺少 {symbol} 在 {date} 的收盘价。"),
+            affected_market: Some(market),
+            affected_symbol: Some(symbol),
+            affected_date: Some(date),
         })
-        .sum::<usize>();
-    Some(present as f64 / required as f64)
+        .collect::<Vec<_>>();
+    let omitted_gaps = total_gaps.saturating_sub(issues.len() as u32);
+
+    MarketCoverageAssessment {
+        coverage_ratio: (required > 0).then(|| present as f64 / required as f64),
+        issues,
+        total_gaps,
+        omitted_gaps,
+    }
 }
 
 fn fx_coverage_for_openings(
@@ -4439,6 +4538,192 @@ mod tests {
             status: MetricStatus::Available,
             note: None,
         }
+    }
+
+    fn daily_market_point(date: NaiveDate) -> DailyMarketPoint {
+        DailyMarketPoint {
+            date,
+            open: Some(100.0),
+            high: Some(100.0),
+            low: Some(100.0),
+            close: 100.0,
+            volume: Some(1.0),
+            adjusted_close: None,
+            dividend: None,
+        }
+    }
+
+    fn authoritative_calendar(
+        complete_start: NaiveDate,
+        complete_through: NaiveDate,
+        sessions: Vec<NaiveDate>,
+    ) -> MarketCalendar {
+        MarketCalendar {
+            sessions,
+            complete_start: Some(complete_start),
+            complete_through: Some(complete_through),
+            availability: available(),
+        }
+    }
+
+    #[test]
+    fn market_coverage_reports_the_exact_missing_point_for_seventeen_of_eighteen() {
+        // Break caught: ratio-only aggregation cannot identify which authoritative
+        // security/session observation is absent.
+        let sessions = [
+            "2026-01-02",
+            "2026-01-05",
+            "2026-01-06",
+            "2026-01-07",
+            "2026-01-08",
+            "2026-01-09",
+            "2026-01-12",
+            "2026-01-13",
+            "2026-01-14",
+        ]
+        .into_iter()
+        .map(day)
+        .collect::<Vec<_>>();
+        let prices = BTreeMap::from([
+            (
+                ("AAPL".to_string(), "US".to_string()),
+                sessions.iter().copied().map(daily_market_point).collect(),
+            ),
+            (
+                ("MSFT".to_string(), "US".to_string()),
+                sessions
+                    .iter()
+                    .copied()
+                    .filter(|date| *date != day("2026-01-08"))
+                    .map(daily_market_point)
+                    .collect(),
+            ),
+        ]);
+        let calendars = BTreeMap::from([(
+            "US".to_string(),
+            authoritative_calendar(day("2026-01-02"), day("2026-01-14"), sessions),
+        )]);
+
+        let assessment =
+            assess_market_coverage(&prices, &calendars, day("2026-01-02"), day("2026-01-14"));
+
+        assert!((assessment.coverage_ratio.unwrap() - 17.0 / 18.0).abs() < 1e-12);
+        assert_eq!(assessment.total_gaps, 1);
+        assert_eq!(assessment.omitted_gaps, 0);
+        assert_eq!(assessment.issues[0].code, "market_price_gap");
+        assert_eq!(assessment.issues[0].affected_market.as_deref(), Some("US"));
+        assert_eq!(
+            assessment.issues[0].affected_symbol.as_deref(),
+            Some("MSFT")
+        );
+        assert_eq!(assessment.issues[0].affected_date, Some(day("2026-01-08")));
+    }
+
+    #[test]
+    fn market_coverage_excludes_closed_market_dates() {
+        // Break caught: calendar-day denominators fabricate a New Year's Day gap.
+        let prices = BTreeMap::from([(
+            ("AAPL".to_string(), "US".to_string()),
+            vec![daily_market_point(day("2026-01-02"))],
+        )]);
+        let calendars = BTreeMap::from([(
+            "US".to_string(),
+            authoritative_calendar(
+                day("2026-01-01"),
+                day("2026-01-02"),
+                vec![day("2026-01-02")],
+            ),
+        )]);
+
+        let assessment =
+            assess_market_coverage(&prices, &calendars, day("2026-01-01"), day("2026-01-02"));
+
+        assert_eq!(assessment.coverage_ratio, Some(1.0));
+        assert_eq!(assessment.total_gaps, 0);
+        assert!(assessment.issues.is_empty());
+    }
+
+    #[test]
+    fn market_coverage_skips_incomplete_calendar_ranges() {
+        // Break caught: a partial calendar must not be treated as proof that an
+        // unrepresented date was an open session.
+        let prices = BTreeMap::from([(
+            ("AAPL".to_string(), "US".to_string()),
+            Vec::<DailyMarketPoint>::new(),
+        )]);
+        let calendars = BTreeMap::from([(
+            "US".to_string(),
+            authoritative_calendar(
+                day("2026-01-02"),
+                day("2026-01-02"),
+                vec![day("2026-01-02")],
+            ),
+        )]);
+
+        let assessment =
+            assess_market_coverage(&prices, &calendars, day("2026-01-01"), day("2026-01-02"));
+
+        assert_eq!(assessment.coverage_ratio, None);
+        assert_eq!(assessment.total_gaps, 0);
+        assert_eq!(assessment.omitted_gaps, 0);
+        assert!(assessment.issues.is_empty());
+    }
+
+    #[test]
+    fn market_coverage_gaps_are_stable_sorted_capped_and_count_omitted() {
+        // Break caught: iteration order must not determine the public issue list,
+        // and capping display rows must not lose the exact total.
+        let sessions = [
+            "2026-01-02",
+            "2026-01-05",
+            "2026-01-06",
+            "2026-01-07",
+            "2026-01-08",
+        ]
+        .into_iter()
+        .map(day)
+        .collect::<Vec<_>>();
+        let prices = ["zeta", "ALPHA", "Echo", "bravo", "delta"]
+            .into_iter()
+            .map(|symbol| {
+                (
+                    (symbol.to_string(), "US".to_string()),
+                    Vec::<DailyMarketPoint>::new(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let calendars = BTreeMap::from([(
+            "US".to_string(),
+            authoritative_calendar(day("2026-01-02"), day("2026-01-08"), sessions),
+        )]);
+
+        let assessment =
+            assess_market_coverage(&prices, &calendars, day("2026-01-02"), day("2026-01-08"));
+        let issue_sort_keys = assessment
+            .issues
+            .iter()
+            .map(|issue| {
+                (
+                    issue.affected_market.clone().unwrap(),
+                    issue.affected_date.unwrap(),
+                    normalized_stock_symbol(issue.affected_symbol.as_deref().unwrap()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(assessment.coverage_ratio, Some(0.0));
+        assert_eq!(assessment.total_gaps, 25);
+        assert_eq!(assessment.issues.len(), 20);
+        assert_eq!(assessment.omitted_gaps, 5);
+        assert!(issue_sort_keys.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(
+            issue_sort_keys.first(),
+            Some(&("US".to_string(), day("2026-01-02"), "ALPHA".to_string()))
+        );
+        assert_eq!(
+            issue_sort_keys.last(),
+            Some(&("US".to_string(), day("2026-01-07"), "ZETA".to_string()))
+        );
     }
 
     fn live_query(start: &str, end: &str, market: Option<&str>) -> StockReviewQuery {
@@ -5394,6 +5679,8 @@ mod tests {
                 .into_iter()
                 .collect(),
             market_data_coverage: Some(1.0),
+            market_price_gap_total: 0,
+            market_price_gap_omitted: 0,
             exchange_rate_coverage: Some(1.0),
             benchmark_symbol: Some("^GSPC".to_string()),
             generated_at: "2024-01-03T00:00:00Z".to_string(),

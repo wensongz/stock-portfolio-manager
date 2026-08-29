@@ -263,6 +263,7 @@ pub fn build_stock_actions(
                 code: "same_day_order_uncertain".to_string(),
                 severity: StockReviewIssueSeverity::Warning,
                 message: "Same-day reversal has date-only precision; confirm transaction order before using derived metrics.".to_string(),
+                affected_market: None,
                 affected_symbol: relevant_events.first().map(|event| event.symbol.clone()),
                 affected_date: Some(date),
             });
@@ -526,6 +527,7 @@ fn issue(
         code: code.to_string(),
         severity,
         message: message.to_string(),
+        affected_market: None,
         affected_symbol: Some(transaction.symbol.clone()),
         affected_date: date,
     }

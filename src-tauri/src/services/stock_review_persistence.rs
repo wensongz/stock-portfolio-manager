@@ -1700,6 +1700,7 @@ fn validation_issue(code: &str, message: &str) -> StockReviewIssue {
         code: code.to_string(),
         severity: StockReviewIssueSeverity::Error,
         message: message.to_string(),
+        affected_market: None,
         affected_symbol: None,
         affected_date: None,
     }
@@ -1720,6 +1721,7 @@ fn stale_override_issue(override_record: &StockReviewOverride) -> StockReviewIss
             "Override {} is excluded because its referenced transactions no longer match the confirmed ledger state.",
             override_record.id
         ),
+        affected_market: None,
         affected_symbol: None,
         affected_date: None,
     }

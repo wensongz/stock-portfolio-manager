@@ -385,6 +385,8 @@ pub struct StockReviewDataQuality {
     pub market_data_coverage: Option<f64>,
     pub exchange_rate_coverage: Option<f64>,
     pub interval_drawdown_only: bool,
+    pub market_price_gap_total: u32,
+    pub market_price_gap_omitted: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -400,6 +402,7 @@ pub struct StockReviewIssue {
     pub code: String,
     pub severity: StockReviewIssueSeverity,
     pub message: String,
+    pub affected_market: Option<String>,
     pub affected_symbol: Option<String>,
     pub affected_date: Option<NaiveDate>,
 }

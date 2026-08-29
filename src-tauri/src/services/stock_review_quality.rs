@@ -16,6 +16,8 @@ pub struct ObservationWindowMaturity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QualityInput {
     pub market_data_coverage: Option<f64>,
+    pub market_price_gap_total: u32,
+    pub market_price_gap_omitted: u32,
     pub exchange_rate_coverage: Option<f64>,
     pub attribution_residual: Option<f64>,
     pub average_portfolio_nav: Option<f64>,
@@ -112,6 +114,7 @@ pub fn build_stock_review_quality(input: &QualityInput) -> StockReviewDataQualit
                 code: "source_ledger_repair_required".to_string(),
                 severity: StockReviewIssueSeverity::Error,
                 message: "请先修复原始交易记录并重建绩效快照，再重新运行股票复盘。".to_string(),
+                affected_market: None,
                 affected_symbol: None,
                 affected_date: None,
             });
@@ -126,6 +129,7 @@ pub fn build_stock_review_quality(input: &QualityInput) -> StockReviewDataQualit
             code: "interval_drawdown_only".to_string(),
             severity: StockReviewIssueSeverity::Info,
             message: "Maximum drawdown is calculated only from peaks visible inside the selected interval; no pre-window peak is inferred.".to_string(),
+            affected_market: None,
             affected_symbol: None,
             affected_date: None,
         });
@@ -169,6 +173,8 @@ pub fn build_stock_review_quality(input: &QualityInput) -> StockReviewDataQualit
         market_data_coverage: input.market_data_coverage,
         exchange_rate_coverage: input.exchange_rate_coverage,
         interval_drawdown_only: input.interval_drawdown_only,
+        market_price_gap_total: input.market_price_gap_total,
+        market_price_gap_omitted: input.market_price_gap_omitted,
     }
 }
 
@@ -192,6 +198,8 @@ mod tests {
     fn available_input() -> QualityInput {
         QualityInput {
             market_data_coverage: Some(0.95),
+            market_price_gap_total: 0,
+            market_price_gap_omitted: 0,
             exchange_rate_coverage: Some(0.95),
             attribution_residual: Some(1.0),
             average_portfolio_nav: Some(1_000.0),
@@ -221,6 +229,46 @@ mod tests {
             MetricStatus::Unavailable
         );
         assert_eq!(classify_coverage_status(None), MetricStatus::Unavailable);
+    }
+
+    #[test]
+    fn market_gap_counts_are_reported_without_overriding_independent_statuses() {
+        // Break caught: exact gap diagnostics must survive quality construction,
+        // while the issue itself must not suppress unrelated metric families.
+        let mut input = available_input();
+        input.market_data_coverage = Some(17.0 / 18.0);
+        input.attribution_residual = Some(0.0);
+        input.market_price_gap_total = 25;
+        input.market_price_gap_omitted = 5;
+        input.issues.push(StockReviewIssue {
+            code: "market_price_gap".to_string(),
+            severity: StockReviewIssueSeverity::Warning,
+            message: "US 行情缓存缺少 MSFT 在 2026-01-08 的收盘价。".to_string(),
+            affected_market: Some("US".to_string()),
+            affected_symbol: Some("MSFT".to_string()),
+            affected_date: Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 8).unwrap()),
+        });
+
+        let quality = build_stock_review_quality(&input);
+
+        assert_eq!(quality.market_price_gap_total, 25);
+        assert_eq!(quality.market_price_gap_omitted, 5);
+        assert_eq!(
+            quality.actual_result_availability.status,
+            MetricStatus::Available
+        );
+        assert_eq!(
+            quality.shadow_value_add_availability.status,
+            MetricStatus::Degraded
+        );
+        assert_eq!(
+            quality.attribution_availability.status,
+            MetricStatus::Degraded
+        );
+        assert_eq!(
+            quality.forward_effect_availability.status,
+            MetricStatus::Available
+        );
     }
 
     #[test]
@@ -310,6 +358,7 @@ mod tests {
             code: "source_ledger_conflict".to_string(),
             severity: StockReviewIssueSeverity::Error,
             message: "Duplicate correction conflicts with the source ledger.".to_string(),
+            affected_market: None,
             affected_symbol: Some("A".to_string()),
             affected_date: None,
         });

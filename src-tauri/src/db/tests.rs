@@ -119,6 +119,35 @@ mod tests {
             serde_json::to_value(crate::models::stock_review::MetricStatus::Available).unwrap();
         assert_eq!(status, serde_json::Value::String("available".to_string()));
 
+        let available = crate::models::stock_review::MetricAvailability {
+            status: crate::models::stock_review::MetricStatus::Available,
+            note: None,
+        };
+        let quality = crate::models::stock_review::StockReviewDataQuality {
+            availability: available.clone(),
+            actual_result_availability: available.clone(),
+            shadow_value_add_availability: available.clone(),
+            attribution_availability: available.clone(),
+            forward_effect_availability: available,
+            issues: vec![crate::models::stock_review::StockReviewIssue {
+                code: "market_price_gap".to_string(),
+                severity: crate::models::stock_review::StockReviewIssueSeverity::Warning,
+                message: "US 行情缓存缺少 MSFT 在 2026-01-08 的收盘价。".to_string(),
+                affected_market: Some("US".to_string()),
+                affected_symbol: Some("MSFT".to_string()),
+                affected_date: Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 8).unwrap()),
+            }],
+            market_data_coverage: Some(17.0 / 18.0),
+            exchange_rate_coverage: Some(1.0),
+            interval_drawdown_only: false,
+            market_price_gap_total: 25,
+            market_price_gap_omitted: 5,
+        };
+        let serialized_quality = serde_json::to_value(quality).unwrap();
+        assert_eq!(serialized_quality["market_price_gap_total"], 25);
+        assert_eq!(serialized_quality["market_price_gap_omitted"], 5);
+        assert_eq!(serialized_quality["issues"][0]["affected_market"], "US");
+
         let unavailable = crate::models::stock_review::ResultQualityMetric {
             availability: crate::models::stock_review::MetricAvailability {
                 status: crate::models::stock_review::MetricStatus::Unavailable,

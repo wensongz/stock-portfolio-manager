@@ -1186,6 +1186,7 @@ fn unavailable_issue(event: &PositionEvent) -> StockReviewIssue {
         code: "campaign_unavailable".to_string(),
         severity: StockReviewIssueSeverity::Error,
         message: "Position replay is inconsistent; later campaign inference is unavailable for this account and symbol.".to_string(),
+        affected_market: None,
         affected_symbol: Some(event.symbol.clone()),
         affected_date: Some(event.trade_date),
     }
@@ -1202,6 +1203,7 @@ fn invalid_transfer_issue(
             "Transfer override {} does not connect equal opposite position events in different accounts.",
             override_record.id
         ),
+        affected_market: None,
         affected_symbol: event.map(|event| event.symbol.clone()),
         affected_date: event.map(|event| event.trade_date),
     }

@@ -87,7 +87,7 @@ pub fn skills_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// whose on-disk version is older than this — but ONLY if the user hasn't
 /// edited it (the `.builtin/{stem}` marker still exists). User-edited skills
 /// (marker removed by `save_skill`) are never auto-overwritten.
-const BUILTIN_SKILLS_VERSION: u32 = 9;
+const BUILTIN_SKILLS_VERSION: u32 = 10;
 
 /// Materialise built-in skills into the user directory on first launch, and
 /// auto-update them when [`BUILTIN_SKILLS_VERSION`] bumps.
@@ -905,7 +905,7 @@ mod tests {
         assert!(skills_dir.join("stock-review.md").exists());
         assert_eq!(
             fs::read_to_string(marker_dir.join("stock-review")).unwrap(),
-            "9"
+            "10"
         );
         assert!(skills_dir.join("my-private-process.md").exists());
         assert!(!marker_dir.join("my-private-process").exists());
@@ -942,7 +942,7 @@ mod tests {
                 fs::read_to_string(skills_dir.join(format!("{stem}.md"))).unwrap(),
                 embedded
             );
-            assert_eq!(fs::read_to_string(marker_dir.join(stem)).unwrap(), "9");
+            assert_eq!(fs::read_to_string(marker_dir.join(stem)).unwrap(), "10");
         }
         assert_eq!(
             fs::read_to_string(skills_dir.join("my-private-process.md")).unwrap(),
@@ -969,6 +969,49 @@ mod tests {
         assert!(!disk_ids("这只股票历史表现怎么样")
             .iter()
             .any(|id| id == "stock-review"));
+    }
+
+    #[test]
+    fn version_nine_upgrade_replaces_stock_review_and_preserves_user_edited_and_custom_skills() {
+        let dir = tempdir().unwrap();
+        let skills_dir = dir.path();
+        let marker_dir = skills_dir.join(BUILTIN_MARKER_DIR);
+        fs::create_dir_all(&marker_dir).unwrap();
+        write(
+            &skills_dir.join("stock-review.md"),
+            "---\nname: old stock review\ndescription: old\ntrigger: 股票操作复盘\nenabled: true\n---\ncall save_stock_review_annotation\n",
+        );
+        write(&marker_dir.join("stock-review"), "9");
+        let user_edited = "---\nname: personal trade review\ndescription: edited builtin\ntrigger: my review\nenabled: true\n---\npersonal process\n";
+        write(&skills_dir.join("trade-review.md"), user_edited);
+        let custom = "---\nname: private\ndescription: user owned\ntrigger: private\nenabled: true\n---\ncustom body\n";
+        write(&skills_dir.join("my-private-process.md"), custom);
+
+        export_builtin_skills_to_dir(skills_dir).unwrap();
+
+        let installed = fs::read_to_string(skills_dir.join("stock-review.md")).unwrap();
+        let factory = BUILTIN_SKILLS
+            .iter()
+            .find(|(stem, _)| *stem == "stock-review")
+            .unwrap()
+            .1;
+        assert_eq!(installed, factory);
+        assert!(installed.contains("股票操作复盘是只读分析"));
+        assert!(!installed.contains("save_stock_review_annotation"));
+        assert_eq!(
+            fs::read_to_string(marker_dir.join("stock-review")).unwrap(),
+            "10"
+        );
+        assert_eq!(
+            fs::read_to_string(skills_dir.join("my-private-process.md")).unwrap(),
+            custom
+        );
+        assert_eq!(
+            fs::read_to_string(skills_dir.join("trade-review.md")).unwrap(),
+            user_edited
+        );
+        assert!(!marker_dir.join("trade-review").exists());
+        assert!(!marker_dir.join("my-private-process").exists());
     }
 
     // --- parse_frontmatter ---------------------------------------------------

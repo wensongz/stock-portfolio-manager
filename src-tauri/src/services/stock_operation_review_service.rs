@@ -1039,7 +1039,7 @@ mod tests {
         assert_eq!(actions[1].action_type, "reduce");
         assert_eq!(actions[1].shares_before, 150.0);
         assert_eq!(actions[1].shares_after, 100.0);
-        assert_eq!(actions[2].action_type, "reduce");
+        assert_eq!(actions[2].action_type, "close");
         assert_eq!(actions[2].shares_before, 100.0);
         assert_eq!(actions[2].shares_after, 0.0);
         assert_eq!(actions[0].account_name, "主账户");
@@ -1069,7 +1069,7 @@ mod tests {
         let actions = project_action_seeds(&transactions, &HashMap::new(), &filtered);
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].symbol, "600000");
-        assert_eq!(actions[0].action_type, "add");
+        assert_eq!(actions[0].action_type, "open");
     }
 
     #[test]
@@ -1356,6 +1356,7 @@ mod tests {
                     override_type TEXT NOT NULL,
                     transaction_ids_json TEXT NOT NULL,
                     value_json TEXT NOT NULL,
+                    reference_fingerprint_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                  );

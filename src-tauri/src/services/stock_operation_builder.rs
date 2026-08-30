@@ -85,14 +85,30 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
 
         let shares_before = *shares_by_position.get(&position_key).unwrap_or(&0.0);
         let (side, action_type, shares_after) = match transaction.transaction_type.as_str() {
-            "BUY" => ("buy", "add", shares_before + transaction.shares),
+            "BUY" => (
+                "buy",
+                if shares_before <= EPSILON {
+                    "open"
+                } else {
+                    "add"
+                },
+                shares_before + transaction.shares,
+            ),
             "SELL" => {
                 let shares_after = shares_before - transaction.shares;
                 if shares_before <= EPSILON || shares_after < -EPSILON {
                     active_action_key = None;
                     continue;
                 }
-                ("sell", "reduce", shares_after)
+                (
+                    "sell",
+                    if shares_after <= EPSILON {
+                        "close"
+                    } else {
+                        "reduce"
+                    },
+                    shares_after,
+                )
             }
             _ => continue,
         };
@@ -240,6 +256,26 @@ mod tests {
         assert_eq!(
             (actions[1].shares_before, actions[1].shares_after),
             (150.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn raw_replay_classifies_position_transitions_as_four_operation_types() {
+        let actions = build_raw_stock_operations(&[
+            transaction("open", "BUY", 100.0, 10.0, "2026-07-01T10:00:00Z"),
+            transaction("add", "BUY", 20.0, 11.0, "2026-07-02T10:00:00Z"),
+            transaction("reduce", "SELL", 50.0, 12.0, "2026-07-03T10:00:00Z"),
+            transaction("close", "SELL", 70.0, 13.0, "2026-07-04T10:00:00Z"),
+        ]);
+
+        assert_eq!(actions.len(), 4);
+        assert_eq!(actions[0].action_type, "open");
+        assert_eq!(actions[1].action_type, "add");
+        assert_eq!(actions[2].action_type, "reduce");
+        assert_eq!(actions[3].action_type, "close");
+        assert_eq!(
+            (actions[3].shares_before, actions[3].shares_after),
+            (70.0, 0.0)
         );
     }
 

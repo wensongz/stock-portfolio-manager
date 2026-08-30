@@ -35,16 +35,6 @@ pub(crate) fn normalize_stock_market(market: &str) -> Option<String> {
     (!market.is_empty()).then(|| market.to_ascii_uppercase())
 }
 
-pub(crate) fn stock_securities_equal(
-    left_symbol: &str,
-    left_market: &str,
-    right_symbol: &str,
-    right_market: &str,
-) -> bool {
-    normalize_stock_symbol(left_symbol) == normalize_stock_symbol(right_symbol)
-        && normalize_stock_market(left_market) == normalize_stock_market(right_market)
-}
-
 pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<RawStockOperation> {
     let mut ordered = transactions.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| {
@@ -200,10 +190,7 @@ fn escape_action_component(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_raw_stock_operations, normalize_stock_market, normalize_stock_symbol,
-        stock_securities_equal,
-    };
+    use super::{build_raw_stock_operations, normalize_stock_market, normalize_stock_symbol};
     use crate::models::Transaction;
 
     fn transaction(
@@ -384,6 +371,5 @@ mod tests {
         );
         assert_eq!(normalize_stock_symbol(" aapl "), Some("AAPL".to_string()));
         assert_eq!(normalize_stock_market(" us "), Some("US".to_string()));
-        assert!(stock_securities_equal("aapl", "us", "AAPL", "US"));
     }
 }

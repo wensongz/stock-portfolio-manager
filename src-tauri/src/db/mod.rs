@@ -537,69 +537,8 @@ impl Database {
               updated_at TEXT NOT NULL,
               PRIMARY KEY (symbol, market, date)
             );
-
-            CREATE TABLE IF NOT EXISTS stock_market_sessions (
-              market TEXT NOT NULL CHECK(market IN ('US','CN','HK')),
-              date TEXT NOT NULL,
-              is_session INTEGER NOT NULL DEFAULT 1 CHECK(is_session IN (0,1)),
-              source TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              PRIMARY KEY (market, date)
-            );
-
-            CREATE TABLE IF NOT EXISTS stock_market_calendar_coverage (
-              market TEXT PRIMARY KEY CHECK(market IN ('US','CN','HK')),
-              source TEXT NOT NULL,
-              complete_start TEXT NOT NULL,
-              complete_through TEXT NOT NULL,
-              revision TEXT NOT NULL,
-              encodes_closed_dates INTEGER NOT NULL DEFAULT 0 CHECK(encodes_closed_dates IN (0,1)),
-              updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS stock_review_annotations (
-              id TEXT PRIMARY KEY,
-              scope_type TEXT NOT NULL CHECK(scope_type IN ('period','stock','campaign','action')),
-              scope_key TEXT NOT NULL,
-              account_id TEXT,
-              symbol TEXT,
-              annotation_type TEXT NOT NULL,
-              value_json TEXT NOT NULL,
-              source TEXT NOT NULL CHECK(source IN ('user','ai_confirmed')),
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS stock_review_overrides (
-              id TEXT PRIMARY KEY,
-              override_type TEXT NOT NULL CHECK(override_type IN ('transfer','duplicate','same_day_order','non_trade')),
-              transaction_ids_json TEXT NOT NULL,
-              value_json TEXT NOT NULL,
-              reference_fingerprint_json TEXT NOT NULL DEFAULT '[]',
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
         ",
         )?;
-
-        let _ = conn.execute_batch(
-            "ALTER TABLE stock_market_sessions ADD COLUMN is_session INTEGER NOT NULL DEFAULT 1 CHECK(is_session IN (0,1));",
-        );
-
-        // Existing installations created before durable override reference
-        // snapshots need the column before corrections can be safely replayed.
-        let has_override_reference_fingerprints = conn
-            .prepare("PRAGMA table_info(stock_review_overrides)")?
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>>>()?
-            .iter()
-            .any(|name| name == "reference_fingerprint_json");
-        if !has_override_reference_fingerprints {
-            conn.execute(
-                "ALTER TABLE stock_review_overrides ADD COLUMN reference_fingerprint_json TEXT NOT NULL DEFAULT '[]'",
-                [],
-            )?;
-        }
 
         Ok(())
     }

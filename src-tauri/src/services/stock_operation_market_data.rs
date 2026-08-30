@@ -119,14 +119,6 @@ mod tests {
     #[test]
     fn endpoint_cache_reads_only_real_rows_in_requested_range() {
         let db = Database::new(":memory:").unwrap();
-        db.conn
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "DROP TABLE stock_market_sessions;
-                 DROP TABLE stock_market_calendar_coverage;",
-            )
-            .unwrap();
         upsert_stock_closes(
             &db,
             "001248",

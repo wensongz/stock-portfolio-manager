@@ -629,7 +629,7 @@ pub fn scope_report_to_symbol(
 ) -> StockOperationReviewReport {
     report
         .actions
-        .retain(|action| crate::models::stock_review::stock_symbols_equal(&action.symbol, symbol));
+        .retain(|action| normalize_stock_symbol(&action.symbol) == normalize_stock_symbol(symbol));
     report.summary = summarize_actions(&report.actions);
     report.securities = summarize_securities(&report.actions);
     report.data_quality = quality_for_actions(&report.actions);

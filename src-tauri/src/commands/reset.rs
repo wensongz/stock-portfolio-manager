@@ -20,16 +20,8 @@ const SYSTEM_CATEGORIES: [(&str, &str, &str, i64); 4] = [
     ("套利", "#8B5CF6", "🔄", 4),
 ];
 
-pub(crate) fn clear_stock_review_data(tx: &Transaction<'_>) -> SqlResult<()> {
-    for table in [
-        "stock_daily_prices",
-        "stock_market_sessions",
-        "stock_market_calendar_coverage",
-        "stock_review_annotations",
-        "stock_review_overrides",
-    ] {
-        tx.execute(&format!("DELETE FROM {table};"), [])?;
-    }
+pub(crate) fn clear_stock_operation_review_cache(tx: &Transaction<'_>) -> SqlResult<()> {
+    tx.execute("DELETE FROM stock_daily_prices", [])?;
     Ok(())
 }
 
@@ -66,7 +58,8 @@ pub fn factory_reset(
     tx.execute_batch("PRAGMA foreign_keys = OFF;")
         .map_err(|e| e.to_string())?;
 
-    clear_stock_review_data(&tx).map_err(|e| format!("failed to clear stock review data: {e}"))?;
+    clear_stock_operation_review_cache(&tx)
+        .map_err(|e| format!("failed to clear stock operation review cache: {e}"))?;
 
     for table in [
         // AI chat history

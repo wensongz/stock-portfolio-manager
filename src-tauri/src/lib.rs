@@ -265,10 +265,6 @@ pub fn run() {
             commands::review::get_decision_statistics,
             commands::review::get_reviewed_symbols,
             commands::review::get_stock_operation_review,
-            commands::review::get_stock_review_report,
-            commands::review::get_stock_campaign_detail,
-            commands::review::save_stock_review_annotation,
-            commands::review::confirm_stock_review_override,
             // Phase 6: AI Config
             commands::ai::get_ai_config,
             commands::ai::update_ai_config,

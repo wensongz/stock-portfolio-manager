@@ -4,11 +4,12 @@ use crate::models::stock_operation_review::{
     StockOperationDataQuality, StockOperationEffect, StockOperationFieldIssue,
     StockOperationReviewQuery, StockOperationReviewReport,
 };
-use crate::models::stock_review::{normalized_stock_market, StockReviewOverride};
 use crate::models::ExchangeRates;
 use crate::models::Transaction;
 use crate::services::exchange_rate_service::convert_currency;
-use crate::services::stock_action_builder::build_stock_actions;
+use crate::services::stock_operation_builder::{
+    build_raw_stock_operations, normalize_stock_market, normalize_stock_symbol,
+};
 use crate::services::stock_operation_review_calculator::{
     calculate_directional_excess, calculate_endpoint_effect, summarize_actions,
     summarize_securities, EndpointEffectInput,
@@ -17,7 +18,6 @@ use crate::services::stock_review_market_data::{default_benchmark_symbol, DailyM
 use crate::services::stock_review_market_data::{load_stock_price_series, upsert_stock_closes};
 use crate::services::{
     performance_service, quote_provider_service, quote_service, snapshot_service,
-    stock_review_persistence,
 };
 use chrono::Utc;
 use chrono::{Datelike, NaiveDate, Weekday};
@@ -64,133 +64,80 @@ pub fn validate_query(query: &StockOperationReviewQuery) -> Result<(), String> {
 }
 
 pub(crate) fn benchmark_symbol_for_market(market: &str) -> Option<&'static str> {
-    normalized_stock_market(market)
+    normalize_stock_market(market)
         .as_deref()
         .and_then(default_benchmark_symbol)
 }
 
-fn action_date(traded_at: &str) -> Option<NaiveDate> {
-    traded_at
-        .get(..10)
-        .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
-}
-
 pub(crate) fn project_action_seeds(
     transactions: &[Transaction],
-    overrides: &[StockReviewOverride],
     account_names: &HashMap<String, String>,
     query: &StockOperationReviewQuery,
 ) -> Vec<StockOperationEffect> {
-    let transactions_by_id = transactions
-        .iter()
-        .map(|transaction| (transaction.id.as_str(), transaction))
-        .collect::<HashMap<_, _>>();
-    let mut actions = build_stock_actions(transactions, overrides)
-        .actions
+    build_raw_stock_operations(transactions)
         .into_iter()
-        .filter(|action| !action.fact_labels.iter().any(|label| label == "transfer"))
         .filter(|action| {
-            matches!(
-                action.action_type.as_str(),
-                "open" | "add" | "reduce" | "close"
-            )
+            action.trade_date >= query.start_date && action.trade_date <= query.end_date
         })
-        .filter_map(|action| {
-            let trade_date = action_date(&action.traded_at)?;
-            if trade_date < query.start_date || trade_date > query.end_date {
-                return None;
-            }
-            if query
+        .filter(|action| {
+            query
                 .account_id
                 .as_ref()
-                .is_some_and(|account_id| account_id != &action.account_id)
-            {
-                return None;
-            }
-            if query.market.as_ref().is_some_and(|market| {
-                normalized_stock_market(market) != normalized_stock_market(&action.market)
-            }) {
-                return None;
-            }
-            let trade_price = action.weighted_average_price?;
-            let shares_before = action.shares_before?;
-            let shares_after = action.shares_after?;
-            let quantity = (shares_after - shares_before).abs();
-            if !trade_price.is_finite()
-                || trade_price <= 0.0
-                || !quantity.is_finite()
-                || quantity <= 0.0
-            {
-                return None;
-            }
-            let source = action
-                .transaction_ids
-                .iter()
-                .find_map(|id| transactions_by_id.get(id.as_str()).copied());
-            let trade_notional_local = action
-                .gross_amount
-                .filter(|value| value.is_finite() && *value != 0.0)
-                .map(f64::abs)
-                .unwrap_or(quantity * trade_price);
-            Some(StockOperationEffect {
-                action_id: action.action_id,
-                transaction_ids: action.transaction_ids,
-                account_id: action.account_id.clone(),
-                account_name: account_names
-                    .get(&action.account_id)
-                    .cloned()
-                    .unwrap_or_else(|| action.account_id.clone()),
-                symbol: action.symbol,
-                name: source.map(|value| value.name.clone()).unwrap_or_default(),
-                market: action.market.clone(),
-                action_type: action.action_type,
-                trade_date,
-                quantity,
-                trade_price,
-                trade_notional_local,
-                trade_notional_base: None,
-                fee_local: action.fees.unwrap_or(0.0),
-                fee_base: None,
-                currency: action
-                    .currency
-                    .or_else(|| source.map(|value| value.currency.clone()))
-                    .unwrap_or_default(),
-                shares_before,
-                shares_after,
-                prior_nav_date: None,
-                prior_nav_base: None,
-                weight_before: None,
-                weight_after: None,
-                weight_change: None,
-                operation_size_ratio: None,
-                evaluation_date: None,
-                end_price: None,
-                price_effect_local: None,
-                price_effect_base: None,
-                price_effect_percent: None,
-                benchmark_symbol: benchmark_symbol_for_market(&action.market).map(str::to_string),
-                benchmark_start_date: None,
-                benchmark_end_date: None,
-                benchmark_return: None,
-                directional_excess_return: None,
-                fact_labels: Vec::new(),
-                issues: Vec::new(),
+                .is_none_or(|id| id == &action.account_id)
+        })
+        .filter(|action| {
+            query.market.as_ref().is_none_or(|market| {
+                normalize_stock_market(market) == normalize_stock_market(&action.market)
             })
         })
-        .collect::<Vec<_>>();
-    actions.sort_by(|left, right| {
-        left.trade_date
-            .cmp(&right.trade_date)
-            .then_with(|| left.action_id.cmp(&right.action_id))
-    });
-    actions
+        .map(|action| StockOperationEffect {
+            action_id: action.action_id,
+            transaction_ids: action.transaction_ids,
+            account_id: action.account_id.clone(),
+            account_name: account_names
+                .get(&action.account_id)
+                .cloned()
+                .unwrap_or_else(|| action.account_id.clone()),
+            symbol: action.symbol,
+            name: action.name,
+            market: action.market.clone(),
+            action_type: action.action_type,
+            trade_date: action.trade_date,
+            quantity: action.quantity,
+            trade_price: action.trade_price,
+            trade_notional_local: action.trade_notional_local,
+            trade_notional_base: None,
+            fee_local: action.fee_local,
+            fee_base: None,
+            currency: action.currency,
+            shares_before: action.shares_before,
+            shares_after: action.shares_after,
+            prior_nav_date: None,
+            prior_nav_base: None,
+            weight_before: None,
+            weight_after: None,
+            weight_change: None,
+            operation_size_ratio: None,
+            evaluation_date: None,
+            end_price: None,
+            price_effect_local: None,
+            price_effect_base: None,
+            price_effect_percent: None,
+            benchmark_symbol: benchmark_symbol_for_market(&action.market).map(str::to_string),
+            benchmark_start_date: None,
+            benchmark_end_date: None,
+            benchmark_return: None,
+            directional_excess_return: None,
+            fact_labels: Vec::new(),
+            issues: Vec::new(),
+        })
+        .collect()
 }
 
 pub(crate) fn security_history_key(symbol: &str, market: &str) -> (String, String) {
     (
-        normalized_stock_market(market).unwrap_or_else(|| market.trim().to_ascii_uppercase()),
-        crate::models::stock_review::normalized_stock_symbol(symbol)
-            .unwrap_or_else(|| symbol.trim().to_ascii_uppercase()),
+        normalize_stock_market(market).unwrap_or_else(|| market.trim().to_ascii_uppercase()),
+        normalize_stock_symbol(symbol).unwrap_or_else(|| symbol.trim().to_ascii_uppercase()),
     )
 }
 
@@ -877,8 +824,7 @@ pub(crate) async fn get_stock_operation_review_with_refresh(
     validate_query(&query)?;
     let account_names = load_account_names(db, query.account_id.as_deref())?;
     let transactions = load_transactions_through(db, query.end_date)?;
-    let overrides = stock_review_persistence::list_overrides(db)?.overrides;
-    let actions = project_action_seeds(&transactions, &overrides, &account_names, &query);
+    let actions = project_action_seeds(&transactions, &account_names, &query);
     let stock_histories =
         load_stock_histories(db, &actions, query.end_date, refresh_market_data).await?;
     let benchmark_histories =
@@ -904,7 +850,6 @@ mod tests {
     use crate::db::Database;
     use crate::models::performance::BenchmarkDataPoint;
     use crate::models::stock_operation_review::StockOperationReviewQuery;
-    use crate::models::stock_review::StockReviewOverride;
     use crate::models::ExchangeRates;
     use crate::models::Transaction;
     use crate::services::stock_review_market_data::DailyMarketPoint;
@@ -1025,6 +970,36 @@ mod tests {
             .unwrap();
     }
 
+    fn seeded_operation_db() -> Database {
+        let db = Database::new(":memory:").unwrap();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, name, market, created_at, updated_at)
+             VALUES ('account-1', '主账户', 'US', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transactions
+                (id, account_id, symbol, name, market, transaction_type, shares,
+                 price, total_amount, commission, currency, traded_at, created_at)
+             VALUES
+                ('buy', 'account-1', 'AAPL', 'Apple', 'US', 'BUY', 10,
+                 100, 1000, 1, 'USD', '2026-07-03T10:00:00Z', '2026-07-03T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stock_daily_prices
+                (symbol, market, date, close, source, updated_at)
+             VALUES ('AAPL', 'US', '2026-07-03', 100, 'test', '2026-07-03T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        db
+    }
+
     #[test]
     fn query_validation_rejects_invalid_ranges_markets_and_currencies() {
         assert!(validate_query(&query()).is_ok());
@@ -1052,12 +1027,7 @@ mod tests {
             transaction("close", "SELL", 100.0, 14.0, "2026-07-20T10:00:00Z"),
         ];
         let names = HashMap::from([("account-1".to_string(), "主账户".to_string())]);
-        let actions = project_action_seeds(
-            &transactions,
-            &Vec::<StockReviewOverride>::new(),
-            &names,
-            &query(),
-        );
+        let actions = project_action_seeds(&transactions, &names, &query());
         assert_eq!(actions.len(), 3);
         assert_eq!(actions[0].action_type, "add");
         assert_eq!(actions[0].quantity, 50.0);
@@ -1069,7 +1039,7 @@ mod tests {
         assert_eq!(actions[1].action_type, "reduce");
         assert_eq!(actions[1].shares_before, 150.0);
         assert_eq!(actions[1].shares_after, 100.0);
-        assert_eq!(actions[2].action_type, "close");
+        assert_eq!(actions[2].action_type, "reduce");
         assert_eq!(actions[2].shares_before, 100.0);
         assert_eq!(actions[2].shares_after, 0.0);
         assert_eq!(actions[0].account_name, "主账户");
@@ -1096,10 +1066,10 @@ mod tests {
         ];
         let mut filtered = query();
         filtered.market = Some("CN".to_string());
-        let actions = project_action_seeds(&transactions, &[], &HashMap::new(), &filtered);
+        let actions = project_action_seeds(&transactions, &HashMap::new(), &filtered);
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].symbol, "600000");
-        assert_eq!(actions[0].action_type, "open");
+        assert_eq!(actions[0].action_type, "add");
     }
 
     #[test]
@@ -1272,7 +1242,6 @@ mod tests {
                 10.0,
                 "2026-07-02T10:00:00Z",
             )],
-            &[],
             &HashMap::new(),
             &query(),
         );
@@ -1332,7 +1301,6 @@ mod tests {
                 10.0,
                 "2026-07-02T10:00:00Z",
             )],
-            &[],
             &HashMap::new(),
             &query(),
         );
@@ -1377,6 +1345,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_override_rows_never_change_raw_operation_results() {
+        let db = seeded_operation_db();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS stock_review_overrides (
+                    id TEXT PRIMARY KEY,
+                    override_type TEXT NOT NULL,
+                    transaction_ids_json TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 DELETE FROM stock_review_overrides;
+                 INSERT INTO stock_review_overrides
+                    (id, override_type, transaction_ids_json, value_json,
+                     reference_fingerprint_json, created_at, updated_at)
+                 VALUES (
+                    'legacy', 'non_trade', '[\"buy\"]', '{}', '[]', '2026-07-03', '2026-07-03'
+                 );",
+            )
+            .unwrap();
+
+        let report = get_stock_operation_review_with_refresh(&db, query(), false)
+            .await
+            .unwrap();
+        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions[0].transaction_ids, vec!["buy".to_string()]);
+    }
+
+    #[tokio::test]
     async fn orchestration_rejects_unknown_selected_account() {
         let db = Database::new(":memory:").unwrap();
         insert_account(&db, "known", "US");
@@ -1400,7 +1400,6 @@ mod tests {
                 transaction("first", "BUY", 100.0, 10.0, "2026-07-02T10:00:00Z"),
                 second,
             ],
-            &[],
             &HashMap::new(),
             &query(),
         );

@@ -238,8 +238,8 @@ pub fn summarize_securities(
     for action in actions {
         let key = (
             action.account_id.clone(),
-            normalized_stock_market(&action.market).unwrap_or_else(|| action.market.clone()),
-            normalized_stock_symbol(&action.symbol).unwrap_or_else(|| action.symbol.clone()),
+            normalize_stock_market(&action.market).unwrap_or_else(|| action.market.clone()),
+            normalize_stock_symbol(&action.symbol).unwrap_or_else(|| action.symbol.clone()),
         );
         grouped.entry(key).or_default().push(action);
     }
@@ -632,6 +632,6 @@ use crate::models::stock_operation_review::{
     StockOperationEffect, StockOperationGroupSummary, StockOperationReviewSummary,
     StockOperationSecuritySummary, StockPositionImpactSummary,
 };
-use crate::models::stock_review::{normalized_stock_market, normalized_stock_symbol};
+use crate::services::stock_operation_builder::{normalize_stock_market, normalize_stock_symbol};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;

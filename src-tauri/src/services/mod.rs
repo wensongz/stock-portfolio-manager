@@ -21,6 +21,7 @@ pub mod snapshot_service;
 pub mod stock_action_builder;
 pub mod stock_campaign_builder;
 pub mod stock_operation_builder;
+pub mod stock_operation_market_data;
 pub mod stock_operation_review_calculator;
 pub mod stock_operation_review_service;
 pub mod stock_review_calendar;

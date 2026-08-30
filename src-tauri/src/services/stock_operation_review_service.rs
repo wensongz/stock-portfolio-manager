@@ -10,12 +10,13 @@ use crate::services::exchange_rate_service::convert_currency;
 use crate::services::stock_operation_builder::{
     build_raw_stock_operations, normalize_stock_market, normalize_stock_symbol,
 };
+use crate::services::stock_operation_market_data::{
+    default_benchmark_symbol, load_stock_price_series, upsert_stock_closes, DailyMarketPoint,
+};
 use crate::services::stock_operation_review_calculator::{
     calculate_directional_excess, calculate_endpoint_effect, summarize_actions,
     summarize_securities, EndpointEffectInput,
 };
-use crate::services::stock_review_market_data::{default_benchmark_symbol, DailyMarketPoint};
-use crate::services::stock_review_market_data::{load_stock_price_series, upsert_stock_closes};
 use crate::services::{
     performance_service, quote_provider_service, quote_service, snapshot_service,
 };
@@ -852,7 +853,7 @@ mod tests {
     use crate::models::stock_operation_review::StockOperationReviewQuery;
     use crate::models::ExchangeRates;
     use crate::models::Transaction;
-    use crate::services::stock_review_market_data::DailyMarketPoint;
+    use crate::services::stock_operation_market_data::DailyMarketPoint;
     use chrono::NaiveDate;
     use std::collections::HashMap;
 
@@ -899,13 +900,7 @@ mod tests {
     fn close(date: &str, value: f64) -> DailyMarketPoint {
         DailyMarketPoint {
             date: self::date(date),
-            open: None,
-            high: None,
-            low: None,
             close: value,
-            volume: None,
-            adjusted_close: None,
-            dividend: None,
         }
     }
 

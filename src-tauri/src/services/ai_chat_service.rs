@@ -119,7 +119,7 @@ mod prefilled_tool_tests {
         assert_eq!(parsed, review.arguments);
 
         let mut wrong_tool = review.clone();
-        wrong_tool.name = "save_stock_review_annotation".to_string();
+        wrong_tool.name = "get_portfolio_overview".to_string();
         assert!(validated_prefilled_tool(&wrong_tool).is_err());
 
         let mut legacy_benchmark = review.clone();

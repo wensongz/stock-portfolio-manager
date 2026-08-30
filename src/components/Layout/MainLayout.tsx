@@ -30,10 +30,10 @@ const menuItems = [
   { key: "/transactions", icon: <SwapOutlined />, label: "交易记录" },
   { key: "/options", icon: <FundOutlined />, label: "期权管理" },
   { key: "/dividends", icon: <GiftOutlined />, label: "分红分析" },
-  { key: "/import", icon: <ImportOutlined />, label: "导入导出" },
-  { key: "/alerts", icon: <BellOutlined />, label: "价格提醒" },
   { key: "/review", icon: <HistoryOutlined />, label: "操作复盘" },
   { key: "/ai-assistant", icon: <RobotOutlined />, label: "AI 助手" },
+  { key: "/alerts", icon: <BellOutlined />, label: "价格提醒" },
+  { key: "/import", icon: <ImportOutlined />, label: "导入导出" },
   { key: "/settings", icon: <SettingOutlined />, label: "设置" },
 ];
 

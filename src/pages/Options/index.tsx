@@ -297,7 +297,7 @@ export default function OptionsPage() {
         expiredContracts.filter(
           (contract) => contract.underlying === selectedExpiredUnderlying,
         ),
-      ),
+      ).reverse(),
     [expiredContracts, groupContracts, selectedExpiredUnderlying],
   );
 

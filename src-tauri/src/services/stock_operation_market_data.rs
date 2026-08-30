@@ -68,6 +68,11 @@ pub(crate) fn load_stock_price_series(
             "SELECT date, close
              FROM stock_daily_prices
              WHERE symbol = ?1 AND market = ?2 AND date BETWEEN ?3 AND ?4
+               AND NOT (
+                   ?2 IN ('CN', 'HK')
+                   AND LOWER(source) = 'xueqiu'
+                   AND (open IS NOT NULL OR high IS NOT NULL OR low IS NOT NULL OR volume IS NOT NULL)
+               )
              ORDER BY date ASC",
         )
         .map_err(|error| error.to_string())?;
@@ -141,6 +146,136 @@ mod tests {
         assert_eq!(
             points.iter().map(|point| point.close).collect::<Vec<_>>(),
             [20.0, 24.0],
+        );
+    }
+
+    #[test]
+    fn endpoint_cache_excludes_legacy_cn_xueqiu_ohlcv_rows() {
+        let db = Database::new(":memory:").unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO stock_daily_prices
+                    (symbol, market, date, open, high, low, close, volume, source, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    "001248",
+                    "CN",
+                    "2026-07-01",
+                    19.0,
+                    21.0,
+                    18.0,
+                    20.0,
+                    1_000.0,
+                    "XueQiu",
+                    "2026-07-01T00:00:00Z",
+                ],
+            )
+            .unwrap();
+        upsert_stock_closes(
+            &db,
+            "001248",
+            "CN",
+            "authoritative",
+            &[(date("2026-07-02"), 24.0)],
+        )
+        .unwrap();
+
+        let points =
+            load_stock_price_series(&db, "001248", "CN", date("2026-07-01"), date("2026-07-02"))
+                .unwrap();
+
+        assert_eq!(
+            points,
+            vec![super::DailyMarketPoint {
+                date: date("2026-07-02"),
+                close: 24.0,
+            }],
+        );
+    }
+
+    #[test]
+    fn endpoint_cache_excludes_legacy_hk_xueqiu_ohlcv_rows() {
+        let db = Database::new(":memory:").unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO stock_daily_prices
+                    (symbol, market, date, open, high, low, close, volume, source, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    "00700",
+                    "HK",
+                    "2026-07-01",
+                    499.0,
+                    501.0,
+                    498.0,
+                    500.0,
+                    1_000.0,
+                    "xueqiu",
+                    "2026-07-01T00:00:00Z",
+                ],
+            )
+            .unwrap();
+        upsert_stock_closes(
+            &db,
+            "00700",
+            "HK",
+            "authoritative",
+            &[(date("2026-07-02"), 504.0)],
+        )
+        .unwrap();
+
+        let points =
+            load_stock_price_series(&db, "00700", "HK", date("2026-07-01"), date("2026-07-02"))
+                .unwrap();
+
+        assert_eq!(
+            points,
+            vec![super::DailyMarketPoint {
+                date: date("2026-07-02"),
+                close: 504.0,
+            }],
+        );
+    }
+
+    #[test]
+    fn endpoint_cache_keeps_us_xueqiu_ohlcv_rows() {
+        let db = Database::new(":memory:").unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO stock_daily_prices
+                    (symbol, market, date, open, high, low, close, volume, source, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    "AAPL",
+                    "US",
+                    "2026-07-01",
+                    199.0,
+                    201.0,
+                    198.0,
+                    200.0,
+                    1_000.0,
+                    "xueqiu",
+                    "2026-07-01T00:00:00Z",
+                ],
+            )
+            .unwrap();
+
+        let points =
+            load_stock_price_series(&db, "AAPL", "US", date("2026-07-01"), date("2026-07-01"))
+                .unwrap();
+
+        assert_eq!(
+            points,
+            vec![super::DailyMarketPoint {
+                date: date("2026-07-01"),
+                close: 200.0,
+            }],
         );
     }
 

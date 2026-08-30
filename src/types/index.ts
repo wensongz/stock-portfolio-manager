@@ -696,6 +696,135 @@ export type StockCampaignStatus = "active" | "completed";
 export type CampaignCashFlowKind = "buy" | "sell" | "dividend" | "fee";
 export type StockReviewIssueSeverity = "info" | "warning" | "error";
 
+export interface StockOperationReviewFilters {
+  accountId: string | null;
+  periodPreset: StockReviewPeriodPreset;
+  startDate: string;
+  endDate: string;
+  market: Market | null;
+  baseCurrency: Currency;
+}
+
+export interface StockOperationReviewQuery {
+  start_date: string;
+  end_date: string;
+  account_id: string | null;
+  market: string | null;
+  base_currency: string;
+}
+
+export interface StockOperationReviewReport {
+  query: StockOperationReviewQuery;
+  summary: StockOperationReviewSummary;
+  securities: StockOperationSecuritySummary[];
+  actions: StockOperationEffect[];
+  data_quality: StockOperationDataQuality;
+  generated_at: string;
+  algorithm_version: string;
+}
+
+export interface StockOperationReviewSummary {
+  total: StockOperationGroupSummary;
+  buys: StockOperationGroupSummary;
+  sells: StockOperationGroupSummary;
+  position_impact: StockPositionImpactSummary;
+}
+
+export interface StockOperationGroupSummary {
+  action_count: number;
+  positive_count: number;
+  negative_count: number;
+  missing_effect_count: number;
+  price_effect_base: number | null;
+  positive_notional_ratio: number | null;
+  weighted_excess_return: number | null;
+}
+
+export interface StockPositionImpactSummary {
+  invested_amount_base: number | null;
+  recovered_amount_base: number | null;
+  largest_absolute_weight_change: number | null;
+  total_fees_base: number | null;
+  missing_weight_count: number;
+}
+
+export interface StockOperationEffect {
+  action_id: string;
+  transaction_ids: string[];
+  account_id: string;
+  account_name: string;
+  symbol: string;
+  name: string;
+  market: string;
+  action_type: StockActionType;
+  trade_date: string;
+  quantity: number;
+  trade_price: number;
+  trade_notional_local: number;
+  trade_notional_base: number | null;
+  fee_local: number;
+  fee_base: number | null;
+  currency: string;
+  shares_before: number;
+  shares_after: number;
+  prior_nav_date: string | null;
+  prior_nav_base: number | null;
+  weight_before: number | null;
+  weight_after: number | null;
+  weight_change: number | null;
+  operation_size_ratio: number | null;
+  evaluation_date: string | null;
+  end_price: number | null;
+  price_effect_local: number | null;
+  price_effect_base: number | null;
+  price_effect_percent: number | null;
+  benchmark_symbol: string | null;
+  benchmark_start_date: string | null;
+  benchmark_end_date: string | null;
+  benchmark_return: number | null;
+  directional_excess_return: number | null;
+  fact_labels: string[];
+  issues: StockOperationFieldIssue[];
+}
+
+export interface StockOperationSecuritySummary {
+  account_id: string;
+  account_name: string;
+  symbol: string;
+  name: string;
+  market: string;
+  currency: string;
+  open_count: number;
+  add_count: number;
+  reduce_count: number;
+  close_count: number;
+  net_shares: number;
+  buy_notional_local: number;
+  sell_notional_local: number;
+  price_effect_local: number | null;
+  price_effect_base: number | null;
+  weighted_excess_return: number | null;
+  largest_absolute_weight_change: number | null;
+  positive_count: number;
+  negative_count: number;
+  missing_effect_count: number;
+}
+
+export interface StockOperationFieldIssue {
+  code: string;
+  field: string;
+  message: string;
+}
+
+export interface StockOperationDataQuality {
+  action_count: number;
+  missing_end_price_count: number;
+  missing_benchmark_count: number;
+  missing_fx_count: number;
+  missing_weight_count: number;
+  notes: string[];
+}
+
 /** Frontend filter state. Tauri invocation arguments are derived from this. */
 export interface StockReviewFilters {
   accountId: string | null;

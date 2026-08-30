@@ -17,7 +17,8 @@ use crate::commands::transactions::query_transactions_inner;
 use crate::db::Database;
 use crate::models::dashboard::DashboardSummary;
 use crate::models::option_review::OptionReviewReport;
-use crate::models::stock_review::{StockReviewAnnotationInput, StockReviewQuery};
+use crate::models::stock_operation_review::StockOperationReviewQuery;
+use crate::models::stock_review::StockReviewAnnotationInput;
 use crate::services::ai_chat_service::build_portfolio_context;
 use crate::services::alert_service;
 use crate::services::exchange_rate_service::{
@@ -29,7 +30,11 @@ use crate::services::option_review_service;
 use crate::services::performance_service::{self, PerformanceFilter};
 use crate::services::quote_provider_service;
 use crate::services::quote_service::{self, resolve_index_secid, QuoteCache};
-use crate::services::skill_service::{self, StockReviewQuestionCandidate};
+#[cfg(test)]
+use crate::services::skill_service;
+#[cfg(test)]
+use crate::services::skill_service::StockReviewQuestionCandidate;
+use crate::services::stock_operation_review_service;
 use crate::services::stock_review_service::{self, ConfirmedAiAnnotationCapability};
 use chrono::{Duration, NaiveDate, Utc};
 use serde_json::{json, Value};
@@ -381,7 +386,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "get_stock_review",
-                "description": "读取与股票操作复盘页面相同的 Rust 确定性报告。只解释返回的数值、状态、问题和事实标签，不重算指标。指标 unavailable/degraded/pending 仍是成功数据。symbol 或 campaign_id 可裁剪到相关详情。",
+                "description": "读取与股票操作复盘页面相同的轻量确定性报告：评价建仓、加仓、减仓和清仓截至复盘期末的价格效果、估算仓位变化及相对所属市场宽基的方向调整效果。只解释返回数值和事实标签，不重算指标，也不把事后涨跌直接判定为决策对错。symbol 可裁剪到单只股票。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -390,9 +395,7 @@ pub fn tool_definitions() -> Vec<Value> {
                         "base_currency": { "type": "string", "enum": ["USD", "CNY", "HKD"] },
                         "account_id": { "type": "string", "description": "可选账户 ID" },
                         "market": { "type": "string", "enum": ["US", "CN", "HK"] },
-                        "benchmark_symbol": { "type": "string", "description": "可选组合基准代码" },
-                        "symbol": { "type": "string", "description": "可选股票代码，仅保留相关动作、Campaign、归因和问题" },
-                        "campaign_id": { "type": "string", "description": "可选 Campaign ID，返回确定性 Campaign 详情" }
+                        "symbol": { "type": "string", "description": "可选股票代码，仅保留该股票的操作并重新汇总" }
                     },
                     "required": ["start_date", "end_date", "base_currency"],
                     "additionalProperties": false
@@ -1338,7 +1341,7 @@ fn optional_trimmed_string(args: &Value, key: &str) -> Result<Option<String>, St
     }
 }
 
-fn parse_stock_review_query(args: &Value) -> Result<StockReviewQuery, String> {
+fn parse_stock_review_query(args: &Value) -> Result<StockOperationReviewQuery, String> {
     require_allowed_object(
         args,
         "get_stock_review",
@@ -1348,9 +1351,7 @@ fn parse_stock_review_query(args: &Value) -> Result<StockReviewQuery, String> {
             "base_currency",
             "account_id",
             "market",
-            "benchmark_symbol",
             "symbol",
-            "campaign_id",
         ],
     )?;
     let start = required_trimmed_string(args, "start_date")?;
@@ -1359,18 +1360,18 @@ fn parse_stock_review_query(args: &Value) -> Result<StockReviewQuery, String> {
         .map_err(|_| "参数 start_date 格式无效，请使用 YYYY-MM-DD。".to_string())?;
     let end_date = NaiveDate::parse_from_str(&end, "%Y-%m-%d")
         .map_err(|_| "参数 end_date 格式无效，请使用 YYYY-MM-DD。".to_string())?;
-    let query = StockReviewQuery {
+    let query = StockOperationReviewQuery {
         start_date,
         end_date,
         account_id: optional_trimmed_string(args, "account_id")?,
         market: optional_trimmed_string(args, "market")?.map(|value| value.to_ascii_uppercase()),
-        benchmark_symbol: optional_trimmed_string(args, "benchmark_symbol")?,
         base_currency: required_trimmed_string(args, "base_currency")?.to_ascii_uppercase(),
     };
-    stock_review_service::validate_query(&query)?;
+    stock_operation_review_service::validate_query(&query)?;
     Ok(query)
 }
 
+#[cfg(test)]
 fn value_symbol_matches(value: &Value, symbol: &str) -> bool {
     value
         .get("symbol")
@@ -1380,12 +1381,14 @@ fn value_symbol_matches(value: &Value, symbol: &str) -> bool {
         })
 }
 
+#[cfg(test)]
 fn retain_matching_symbol(values: &mut Value, symbol: &str) {
     if let Some(values) = values.as_array_mut() {
         values.retain(|value| value_symbol_matches(value, symbol));
     }
 }
 
+#[cfg(test)]
 fn issue_question_id(issue: &Value) -> Option<String> {
     let code = issue.get("code")?.as_str()?.trim();
     let symbol = issue
@@ -1404,6 +1407,7 @@ fn issue_question_id(issue: &Value) -> Option<String> {
     })
 }
 
+#[cfg(test)]
 fn annotation_answered_question_ids(report: &Value) -> std::collections::HashSet<String> {
     let mut answered = std::collections::HashSet::new();
     let campaigns = report
@@ -1482,6 +1486,7 @@ fn annotation_answered_question_ids(report: &Value) -> std::collections::HashSet
     answered
 }
 
+#[cfg(test)]
 fn structured_stock_review_questions(
     report: &Value,
 ) -> Vec<skill_service::SelectedStockReviewQuestion> {
@@ -1598,6 +1603,7 @@ fn structured_stock_review_questions(
     skill_service::select_stock_review_questions(&candidates)
 }
 
+#[cfg(test)]
 fn collection_limit(path: &str) -> usize {
     match path {
         "report.actions"
@@ -1620,6 +1626,7 @@ fn collection_limit(path: &str) -> usize {
     }
 }
 
+#[cfg(test)]
 fn collection_row_impact(value: &Value) -> f64 {
     let direct = ["contribution", "amount", "percentage_of_average_nav"]
         .iter()
@@ -1635,6 +1642,7 @@ fn collection_row_impact(value: &Value) -> f64 {
     direct.max(weight)
 }
 
+#[cfg(test)]
 fn collection_row_key(value: &Value) -> String {
     ["action_id", "campaign_id", "id", "code", "key"]
         .iter()
@@ -1643,6 +1651,7 @@ fn collection_row_key(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+#[cfg(test)]
 fn canonical_value_sort_key(value: &Value, output: &mut String) {
     match value {
         Value::Null => output.push_str("null"),
@@ -1678,6 +1687,7 @@ fn canonical_value_sort_key(value: &Value, output: &mut String) {
     }
 }
 
+#[cfg(test)]
 fn canonicalize_object_keys(value: &mut Value) {
     match value {
         Value::Array(values) => {
@@ -1697,6 +1707,7 @@ fn canonicalize_object_keys(value: &mut Value) {
     }
 }
 
+#[cfg(test)]
 fn append_sort_key_field(output: &mut String, value: &str) {
     output.push_str(&value.len().to_string());
     output.push(':');
@@ -1704,6 +1715,7 @@ fn append_sort_key_field(output: &mut String, value: &str) {
     output.push('|');
 }
 
+#[cfg(test)]
 fn issue_semantic_sort_key(issue: &Value) -> String {
     let code = issue
         .get("code")
@@ -1754,6 +1766,7 @@ fn issue_semantic_sort_key(issue: &Value) -> String {
     key
 }
 
+#[cfg(test)]
 fn row_is_selected_reference(
     value: &Value,
     path: &str,
@@ -1791,6 +1804,7 @@ fn row_is_selected_reference(
     false
 }
 
+#[cfg(test)]
 fn cap_stock_review_collections(
     value: &mut Value,
     path: &str,
@@ -1900,12 +1914,14 @@ fn cap_stock_review_collections(
     }
 }
 
+#[cfg(test)]
 fn annotation_is_global_portfolio_context(annotation: &Value) -> bool {
     annotation.get("scope_type").and_then(Value::as_str) == Some("period")
         && annotation.get("account_id").is_none_or(Value::is_null)
         && annotation.get("symbol").is_none_or(Value::is_null)
 }
 
+#[cfg(test)]
 fn retain_campaign_annotations(
     annotations: &mut Value,
     campaign_id: &str,
@@ -1929,6 +1945,7 @@ fn retain_campaign_annotations(
     });
 }
 
+#[cfg(test)]
 fn compact_stock_review_payload(
     mut report: Value,
     symbol: Option<&str>,
@@ -2120,36 +2137,31 @@ async fn tool_stock_review(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         Ok(symbol) => symbol,
         Err(error) => return ToolResult::err_json(error),
     };
-    let campaign_id = match optional_trimmed_string(args, "campaign_id") {
-        Ok(campaign_id) => campaign_id,
-        Err(error) => return ToolResult::err_json(error),
-    };
-    let (report, campaign_detail) =
-        match stock_review_service::get_stock_review_for_ai(ctx.db, query, campaign_id.as_deref())
-            .await
-        {
-            Ok(artifacts) => artifacts,
+    let report =
+        match stock_operation_review_service::get_stock_operation_review(ctx.db, query).await {
+            Ok(report) => report,
             Err(error) => {
-                return ToolResult::err_json(format!("股票复盘报告参数或数据准备失败：{error}"))
+                return ToolResult::err_json(format!("股票操作复盘参数或数据准备失败：{error}"))
             }
         };
-    let campaign_detail = match campaign_detail.map(serde_json::to_value).transpose() {
-        Ok(detail) => detail,
-        Err(error) => return ToolResult::err_json(format!("Campaign 详情序列化失败：{error}")),
-    };
-    let report = match serde_json::to_value(report) {
-        Ok(report) => report,
-        Err(error) => return ToolResult::err_json(format!("股票复盘报告序列化失败：{error}")),
-    };
-    match compact_stock_review_payload(
-        report,
-        symbol.as_deref(),
-        campaign_id.as_deref(),
-        campaign_detail,
-    ) {
-        Ok(payload) => ToolResult::ok_json(payload),
-        Err(error) => ToolResult::err_json(error),
-    }
+    let report = symbol
+        .as_deref()
+        .map(|symbol| {
+            stock_operation_review_service::scope_report_to_symbol(report.clone(), symbol)
+        })
+        .unwrap_or(report);
+    ToolResult::ok_json(json!({
+        "deterministic_source": "stock_operation_review_service",
+        "scope": { "symbol": symbol },
+        "report": report,
+        "assistant_policy": {
+            "endpoint_effect_is_hindsight_price_comparison": true,
+            "not_portfolio_twr_attribution": true,
+            "unallocated_dividends_excluded": true,
+            "do_not_label_decision_right_or_wrong_from_price_alone": true,
+            "maximum_follow_up_questions": 3
+        }
+    }))
 }
 
 fn tool_save_stock_review_annotation(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
@@ -2370,9 +2382,7 @@ mod tests {
                 "base_currency",
                 "account_id",
                 "market",
-                "benchmark_symbol",
                 "symbol",
-                "campaign_id",
             ]
             .into_iter()
             .collect()
@@ -2397,6 +2407,27 @@ mod tests {
         assert!(names.iter().all(|name| {
             !name.contains("stock_review_override") && !name.contains("stock_review_correction")
         }));
+    }
+
+    #[test]
+    fn lightweight_stock_review_parser_rejects_legacy_benchmark_and_campaign_arguments() {
+        let benchmark = parse_stock_review_query(&json!({
+            "start_date": "2026-07-01",
+            "end_date": "2026-08-30",
+            "base_currency": "CNY",
+            "benchmark_symbol": "000300.SS"
+        }))
+        .unwrap_err();
+        assert!(benchmark.contains("benchmark_symbol"));
+
+        let campaign = parse_stock_review_query(&json!({
+            "start_date": "2026-07-01",
+            "end_date": "2026-08-30",
+            "base_currency": "CNY",
+            "campaign_id": "campaign-1"
+        }))
+        .unwrap_err();
+        assert!(campaign.contains("campaign_id"));
     }
 
     #[test]
@@ -2801,9 +2832,13 @@ mod tests {
         .await;
         assert!(result.ok, "{}", result.content);
         let payload: Value = serde_json::from_str(&result.content).unwrap();
-        assert_eq!(payload["deterministic_source"], "stock_review_service");
+        assert_eq!(
+            payload["deterministic_source"],
+            "stock_operation_review_service"
+        );
         assert!(payload["report"]["summary"].is_object());
         assert!(payload["report"]["data_quality"].is_object());
+        assert!(payload.get("campaign_detail").is_none());
     }
 
     #[tokio::test]

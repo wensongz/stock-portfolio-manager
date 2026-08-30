@@ -7,6 +7,7 @@ use crate::services::quote_service;
 use chrono::{Duration, NaiveDate, Utc};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 const STOCK_REVIEW_HORIZON_DAYS: i64 = 180;
 
@@ -176,6 +177,51 @@ pub fn upsert_stock_candles(
     transaction.commit().map_err(|error| error.to_string())
 }
 
+/// Store authoritative daily closes without fabricating OHLCV fields.
+pub(crate) fn upsert_stock_closes(
+    db: &Database,
+    symbol: &str,
+    market: &str,
+    source: &str,
+    prices: &[(NaiveDate, f64)],
+) -> Result<(), String> {
+    let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let updated_at = Utc::now().to_rfc3339();
+
+    for (date, close) in prices {
+        if !close.is_finite() || *close <= 0.0 {
+            continue;
+        }
+        transaction
+            .execute(
+                "INSERT INTO stock_daily_prices
+                    (symbol, market, date, open, high, low, close, volume, adjusted_close, dividend, source, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, NULL, NULL, ?4, NULL, NULL, NULL, ?5, ?6)
+                 ON CONFLICT(symbol, market, date) DO UPDATE SET
+                    open = NULL,
+                    high = NULL,
+                    low = NULL,
+                    close = excluded.close,
+                    volume = NULL,
+                    adjusted_close = NULL,
+                    dividend = NULL,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at",
+                params![
+                    symbol,
+                    market,
+                    date.format("%Y-%m-%d").to_string(),
+                    close,
+                    source,
+                    updated_at,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
 /// Load cached stock points ordered by their actual market-session dates.
 pub fn load_stock_price_series(
     db: &Database,
@@ -190,6 +236,11 @@ pub fn load_stock_price_series(
             "SELECT date, open, high, low, close, volume, adjusted_close, dividend
              FROM stock_daily_prices
              WHERE symbol = ?1 AND market = ?2 AND date BETWEEN ?3 AND ?4
+               AND NOT (
+                   ?2 IN ('CN', 'HK')
+                   AND LOWER(source) = 'xueqiu'
+                   AND (open IS NOT NULL OR high IS NOT NULL OR low IS NOT NULL OR volume IS NOT NULL)
+               )
              ORDER BY date ASC",
         )
         .map_err(|error| error.to_string())?;
@@ -229,23 +280,39 @@ pub fn load_stock_price_series(
     .collect()
 }
 
-/// Fetch only absent leading/trailing calendar ranges, then return the
-/// reloaded cache.  Interior holes remain visible as holes in the actual
-/// market-session series and are never forward-filled.
+/// Refresh leading/trailing cache bounds and any missing authoritative market
+/// sessions, then return the reloaded cache. Prices are never forward-filled.
 pub async fn ensure_stock_price_cache(
     db: &Database,
     symbol: &str,
     market: &str,
     start: NaiveDate,
     end: NaiveDate,
+    expected_sessions: Option<&[NaiveDate]>,
     provider: &str,
 ) -> Result<Vec<DailyMarketPoint>, String> {
-    let cached = load_stock_price_series(db, symbol, market, start, end)?;
-    for (gap_start, gap_end) in cache_fill_ranges(&cached, start, end) {
-        let candles =
-            quote_service::fetch_stock_candles(symbol, market, gap_start, gap_end, provider)
-                .await?;
-        upsert_stock_candles(db, symbol, market, provider, &candles)?;
+    let mut cached = load_stock_price_series(db, symbol, market, start, end)?;
+    for (gap_start, gap_end) in
+        cache_fill_ranges_for_sessions(&cached, start, end, expected_sessions)
+    {
+        if let Ok(prices) =
+            quote_service::fetch_stock_history(symbol, market, gap_start, gap_end, provider).await
+        {
+            upsert_stock_closes(db, symbol, market, provider, &prices)?;
+        }
+    }
+    cached = load_stock_price_series(db, symbol, market, start, end)?;
+    if let Some(expected_sessions) = expected_sessions {
+        if let Some((gap_start, gap_end)) =
+            session_gap_fill_range(&cached, expected_sessions, start, end)
+        {
+            if let Ok(prices) =
+                quote_service::fetch_stock_history(symbol, market, gap_start, gap_end, provider)
+                    .await
+            {
+                upsert_stock_closes(db, symbol, market, provider, &prices)?;
+            }
+        }
     }
     load_stock_price_series(db, symbol, market, start, end)
 }
@@ -277,6 +344,84 @@ fn cache_fill_ranges(
         }
         _ => Vec::new(),
     }
+}
+
+/// Bound provider requests to known market sessions when an authoritative
+/// calendar is available. A closed trailing day must not become an empty
+/// provider request that triggers fallback providers. `None` preserves the
+/// natural-date fallback used when calendar coverage is unavailable.
+fn cache_fill_ranges_for_sessions(
+    cached: &[DailyMarketPoint],
+    start: NaiveDate,
+    end: NaiveDate,
+    expected_sessions: Option<&[NaiveDate]>,
+) -> Vec<(NaiveDate, NaiveDate)> {
+    let Some(expected_sessions) = expected_sessions else {
+        return cache_fill_ranges(cached, start, end);
+    };
+    let sessions = expected_sessions
+        .iter()
+        .copied()
+        .filter(|date| *date >= start && *date <= end)
+        .collect::<BTreeSet<_>>();
+    let Some(first_session) = sessions.first().copied() else {
+        return Vec::new();
+    };
+    let last_session = sessions.last().copied().unwrap_or(first_session);
+    let authoritative_cached = cached
+        .iter()
+        .filter(|point| sessions.contains(&point.date))
+        .cloned()
+        .collect::<Vec<_>>();
+    cache_fill_ranges(&authoritative_cached, first_session, last_session)
+}
+
+/// Return one bounded provider refresh covering every missing authoritative
+/// market session. Provider rows on weekends or holidays do not satisfy a
+/// missing exchange session.
+fn session_gap_fill_range(
+    cached: &[DailyMarketPoint],
+    expected_sessions: &[NaiveDate],
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Option<(NaiveDate, NaiveDate)> {
+    let present = cached
+        .iter()
+        .map(|point| point.date)
+        .collect::<BTreeSet<_>>();
+    let first_provider_observation = expected_sessions
+        .iter()
+        .copied()
+        .find(|date| *date >= start && *date <= end && present.contains(date));
+    let refresh_start = first_provider_observation.unwrap_or(start).max(start);
+    let mut missing = expected_sessions
+        .iter()
+        .copied()
+        // The leading range has already been requested by the bounds fill.
+        // If a provider's first observation is later (for example an IPO),
+        // only holes at or after that observation are retryable.
+        .filter(|date| *date >= refresh_start && *date <= end)
+        .filter(|date| !present.contains(date));
+    let first = missing.next()?;
+    let last = missing.next_back().unwrap_or(first);
+    Some((first, last))
+}
+
+/// A complete authoritative calendar is the date authority for review
+/// prices. Provider observations stamped on closed dates are ignored rather
+/// than being allowed to distort shadow curves or satisfy coverage.
+pub fn filter_price_points_to_authoritative_sessions(
+    points: Vec<DailyMarketPoint>,
+    calendar: &MarketCalendar,
+) -> Vec<DailyMarketPoint> {
+    if calendar.availability.status != MetricStatus::Available {
+        return points;
+    }
+    let sessions = calendar.sessions.iter().copied().collect::<BTreeSet<_>>();
+    points
+        .into_iter()
+        .filter(|point| sessions.contains(&point.date))
+        .collect()
 }
 
 /// Read existing benchmark cache only.  Benchmark fetching stays with the
@@ -511,9 +656,11 @@ fn unavailable(note: &str) -> MetricAvailability {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_fill_ranges, classify_coverage, classify_return_mode, default_benchmark_symbol,
-        evaluation_cache_end, load_benchmark_series, load_stock_price_series,
-        market_point_on_session, nth_market_session_after, upsert_stock_candles, DailyMarketPoint,
+        cache_fill_ranges, cache_fill_ranges_for_sessions, classify_coverage, classify_return_mode,
+        default_benchmark_symbol, evaluation_cache_end,
+        filter_price_points_to_authoritative_sessions, load_benchmark_series,
+        load_stock_price_series, market_point_on_session, nth_market_session_after,
+        session_gap_fill_range, upsert_stock_candles, upsert_stock_closes, DailyMarketPoint,
         MarketCalendar, MarketReturnMode,
     };
     use crate::db::Database;
@@ -599,6 +746,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(source, "second-source");
+    }
+
+    #[test]
+    fn cn_review_ignores_legacy_xueqiu_candles_stamped_with_utc_dates() {
+        let db = Database::new(":memory:").unwrap();
+        upsert_stock_candles(
+            &db,
+            "sz001248",
+            "CN",
+            "xueqiu",
+            &[candle("2026-07-01", 23.95)],
+        )
+        .unwrap();
+        upsert_stock_closes(
+            &db,
+            "sz001248",
+            "CN",
+            "xueqiu",
+            &[(date("2026-07-02"), 23.95)],
+        )
+        .unwrap();
+
+        let prices = load_stock_price_series(
+            &db,
+            "sz001248",
+            "CN",
+            date("2026-07-01"),
+            date("2026-07-02"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            prices.iter().map(|point| point.date).collect::<Vec<_>>(),
+            vec![date("2026-07-02")]
+        );
+    }
+
+    #[test]
+    fn refreshed_xueqiu_close_clears_legacy_shifted_ohlcv_provenance() {
+        let db = Database::new(":memory:").unwrap();
+        upsert_stock_candles(
+            &db,
+            "sz001248",
+            "CN",
+            "xueqiu",
+            &[candle("2026-07-02", 22.02)],
+        )
+        .unwrap();
+        upsert_stock_closes(
+            &db,
+            "sz001248",
+            "CN",
+            "xueqiu",
+            &[(date("2026-07-02"), 23.95)],
+        )
+        .unwrap();
+
+        let prices = load_stock_price_series(
+            &db,
+            "sz001248",
+            "CN",
+            date("2026-07-02"),
+            date("2026-07-02"),
+        )
+        .unwrap();
+
+        assert_eq!(prices.len(), 1);
+        assert_eq!(prices[0].close, 23.95);
+        assert_eq!(prices[0].open, None);
+        assert_eq!(prices[0].high, None);
+        assert_eq!(prices[0].low, None);
+        assert_eq!(prices[0].volume, None);
     }
 
     #[test]
@@ -713,6 +932,111 @@ mod tests {
                 (date("2024-01-01"), date("2024-01-02")),
                 (date("2024-01-06"), date("2024-01-08")),
             ]
+        );
+    }
+
+    #[test]
+    fn authoritative_cache_fill_skips_a_closed_trailing_day() {
+        let cached = vec![point(date("2026-08-27")), point(date("2026-08-28"))];
+        let sessions = vec![date("2026-08-27"), date("2026-08-28")];
+
+        assert_eq!(
+            cache_fill_ranges_for_sessions(
+                &cached,
+                date("2026-08-27"),
+                date("2026-08-29"),
+                Some(&sessions),
+            ),
+            Vec::<(NaiveDate, NaiveDate)>::new()
+        );
+    }
+
+    #[test]
+    fn authoritative_cache_fill_requests_the_missing_last_session_only() {
+        let cached = vec![point(date("2026-08-27"))];
+        let sessions = vec![date("2026-08-27"), date("2026-08-28")];
+
+        assert_eq!(
+            cache_fill_ranges_for_sessions(
+                &cached,
+                date("2026-08-27"),
+                date("2026-08-29"),
+                Some(&sessions),
+            ),
+            vec![(date("2026-08-28"), date("2026-08-28"))]
+        );
+    }
+
+    #[test]
+    fn authoritative_cache_fill_skips_a_window_without_sessions() {
+        assert_eq!(
+            cache_fill_ranges_for_sessions(&[], date("2026-08-29"), date("2026-08-30"), Some(&[]),),
+            Vec::<(NaiveDate, NaiveDate)>::new()
+        );
+    }
+
+    #[test]
+    fn cache_fill_keeps_natural_date_fallback_without_authoritative_calendar() {
+        assert_eq!(
+            cache_fill_ranges_for_sessions(&[], date("2026-08-29"), date("2026-08-30"), None,),
+            vec![(date("2026-08-29"), date("2026-08-30"))]
+        );
+    }
+
+    #[test]
+    fn authoritative_session_gap_requests_an_interior_refresh() {
+        let cached = vec![
+            point(date("2026-07-02")),
+            point(date("2026-07-05")),
+            point(date("2026-07-06")),
+        ];
+        let sessions = vec![date("2026-07-02"), date("2026-07-03"), date("2026-07-06")];
+
+        assert_eq!(
+            session_gap_fill_range(&cached, &sessions, date("2026-07-02"), date("2026-07-06")),
+            Some((date("2026-07-03"), date("2026-07-03")))
+        );
+    }
+
+    #[test]
+    fn authoritative_session_gap_does_not_retry_before_provider_first_observation() {
+        // The provider was already asked for the full range and returned a
+        // newly listed security beginning on July 2. Pre-listing sessions are
+        // not an interior cache hole and must not trigger fallback requests.
+        let cached = vec![point(date("2026-07-02")), point(date("2026-07-03"))];
+        let sessions = vec![
+            date("2026-06-30"),
+            date("2026-07-01"),
+            date("2026-07-02"),
+            date("2026-07-03"),
+        ];
+
+        assert_eq!(
+            session_gap_fill_range(&cached, &sessions, date("2026-06-30"), date("2026-07-03")),
+            None
+        );
+    }
+
+    #[test]
+    fn authoritative_calendar_removes_provider_weekend_rows() {
+        let calendar = MarketCalendar {
+            sessions: vec![date("2026-07-02"), date("2026-07-03"), date("2026-07-06")],
+            complete_start: Some(date("2026-07-02")),
+            complete_through: Some(date("2026-07-06")),
+            availability: super::available(),
+        };
+        let points = vec![
+            point(date("2026-07-02")),
+            point(date("2026-07-05")),
+            point(date("2026-07-06")),
+        ];
+
+        assert_eq!(
+            filter_price_points_to_authoritative_sessions(points, &calendar)
+                .into_iter()
+                .map(|point| point.date)
+                .collect::<Vec<_>>(),
+            vec![date("2026-07-02"), date("2026-07-06")]
         );
     }
 

@@ -1,29 +1,21 @@
 import { Alert, Button, Card, Empty, Space, Spin, Typography } from "antd";
 import { ReloadOutlined } from "@ant-design/icons";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAccountStore } from "../../stores/accountStore";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
-import { stockReviewReportIdentity, useStockReviewStore } from "../../stores/stockReviewStore";
-import type { Currency, StockCampaignDetail, StockReviewFilters as Filters, StockReviewOverrideInput } from "../../types";
+import { useStockOperationReviewStore } from "../../stores/stockOperationReviewStore";
+import type { Currency, StockOperationReviewFilters as Filters } from "../../types";
 import {
-  buildStockCampaignAiPrefill,
-  buildStockReviewAiPrefill,
-  buildStockReviewReportFilters,
-  buildStockReviewTransactionCandidates,
-  getStockReviewPageState,
-  loadStockReviewFilters,
-  saveStockReviewFilters,
-} from "./stockReviewViewModel";
-import LegacyStockReviewPanel from "./LegacyStockReviewPanel";
-import PortfolioComparisonChart from "./PortfolioComparisonChart";
-import RebalanceAttributionPanel from "./RebalanceAttributionPanel";
-import RiskStructurePanel from "./RiskStructurePanel";
-import StockActionsTable from "./StockActionsTable";
-import StockCampaignDrawer from "./StockCampaignDrawer";
-import StockReviewDataQuality from "./StockReviewDataQuality";
+  buildStockOperationReviewAiPrefill,
+  loadStockOperationReviewFilters,
+  saveStockOperationReviewFilters,
+} from "./stockOperationReviewViewModel";
+import StockOperationActionsTable from "./StockOperationActionsTable";
+import StockOperationReviewQuality from "./StockOperationReviewQuality";
+import StockOperationReviewSummaryCards from "./StockOperationReviewSummaryCards";
+import StockOperationSecurityTable from "./StockOperationSecurityTable";
 import StockReviewFilters from "./StockReviewFilters";
-import StockReviewSummaryCards from "./StockReviewSummaryCards";
 
 const { Text } = Typography;
 
@@ -32,22 +24,9 @@ export default function StockReviewTab() {
   const { accounts, fetchAccounts } = useAccountStore();
   const baseCurrency = useExchangeRateStore((state) => state.baseCurrency);
   const setBaseCurrency = useExchangeRateStore((state) => state.setBaseCurrency);
-  const {
-    report,
-    reportLoading,
-    campaignLoading,
-    mutating,
-    selectedCampaign,
-    error,
-    loadReport,
-    loadCampaignDetail,
-    saveAnnotation,
-    confirmOverride,
-    clearSelectedCampaign,
-    clearError,
-  } = useStockReviewStore();
+  const { report, loading, error, loadReport, clearError } = useStockOperationReviewStore();
   const [filters, setFilters] = useState<Filters>(() =>
-    loadStockReviewFilters(localStorage, new Date(), baseCurrency),
+    loadStockOperationReviewFilters(localStorage, new Date(), baseCurrency),
   );
 
   useEffect(() => { void fetchAccounts(); }, [fetchAccounts]);
@@ -57,29 +36,17 @@ export default function StockReviewTab() {
     }
   }, [baseCurrency, filters.baseCurrency]);
   useEffect(() => {
-    saveStockReviewFilters(localStorage, filters);
+    saveStockOperationReviewFilters(localStorage, filters);
     void loadReport(filters);
   }, [filters, loadReport]);
-
-  const pageState = getStockReviewPageState(report, error);
-  const reportFilters = useMemo<Filters | null>(
-    () => report ? buildStockReviewReportFilters(report, filters.periodPreset) : null,
-    [report, filters.periodPreset],
-  );
-  const transactionCandidates = useMemo(
-    () => report ? buildStockReviewTransactionCandidates(report) : [],
-    [report],
-  );
 
   const changeFilters = (next: Filters) => {
     clearError();
     if (next.baseCurrency !== baseCurrency) setBaseCurrency(next.baseCurrency);
     setFilters(next);
   };
-  const openCampaign = (campaignId: string) => {
-    if (reportFilters) void loadCampaignDetail(reportFilters, campaignId);
-  };
-  const navigateWithPrefill = (prefill: ReturnType<typeof buildStockReviewAiPrefill>) => {
+  const askAi = () => {
+    const prefill = buildStockOperationReviewAiPrefill(filters);
     navigate("/ai-assistant", {
       state: {
         prefillPrompt: prefill.prompt,
@@ -90,32 +57,7 @@ export default function StockReviewTab() {
       },
     });
   };
-  const askPortfolioAi = () => {
-    if (reportFilters) navigateWithPrefill(buildStockReviewAiPrefill(reportFilters));
-  };
-  const askCampaignAi = (detail: StockCampaignDetail) => {
-    if (reportFilters) {
-      navigateWithPrefill(
-        buildStockCampaignAiPrefill(
-          reportFilters,
-          detail.summary.symbol,
-          detail.summary.campaign_id,
-        ),
-      );
-    }
-  };
-  const campaignMutationContext = report && selectedCampaign ? {
-    campaignId: selectedCampaign.summary.campaign_id,
-    reportIdentity: stockReviewReportIdentity(report),
-  } : null;
-  const saveCampaignAnnotation = (input: Parameters<typeof saveAnnotation>[0]) =>
-    campaignMutationContext
-      ? saveAnnotation(input, campaignMutationContext)
-      : Promise.resolve(null);
-  const applyOverride = (input: StockReviewOverrideInput) =>
-    reportFilters && campaignMutationContext
-      ? confirmOverride(reportFilters, input, campaignMutationContext)
-      : Promise.resolve(null);
+  const currency = (report?.query.base_currency ?? filters.baseCurrency) as Currency;
 
   return (
     <div className="space-y-5">
@@ -123,11 +65,11 @@ export default function StockReviewTab() {
         <StockReviewFilters
           filters={filters}
           accounts={accounts}
-          loading={reportLoading}
-          canAskAi={Boolean(reportFilters)}
+          loading={loading}
+          canAskAi={Boolean(report)}
           onChange={changeFilters}
           onRefresh={() => void loadReport(filters)}
-          onAskAi={askPortfolioAi}
+          onAskAi={askAi}
         />
       </Card>
 
@@ -137,54 +79,48 @@ export default function StockReviewTab() {
           showIcon
           closable
           onClose={clearError}
-          message="最近一次操作未完成，仍保留上一次成功报告"
+          message="最近一次刷新未完成，仍保留上一次成功报告"
           description={error}
           action={<Button size="small" icon={<ReloadOutlined />} onClick={() => void loadReport(filters)}>重试</Button>}
         />
       )}
 
-      {pageState.kind === "error" ? (
+      {error && !report ? (
         <Card>
           <Empty
             image={Empty.PRESENTED_IMAGE_SIMPLE}
             description={
               <Space orientation="vertical">
-                <Text>股票复盘报告加载失败：{error}</Text>
+                <Text>股票操作复盘加载失败：{error}</Text>
                 <Button type="primary" icon={<ReloadOutlined />} onClick={() => void loadReport(filters)}>重试</Button>
               </Space>
             }
           />
         </Card>
-      ) : reportLoading && !report ? (
-        <Card><div style={{ padding: 64, textAlign: "center" }}><Spin description="正在同步交易日历并生成股票操作复盘…" /></div></Card>
+      ) : loading && !report ? (
+        <Card><div style={{ padding: 64, textAlign: "center" }}><Spin description="正在生成股票操作效果复盘…" /></div></Card>
       ) : report ? (
         <Space orientation="vertical" size="large" style={{ width: "100%" }}>
-          <StockReviewDataQuality report={report} />
-          <StockReviewSummaryCards summary={report.summary} methodology={report.methodology} currency={report.methodology.query.base_currency as Currency} loading={reportLoading} />
-          <PortfolioComparisonChart report={report} onOpenCampaign={openCampaign} />
-          <RebalanceAttributionPanel report={report} />
-          <RiskStructurePanel report={report} />
-          {report.campaigns.length === 0 && (
-            <Card><Empty description="所选区间没有 Campaign；报告摘要、归因、风险与动作仍按后端结果分别展示。" /></Card>
+          <StockOperationReviewQuality quality={report.data_quality} />
+          <StockOperationReviewSummaryCards summary={report.summary} currency={currency} loading={loading} />
+          {report.actions.length === 0 ? (
+            <Card><Empty description="所选区间没有可评价的股票买卖操作" /></Card>
+          ) : (
+            <>
+              <StockOperationSecurityTable
+                rows={report.securities}
+                baseCurrency={currency}
+                reportAccountId={report.query.account_id}
+              />
+              <StockOperationActionsTable
+                actions={report.actions}
+                baseCurrency={currency}
+                reportAccountId={report.query.account_id}
+              />
+            </>
           )}
-          <StockActionsTable actions={report.actions} campaigns={report.campaigns} baseCurrency={report.methodology.query.base_currency as Currency} onOpenCampaign={openCampaign} />
         </Space>
       ) : null}
-
-      <LegacyStockReviewPanel />
-      <StockCampaignDrawer
-        open={campaignLoading || Boolean(selectedCampaign)}
-        loading={campaignLoading}
-        mutating={mutating}
-        detail={selectedCampaign}
-        currency={(report?.methodology.query.base_currency ?? filters.baseCurrency) as Currency}
-        reportEndDate={report?.methodology.query.end_date ?? filters.endDate}
-        transactionCandidates={transactionCandidates}
-        onClose={clearSelectedCampaign}
-        onAskAi={askCampaignAi}
-        onSaveAnnotation={saveCampaignAnnotation}
-        onConfirmOverride={applyOverride}
-      />
     </div>
   );
 }

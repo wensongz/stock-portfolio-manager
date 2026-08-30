@@ -20,9 +20,10 @@ use crate::services::stock_review_calendar::{
     self, CalendarSyncOutcome, CalendarSyncStatus, IndexHistorySource,
 };
 use crate::services::stock_review_market_data::{
-    default_benchmark_symbol, ensure_stock_price_cache, load_benchmark_series,
-    load_market_sessions, load_stock_price_series, nth_market_session_after, DailyMarketPoint,
-    MarketCalendar, MarketReturnMode,
+    default_benchmark_symbol, ensure_stock_price_cache,
+    filter_price_points_to_authoritative_sessions, load_benchmark_series, load_market_sessions,
+    load_stock_price_series, nth_market_session_after, DailyMarketPoint, MarketCalendar,
+    MarketReturnMode,
 };
 use crate::services::stock_review_metrics::*;
 use crate::services::stock_review_persistence::{
@@ -1379,12 +1380,36 @@ where
         };
         // A network error is non-fatal. The exact same cache read below decides
         // whether dependent metrics are still usable.
-        let _ =
-            ensure_stock_price_cache(db, symbol, market, price_start, price_end, provider).await;
-        prices_by_security.insert(
-            (symbol.clone(), market.clone()),
-            load_stock_price_series(db, symbol, market, price_start, price_end)?,
-        );
+        let expected_sessions = market_calendars_by_market
+            .get(market)
+            .filter(|calendar| calendar.availability.status == MetricStatus::Available)
+            .and_then(|_| market_sessions_by_market.get(market).map(Vec::as_slice));
+        let cached_market_points =
+            load_stock_price_series(db, symbol, market, price_start, price_end)?;
+        let fetch_start = stock_price_fetch_start(
+            db,
+            &query,
+            symbol,
+            market,
+            price_start,
+            &cached_market_points,
+        )?;
+        let _ = ensure_stock_price_cache(
+            db,
+            symbol,
+            market,
+            fetch_start,
+            price_end,
+            expected_sessions,
+            provider,
+        )
+        .await;
+        let points = load_stock_price_series(db, symbol, market, price_start, price_end)?;
+        let points = market_calendars_by_market
+            .get(market)
+            .map(|calendar| filter_price_points_to_authoritative_sessions(points.clone(), calendar))
+            .unwrap_or(points);
+        prices_by_security.insert((symbol.clone(), market.clone()), points);
     }
 
     let benchmark_specs = benchmark_specs(&query, &review_markets);
@@ -1657,8 +1682,15 @@ where
     let prices_by_security = security_keys
         .iter()
         .map(|(symbol, market)| {
-            load_stock_price_series(db, symbol, market, price_start, price_end)
-                .map(|points| ((symbol.clone(), market.clone()), points))
+            load_stock_price_series(db, symbol, market, price_start, price_end).map(|points| {
+                let points = market_calendars_by_market
+                    .get(market)
+                    .map(|calendar| {
+                        filter_price_points_to_authoritative_sessions(points.clone(), calendar)
+                    })
+                    .unwrap_or(points);
+                ((symbol.clone(), market.clone()), points)
+            })
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     let mut benchmark_series = Vec::new();
@@ -1702,6 +1734,14 @@ where
         expected_baseline_date.zip(expected_actual_dates.last().copied());
     let (baseline, actual_values, mut actual_availability, actual_nav_complete) =
         load_actual_values(db, &query, expected_baseline_date, &expected_actual_dates)?;
+    let filtered_snapshot_fx_unavailable = actual_availability
+        .note
+        .as_deref()
+        .is_some_and(|note| note.contains("exact daily FX"));
+    let filtered_snapshot_cash_unavailable = actual_availability
+        .note
+        .as_deref()
+        .is_some_and(|note| note.contains("daily cash ledger"));
     let actual_origin_date = expected_baseline_date
         .or_else(|| expected_actual_dates.first().copied())
         .unwrap_or(query.start_date);
@@ -1730,11 +1770,7 @@ where
     let (opening_cash, opening_cash_complete) =
         opening_cash(db, corrected_transactions, &query, actual_origin_date)?;
     let mut preparation_issues = calendar_sync_issues(&calendar_outcomes);
-    if actual_availability
-        .note
-        .as_deref()
-        .is_some_and(|note| note.contains("exact daily FX"))
-    {
+    if filtered_snapshot_fx_unavailable {
         preparation_issues.push(StockReviewIssue {
             code: "snapshot_fx_unavailable".to_string(),
             severity: StockReviewIssueSeverity::Error,
@@ -1744,7 +1780,7 @@ where
             affected_date: None,
         });
     }
-    if (query.account_id.is_some() || query.market.is_some()) && !actual_values.is_empty() {
+    if filtered_snapshot_cash_unavailable {
         preparation_issues.push(StockReviewIssue {
             code: "filtered_nav_cash_unavailable".to_string(),
             severity: StockReviewIssueSeverity::Error,
@@ -1802,6 +1838,10 @@ where
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let prelisting_valuation =
+        with_prelisting_snapshot_valuations(db, &query, &prices_by_security, &valuation_dates)?;
+    preparation_issues.extend(prelisting_valuation.issues.clone());
+    let valuation_prices_by_security = &prelisting_valuation.valuation_prices;
     let fx_dates = valuation_dates
         .iter()
         .copied()
@@ -1866,7 +1906,7 @@ where
             && left.currency == right.currency
             && left.base_currency == right.base_currency
     });
-    let shadow_prices = prices_by_security
+    let shadow_prices = valuation_prices_by_security
         .iter()
         .flat_map(|((symbol, market), points)| {
             let currency = market_currency(market).to_string();
@@ -2158,7 +2198,7 @@ where
 
     let opening_market_values_base = opening_market_values(
         &opening_positions,
-        &prices_by_security,
+        valuation_prices_by_security,
         &fx_points,
         &query.base_currency,
         actual_origin_date,
@@ -2219,7 +2259,7 @@ where
         &scoped_actions,
         &opening_cash,
         &actual_values,
-        &prices_by_security,
+        valuation_prices_by_security,
         &fx_points,
         &split_events,
         &dividend_events,
@@ -2251,6 +2291,7 @@ where
             assess_market_coverage(
                 &prices_by_security,
                 &market_calendars_by_market,
+                &prelisting_valuation.required_market_starts,
                 valuation_start,
                 valuation_end,
             )
@@ -2425,6 +2466,7 @@ fn load_current_holding_keys(
         .prepare(
             "SELECT DISTINCT symbol, market FROM holdings
              WHERE shares > 0
+               AND symbol NOT LIKE '$CASH-%'
                AND (?1 IS NULL OR account_id = ?1)
                AND (?2 IS NULL OR market = ?2)",
         )
@@ -2737,11 +2779,16 @@ fn load_actual_values(
         };
         return Ok((baseline, values, availability, nav_complete));
     }
-    // Filtered daily snapshots do not contain account cash. Preserve their
-    // stock value path for context, but do not claim an authoritative TWR.
+    // Filtered snapshots include explicit $CASH-* holding rows. Aggregate
+    // stock and cash together, and claim a filtered NAV only when the exact
+    // baseline plus every required session has both convertible values and an
+    // explicit cash row.
+    let filtered_start = expected_baseline_date
+        .map(|date| date.min(query.start_date))
+        .unwrap_or(query.start_date);
     let mut statement = conn
         .prepare(
-            "SELECT snapshots.date, snapshots.market, snapshots.market_value,
+            "SELECT snapshots.date, snapshots.symbol, snapshots.market, snapshots.market_value,
                     portfolio.exchange_rates
              FROM daily_holding_snapshots AS snapshots
              LEFT JOIN daily_portfolio_values AS portfolio
@@ -2756,7 +2803,7 @@ fn load_actual_values(
     let rows = statement
         .query_map(
             params![
-                query.start_date.format("%Y-%m-%d").to_string(),
+                filtered_start.format("%Y-%m-%d").to_string(),
                 query.end_date.format("%Y-%m-%d").to_string(),
                 query.account_id,
                 query.market,
@@ -2765,20 +2812,44 @@ fn load_actual_values(
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, f64>(2)?,
-                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    let mut daily_values = BTreeMap::<NaiveDate, Option<f64>>::new();
-    for (date, market, value, rates_json) in rows {
+    #[derive(Default)]
+    struct FilteredSnapshotDay {
+        value_base: Option<f64>,
+        has_rows: bool,
+        has_cash: bool,
+    }
+
+    let required_dates = expected_baseline_date
+        .into_iter()
+        .chain(expected_actual_dates.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut daily_values = required_dates
+        .iter()
+        .copied()
+        .map(|date| {
+            (
+                date,
+                FilteredSnapshotDay {
+                    value_base: Some(0.0),
+                    ..FilteredSnapshotDay::default()
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (date, symbol, market, value, rates_json) in rows {
         let Some(date) = NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok() else {
             continue;
         };
-        if !expected_actual_dates.contains(&date) {
+        if !required_dates.contains(&date) {
             continue;
         }
         let currency = market_currency(&market);
@@ -2798,36 +2869,69 @@ fn load_actual_values(
                 })
                 .filter(|converted| converted.is_finite())
         };
-        let entry = daily_values.entry(date).or_insert(Some(0.0));
-        *entry = match (*entry, converted) {
+        let entry = daily_values.entry(date).or_default();
+        entry.has_rows = true;
+        entry.has_cash |= crate::services::quote_service::is_cash_symbol(&symbol);
+        entry.value_base = match (entry.value_base, converted) {
             (Some(total), Some(converted)) => Some(total + converted),
             _ => None,
         };
     }
-    let conversion_incomplete = daily_values.values().any(Option::is_none);
+    let conversion_incomplete = daily_values
+        .values()
+        .any(|day| day.has_rows && day.value_base.is_none());
+    let cash_incomplete = daily_values
+        .values()
+        .any(|day| day.has_rows && !day.has_cash);
+    let snapshot_incomplete = daily_values.values().any(|day| !day.has_rows);
     let values = if conversion_incomplete {
         Vec::new()
     } else {
-        daily_values
-            .into_iter()
-            .filter_map(|(date, value_base)| {
-                value_base.map(|value_base| PortfolioValuePoint { date, value_base })
+        expected_actual_dates
+            .iter()
+            .filter_map(|date| {
+                daily_values.get(date).and_then(|day| {
+                    day.value_base.map(|value_base| PortfolioValuePoint {
+                        date: *date,
+                        value_base,
+                    })
+                })
             })
             .collect()
     };
-    Ok((
-        None,
-        values,
+    let baseline = (!conversion_incomplete && !cash_incomplete && !snapshot_incomplete)
+        .then(|| {
+            expected_baseline_date.and_then(|date| {
+                daily_values.get(&date).and_then(|day| {
+                    day.value_base
+                        .map(|value_base| PortfolioValuePoint { date, value_base })
+                })
+            })
+        })
+        .flatten();
+    let nav_complete = baseline.is_some()
+        && !conversion_incomplete
+        && !cash_incomplete
+        && !snapshot_incomplete
+        && values.len() == expected_actual_dates.len();
+    let availability = if nav_complete {
+        MetricAvailability {
+            status: MetricStatus::Available,
+            note: None,
+        }
+    } else {
         MetricAvailability {
             status: MetricStatus::Unavailable,
             note: Some(if conversion_incomplete {
-                "Filtered snapshots lack exact daily FX for at least one local market value, as well as an authoritative daily cash ledger; actual TWR and aggregate NAV-dependent metrics are unavailable.".to_string()
-            } else {
+                "Filtered snapshots lack exact daily FX for at least one local market value; actual TWR and aggregate NAV-dependent metrics are unavailable.".to_string()
+            } else if cash_incomplete {
                 "Filtered snapshots lack an authoritative daily cash ledger; actual TWR is unavailable.".to_string()
+            } else {
+                "Filtered portfolio snapshots do not cover the exact baseline and requested market sessions.".to_string()
             }),
-        },
-        false,
-    ))
+        }
+    };
+    Ok((baseline, values, availability, nav_complete))
 }
 
 fn convert_snapshot_value(value_usd: f64, rates_json: &str, base_currency: &str) -> Option<f64> {
@@ -4459,9 +4563,209 @@ struct MarketCoverageAssessment {
     omitted_gaps: u32,
 }
 
+#[derive(Debug, Clone)]
+struct PrelistingSnapshotValuation {
+    valuation_prices: BTreeMap<(String, String), Vec<DailyMarketPoint>>,
+    required_market_starts: BTreeMap<(String, String), NaiveDate>,
+    issues: Vec<StockReviewIssue>,
+}
+
+/// Once a real first market close is cached, an earlier non-zero holding
+/// snapshot proves that the leading interval is a valuation-only period (for
+/// example an IPO allotment), not a quote-cache range to refetch on every
+/// review load.
+fn stock_price_fetch_start(
+    db: &Database,
+    query: &StockReviewQuery,
+    symbol: &str,
+    market: &str,
+    requested_start: NaiveDate,
+    cached_market_points: &[DailyMarketPoint],
+) -> Result<NaiveDate, String> {
+    let Some(first_market_date) = cached_market_points.first().map(|point| point.date) else {
+        return Ok(requested_start);
+    };
+    if first_market_date <= requested_start {
+        return Ok(requested_start);
+    }
+    let normalized_symbol = normalized_stock_symbol(symbol).unwrap_or_else(|| symbol.to_string());
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let mut statement = conn
+        .prepare(
+            "SELECT symbol
+             FROM daily_holding_snapshots
+             WHERE date >= ?1 AND date < ?2
+               AND market = ?3
+               AND shares != 0
+               AND close_price > 0
+               AND (?4 IS NULL OR account_id = ?4)",
+        )
+        .map_err(|error| error.to_string())?;
+    let symbols = statement
+        .query_map(
+            params![
+                requested_start.format("%Y-%m-%d").to_string(),
+                first_market_date.format("%Y-%m-%d").to_string(),
+                market,
+                query.account_id,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let has_pre_market_valuation = symbols.into_iter().any(|candidate| {
+        normalized_stock_symbol(&candidate).as_deref() == Some(normalized_symbol.as_str())
+    });
+    Ok(if has_pre_market_valuation {
+        first_market_date
+    } else {
+        requested_start
+    })
+}
+
+/// Daily holding snapshots may legitimately value an allotted IPO at its
+/// issue price before the first exchange close. Reuse that value only before
+/// the first real cached market observation. It is deliberately kept in a
+/// separate valuation series so it cannot masquerade as quote coverage.
+fn with_prelisting_snapshot_valuations(
+    db: &Database,
+    query: &StockReviewQuery,
+    market_prices: &BTreeMap<(String, String), Vec<DailyMarketPoint>>,
+    valuation_dates: &[NaiveDate],
+) -> Result<PrelistingSnapshotValuation, String> {
+    let mut valuation_prices = market_prices.clone();
+    let mut required_market_starts = BTreeMap::new();
+    let mut issues = Vec::new();
+    let Some(first_date) = valuation_dates.iter().min().copied() else {
+        return Ok(PrelistingSnapshotValuation {
+            valuation_prices,
+            required_market_starts,
+            issues,
+        });
+    };
+    let last_date = valuation_dates.iter().max().copied().unwrap_or(first_date);
+    let requested_dates = valuation_dates.iter().copied().collect::<BTreeSet<_>>();
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let mut statement = conn
+        .prepare(
+            "SELECT date, symbol, market, close_price
+             FROM daily_holding_snapshots
+             WHERE date BETWEEN ?1 AND ?2
+               AND shares != 0
+               AND close_price > 0
+               AND symbol NOT LIKE '$CASH-%'
+               AND (?3 IS NULL OR account_id = ?3)
+               AND (?4 IS NULL OR market = ?4)
+             ORDER BY date ASC, account_id ASC, symbol ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(
+            params![
+                first_date.format("%Y-%m-%d").to_string(),
+                last_date.format("%Y-%m-%d").to_string(),
+                query.account_id,
+                query.market,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    drop(conn);
+
+    let mut snapshot_prices = BTreeMap::<(String, String, NaiveDate), Vec<f64>>::new();
+    for (date, symbol, market, close) in rows {
+        let Some(date) = NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok() else {
+            continue;
+        };
+        let Some(symbol) = normalized_stock_symbol(&symbol) else {
+            continue;
+        };
+        if requested_dates.contains(&date) && close.is_finite() && close > 0.0 {
+            snapshot_prices
+                .entry((symbol, market, date))
+                .or_default()
+                .push(close);
+        }
+    }
+
+    for ((symbol, market), market_points) in market_prices {
+        let Some(first_market_date) = market_points.first().map(|point| point.date) else {
+            // Without one real exchange observation there is no authoritative
+            // listing boundary, so snapshot prices cannot safely fill the gap.
+            continue;
+        };
+        let normalized_symbol = normalized_stock_symbol(symbol).unwrap_or_else(|| symbol.clone());
+        let mut added = false;
+        let points = valuation_prices
+            .get_mut(&(symbol.clone(), market.clone()))
+            .expect("valuation series was cloned from market series");
+        for date in requested_dates
+            .iter()
+            .copied()
+            .filter(|date| *date < first_market_date)
+        {
+            let Some(candidates) =
+                snapshot_prices.get(&(normalized_symbol.clone(), market.clone(), date))
+            else {
+                continue;
+            };
+            let reference = candidates[0];
+            let consistent = candidates
+                .iter()
+                .all(|candidate| (candidate - reference).abs() <= reference.abs().max(1.0) * 1e-9);
+            if !consistent || points.iter().any(|point| point.date == date) {
+                continue;
+            }
+            points.push(DailyMarketPoint {
+                date,
+                open: None,
+                high: None,
+                low: None,
+                close: reference,
+                volume: None,
+                adjusted_close: None,
+                dividend: None,
+            });
+            added = true;
+        }
+        if added {
+            points.sort_by_key(|point| point.date);
+            required_market_starts.insert((symbol.clone(), market.clone()), first_market_date);
+            issues.push(StockReviewIssue {
+                code: "prelisting_snapshot_valuation".to_string(),
+                severity: StockReviewIssueSeverity::Info,
+                message: format!(
+                    "{symbol} uses authoritative holding-snapshot prices before its first cached exchange close on {first_market_date}; those values are excluded from market quote coverage."
+                ),
+                affected_market: Some(market.clone()),
+                affected_symbol: Some(symbol.clone()),
+                affected_date: Some(first_market_date),
+            });
+        }
+    }
+
+    Ok(PrelistingSnapshotValuation {
+        valuation_prices,
+        required_market_starts,
+        issues,
+    })
+}
+
 fn assess_market_coverage(
     prices: &BTreeMap<(String, String), Vec<DailyMarketPoint>>,
     calendars: &BTreeMap<String, MarketCalendar>,
+    required_market_starts: &BTreeMap<(String, String), NaiveDate>,
     start: NaiveDate,
     end: NaiveDate,
 ) -> MarketCoverageAssessment {
@@ -4499,11 +4803,22 @@ fn assess_market_coverage(
         else {
             continue;
         };
+        let required_start = required_market_starts
+            .iter()
+            .filter(|((candidate_symbol, candidate_market), _)| {
+                candidate_market == &market
+                    && normalized_stock_symbol(candidate_symbol).as_deref()
+                        == Some(normalized_symbol.as_str())
+            })
+            .map(|(_, date)| *date)
+            .min()
+            .unwrap_or(start)
+            .max(start);
         for date in calendar
             .sessions
             .iter()
             .copied()
-            .filter(|date| *date >= start && *date <= end)
+            .filter(|date| *date >= required_start && *date <= end)
         {
             required += 1;
             if present_dates.contains(&date) {
@@ -4662,8 +4977,13 @@ mod tests {
             authoritative_calendar(day("2026-01-02"), day("2026-01-14"), sessions),
         )]);
 
-        let assessment =
-            assess_market_coverage(&prices, &calendars, day("2026-01-02"), day("2026-01-14"));
+        let assessment = assess_market_coverage(
+            &prices,
+            &calendars,
+            &BTreeMap::new(),
+            day("2026-01-02"),
+            day("2026-01-14"),
+        );
 
         assert!((assessment.coverage_ratio.unwrap() - 17.0 / 18.0).abs() < 1e-12);
         assert_eq!(assessment.total_gaps, 1);
@@ -4693,12 +5013,115 @@ mod tests {
             ),
         )]);
 
-        let assessment =
-            assess_market_coverage(&prices, &calendars, day("2026-01-01"), day("2026-01-02"));
+        let assessment = assess_market_coverage(
+            &prices,
+            &calendars,
+            &BTreeMap::new(),
+            day("2026-01-01"),
+            day("2026-01-02"),
+        );
 
         assert_eq!(assessment.coverage_ratio, Some(1.0));
         assert_eq!(assessment.total_gaps, 0);
         assert!(assessment.issues.is_empty());
+    }
+
+    #[test]
+    fn prelisting_snapshot_prices_are_used_for_valuation_but_not_market_coverage() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "CN");
+        insert_holding_snapshot(
+            &db,
+            "2026-06-30",
+            "acct",
+            "sz001248",
+            "CN",
+            1_000.0,
+            10.11,
+            10_110.0,
+        );
+        insert_holding_snapshot(
+            &db,
+            "2026-07-01",
+            "acct",
+            "sz001248",
+            "CN",
+            1_000.0,
+            10.11,
+            10_110.0,
+        );
+        let mut query = live_query("2026-06-30", "2026-07-02", Some("CN"));
+        query.account_id = Some("acct".to_string());
+        let market_prices = BTreeMap::from([(
+            ("sz001248".to_string(), "CN".to_string()),
+            vec![DailyMarketPoint {
+                date: day("2026-07-02"),
+                open: None,
+                high: None,
+                low: None,
+                close: 23.95,
+                volume: None,
+                adjusted_close: None,
+                dividend: None,
+            }],
+        )]);
+        assert_eq!(
+            stock_price_fetch_start(
+                &db,
+                &query,
+                "sz001248",
+                "CN",
+                day("2026-06-20"),
+                &market_prices[&("sz001248".to_string(), "CN".to_string())],
+            )
+            .unwrap(),
+            day("2026-07-02")
+        );
+
+        let fallback = with_prelisting_snapshot_valuations(
+            &db,
+            &query,
+            &market_prices,
+            &[day("2026-06-30"), day("2026-07-01"), day("2026-07-02")],
+        )
+        .unwrap();
+
+        let prices = &fallback.valuation_prices[&("sz001248".to_string(), "CN".to_string())];
+        assert_eq!(
+            prices
+                .iter()
+                .map(|point| (point.date, point.close))
+                .collect::<Vec<_>>(),
+            vec![
+                (day("2026-06-30"), 10.11),
+                (day("2026-07-01"), 10.11),
+                (day("2026-07-02"), 23.95),
+            ]
+        );
+        assert_eq!(
+            fallback.required_market_starts[&("sz001248".to_string(), "CN".to_string())],
+            day("2026-07-02")
+        );
+        assert_eq!(fallback.issues.len(), 1);
+        assert_eq!(fallback.issues[0].code, "prelisting_snapshot_valuation");
+
+        let calendars = BTreeMap::from([(
+            "CN".to_string(),
+            authoritative_calendar(
+                day("2026-06-30"),
+                day("2026-07-02"),
+                vec![day("2026-06-30"), day("2026-07-01"), day("2026-07-02")],
+            ),
+        )]);
+        let assessment = assess_market_coverage(
+            &market_prices,
+            &calendars,
+            &fallback.required_market_starts,
+            day("2026-06-30"),
+            day("2026-07-02"),
+        );
+        assert_eq!(assessment.coverage_ratio, Some(1.0));
+        assert_eq!(assessment.total_gaps, 0);
     }
 
     #[test]
@@ -4718,8 +5141,13 @@ mod tests {
             ),
         )]);
 
-        let assessment =
-            assess_market_coverage(&prices, &calendars, day("2026-01-01"), day("2026-01-02"));
+        let assessment = assess_market_coverage(
+            &prices,
+            &calendars,
+            &BTreeMap::new(),
+            day("2026-01-01"),
+            day("2026-01-02"),
+        );
 
         assert_eq!(assessment.coverage_ratio, None);
         assert_eq!(assessment.total_gaps, 0);
@@ -4755,8 +5183,13 @@ mod tests {
             authoritative_calendar(day("2026-01-02"), day("2026-01-08"), sessions),
         )]);
 
-        let assessment =
-            assess_market_coverage(&prices, &calendars, day("2026-01-02"), day("2026-01-08"));
+        let assessment = assess_market_coverage(
+            &prices,
+            &calendars,
+            &BTreeMap::new(),
+            day("2026-01-02"),
+            day("2026-01-08"),
+        );
         let issue_sort_keys = assessment
             .issues
             .iter()
@@ -4807,8 +5240,13 @@ mod tests {
             authoritative_calendar(day("2026-01-02"), day("2026-01-06"), sessions),
         )]);
 
-        let assessment =
-            assess_market_coverage(&prices, &calendars, day("2026-01-02"), day("2026-01-06"));
+        let assessment = assess_market_coverage(
+            &prices,
+            &calendars,
+            &BTreeMap::new(),
+            day("2026-01-02"),
+            day("2026-01-06"),
+        );
 
         assert!((assessment.coverage_ratio.unwrap() - 2.0 / 3.0).abs() < 1e-12);
         assert_eq!(assessment.total_gaps, 1);
@@ -5071,6 +5509,19 @@ mod tests {
              VALUES (?1, ?2, ?3, ?3, ?4, ?5, 1, ?6, '2024-01-01', '2024-01-01')",
             params![id, account_id, symbol, market, shares, currency],
         ).unwrap();
+    }
+
+    #[test]
+    fn current_holding_keys_exclude_cash_positions() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct", "CN");
+        insert_holding(&db, "stock", "acct", "sh600519", "CN", "CNY", 1.0);
+        insert_holding(&db, "cash", "acct", "$CASH-CNY", "CN", "CNY", 1_000.0);
+
+        let keys =
+            load_current_holding_keys(&db, &live_query("2026-07-01", "2026-07-31", None)).unwrap();
+
+        assert_eq!(keys, vec![("sh600519".to_string(), "CN".to_string())]);
     }
 
     fn exchange_rates(date: &str, usd_cny: f64) -> crate::models::ExchangeRates {
@@ -6878,6 +7329,7 @@ mod tests {
             insert_portfolio_value(&db, date, 200.0, 7.0);
             insert_holding_snapshot(&db, date, "acct", "AAPL", "US", 1.0, 100.0, 100.0);
             insert_holding_snapshot(&db, date, "acct", "600000", "CN", 7.0, 100.0, 700.0);
+            insert_holding_snapshot(&db, date, "acct", "$CASH-USD", "US", 0.0, 1.0, 0.0);
         }
         let cache_start = day("2023-12-01");
         seed_stock_cache_bounds(
@@ -6905,8 +7357,11 @@ mod tests {
             .actual_values
             .iter()
             .all(|point| (point.value_base - 200.0).abs() < 1e-12));
-        assert_eq!(prepared.attribution_input.average_portfolio_nav, None);
-        assert!(prepared
+        assert_eq!(
+            prepared.attribution_input.average_portfolio_nav,
+            Some(200.0)
+        );
+        assert!(!prepared
             .preparation_issues
             .iter()
             .any(|issue| issue.code == "filtered_nav_cash_unavailable"));
@@ -9338,6 +9793,62 @@ mod tests {
         assert_eq!(availability.status, MetricStatus::Available);
         assert_eq!(baseline.unwrap().date, day("2024-01-05"));
         assert_eq!(values.last().unwrap().date, day("2024-01-08"));
+    }
+
+    #[test]
+    fn filtered_actual_nav_includes_cash_and_exact_baseline_snapshot() {
+        let db = Database::new(":memory:").unwrap();
+        for (date, stock_value, cash_value) in [
+            ("2024-01-09", 700.0, 70.0),
+            ("2024-01-10", 770.0, 70.0),
+            ("2024-01-11", 840.0, 70.0),
+        ] {
+            insert_portfolio_value(&db, date, 0.0, 7.0);
+            insert_holding_snapshot(
+                &db,
+                date,
+                "acct",
+                "600000",
+                "CN",
+                1.0,
+                stock_value,
+                stock_value,
+            );
+            insert_holding_snapshot(
+                &db,
+                date,
+                "acct",
+                "$CASH-CNY",
+                "CN",
+                cash_value,
+                1.0,
+                cash_value,
+            );
+        }
+        let mut query = complete_cached_fixture(false).query;
+        query.start_date = day("2024-01-10");
+        query.end_date = day("2024-01-11");
+        query.account_id = Some("acct".to_string());
+        query.market = None;
+
+        let (baseline, values, availability, nav_complete) = load_actual_values(
+            &db,
+            &query,
+            Some(day("2024-01-09")),
+            &[day("2024-01-10"), day("2024-01-11")],
+        )
+        .unwrap();
+
+        assert!(nav_complete);
+        assert_eq!(availability.status, MetricStatus::Available);
+        assert!((baseline.unwrap().value_base - 110.0).abs() < 1e-12);
+        assert_eq!(
+            values
+                .iter()
+                .map(|point| (point.date, point.value_base))
+                .collect::<Vec<_>>(),
+            vec![(day("2024-01-10"), 120.0), (day("2024-01-11"), 130.0)]
+        );
     }
 
     #[test]

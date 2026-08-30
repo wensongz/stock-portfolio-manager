@@ -257,12 +257,15 @@ fn import_options_csv_inner(
             .parse()
             .unwrap_or(0.0);
 
-        let commission: f64 =
-            get_field(&record, &headers, &["佣金", "commission", "Commission", "Comm"])
-            .unwrap_or_default()
-            .replace(',', "")
-            .parse()
-            .unwrap_or(0.0);
+        let commission: f64 = get_field(
+            &record,
+            &headers,
+            &["佣金", "commission", "Commission", "Comm"],
+        )
+        .unwrap_or_default()
+        .replace(',', "")
+        .parse()
+        .unwrap_or(0.0);
 
         let fee: f64 = get_field(&record, &headers, &["费用", "fee", "Fee"])
             .unwrap_or_default()
@@ -273,7 +276,13 @@ fn import_options_csv_inner(
         let traded_at = get_field(
             &record,
             &headers,
-            &["交易时间", "traded_at", "Trade Date", "Trade Date/Time", "Date/Time"],
+            &[
+                "交易时间",
+                "traded_at",
+                "Trade Date",
+                "Trade Date/Time",
+                "Date/Time",
+            ],
         );
         let settled_at = get_field(
             &record,
@@ -394,7 +403,9 @@ fn import_options_csv_inner(
         if row.action == "SELL" && row.code.starts_with("O") {
             // Exported CSVs carry negative quantities for SELL opens; the
             // boundary check works with positive contract counts.
-            *available_by_symbol.entry(row.option_symbol.clone()).or_insert(0) += row.quantity.abs();
+            *available_by_symbol
+                .entry(row.option_symbol.clone())
+                .or_insert(0) += row.quantity.abs();
             open_pool.push(OpenDetail {
                 underlying: row.underlying.clone(),
                 expiry_date: row.expiry_date.clone(),
@@ -409,7 +420,10 @@ fn import_options_csv_inner(
         let is_close = row.action == "BUY" && is_close_code(&row.code);
         if is_close {
             let close_qty = row.quantity.abs();
-            let avail = available_by_symbol.get(&row.option_symbol).copied().unwrap_or(0);
+            let avail = available_by_symbol
+                .get(&row.option_symbol)
+                .copied()
+                .unwrap_or(0);
             if avail >= close_qty {
                 available_by_symbol.insert(row.option_symbol.clone(), avail - close_qty);
             } else if !has_split_match(
@@ -1478,11 +1492,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO accounts (id, name, market, created_at, updated_at)
                  VALUES (?1, ?2, 'US', ?3, ?3)",
-                rusqlite::params![
-                    account_id,
-                    "Test Account",
-                    chrono::Utc::now().to_rfc3339()
-                ],
+                rusqlite::params![account_id, "Test Account", chrono::Utc::now().to_rfc3339()],
             )
             .expect("failed to insert account");
         }
@@ -1516,8 +1526,7 @@ Total, ,,,,,,,,,,,
 
     #[test]
     fn test_parse_english_header_csv_preview() {
-        let preview =
-            parse_options_csv(ENGLISH_CSV.to_string()).expect("preview should succeed");
+        let preview = parse_options_csv(ENGLISH_CSV.to_string()).expect("preview should succeed");
         assert_eq!(preview.valid_rows, 4);
         assert!(
             preview.error_rows.is_empty(),
@@ -1540,15 +1549,22 @@ a,AAPL 20FEB26 100 P,2026-02-20,,SMART,买入,1,0.10,10.00,0,0,C;P,C;P
         let csv = "账户,股票,交易时间,交割时间,交易所,操作,股票数量,价格,金额,佣金,费用,类型,代码
 a,AAPL 20FEB26 100 P,2026-02-20,,SMART,买入,1,0.01,1.00,0,0,C;Ep,C;Ep
 ";
-        let result = import_options_csv_inner(&db, &account_id, csv).expect("import should succeed");
+        let result =
+            import_options_csv_inner(&db, &account_id, csv).expect("import should succeed");
         assert_eq!(result.imported, 0, "orphan close must not be inserted");
-        assert_eq!(result.errors.len(), 1, "expected one error, got: {:?}", result.errors);
+        assert_eq!(
+            result.errors.len(),
+            1,
+            "expected one error, got: {:?}",
+            result.errors
+        );
     }
 
     #[test]
     fn test_import_close_matches_open_in_same_csv() {
         let (db, account_id) = db_with_account();
-        let result = import_options_csv_inner(&db, &account_id, CN_CSV).expect("import should succeed");
+        let result =
+            import_options_csv_inner(&db, &account_id, CN_CSV).expect("import should succeed");
         assert_eq!(result.imported, 2, "open + close should both import");
         assert!(
             result.errors.is_empty(),
@@ -1574,7 +1590,8 @@ a,AAPL 20FEB26 100 P,2026-02-20,,SMART,买入,1,0.01,1.00,0,0,C;Ep,C;Ep
         let csv = "账户,股票,交易时间,交割时间,交易所,操作,股票数量,价格,金额,佣金,费用,类型,代码
 a,AAPL 20FEB26 100 P,2026-02-20,,SMART,买入,1,0.10,10.00,0,0,C;P,C;P
 ";
-        let result = import_options_csv_inner(&db, &account_id, csv).expect("import should succeed");
+        let result =
+            import_options_csv_inner(&db, &account_id, csv).expect("import should succeed");
         assert_eq!(result.imported, 1, "close should match the existing open");
         assert!(
             result.errors.is_empty(),
@@ -1591,9 +1608,14 @@ a,AAPL 20FEB26 100 P,2026-02-20,,SMART,买入,1,0.10,10.00,0,0,C;P,C;P
 a,AAPL 20FEB26 100 P,2026-01-15,,SMART,卖出,1,2.00,200.00,0,0,LMT,O
 a,AAPL 20FEB26 100 P,2026-02-20,,SMART,买入,2,0.10,20.00,0,0,C;P,C;P
 ";
-        let result = import_options_csv_inner(&db, &account_id, csv).expect("import should succeed");
+        let result =
+            import_options_csv_inner(&db, &account_id, csv).expect("import should succeed");
         assert_eq!(result.imported, 1, "only the open should import");
-        assert_eq!(result.errors.len(), 1, "close exceeding open qty must be rejected");
+        assert_eq!(
+            result.errors.len(),
+            1,
+            "close exceeding open qty must be rejected"
+        );
     }
 
     #[test]
@@ -1615,8 +1637,12 @@ a,AAPL 20FEB26 100 P,2026-02-20,,SMART,买入,2,0.10,20.00,0,0,C;P,C;P
 a,BRK B 16JUN23 330 C,2023-01-10,,SMART,卖出,1,2.00,200.00,0,0,LMT,O
 a,BRK B 16JUN23 165 C,2023-06-10,,SMART,买入,1,0.10,10.00,0,0,C;P,C;P
 ";
-        let result = import_options_csv_inner(&db, &account_id, csv).expect("import should succeed");
-        assert_eq!(result.imported, 2, "split-adjusted close should match via split config");
+        let result =
+            import_options_csv_inner(&db, &account_id, csv).expect("import should succeed");
+        assert_eq!(
+            result.imported, 2,
+            "split-adjusted close should match via split config"
+        );
         assert!(
             result.errors.is_empty(),
             "expected no errors, got: {:?}",
@@ -1779,11 +1805,19 @@ a,BRK B 16JUN23 165 C,2023-06-10,,SMART,买入,1,0.10,10.00,0,0,C;P,C;P
         // Clear all records, then re-import the exported CSV.
         {
             let conn = db.conn.lock().unwrap();
-            conn.execute("DELETE FROM option_records WHERE account_id = ?1", rusqlite::params![account_id])
-                .unwrap();
+            conn.execute(
+                "DELETE FROM option_records WHERE account_id = ?1",
+                rusqlite::params![account_id],
+            )
+            .unwrap();
         }
-        let result = import_options_csv_inner(&db, &account_id, &csv).expect("import should succeed");
-        assert_eq!(result.imported, 3, "all 3 rows re-imported, got {:?}", result.errors);
+        let result =
+            import_options_csv_inner(&db, &account_id, &csv).expect("import should succeed");
+        assert_eq!(
+            result.imported, 3,
+            "all 3 rows re-imported, got {:?}",
+            result.errors
+        );
         // After import, recompute should mark the open (SELL O) as expired.
         recompute_option_statuses(&db, &account_id).expect("recompute should succeed");
         let conn = db.conn.lock().unwrap();
@@ -1795,7 +1829,11 @@ a,BRK B 16JUN23 165 C,2023-06-10,,SMART,买入,1,0.10,10.00,0,0,C;P,C;P
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(status, "expired", "round-trip open should be expired, got {}", status);
+        assert_eq!(
+            status, "expired",
+            "round-trip open should be expired, got {}",
+            status
+        );
     }
 
     #[test]
@@ -1807,8 +1845,12 @@ a,857 30OCT23 6 C,2023-09-06,,SMART,卖出,200,0.13,52000.00,-204,0,LMT,O
 a,857 30OCT23 6 C,2023-09-13,,SMART,买入,100,0.07,14000.00,-78,0,C,C
 a,857 30OCT23 6 C,2023-10-30,,SMART,买入,100,0.00,0.00,0,0,C;Ep,C;Ep
 ";
-        let result = import_options_csv_inner(&db, &account_id, csv).expect("import should succeed");
-        assert_eq!(result.imported, 3, "open + C close + C;Ep close should all import");
+        let result =
+            import_options_csv_inner(&db, &account_id, csv).expect("import should succeed");
+        assert_eq!(
+            result.imported, 3,
+            "open + C close + C;Ep close should all import"
+        );
         assert!(
             result.errors.is_empty(),
             "expected no errors, got: {:?}",

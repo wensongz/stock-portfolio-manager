@@ -663,6 +663,7 @@ fn resolve_builtin_review_conflicts(mut skills: Vec<Skill>) -> Vec<Skill> {
     skills
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StockReviewSection {
@@ -674,6 +675,7 @@ pub enum StockReviewSection {
     NextCycleSuggestions,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StockReviewFactGroup {
@@ -684,6 +686,7 @@ pub enum StockReviewFactGroup {
     Attribution,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StockReviewEvidenceClass {
@@ -693,12 +696,14 @@ pub enum StockReviewEvidenceClass {
     Question,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StockReviewMetricSource {
     DeterministicTool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct StockReviewResponsePolicy {
     pub sections: Vec<StockReviewSection>,
@@ -713,6 +718,7 @@ pub struct StockReviewResponsePolicy {
     pub allow_concrete_trade_advice: bool,
 }
 
+#[cfg(test)]
 pub fn stock_review_response_policy() -> StockReviewResponsePolicy {
     StockReviewResponsePolicy {
         sections: vec![
@@ -746,6 +752,7 @@ pub fn stock_review_response_policy() -> StockReviewResponsePolicy {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct StockReviewQuestionCandidate {
     pub id: String,
@@ -760,6 +767,7 @@ pub struct StockReviewQuestionCandidate {
     pub prose_completion_only: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StockReviewQuestionReason {
@@ -770,6 +778,7 @@ pub enum StockReviewQuestionReason {
     DurableReusableContext,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SelectedStockReviewQuestion {
     pub id: String,
@@ -778,6 +787,7 @@ pub struct SelectedStockReviewQuestion {
     pub skippable: bool,
 }
 
+#[cfg(test)]
 pub fn select_stock_review_questions(
     candidates: &[StockReviewQuestionCandidate],
 ) -> Vec<SelectedStockReviewQuestion> {
@@ -986,12 +996,7 @@ mod tests {
             .expect("stock-review builtin must be registered");
         assert_eq!(
             stock_review.trigger,
-            vec![
-                "股票操作复盘",
-                "调仓复盘",
-                "股票复盘报告",
-                "股票Campaign复盘"
-            ]
+            vec!["股票操作复盘", "调仓复盘", "股票复盘报告"]
         );
 
         assert_eq!(activated_ids("股票操作复盘"), vec!["stock-review"]);

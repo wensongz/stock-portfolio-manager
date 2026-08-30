@@ -457,9 +457,7 @@ mod tests {
                             traded_at, notes, created_at)
                      VALUES (?1, ?2, 'a', 'AAPL', 'Apple', 'US',
                              ?3, ?4, ?5, ?6, ?7, 'USD', ?8, NULL, ?9)",
-                    rusqlite::params![
-                        id, holding_id, ttype, shares, price, amount, comm, ts, ts
-                    ],
+                    rusqlite::params![id, holding_id, ttype, shares, price, amount, comm, ts, ts],
                 )
                 .unwrap();
             }
@@ -467,6 +465,10 @@ mod tests {
         let conn = db.conn.lock().unwrap();
         let (realized, total_buy_cost) = compute_realized_pnl(&conn, &holding_id).unwrap();
         assert_eq!(total_buy_cost, 1001.0);
-        assert!((realized - 197.8).abs() < 0.01, "realized PnL was {}", realized);
+        assert!(
+            (realized - 197.8).abs() < 0.01,
+            "realized PnL was {}",
+            realized
+        );
     }
 }

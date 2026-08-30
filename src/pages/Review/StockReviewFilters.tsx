@@ -1,9 +1,8 @@
-import { Button, DatePicker, Flex, Input, Select, Space, Typography } from "antd";
+import { Button, DatePicker, Flex, Select, Space, Typography } from "antd";
 import { ReloadOutlined, RobotOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
-import { useEffect, useState } from "react";
-import type { Account, Currency, Market, StockReviewFilters as Filters, StockReviewPeriodPreset } from "../../types";
-import { getStockReviewDateRange } from "./stockReviewViewModel";
+import type { Account, Currency, Market, StockOperationReviewFilters as Filters, StockReviewPeriodPreset } from "../../types";
+import { getStockOperationReviewDateRange } from "./stockOperationReviewViewModel";
 
 const { Text } = Typography;
 const { RangePicker } = DatePicker;
@@ -27,14 +26,11 @@ export default function StockReviewFilters({
   onRefresh,
   onAskAi,
 }: Props) {
-  const [specifiedBenchmark, setSpecifiedBenchmark] = useState(filters.benchmarkSymbol != null);
-  useEffect(() => setSpecifiedBenchmark(filters.benchmarkSymbol != null), [filters.benchmarkSymbol]);
-
   const update = (patch: Partial<Filters>) => onChange({ ...filters, ...patch });
   const changePreset = (periodPreset: StockReviewPeriodPreset) => {
     const range = periodPreset === "CUSTOM"
       ? { startDate: filters.startDate, endDate: filters.endDate }
-      : getStockReviewDateRange(periodPreset);
+      : getStockOperationReviewDateRange(periodPreset);
     update({ periodPreset, ...range });
   };
 
@@ -91,32 +87,6 @@ export default function StockReviewFilters({
             options={[{ value: "all", label: "全部市场" }, { value: "US", label: "美股" }, { value: "CN", label: "A 股" }, { value: "HK", label: "港股" }]}
           />
         </Space>
-        <Space orientation="vertical" size={2}>
-          <Text type="secondary">基准</Text>
-          <Select
-            aria-label="股票复盘基准模式"
-            value={specifiedBenchmark ? "specified" : "auto"}
-            style={{ minWidth: 150 }}
-            onChange={(value) => {
-              const specified = value === "specified";
-              setSpecifiedBenchmark(specified);
-              if (!specified) update({ benchmarkSymbol: null });
-            }}
-            options={[{ value: "auto", label: "自动混合基准" }, { value: "specified", label: "指定基准" }]}
-          />
-        </Space>
-        {specifiedBenchmark && (
-          <Space orientation="vertical" size={2}>
-            <Text type="secondary">基准代码</Text>
-            <Input
-              aria-label="股票复盘指定基准代码"
-              value={filters.benchmarkSymbol ?? ""}
-              placeholder="例如 ^GSPC"
-              style={{ width: 140 }}
-              onChange={(event) => update({ benchmarkSymbol: event.target.value.trim() || null })}
-            />
-          </Space>
-        )}
         <Space orientation="vertical" size={2}>
           <Text type="secondary">基准币种</Text>
           <Select

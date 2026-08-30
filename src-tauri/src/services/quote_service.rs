@@ -1460,6 +1460,11 @@ pub(crate) fn parse_xueqiu_history_response(
     let mut data = resp
         .data
         .ok_or_else(|| format!("fetch_stock_history_xueqiu: no data for {}", symbol))?;
+    let explicit_successful_empty = data.column.as_ref().is_some_and(Vec::is_empty)
+        && data.item.as_ref().is_some_and(Vec::is_empty);
+    if explicit_successful_empty {
+        return Ok(XueqiuHistoryOutcome::Empty);
+    }
     let columns = data.column.take().unwrap_or_default();
     if columns.is_empty() {
         let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
@@ -3911,6 +3916,30 @@ mod tests {
             XueqiuHistoryOutcome::StartsAfterRange {
                 first_available_date: chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
             }
+        );
+    }
+
+    #[test]
+    fn successful_empty_xueqiu_history_is_not_reported_as_missing_user_cookie() {
+        let body = r#"{
+          "data": {"symbol":"SZ001248","column":[],"item":[]},
+          "error_code":0,
+          "error_description":""
+        }"#;
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 6, 24).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
+
+        assert_eq!(
+            parse_xueqiu_history_response(
+                body,
+                "sz001248",
+                "CN",
+                start,
+                end,
+                "https://example.test/kline",
+            )
+            .unwrap(),
+            XueqiuHistoryOutcome::Empty
         );
     }
 

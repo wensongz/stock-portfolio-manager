@@ -71,9 +71,7 @@ fn validated_prefilled_tool(context: &PrefilledToolContext) -> Result<String, St
         "base_currency",
         "account_id",
         "market",
-        "benchmark_symbol",
         "symbol",
-        "campaign_id",
     ];
     if args.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
         return Err("股票复盘工具参数包含未支持字段".to_string());
@@ -105,7 +103,7 @@ mod prefilled_tool_tests {
 
     #[test]
     fn accepts_exact_stock_review_scope_and_rejects_other_tools_or_extra_fields() {
-        let campaign = PrefilledToolContext {
+        let review = PrefilledToolContext {
             name: "get_stock_review".to_string(),
             arguments: json!({
                 "start_date": "2026-01-01",
@@ -113,20 +111,26 @@ mod prefilled_tool_tests {
                 "base_currency": "USD",
                 "account_id": "account-a",
                 "market": "US",
-                "benchmark_symbol": "SPY",
-                "symbol": "AAPL",
-                "campaign_id": "campaign-7"
+                "symbol": "AAPL"
             }),
         };
-        let serialized = validated_prefilled_tool(&campaign).unwrap();
+        let serialized = validated_prefilled_tool(&review).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(parsed, campaign.arguments);
+        assert_eq!(parsed, review.arguments);
 
-        let mut wrong_tool = campaign.clone();
+        let mut wrong_tool = review.clone();
         wrong_tool.name = "save_stock_review_annotation".to_string();
         assert!(validated_prefilled_tool(&wrong_tool).is_err());
 
-        let mut extra = campaign;
+        let mut legacy_benchmark = review.clone();
+        legacy_benchmark.arguments["benchmark_symbol"] = json!("SPY");
+        assert!(validated_prefilled_tool(&legacy_benchmark).is_err());
+
+        let mut legacy_campaign = review.clone();
+        legacy_campaign.arguments["campaign_id"] = json!("campaign-7");
+        assert!(validated_prefilled_tool(&legacy_campaign).is_err());
+
+        let mut extra = review;
         extra.arguments["unexpected"] = json!(true);
         assert!(validated_prefilled_tool(&extra).is_err());
     }

@@ -52,7 +52,7 @@ test("reads a stock-review skill activation only from a valid prefill", () => {
   );
 });
 
-test("reads the exact portfolio and Campaign tool scope without changing the visible prompt", () => {
+test("reads the exact lightweight stock-review tool scope without changing the visible prompt", () => {
   const portfolio = {
     prefillPrompt: "approved portfolio prompt",
     prefillActiveSkill: "stock-review",
@@ -64,7 +64,6 @@ test("reads the exact portfolio and Campaign tool scope without changing the vis
       base_currency: "USD",
       account_id: "account-a",
       market: "US",
-      benchmark_symbol: "SPY",
     },
   };
   assert.deepEqual(readAiPrefillToolContext(portfolio), {
@@ -73,18 +72,26 @@ test("reads the exact portfolio and Campaign tool scope without changing the vis
   });
   assert.equal(readAiPrefill(portfolio), "approved portfolio prompt");
 
-  const campaign = {
+  const stock = {
     ...portfolio,
     prefillToolArguments: {
       ...portfolio.prefillToolArguments,
       symbol: "AAPL",
-      campaign_id: "campaign-7",
     },
   };
-  assert.deepEqual(readAiPrefillToolContext(campaign), {
+  assert.deepEqual(readAiPrefillToolContext(stock), {
     name: "get_stock_review",
-    arguments: campaign.prefillToolArguments,
+    arguments: stock.prefillToolArguments,
   });
+
+  assert.equal(readAiPrefillToolContext({
+    ...portfolio,
+    prefillToolArguments: { ...portfolio.prefillToolArguments, campaign_id: "legacy" },
+  }), null);
+  assert.equal(readAiPrefillToolContext({
+    ...portfolio,
+    prefillToolArguments: { ...portfolio.prefillToolArguments, benchmark_symbol: "SPY" },
+  }), null);
 });
 
 test("structured tool context is staged for exactly one next chat turn", () => {

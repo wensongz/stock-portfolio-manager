@@ -42,8 +42,10 @@ fn get_dividend_analysis_inner(
         name: String,
         accounts: std::collections::BTreeMap<String, f64>, // account_id -> total
     }
-    let mut by_market: std::collections::BTreeMap<String, std::collections::BTreeMap<String, CompanyAcc>> =
-        std::collections::BTreeMap::new();
+    let mut by_market: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, CompanyAcc>,
+    > = std::collections::BTreeMap::new();
     // account_id -> (name, market)
     let mut account_info: std::collections::BTreeMap<String, (String, String)> =
         std::collections::BTreeMap::new();
@@ -146,7 +148,11 @@ fn get_dividend_analysis_inner(
                 }
             })
             .collect();
-        rows.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
+        rows.sort_by(|a, b| {
+            b.total
+                .partial_cmp(&a.total)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let total: f64 = rows.iter().map(|r| r.total).sum();
         grand_total += total;
@@ -218,14 +224,14 @@ mod tests {
         let db = Database::new(":memory:").expect("failed to create in-memory database");
         let ts = now();
         let insert = |conn: &rusqlite::Connection,
-                          id: &str,
-                          account_id: &str,
-                          symbol: &str,
-                          name: &str,
-                          market: &str,
-                          amount: f64,
-                          comm: f64,
-                          traded: &str| {
+                      id: &str,
+                      account_id: &str,
+                      symbol: &str,
+                      name: &str,
+                      market: &str,
+                      amount: f64,
+                      comm: f64,
+                      traded: &str| {
             conn.execute(
                 "INSERT INTO transactions (id, holding_id, account_id, symbol, name, market,
                         transaction_type, shares, price, total_amount, commission, currency,
@@ -251,12 +257,62 @@ mod tests {
                 .unwrap();
             }
             // CN 2025: 美的集团 across two accounts; 贵州茅台 one account.
-            insert(&conn, "t1", "a1", "000333.SZ", "美的集团", "CN", 108_680.0, 0.0, "2025-06-10");
-            insert(&conn, "t2", "a2", "000333.SZ", "美的集团", "CN", 57_000.0, 0.0, "2025-06-10");
-            insert(&conn, "t3", "a1", "600519.SH", "贵州茅台", "CN", 42_036.35, 0.0, "2025-07-01");
-            insert(&conn, "t4", "a3", "AAPL", "Apple", "US", 100.0, 1.0, "2025-02-14"); // net 99
-            // A 2024 dividend that must be excluded when filtering year 2025.
-            insert(&conn, "t5", "a1", "000333.SZ", "美的集团", "CN", 999.0, 0.0, "2024-06-10");
+            insert(
+                &conn,
+                "t1",
+                "a1",
+                "000333.SZ",
+                "美的集团",
+                "CN",
+                108_680.0,
+                0.0,
+                "2025-06-10",
+            );
+            insert(
+                &conn,
+                "t2",
+                "a2",
+                "000333.SZ",
+                "美的集团",
+                "CN",
+                57_000.0,
+                0.0,
+                "2025-06-10",
+            );
+            insert(
+                &conn,
+                "t3",
+                "a1",
+                "600519.SH",
+                "贵州茅台",
+                "CN",
+                42_036.35,
+                0.0,
+                "2025-07-01",
+            );
+            insert(
+                &conn,
+                "t4",
+                "a3",
+                "AAPL",
+                "Apple",
+                "US",
+                100.0,
+                1.0,
+                "2025-02-14",
+            ); // net 99
+               // A 2024 dividend that must be excluded when filtering year 2025.
+            insert(
+                &conn,
+                "t5",
+                "a1",
+                "000333.SZ",
+                "美的集团",
+                "CN",
+                999.0,
+                0.0,
+                "2024-06-10",
+            );
         }
         db
     }
@@ -264,7 +320,8 @@ mod tests {
     #[test]
     fn test_dividend_analysis_aggregates_by_market_and_account() {
         let db = db_with_dividends();
-        let analysis = get_dividend_analysis_inner(&db, Some(2025)).expect("analysis should succeed");
+        let analysis =
+            get_dividend_analysis_inner(&db, Some(2025)).expect("analysis should succeed");
         assert_eq!(analysis.year, 2025);
 
         // Two markets present: CN and US (HK has none).
@@ -278,7 +335,11 @@ mod tests {
         assert_eq!(cn.accounts[0].account_name, "中信证券");
         assert_eq!(cn.accounts[1].account_name, "平安证券");
         // CN total = 108680 + 57000 + 42036.35 = 207716.35
-        assert!((cn.total - 207_716.35).abs() < 0.01, "CN total {}", cn.total);
+        assert!(
+            (cn.total - 207_716.35).abs() < 0.01,
+            "CN total {}",
+            cn.total
+        );
         // CN rows: 美的集团 (total 165680), 贵州茅台 (42036.35)
         assert_eq!(cn.rows.len(), 2);
         assert_eq!(cn.rows[0].symbol, "000333.SZ");
@@ -301,7 +362,8 @@ mod tests {
     #[test]
     fn test_dividend_analysis_year_filter_excludes_other_years() {
         let db = db_with_dividends();
-        let analysis = get_dividend_analysis_inner(&db, Some(2024)).expect("analysis should succeed");
+        let analysis =
+            get_dividend_analysis_inner(&db, Some(2024)).expect("analysis should succeed");
         // Only the 2024 美的集团 999 dividend.
         assert_eq!(analysis.markets.len(), 1);
         assert_eq!(analysis.markets[0].market, "CN");
@@ -312,7 +374,8 @@ mod tests {
     #[test]
     fn test_dividend_analysis_no_data_year() {
         let db = db_with_dividends();
-        let analysis = get_dividend_analysis_inner(&db, Some(2030)).expect("analysis should succeed");
+        let analysis =
+            get_dividend_analysis_inner(&db, Some(2030)).expect("analysis should succeed");
         assert!(analysis.markets.is_empty());
         assert_eq!(analysis.grand_total, 0.0);
     }

@@ -1099,8 +1099,22 @@ mod tests {
         let (db, account_id) = db_with_account();
         let conn = db.conn.lock().unwrap();
         // Deposit 1000, then withdraw 400: SELL on $CASH-USD
-        adjust_cash_holding(&conn, &account_id, "USD", "US", cash_delta("BUY", "$CASH-USD", 1000.0, 0.0)).unwrap();
-        adjust_cash_holding(&conn, &account_id, "USD", "US", cash_delta("SELL", "$CASH-USD", 400.0, 0.0)).unwrap();
+        adjust_cash_holding(
+            &conn,
+            &account_id,
+            "USD",
+            "US",
+            cash_delta("BUY", "$CASH-USD", 1000.0, 0.0),
+        )
+        .unwrap();
+        adjust_cash_holding(
+            &conn,
+            &account_id,
+            "USD",
+            "US",
+            cash_delta("SELL", "$CASH-USD", 400.0, 0.0),
+        )
+        .unwrap();
         assert_eq!(get_cash_shares(&conn, &account_id, "USD"), 600.0);
     }
 
@@ -1109,11 +1123,32 @@ mod tests {
         let (db, account_id) = db_with_account();
         let conn = db.conn.lock().unwrap();
         // Deposit 1000, withdraw 400 (balance 600)
-        adjust_cash_holding(&conn, &account_id, "USD", "US", cash_delta("BUY", "$CASH-USD", 1000.0, 0.0)).unwrap();
-        adjust_cash_holding(&conn, &account_id, "USD", "US", cash_delta("SELL", "$CASH-USD", 400.0, 0.0)).unwrap();
+        adjust_cash_holding(
+            &conn,
+            &account_id,
+            "USD",
+            "US",
+            cash_delta("BUY", "$CASH-USD", 1000.0, 0.0),
+        )
+        .unwrap();
+        adjust_cash_holding(
+            &conn,
+            &account_id,
+            "USD",
+            "US",
+            cash_delta("SELL", "$CASH-USD", 400.0, 0.0),
+        )
+        .unwrap();
         assert_eq!(get_cash_shares(&conn, &account_id, "USD"), 600.0);
         // Reverse the withdrawal (what delete_transaction does): +400
-        adjust_cash_holding(&conn, &account_id, "USD", "US", -cash_delta("SELL", "$CASH-USD", 400.0, 0.0)).unwrap();
+        adjust_cash_holding(
+            &conn,
+            &account_id,
+            "USD",
+            "US",
+            -cash_delta("SELL", "$CASH-USD", 400.0, 0.0),
+        )
+        .unwrap();
         assert_eq!(get_cash_shares(&conn, &account_id, "USD"), 1000.0);
     }
 

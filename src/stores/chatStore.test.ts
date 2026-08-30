@@ -17,9 +17,7 @@ const exactContext = {
     base_currency: "USD",
     account_id: "account-a",
     market: "US",
-    benchmark_symbol: "SPY",
     symbol: "AAPL",
-    campaign_id: "campaign-7",
   },
 };
 

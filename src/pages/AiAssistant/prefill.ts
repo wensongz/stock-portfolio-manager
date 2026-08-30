@@ -35,9 +35,7 @@ const STOCK_REVIEW_TOOL_ARGUMENT_KEYS = new Set([
   "base_currency",
   "account_id",
   "market",
-  "benchmark_symbol",
   "symbol",
-  "campaign_id",
 ]);
 
 export function readAiPrefillToolContext(state: unknown): AiPrefillToolContext | null {

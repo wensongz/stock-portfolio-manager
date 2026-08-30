@@ -46,7 +46,10 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
 
     let mut shares_by_position: HashMap<(String, String, String), f64> = HashMap::new();
     let mut actions: Vec<RawStockOperation> = Vec::new();
-    let mut active_action_key: Option<(String, String, String, NaiveDate, &'static str)> = None;
+    let mut latest_action_by_position: HashMap<
+        (String, String, String),
+        (usize, NaiveDate, &'static str),
+    > = HashMap::new();
 
     for transaction in ordered {
         if is_cash_symbol(&transaction.symbol) || transaction.transaction_type == "PAY" {
@@ -68,8 +71,8 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
         );
 
         if transaction.transaction_type == "OPEN" {
-            *shares_by_position.entry(position_key).or_default() += transaction.shares;
-            active_action_key = None;
+            *shares_by_position.entry(position_key.clone()).or_default() += transaction.shares;
+            latest_action_by_position.remove(&position_key);
             continue;
         }
 
@@ -87,7 +90,7 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
             "SELL" => {
                 let shares_after = shares_before - transaction.shares;
                 if shares_before <= EPSILON || shares_after < -EPSILON {
-                    active_action_key = None;
+                    latest_action_by_position.remove(&position_key);
                     continue;
                 }
                 (
@@ -102,19 +105,16 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
             }
             _ => continue,
         };
-        shares_by_position.insert(position_key, shares_after);
+        shares_by_position.insert(position_key.clone(), shares_after);
 
-        let action_key = (
-            transaction.account_id.clone(),
-            symbol_key,
-            market_key,
-            trade_date,
-            side,
-        );
-        if active_action_key.as_ref() == Some(&action_key) {
+        let merge_index = latest_action_by_position
+            .get(&position_key)
+            .filter(|(_, date, direction)| *date == trade_date && *direction == side)
+            .map(|(index, _, _)| *index);
+        if let Some(index) = merge_index {
             let action = actions
-                .last_mut()
-                .expect("an active action group must have an action");
+                .get_mut(index)
+                .expect("a tracked action group must have an action");
             let weighted_total =
                 action.trade_price * action.quantity + transaction.shares * transaction.price;
             action.quantity += transaction.shares;
@@ -127,6 +127,7 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
                 action.action_type = action_type.to_string();
             }
         } else {
+            let index = actions.len();
             actions.push(RawStockOperation {
                 action_id: action_id(transaction, trade_date, side),
                 transaction_ids: vec![transaction.id.clone()],
@@ -145,8 +146,8 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
                 shares_before,
                 shares_after,
             });
+            latest_action_by_position.insert(position_key, (index, trade_date, side));
         }
-        active_action_key = Some(action_key);
     }
 
     actions
@@ -238,6 +239,8 @@ mod tests {
         );
         assert_eq!(actions[0].quantity, 50.0);
         assert!((actions[0].trade_price - 11.6).abs() < 1e-12);
+        assert_eq!(actions[0].trade_notional_local, 580.0);
+        assert_eq!(actions[0].fee_local, 2.0);
         assert_eq!(
             (actions[0].shares_before, actions[0].shares_after),
             (100.0, 150.0)
@@ -332,6 +335,61 @@ mod tests {
         assert_eq!(
             (actions[2].shares_before, actions[2].shares_after),
             (90.0, 120.0)
+        );
+    }
+
+    #[test]
+    fn raw_replay_merges_same_position_across_interleaved_other_security() {
+        let aapl_buy_1 = transaction("aapl-1", "BUY", 10.0, 11.0, "2026-07-02T10:00:00Z");
+
+        let mut msft_buy = transaction("msft", "BUY", 5.0, 20.0, "2026-07-02T11:00:00Z");
+        msft_buy.symbol = "MSFT".to_string();
+        msft_buy.name = "Microsoft".to_string();
+
+        let mut aapl_buy_2 = transaction("aapl-2", "BUY", 20.0, 12.0, "2026-07-02T12:00:00Z");
+        aapl_buy_2.symbol = "aapl".to_string();
+        aapl_buy_2.market = "us".to_string();
+
+        let actions = build_raw_stock_operations(&[aapl_buy_1, msft_buy, aapl_buy_2]);
+
+        assert_eq!(actions.len(), 2);
+        assert_eq!(
+            actions[0].transaction_ids,
+            vec!["aapl-1".to_string(), "aapl-2".to_string()]
+        );
+        assert_eq!(actions[0].quantity, 30.0);
+        assert_eq!(actions[1].transaction_ids, vec!["msft".to_string()]);
+    }
+
+    #[test]
+    fn raw_replay_keeps_accounts_and_markets_as_distinct_positions() {
+        let account_one_us = transaction("account-1-us", "BUY", 10.0, 11.0, "2026-07-02T10:00:00Z");
+
+        let mut account_two_us =
+            transaction("account-2-us", "BUY", 20.0, 12.0, "2026-07-02T11:00:00Z");
+        account_two_us.account_id = "account-2".to_string();
+
+        let mut account_one_hk =
+            transaction("account-1-hk", "BUY", 30.0, 13.0, "2026-07-02T12:00:00Z");
+        account_one_hk.market = "HK".to_string();
+
+        let actions = build_raw_stock_operations(&[account_one_us, account_two_us, account_one_hk]);
+
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].transaction_ids, vec!["account-1-us".to_string()]);
+        assert_eq!(actions[1].transaction_ids, vec!["account-2-us".to_string()]);
+        assert_eq!(actions[2].transaction_ids, vec!["account-1-hk".to_string()]);
+        assert_eq!(
+            (actions[0].account_id.as_str(), actions[0].market.as_str()),
+            ("account-1", "US")
+        );
+        assert_eq!(
+            (actions[1].account_id.as_str(), actions[1].market.as_str()),
+            ("account-2", "US")
+        );
+        assert_eq!(
+            (actions[2].account_id.as_str(), actions[2].market.as_str()),
+            ("account-1", "HK")
         );
     }
 

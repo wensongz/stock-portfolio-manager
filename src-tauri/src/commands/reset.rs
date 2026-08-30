@@ -25,9 +25,11 @@ pub(crate) fn clear_stock_operation_review_cache(tx: &Transaction<'_>) -> SqlRes
     Ok(())
 }
 
-/// Wipe every user-owned row in the database and reset the two config
-/// tables to their built-in defaults, then clear the in-memory caches and
-/// the backup config file.
+/// Wipe every active user-owned row managed by the current runtime, reset the
+/// two config tables to their built-in defaults, then clear the in-memory
+/// caches and the backup config file. Retired legacy stock-review tables are
+/// intentionally left inert: they are not read, migrated, written, deleted,
+/// or reset.
 ///
 /// This is the "factory reset" entry point. It runs in a single transaction
 /// so a failure at any step rolls back every prior change — the user is

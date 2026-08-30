@@ -58,6 +58,52 @@ test("one-year preset preserves leap-day calendar semantics", () => {
   );
 });
 
+test("Q1 presets cross the previous calendar-year boundary", () => {
+  const january = new Date("2026-01-01T00:15:00+08:00");
+  assert.deepEqual(getStockOperationReviewDateRange("QTD", january), {
+    startDate: "2026-01-01",
+    endDate: "2026-01-01",
+  });
+  assert.deepEqual(getStockOperationReviewDateRange("PREV_QUARTER", january), {
+    startDate: "2025-10-01",
+    endDate: "2025-12-31",
+  });
+  assert.deepEqual(getStockOperationReviewDateRange("YTD", january), {
+    startDate: "2026-01-01",
+    endDate: "2026-01-01",
+  });
+});
+
+test("date presets change calendar day at Shanghai midnight", () => {
+  assert.deepEqual(
+    getStockOperationReviewDateRange("YTD", new Date("2025-12-31T15:59:59Z")),
+    { startDate: "2025-01-01", endDate: "2025-12-31" },
+  );
+  assert.deepEqual(
+    getStockOperationReviewDateRange("YTD", new Date("2025-12-31T16:00:00Z")),
+    { startDate: "2026-01-01", endDate: "2026-01-01" },
+  );
+});
+
+test("custom ranges reject impossible and reversed dates", () => {
+  assert.throws(
+    () =>
+      getStockOperationReviewDateRange("CUSTOM", now, {
+        startDate: "2026-02-30",
+        endDate: "2026-03-01",
+      }),
+    /有效日期/,
+  );
+  assert.throws(
+    () =>
+      getStockOperationReviewDateRange("CUSTOM", now, {
+        startDate: "2026-09-01",
+        endDate: "2026-08-30",
+      }),
+    /开始日期/,
+  );
+});
+
 test("filters migrate old benchmark data but save only lightweight fields", () => {
   const old = {
     accountId: "account-a",

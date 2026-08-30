@@ -52,7 +52,7 @@ test("reads a stock-review skill activation only from a valid prefill", () => {
   );
 });
 
-test("reads the exact lightweight stock-review tool scope without changing the visible prompt", () => {
+test("stock-review prefill requests only get_stock_review without changing the visible prompt", () => {
   const portfolio = {
     prefillPrompt: "approved portfolio prompt",
     prefillActiveSkill: "stock-review",
@@ -83,6 +83,8 @@ test("reads the exact lightweight stock-review tool scope without changing the v
     name: "get_stock_review",
     arguments: stock.prefillToolArguments,
   });
+
+  assert.equal(readAiPrefillToolContext(portfolio)?.name, "get_stock_review");
 
   assert.equal(readAiPrefillToolContext({
     ...portfolio,
@@ -181,11 +183,7 @@ test("persisted context reconstruction rejects any second same-id malformed reco
   ]), null);
 });
 
-test("persisted host provenance never elevates a write tool or invalid scope", () => {
-  assert.equal(readPersistedAiToolContext([{
-    ...genuineHostCall,
-    name: "save_stock_review_annotation",
-  }]), null);
+test("persisted host provenance rejects invalid scope", () => {
   assert.equal(readPersistedAiToolContext([{
     ...genuineHostCall,
     arguments: JSON.stringify({

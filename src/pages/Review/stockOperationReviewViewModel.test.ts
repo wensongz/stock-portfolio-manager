@@ -51,6 +51,13 @@ test("lightweight date presets use calendar boundaries", () => {
   });
 });
 
+test("one-year preset preserves leap-day calendar semantics", () => {
+  assert.deepEqual(
+    getStockOperationReviewDateRange("1Y", new Date("2024-02-29T23:30:00+08:00")),
+    { startDate: "2023-03-01", endDate: "2024-02-29" },
+  );
+});
+
 test("filters migrate old benchmark data but save only lightweight fields", () => {
   const old = {
     accountId: "account-a",

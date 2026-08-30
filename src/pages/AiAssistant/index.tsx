@@ -132,7 +132,6 @@ const TOOL_LABELS: Record<string, string> = {
   get_option_positions: "期权持仓",
   get_option_review: "期权操作复盘",
   get_stock_review: "股票操作复盘",
-  save_stock_review_annotation: "保存股票复盘注释",
 };
 
 export default function AiAssistantPage() {

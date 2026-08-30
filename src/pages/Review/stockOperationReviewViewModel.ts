@@ -7,7 +7,6 @@ import type {
   StockOperationSecuritySummary,
   StockReviewPeriodPreset,
 } from "../../types";
-import { getStockReviewDateRange } from "./stockReviewViewModel.ts";
 
 export const STOCK_OPERATION_REVIEW_FILTERS_STORAGE_KEY =
   "review_stock_operation_filters_v1";
@@ -27,12 +26,114 @@ interface FilterStorage {
   setItem(key: string, value: string): void;
 }
 
+interface CalendarDate {
+  year: number;
+  month: number;
+  day: number;
+}
+
+interface StockOperationReviewDateRange {
+  startDate: string;
+  endDate: string;
+}
+
+function shanghaiCalendarDate(now: Date): CalendarDate {
+  if (Number.isNaN(now.getTime())) throw new RangeError("当前日期无效");
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(now);
+  const value = (type: Intl.DateTimeFormatPartTypes) =>
+    Number(parts.find((part) => part.type === type)?.value);
+  return { year: value("year"), month: value("month"), day: value("day") };
+}
+
+function formatCalendarDate({ year, month, day }: CalendarDate): string {
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function shiftCalendarDays(date: CalendarDate, days: number): CalendarDate {
+  const shifted = new Date(Date.UTC(date.year, date.month - 1, date.day + days));
+  return {
+    year: shifted.getUTCFullYear(),
+    month: shifted.getUTCMonth() + 1,
+    day: shifted.getUTCDate(),
+  };
+}
+
+function daysInCalendarMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+function isValidDateOnly(value: unknown): value is string {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number);
+  return formatCalendarDate(shiftCalendarDays({ year, month, day }, 0)) === value;
+}
+
+function validateDateRange(range: StockOperationReviewDateRange): StockOperationReviewDateRange {
+  if (!isValidDateOnly(range.startDate) || !isValidDateOnly(range.endDate)) {
+    throw new RangeError("请选择有效日期");
+  }
+  if (range.startDate > range.endDate) {
+    throw new RangeError("开始日期不能晚于结束日期");
+  }
+  return range;
+}
+
 export function getStockOperationReviewDateRange(
   preset: StockReviewPeriodPreset,
   now: Date = new Date(),
   custom?: { startDate: string; endDate: string },
 ) {
-  return getStockReviewDateRange(preset, now, custom);
+  if (preset === "CUSTOM") {
+    if (!custom) throw new RangeError("自定义周期需要有效日期");
+    return validateDateRange(custom);
+  }
+
+  const end = shanghaiCalendarDate(now);
+  if (preset === "YTD") {
+    return { startDate: `${end.year}-01-01`, endDate: formatCalendarDate(end) };
+  }
+  if (preset === "1Y") {
+    const priorAnniversary = {
+      year: end.year - 1,
+      month: end.month,
+      day: Math.min(end.day, daysInCalendarMonth(end.year - 1, end.month)),
+    };
+    return {
+      startDate: formatCalendarDate(shiftCalendarDays(priorAnniversary, 1)),
+      endDate: formatCalendarDate(end),
+    };
+  }
+
+  const quarterStartMonth = Math.floor((end.month - 1) / 3) * 3 + 1;
+  if (preset === "QTD") {
+    return {
+      startDate: formatCalendarDate({ year: end.year, month: quarterStartMonth, day: 1 }),
+      endDate: formatCalendarDate(end),
+    };
+  }
+
+  const currentQuarterStart = new Date(Date.UTC(end.year, quarterStartMonth - 1, 1));
+  const previousQuarterEnd = new Date(currentQuarterStart.getTime() - 86_400_000);
+  const previousQuarterStart = new Date(
+    Date.UTC(previousQuarterEnd.getUTCFullYear(), previousQuarterEnd.getUTCMonth() - 2, 1),
+  );
+  return {
+    startDate: formatCalendarDate({
+      year: previousQuarterStart.getUTCFullYear(),
+      month: previousQuarterStart.getUTCMonth() + 1,
+      day: 1,
+    }),
+    endDate: formatCalendarDate({
+      year: previousQuarterEnd.getUTCFullYear(),
+      month: previousQuarterEnd.getUTCMonth() + 1,
+      day: previousQuarterEnd.getUTCDate(),
+    }),
+  };
 }
 
 export function createDefaultStockOperationReviewFilters(
@@ -56,9 +157,7 @@ function nullableString(value: unknown): string | null | undefined {
 }
 
 function validDate(value: unknown): value is string {
-  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
-  const parsed = new Date(`${value}T00:00:00Z`);
-  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+  return isValidDateOnly(value);
 }
 
 function parseFilters(

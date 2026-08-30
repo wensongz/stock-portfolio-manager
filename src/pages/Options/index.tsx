@@ -489,20 +489,20 @@ export default function OptionsPage() {
       title: "期权标识",
       dataIndex: "option_symbol",
       key: "option_symbol",
-      width: 245,
+      width: 255,
     },
     {
       title: "股票",
       dataIndex: "underlying",
       key: "underlying",
-      width: 80,
+      width: 75,
       render: (v: string) => <Tag color="blue">{v}</Tag>,
     },
     {
       title: "到期日",
       dataIndex: "expiry_date",
       key: "expiry_date",
-      width: 100,
+      width: 90,
     },
     {
       title: "行权价",

@@ -582,21 +582,36 @@ fn recompute_option_statuses(db: &Database, account_id: &str) -> Result<(), Stri
             continue;
         }
 
-        let total_open_qty: i64 = opens.iter().map(|r| r.quantity.abs()).sum();
-        let total_close_qty: i64 = closes.iter().map(|r| r.quantity.abs()).sum();
+        let mut remaining_by_open: Vec<_> = opens
+            .iter()
+            .map(|open| (open.id.as_str(), open.quantity.abs()))
+            .collect();
 
-        if total_open_qty > 0 && total_close_qty >= total_open_qty {
-            let status = match closes.last().map(|c| c.code.as_str()) {
-                Some("A;C") => "assigned",
-                Some("C;P") | Some("C") => "closed",
-                _ => "expired",
-            };
+        for close in closes {
+            let mut remaining_close = close.quantity.abs();
+            for (open_id, remaining_open) in &mut remaining_by_open {
+                if remaining_close == 0 {
+                    break;
+                }
+                if *remaining_open == 0 {
+                    continue;
+                }
 
-            for open in &opens {
-                let _ = conn.execute(
-                    "UPDATE option_records SET contract_status = ?1 WHERE id = ?2",
-                    rusqlite::params![status, open.id],
-                );
+                let matched = (*remaining_open).min(remaining_close);
+                *remaining_open -= matched;
+                remaining_close -= matched;
+
+                if *remaining_open == 0 {
+                    let status = match close.code.as_str() {
+                        "A;C" => "assigned",
+                        "C;P" | "C" => "closed",
+                        _ => "expired",
+                    };
+                    let _ = conn.execute(
+                        "UPDATE option_records SET contract_status = ?1 WHERE id = ?2",
+                        rusqlite::params![status, *open_id],
+                    );
+                }
             }
         }
     }
@@ -1316,43 +1331,13 @@ fn get_field(
 }
 
 /// Internal helper that doesn't require State wrapper.
-/// Uses pre-computed contract_status from the DB for fast loading; avoids
-/// the expensive open-vs-close quantity matching on every call.
+/// Recomputes contract_status before loading so persisted records immediately
+/// pick up the current FIFO matching rules.
 pub fn get_option_contracts_inner(
     db: &Database,
     account_id: &str,
 ) -> Result<Vec<OptionContract>, String> {
-    // Lazy one-time recompute: if the account has records but none have a
-    // non-'active' contract_status, the data hasn't been migrated yet.
-    let needs_recompute: bool = {
-        let conn = db.conn.lock().map_err(|e| e.to_string())?;
-        let total: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM option_records WHERE account_id = ?1",
-                rusqlite::params![account_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        if total == 0 {
-            false
-        } else {
-            let non_active: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM option_records WHERE account_id = ?1 AND contract_status != 'active'",
-                    rusqlite::params![account_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            non_active == 0
-        }
-    };
-    if needs_recompute {
-        let _ = recompute_option_statuses(db, account_id);
-        // Fall through to the fetch below, which reads the freshly recomputed
-        // statuses. NOTE: do not re-enter this function — recompute can
-        // legitimately leave every record 'active' (e.g. open positions with
-        // no closing record yet), so recursing here would overflow the stack.
-    }
+    recompute_option_statuses(db, account_id)?;
 
     // Fetch all records — open records have pre-computed contract_status;
     // close records are only needed to display close_price/close_code.
@@ -1425,14 +1410,34 @@ pub fn get_option_contracts_inner(
             .collect();
         closes.sort_by(|a, b| a.traded_at.cmp(&b.traded_at));
 
-        let last_close = closes.last();
+        let mut remaining_by_open: Vec<_> = opens
+            .iter()
+            .map(|open| (open.id.as_str(), open.quantity.abs()))
+            .collect();
+        let mut completing_close_by_open = std::collections::HashMap::new();
+        for close in closes {
+            let mut remaining_close = close.quantity.abs();
+            for (open_id, remaining_open) in &mut remaining_by_open {
+                if remaining_close == 0 {
+                    break;
+                }
+                if *remaining_open == 0 {
+                    continue;
+                }
 
-        // Use the pre-computed contract_status from the first open record.
-        // All open records in the same group share the same status.
-        let status = opens[0].contract_status.clone();
+                let matched = (*remaining_open).min(remaining_close);
+                *remaining_open -= matched;
+                remaining_close -= matched;
+                if *remaining_open == 0 {
+                    completing_close_by_open.insert(*open_id, close);
+                }
+            }
+        }
 
         for open in &opens {
+            let status = open.contract_status.clone();
             let is_expired = status != "active";
+            let completing_close = completing_close_by_open.get(open.id.as_str());
             contracts.push(OptionContract {
                 id: open.id.clone(),
                 option_symbol: open.option_symbol.clone(),
@@ -1446,12 +1451,12 @@ pub fn get_option_contracts_inner(
                 commission: open.commission,
                 traded_at: open.traded_at.clone(),
                 close_price: if is_expired {
-                    last_close.map(|r| r.price)
+                    completing_close.map(|record| record.price)
                 } else {
                     None
                 },
                 close_code: if is_expired {
-                    last_close.map(|r| r.code.clone())
+                    completing_close.map(|record| record.code.clone())
                 } else {
                     None
                 },
@@ -1789,6 +1794,101 @@ a,BRK B 16JUN23 165 C,2023-06-10,,SMART,买入,1,0.10,10.00,0,0,C;P,C;P
             "sell 100 then buy back 100 (C) should be closed, got {}",
             status
         );
+    }
+
+    #[test]
+    fn test_partial_group_close_completes_oldest_open_fifo() {
+        // Two opens share one option symbol. Closing 10 of 150 contracts must
+        // complete the oldest 10-contract open while leaving the other 140 active.
+        let (db, account_id) = db_with_account();
+        let ts = chrono::Utc::now().to_rfc3339();
+        {
+            let conn = db.conn.lock().unwrap();
+            for (id, action, code, qty, traded) in [
+                ("o1", "SELL", "O", -10, "2024-10-01, 10:01:41"),
+                ("o2", "SELL", "O", -140, "2024-10-01, 11:30:40"),
+                ("c1", "BUY", "C", 10, "2024-12-04, 09:57:34"),
+            ] {
+                conn.execute(
+                    "INSERT INTO option_records (id, account_id, option_symbol, underlying, expiry_date, strike_price, option_type, action, code, quantity, price, amount, commission, fee, traded_at, settled_at, created_at, contract_status)
+                     VALUES (?1, ?2, 'BABA 15JAN27 160 C', 'BABA', '15JAN27', 160.0, 'C', ?3, ?4, ?5, 1.0, 0.0, 0.0, 0.0, ?6, NULL, ?7, 'active')",
+                    rusqlite::params![id, account_id, action, code, qty, traded, ts],
+                )
+                .unwrap();
+            }
+        }
+
+        let contracts = get_option_contracts_inner(&db, &account_id)
+            .expect("partial close should produce option contracts");
+        let oldest = contracts
+            .iter()
+            .find(|contract| contract.id == "o1")
+            .expect("oldest open should be returned");
+        let remaining = contracts
+            .iter()
+            .find(|contract| contract.id == "o2")
+            .expect("remaining open should be returned");
+
+        assert_eq!(oldest.status, "closed");
+        assert_eq!(oldest.close_code.as_deref(), Some("C"));
+        assert_eq!(remaining.status, "active");
+        assert_eq!(remaining.close_code, None);
+        assert_eq!(
+            contracts
+                .iter()
+                .filter(|contract| contract.status != "active")
+                .map(|contract| contract.contracts.abs())
+                .sum::<i64>(),
+            10,
+        );
+        assert_eq!(
+            contracts
+                .iter()
+                .filter(|contract| contract.status == "active")
+                .map(|contract| contract.contracts.abs())
+                .sum::<i64>(),
+            140,
+        );
+    }
+
+    #[test]
+    fn test_fifo_contracts_keep_each_opens_completing_close_details() {
+        let (db, account_id) = db_with_account();
+        let ts = chrono::Utc::now().to_rfc3339();
+        {
+            let conn = db.conn.lock().unwrap();
+            for (id, action, code, qty, price, traded) in [
+                ("o1", "SELL", "O", -10, 3.0, "2024-10-01, 10:01:41"),
+                ("o2", "SELL", "O", -10, 4.0, "2024-10-01, 11:30:40"),
+                ("c1", "BUY", "C", 10, 2.0, "2024-12-04, 09:57:34"),
+                ("c2", "BUY", "C;Ep", 10, 0.0, "2025-01-15"),
+            ] {
+                conn.execute(
+                    "INSERT INTO option_records (id, account_id, option_symbol, underlying, expiry_date, strike_price, option_type, action, code, quantity, price, amount, commission, fee, traded_at, settled_at, created_at, contract_status)
+                     VALUES (?1, ?2, 'BABA 15JAN27 160 C', 'BABA', '15JAN27', 160.0, 'C', ?3, ?4, ?5, ?6, 0.0, 0.0, 0.0, ?7, NULL, ?8, 'active')",
+                    rusqlite::params![id, account_id, action, code, qty, price, traded, ts],
+                )
+                .unwrap();
+            }
+        }
+
+        let contracts = get_option_contracts_inner(&db, &account_id)
+            .expect("completed FIFO opens should be returned");
+        let oldest = contracts
+            .iter()
+            .find(|contract| contract.id == "o1")
+            .expect("oldest open should be returned");
+        let newest = contracts
+            .iter()
+            .find(|contract| contract.id == "o2")
+            .expect("newest open should be returned");
+
+        assert_eq!(oldest.status, "closed");
+        assert_eq!(oldest.close_code.as_deref(), Some("C"));
+        assert_eq!(oldest.close_price, Some(2.0));
+        assert_eq!(newest.status, "expired");
+        assert_eq!(newest.close_code.as_deref(), Some("C;Ep"));
+        assert_eq!(newest.close_price, Some(0.0));
     }
 
     #[test]

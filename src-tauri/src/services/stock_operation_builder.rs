@@ -133,6 +133,9 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
             action.fee_local += transaction.commission;
             action.transaction_ids.push(transaction.id.clone());
             action.shares_after = shares_after;
+            if action_type == "close" {
+                action.action_type = action_type.to_string();
+            }
         } else {
             actions.push(RawStockOperation {
                 action_id: action_id(transaction, trade_date, side),
@@ -276,6 +279,43 @@ mod tests {
         assert_eq!(
             (actions[3].shares_before, actions[3].shares_after),
             (70.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn raw_replay_marks_merged_same_day_sells_ending_at_zero_as_close() {
+        let actions = build_raw_stock_operations(&[
+            transaction("opening", "OPEN", 100.0, 10.0, "2026-07-01T10:00:00Z"),
+            transaction("partial-sell", "SELL", 40.0, 11.0, "2026-07-02T10:00:00Z"),
+            transaction("final-sell", "SELL", 60.0, 12.0, "2026-07-02T11:00:00Z"),
+        ]);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0].transaction_ids,
+            vec!["partial-sell".to_string(), "final-sell".to_string()]
+        );
+        assert_eq!(actions[0].action_type, "close");
+        assert_eq!(actions[0].quantity, 100.0);
+        assert_eq!(
+            (actions[0].shares_before, actions[0].shares_after),
+            (100.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn raw_replay_keeps_merged_same_day_buys_starting_at_zero_as_open() {
+        let actions = build_raw_stock_operations(&[
+            transaction("open-1", "BUY", 40.0, 10.0, "2026-07-01T10:00:00Z"),
+            transaction("open-2", "BUY", 60.0, 11.0, "2026-07-01T11:00:00Z"),
+        ]);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action_type, "open");
+        assert_eq!(actions[0].quantity, 100.0);
+        assert_eq!(
+            (actions[0].shares_before, actions[0].shares_after),
+            (0.0, 100.0)
         );
     }
 

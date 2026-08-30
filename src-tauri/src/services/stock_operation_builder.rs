@@ -55,9 +55,8 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
     });
 
     let mut shares_by_position: HashMap<(String, String, String), f64> = HashMap::new();
-    let mut action_indexes: HashMap<(String, String, String, NaiveDate, &'static str), usize> =
-        HashMap::new();
     let mut actions: Vec<RawStockOperation> = Vec::new();
+    let mut active_action_key: Option<(String, String, String, NaiveDate, &'static str)> = None;
 
     for transaction in ordered {
         if is_cash_symbol(&transaction.symbol) || transaction.transaction_type == "PAY" {
@@ -80,6 +79,7 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
 
         if transaction.transaction_type == "OPEN" {
             *shares_by_position.entry(position_key).or_default() += transaction.shares;
+            active_action_key = None;
             continue;
         }
 
@@ -89,6 +89,7 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
             "SELL" => {
                 let shares_after = shares_before - transaction.shares;
                 if shares_before <= EPSILON || shares_after < -EPSILON {
+                    active_action_key = None;
                     continue;
                 }
                 ("sell", "reduce", shares_after)
@@ -104,8 +105,10 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
             trade_date,
             side,
         );
-        if let Some(&action_index) = action_indexes.get(&action_key) {
-            let action = &mut actions[action_index];
+        if active_action_key.as_ref() == Some(&action_key) {
+            let action = actions
+                .last_mut()
+                .expect("an active action group must have an action");
             let weighted_total =
                 action.trade_price * action.quantity + transaction.shares * transaction.price;
             action.quantity += transaction.shares;
@@ -114,28 +117,27 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
             action.fee_local += transaction.commission;
             action.transaction_ids.push(transaction.id.clone());
             action.shares_after = shares_after;
-            continue;
+        } else {
+            actions.push(RawStockOperation {
+                action_id: action_id(transaction, trade_date, side),
+                transaction_ids: vec![transaction.id.clone()],
+                account_id: transaction.account_id.clone(),
+                symbol: transaction.symbol.clone(),
+                name: transaction.name.clone(),
+                market: transaction.market.clone(),
+                action_type: action_type.to_string(),
+                traded_at: transaction.traded_at.clone(),
+                trade_date,
+                quantity: transaction.shares,
+                trade_price: transaction.price,
+                trade_notional_local: transaction.total_amount.abs(),
+                fee_local: transaction.commission,
+                currency: transaction.currency.clone(),
+                shares_before,
+                shares_after,
+            });
         }
-
-        action_indexes.insert(action_key, actions.len());
-        actions.push(RawStockOperation {
-            action_id: action_id(transaction, trade_date, side),
-            transaction_ids: vec![transaction.id.clone()],
-            account_id: transaction.account_id.clone(),
-            symbol: transaction.symbol.clone(),
-            name: transaction.name.clone(),
-            market: transaction.market.clone(),
-            action_type: action_type.to_string(),
-            traded_at: transaction.traded_at.clone(),
-            trade_date,
-            quantity: transaction.shares,
-            trade_price: transaction.price,
-            trade_notional_local: transaction.total_amount.abs(),
-            fee_local: transaction.commission,
-            currency: transaction.currency.clone(),
-            shares_before,
-            shares_after,
-        });
+        active_action_key = Some(action_key);
     }
 
     actions
@@ -238,6 +240,35 @@ mod tests {
         assert_eq!(
             (actions[1].shares_before, actions[1].shares_after),
             (150.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn raw_replay_keeps_intraday_buy_sell_buy_as_separate_action_groups() {
+        let rows = vec![
+            transaction("opening", "OPEN", 100.0, 10.0, "2026-07-01"),
+            transaction("buy-1", "BUY", 10.0, 11.0, "2026-07-02T10:00:00Z"),
+            transaction("sell", "SELL", 20.0, 12.0, "2026-07-02T11:00:00Z"),
+            transaction("buy-2", "BUY", 30.0, 13.0, "2026-07-02T12:00:00Z"),
+        ];
+
+        let actions = build_raw_stock_operations(&rows);
+
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].transaction_ids, vec!["buy-1".to_string()]);
+        assert_eq!(
+            (actions[0].shares_before, actions[0].shares_after),
+            (100.0, 110.0)
+        );
+        assert_eq!(actions[1].transaction_ids, vec!["sell".to_string()]);
+        assert_eq!(
+            (actions[1].shares_before, actions[1].shares_after),
+            (110.0, 90.0)
+        );
+        assert_eq!(actions[2].transaction_ids, vec!["buy-2".to_string()]);
+        assert_eq!(
+            (actions[2].shares_before, actions[2].shares_after),
+            (90.0, 120.0)
         );
     }
 

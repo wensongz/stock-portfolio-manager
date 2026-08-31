@@ -20,6 +20,7 @@ import type { UploadFile } from "antd/es/upload";
 import dayjs from "dayjs";
 import { invoke } from "@tauri-apps/api/core";
 import type { Account } from "../../types";
+import { parseThsCsv, type ThsCsvRow } from "./thsCsvParser";
 
 const { Dragger } = Upload;
 const { Text, Paragraph } = Typography;
@@ -28,18 +29,7 @@ const { Text, Paragraph } = Typography;
 // Types
 // ---------------------------------------------------------------------------
 
-interface EditableRow {
-  key: string;
-  selected: boolean;
-  transaction_type: string; // "BUY" | "SELL" | "PAY"
-  symbol: string;
-  stock_name: string;
-  traded_at: string; // ISO-8601
-  price: number;
-  shares: number;
-  total_amount: number;
-  commission: number;
-  notes?: string;
+interface EditableRow extends ThsCsvRow {
   lookingUp?: boolean;
   importOk?: boolean;
   importError?: string;
@@ -56,208 +46,6 @@ interface ImportFromThsCsvModalProps {
   account: Account;
   onClose: () => void;
   onImported: () => void;
-}
-
-// ---------------------------------------------------------------------------
-// CSV parsing helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Split a single CSV line respecting double-quoted fields.
- */
-function splitCsvLine(line: string): string[] {
-  const result: string[] = [];
-  let current = "";
-  let inQuotes = false;
-
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        current += '"';
-        i++;
-      } else {
-        inQuotes = !inQuotes;
-      }
-    } else if (ch === "," && !inQuotes) {
-      result.push(current);
-      current = "";
-    } else {
-      current += ch;
-    }
-  }
-  result.push(current);
-  return result;
-}
-
-function parseNum(s: string | undefined): number {
-  return parseFloat((s ?? "").replace(/,/g, "").trim());
-}
-
-/**
- * Build an ISO-8601 datetime string from THS date/time fields.
- *   date: "20260430" or "2026/04/30" or "2026-04-30"
- *   time: "14:13:09" or "141309" or "" (defaults to 09:30:00)
- */
-function buildDateTime(date: string, time: string): string {
-  const d = date.trim().replace(/[\/\-]/g, "");
-  const datePart =
-    d.length === 8
-      ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`
-      : date.trim();
-
-  const t = time.trim().replace(/:/g, "");
-  const timePart =
-    t.length === 6
-      ? `${t.slice(0, 2)}:${t.slice(2, 4)}:${t.slice(4, 6)}`
-      : time.trim() || "09:30:00";
-
-  return `${datePart}T${timePart}`;
-}
-
-/**
- * Derive the SH/SZ-prefixed symbol from the 6-digit code and optional
- * exchange name column.
- */
-function deriveSymbol(code: string, exchange: string): string {
-  const c = code.trim();
-  if (exchange.includes("上海") || exchange.toUpperCase().includes("SH")) {
-    return `sh${c}`;
-  }
-  if (exchange.includes("深圳") || exchange.toUpperCase().includes("SZ")) {
-    return `sz${c}`;
-  }
-  // Heuristic: Shanghai codes begin with 5 (ETFs/funds) or 6 (A-shares);
-  // Shenzhen codes begin with 0, 1, 2, 3, or 4.
-  return c.startsWith("6") || c.startsWith("5") ? `sh${c}` : `sz${c}`;
-}
-
-/**
- * Parse a 同花顺 historical-trade CSV export.
- *
- * Recognised columns (THS saves them in GB18030; the component retries with
- * that encoding when UTF-8 yields no header):
- *   成交日期（或交易日期、发生日期） 成交时间  证券代码  证券名称  交易所名称（或交易市场）
- *   成交价格（或成交均价）  成交数量  成交金额  发生金额
- *   手续费  印花税  附加费  过户费
- *
- * Commission is aggregated: 手续费 + 印花税 + 附加费 + 过户费.
- * Transaction type is inferred from 发生金额 sign: negative → BUY, positive → SELL.
- */
-function parseThsCsv(text: string): EditableRow[] {
-  // Strip UTF-8 BOM
-  const stripped = text.startsWith("\uFEFF") ? text.slice(1) : text;
-  const lines = stripped.split(/\r?\n/);
-
-  // Find header row: must contain 证券代码
-  let headerIdx = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes("证券代码")) {
-      headerIdx = i;
-      break;
-    }
-  }
-  if (headerIdx === -1) return [];
-
-  const headers = splitCsvLine(lines[headerIdx]).map((h) => h.trim());
-  const col = (name: string) => headers.indexOf(name);
-
-  const iDate = col("成交日期") !== -1 ? col("成交日期") : col("交易日期") !== -1 ? col("交易日期") : col("发生日期");
-  const iTime = col("成交时间");
-  const iCode = col("证券代码");
-  const iName = col("证券名称");
-  const iOp = col("操作") !== -1 ? col("操作") : col("业务名称");
-  const iExchange = col("交易所名称") !== -1 ? col("交易所名称") : col("交易市场");
-  const iPrice = col("成交价格") !== -1 ? col("成交价格") : col("成交均价");
-  const iShares = col("成交数量");
-  const iAmount = col("成交金额");
-  const iHappen = col("发生金额");
-  const iCommission = col("手续费");
-  const iStamp = col("印花税");
-  const iExtra = col("附加费");
-  const iTransfer = col("过户费");
-
-  if (iCode === -1 || iShares === -1) return [];
-
-  const rows: EditableRow[] = [];
-  let idx = 0;
-
-  for (let i = headerIdx + 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line.trim()) continue;
-
-    const cols = splitCsvLine(line);
-    const get = (j: number) => (j !== -1 ? cols[j] ?? "" : "");
-
-    // THS may store short codes without leading zeros (e.g. "1" for 000001).
-    // Pad to 6 digits before validation.
-    const code = get(iCode).trim().replace(/^\d{1,5}$/, (s) => s.padStart(6, "0"));
-    // Skip rows without a valid 6-digit numeric code
-    if (!/^\d{6}$/.test(code)) continue;
-
-    const operation = iOp !== -1 ? get(iOp).trim() : "";
-    // Skip CDR custody service fee deductions (daily fees, not real trades)
-    if (operation === "上海存托服务费扣收") continue;
-    const isDividend = operation === "红股派息" || operation === "股息入账";
-
-    const shares = parseNum(get(iShares));
-    if (!isDividend && (isNaN(shares) || shares === 0)) continue;
-
-    const price = parseNum(get(iPrice));
-    const tradeAmount = parseNum(get(iAmount));
-    const happenAmt = parseNum(get(iHappen));
-
-    let transaction_type: string;
-    let total_amount: number;
-
-    if (isDividend) {
-      // Dividend: type=PAY, amount = 发生金额, no shares/price change
-      if (isNaN(happenAmt) || happenAmt === 0) continue;
-      transaction_type = "PAY";
-      total_amount = Math.abs(happenAmt);
-    } else {
-      total_amount = isNaN(tradeAmount) || tradeAmount === 0
-        ? Math.round(Math.abs(price) * Math.abs(shares) * 100) / 100
-        : Math.abs(tradeAmount);
-
-      // Transaction type from 发生金额 sign
-      transaction_type = !isNaN(happenAmt) && happenAmt > 0 ? "SELL" : "BUY";
-    }
-
-    // Commission = sum of the four fee columns
-    const commission = Math.round(
-      (
-        (isNaN(parseNum(get(iCommission))) ? 0 : Math.abs(parseNum(get(iCommission)))) +
-        (isNaN(parseNum(get(iStamp))) ? 0 : Math.abs(parseNum(get(iStamp)))) +
-        (isNaN(parseNum(get(iExtra))) ? 0 : Math.abs(parseNum(get(iExtra)))) +
-        (isNaN(parseNum(get(iTransfer))) ? 0 : Math.abs(parseNum(get(iTransfer))))
-      ) * 100
-    ) / 100;
-
-    const exchange = get(iExchange);
-    const symbol = deriveSymbol(code, exchange);
-    const stock_name = get(iName).trim();
-
-    const date = get(iDate);
-    const time = get(iTime);
-    const traded_at = buildDateTime(date, time);
-
-    rows.push({
-      key: String(idx++),
-      selected: true,
-      transaction_type,
-      symbol,
-      stock_name: stock_name || symbol,
-      traded_at,
-      price: isDividend ? 0 : Math.abs(price),
-      shares: isDividend ? 0 : Math.abs(shares),
-      total_amount,
-      commission,
-      notes: isDividend ? "分红派息" : undefined,
-    });
-  }
-
-  return rows;
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +148,7 @@ export default function ImportFromThsCsvModal({
           const textGb = e2.target?.result as string;
           if (!attemptParse(textGb)) {
             setParseError(
-              "未从 CSV 中识别到交易记录。请确认文件为同花顺导出的历史成交 CSV，且包含「证券代码」列标题行。"
+              "未从 CSV 中识别到交易记录。请确认文件为同花顺或券商导出的 A 股历史成交 CSV，且包含「证券代码」列标题行。"
             );
           }
         };
@@ -633,7 +421,7 @@ export default function ImportFromThsCsvModal({
 
   return (
     <Modal
-      title="从同花顺历史成交 CSV 导入交易记录（A股）"
+      title="从历史成交 CSV 导入交易记录（A股）"
       open={open}
       onCancel={handleClose}
       footer={footer}
@@ -656,10 +444,10 @@ export default function ImportFromThsCsvModal({
             title="如何导出 CSV"
             description={
               <Paragraph className="!mb-0" style={{ fontSize: 13 }}>
-                同花顺客户端导出的历史成交文件为 Excel 格式，请先用 WPS 表格、Microsoft
-                Excel 或 macOS Numbers 打开，然后另存为 <strong>CSV（逗号分隔）</strong>
-                格式，再上传到此处。程序将自动识别以下列：
-                成交日期、成交时间、证券代码、证券名称、交易所名称、成交价格（或成交均价）、成交数量、成交金额、发生金额、手续费、印花税、附加费、过户费。
+                支持同花顺及部分券商导出的 A 股历史成交文件；如果文件为 Excel 格式，请先用
+                WPS 表格、Microsoft Excel 或 macOS Numbers 打开，然后另存为
+                <strong> CSV（逗号分隔）</strong> 格式。程序将自动识别以下列：
+                成交日期、成交时间、证券代码、证券名称、操作（或业务名称、买卖标志）、交易所名称、成交价格（或成交均价）、成交数量、成交金额、发生金额（或清算金额）、手续费、印花税、附加费、过户费。
                 手续费将自动汇总（手续费 + 印花税 + 附加费 + 过户费）。
               </Paragraph>
             }
@@ -674,7 +462,7 @@ export default function ImportFromThsCsvModal({
             <p className="ant-upload-drag-icon">
               <InboxOutlined />
             </p>
-            <p className="ant-upload-text">点击或拖拽同花顺历史成交 CSV 到此处</p>
+            <p className="ant-upload-text">点击或拖拽 A 股历史成交 CSV 到此处</p>
             <p className="ant-upload-hint">支持 UTF-8 及 GB18030 编码，.csv 格式</p>
           </Dragger>
           {parseError && (

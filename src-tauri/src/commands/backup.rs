@@ -37,7 +37,7 @@ fn load_config(app: &tauri::AppHandle) -> BackupConfig {
         .unwrap_or_default()
 }
 
-fn save_config(app: &tauri::AppHandle, config: &BackupConfig) -> Result<(), String> {
+pub(crate) fn save_config(app: &tauri::AppHandle, config: &BackupConfig) -> Result<(), String> {
     let path = config_path(app);
     let json = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
     atomic_write(&path, json.as_bytes())

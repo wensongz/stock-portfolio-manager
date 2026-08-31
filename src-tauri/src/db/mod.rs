@@ -1,6 +1,13 @@
 use rusqlite::{Connection, Result};
 use std::sync::Mutex;
 
+pub(crate) const SYSTEM_CATEGORIES: [(&str, &str, &str, i64); 4] = [
+    ("现金类", "#22C55E", "💵", 1),
+    ("分红股", "#3B82F6", "💰", 2),
+    ("成长股", "#F97316", "🚀", 3),
+    ("套利", "#8B5CF6", "🔄", 4),
+];
+
 pub struct Database {
     pub conn: Mutex<Connection>,
     pub path: String,
@@ -88,48 +95,14 @@ impl Database {
         ")?;
 
         // Seed system categories (ignore if already exist)
-        let categories = [
-            (
-                uuid::Uuid::new_v4().to_string(),
-                "现金类",
-                "#22C55E",
-                "💵",
-                1,
-                1,
-            ),
-            (
-                uuid::Uuid::new_v4().to_string(),
-                "分红股",
-                "#3B82F6",
-                "💰",
-                1,
-                2,
-            ),
-            (
-                uuid::Uuid::new_v4().to_string(),
-                "成长股",
-                "#F97316",
-                "🚀",
-                1,
-                3,
-            ),
-            (
-                uuid::Uuid::new_v4().to_string(),
-                "套利",
-                "#8B5CF6",
-                "🔄",
-                1,
-                4,
-            ),
-        ];
-
         let now = chrono::Utc::now().to_rfc3339();
-        for (id, name, color, icon, is_system, sort_order) in &categories {
+        for (name, color, icon, sort_order) in SYSTEM_CATEGORIES {
+            let id = uuid::Uuid::new_v4().to_string();
             conn.execute(
                 "INSERT OR IGNORE INTO categories (id, name, color, icon, is_system, sort_order, created_at)
                  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
                  WHERE NOT EXISTS (SELECT 1 FROM categories WHERE name = ?2 AND is_system = 1)",
-                rusqlite::params![id, name, color, icon, is_system, sort_order, now],
+                rusqlite::params![id, name, color, icon, 1, sort_order, now],
             )?;
         }
 

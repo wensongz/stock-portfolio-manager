@@ -1,7 +1,11 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
-    use crate::db::Database;
+    use crate::db::{
+        migrations::{column_exists, run_migrations, CURRENT_SCHEMA_VERSION},
+        Database,
+    };
+    use rusqlite::Connection;
 
     fn create_test_db() -> Database {
         Database::new(":memory:").expect("failed to create in-memory database")
@@ -1120,5 +1124,198 @@ mod tests {
         // avg_cost = 411 / 60 = 6.85
         assert!((shares - 60.0).abs() < 1e-9);
         assert!((avg_cost - 6.85).abs() < 1e-9, "avg_cost={avg_cost}");
+    }
+
+    #[test]
+    fn fresh_and_reopened_databases_use_the_current_schema_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        run_migrations(&mut conn).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let changes_after_first_run = conn.total_changes();
+        run_migrations(&mut conn).unwrap();
+
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(conn.total_changes(), changes_after_first_run);
+    }
+
+    #[test]
+    fn unversioned_legacy_database_adds_columns_repairs_open_rows_and_keeps_data() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE accounts (
+               id TEXT PRIMARY KEY, name TEXT NOT NULL,
+               market TEXT NOT NULL CHECK(market IN ('US', 'CN', 'HK')),
+               description TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE categories (
+               id TEXT PRIMARY KEY, name TEXT NOT NULL, color TEXT NOT NULL, icon TEXT NOT NULL,
+               is_system INTEGER NOT NULL DEFAULT 0, sort_order INTEGER NOT NULL DEFAULT 0,
+               created_at TEXT NOT NULL
+             );
+             CREATE TABLE holdings (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+               symbol TEXT NOT NULL, name TEXT NOT NULL,
+               market TEXT NOT NULL CHECK(market IN ('US', 'CN', 'HK')),
+               category_id TEXT REFERENCES categories(id) ON DELETE SET NULL,
+               shares REAL NOT NULL, avg_cost REAL NOT NULL,
+               currency TEXT NOT NULL CHECK(currency IN ('USD', 'CNY', 'HKD')),
+               created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE transactions (
+               id TEXT PRIMARY KEY,
+               holding_id TEXT REFERENCES holdings(id) ON DELETE SET NULL,
+               account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+               symbol TEXT NOT NULL, name TEXT NOT NULL,
+               market TEXT NOT NULL CHECK(market IN ('US', 'CN', 'HK')),
+               transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'PAY')),
+               shares REAL NOT NULL, price REAL NOT NULL, total_amount REAL NOT NULL,
+               commission REAL NOT NULL DEFAULT 0,
+               currency TEXT NOT NULL CHECK(currency IN ('USD', 'CNY', 'HKD')),
+               traded_at TEXT NOT NULL, notes TEXT, created_at TEXT NOT NULL
+             );
+             CREATE TABLE quarterly_snapshots (
+               id TEXT PRIMARY KEY, quarter TEXT NOT NULL UNIQUE, snapshot_date TEXT NOT NULL,
+               total_value REAL NOT NULL, total_cost REAL NOT NULL, total_pnl REAL NOT NULL,
+               us_value REAL NOT NULL, us_cost REAL NOT NULL, cn_value REAL NOT NULL,
+               cn_cost REAL NOT NULL, hk_value REAL NOT NULL, hk_cost REAL NOT NULL,
+               exchange_rates TEXT NOT NULL, overall_notes TEXT, created_at TEXT NOT NULL
+             );
+             CREATE TABLE quarterly_holding_snapshots (
+               id TEXT PRIMARY KEY,
+               quarterly_snapshot_id TEXT NOT NULL REFERENCES quarterly_snapshots(id) ON DELETE CASCADE,
+               account_id TEXT NOT NULL,
+               account_name TEXT NOT NULL, symbol TEXT NOT NULL, name TEXT NOT NULL,
+               market TEXT NOT NULL, category_name TEXT NOT NULL, category_color TEXT NOT NULL,
+               shares REAL NOT NULL, avg_cost REAL NOT NULL, close_price REAL NOT NULL,
+               market_value REAL NOT NULL, cost_value REAL NOT NULL, pnl REAL NOT NULL,
+               pnl_percent REAL NOT NULL, weight REAL NOT NULL, notes TEXT
+             );
+             CREATE TABLE quote_provider_config (
+               id INTEGER PRIMARY KEY, us_provider TEXT NOT NULL, hk_provider TEXT NOT NULL,
+               cn_provider TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE ai_config (
+               id INTEGER PRIMARY KEY, provider TEXT NOT NULL, api_key TEXT NOT NULL,
+               model TEXT NOT NULL, base_url TEXT, system_prompt TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE chat_sessions (
+               id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE chat_messages (
+               id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+               role TEXT NOT NULL,
+               content TEXT NOT NULL, prompt_tokens INTEGER NOT NULL DEFAULT 0,
+               completion_tokens INTEGER NOT NULL DEFAULT 0,
+               total_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0,
+               created_at TEXT NOT NULL
+             );
+             CREATE TABLE option_records (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+               option_symbol TEXT NOT NULL,
+               underlying TEXT NOT NULL, expiry_date TEXT NOT NULL, strike_price REAL NOT NULL,
+               option_type TEXT NOT NULL CHECK(option_type IN ('P', 'C')),
+               action TEXT NOT NULL CHECK(action IN ('SELL', 'BUY')), code TEXT NOT NULL,
+               quantity INTEGER NOT NULL, price REAL NOT NULL, amount REAL NOT NULL,
+               commission REAL NOT NULL DEFAULT 0, fee REAL NOT NULL DEFAULT 0,
+               traded_at TEXT, settled_at TEXT, created_at TEXT NOT NULL
+             );
+             INSERT INTO accounts VALUES ('account-1', 'Legacy', 'US', NULL, 'old', 'old');
+             INSERT INTO holdings VALUES
+               ('holding-1', 'account-1', 'AAPL', 'Apple', 'US', NULL, 1, 100, 'USD', 'old', 'old');
+             INSERT INTO transactions VALUES
+               ('transaction-1', 'holding-1', 'account-1', 'AAPL', 'Apple', 'US',
+                'BUY', 1, 100, 100, 0, 'USD', 'old', 'backfill:initial', 'old');
+             INSERT INTO quote_provider_config VALUES (1, 'yahoo', 'yahoo', 'eastmoney', 'old');
+             INSERT INTO ai_config VALUES
+               (1, 'openai', 'legacy-key', 'legacy-model', NULL, 'legacy prompt', 'old');",
+        )
+        .unwrap();
+
+        run_migrations(&mut conn).unwrap();
+
+        for (table, column) in [
+            ("quarterly_holding_snapshots", "decision_quality"),
+            ("quote_provider_config", "xueqiu_cookie"),
+            ("quote_provider_config", "xueqiu_u"),
+            ("quote_provider_config", "cn_adjust_sell_pay_cost"),
+            ("quote_provider_config", "us_adjust_sell_pay_cost"),
+            ("quote_provider_config", "hk_adjust_sell_pay_cost"),
+            ("ai_config", "tools_enabled"),
+            ("chat_messages", "reasoning"),
+            ("chat_messages", "tool_calls"),
+            ("option_records", "contract_status"),
+        ] {
+            assert!(
+                column_exists(&conn, table, column).unwrap(),
+                "{table}.{column}"
+            );
+        }
+        let transaction_type: String = conn
+            .query_row(
+                "SELECT transaction_type FROM transactions WHERE id = 'transaction-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let api_key: String = conn
+            .query_row("SELECT api_key FROM ai_config WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let required_indices: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name IN (
+                   'idx_daily_holding_snapshots_date',
+                   'idx_quarterly_holding_snapshots_snapshot_id',
+                   'idx_chat_messages_session'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let invalid_transaction = conn.execute(
+            "INSERT INTO transactions
+             (id, account_id, symbol, name, market, transaction_type, shares, price,
+              total_amount, commission, currency, traded_at, created_at)
+             VALUES ('invalid', 'account-1', 'AAPL', 'Apple', 'US', 'INVALID',
+                     1, 1, 1, 0, 'USD', 'old', 'old')",
+            [],
+        );
+
+        assert_eq!(transaction_type, "OPEN");
+        assert_eq!(api_key, "legacy-key");
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(required_indices, 3);
+        assert!(invalid_transaction.is_err());
+    }
+
+    #[test]
+    fn incompatible_legacy_schema_returns_an_error_without_advancing_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE transactions (id TEXT PRIMARY KEY);")
+            .unwrap();
+
+        let error = run_migrations(&mut conn).unwrap_err();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+
+        assert!(
+            error.to_string().contains("column"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(version, 0);
     }
 }

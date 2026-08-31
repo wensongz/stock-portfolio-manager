@@ -3,7 +3,7 @@ use crate::models::quote_provider::QuoteProviderConfig;
 use chrono::Utc;
 
 pub fn get_quote_provider_config(db: &Database) -> Result<QuoteProviderConfig, String> {
-    let conn = db.conn.lock().unwrap();
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
 
     let result = conn.query_row(
         "SELECT us_provider, hk_provider, cn_provider, xueqiu_cookie, xueqiu_u,
@@ -17,16 +17,17 @@ pub fn get_quote_provider_config(db: &Database) -> Result<QuoteProviderConfig, S
                 cn_provider: row.get(2)?,
                 xueqiu_cookie: row.get(3)?,
                 xueqiu_u: row.get(4)?,
-                cn_adjust_sell_pay_cost: row.get::<_, i64>(5).unwrap_or(1) != 0,
-                us_adjust_sell_pay_cost: row.get::<_, i64>(6).unwrap_or(0) != 0,
-                hk_adjust_sell_pay_cost: row.get::<_, i64>(7).unwrap_or(0) != 0,
+                cn_adjust_sell_pay_cost: row.get::<_, i64>(5)? != 0,
+                us_adjust_sell_pay_cost: row.get::<_, i64>(6)? != 0,
+                hk_adjust_sell_pay_cost: row.get::<_, i64>(7)? != 0,
             })
         },
     );
 
     match result {
         Ok(config) => Ok(config),
-        Err(_) => Ok(QuoteProviderConfig::default()),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(QuoteProviderConfig::default()),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -125,4 +126,27 @@ pub fn market_adjusts_sell_pay_cost(conn: &rusqlite::Connection, market: &str) -
     conn.query_row(query, [], |row| row.get::<_, i64>(0))
         .unwrap_or(default_val)
         != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_quote_provider_config;
+    use crate::db::Database;
+
+    #[test]
+    fn schema_errors_are_not_reported_as_default_config() {
+        let db = Database::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TABLE quote_provider_config;
+                 CREATE TABLE quote_provider_config (id INTEGER PRIMARY KEY, us_provider TEXT);
+                 INSERT INTO quote_provider_config VALUES (1, 'broken');",
+            )
+            .unwrap();
+        }
+
+        let error = get_quote_provider_config(&db).unwrap_err();
+        assert!(error.contains("hk_provider") || error.contains("column"));
+    }
 }

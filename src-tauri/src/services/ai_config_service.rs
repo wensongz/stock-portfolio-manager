@@ -3,7 +3,7 @@ use crate::models::ai_config::AiConfig;
 use chrono::Utc;
 
 pub fn get_ai_config(db: &Database) -> Result<AiConfig, String> {
-    let conn = db.conn.lock().unwrap();
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
 
     let result = conn.query_row(
         "SELECT provider, api_key, model, base_url, system_prompt,
@@ -24,7 +24,8 @@ pub fn get_ai_config(db: &Database) -> Result<AiConfig, String> {
 
     match result {
         Ok(config) => Ok(config),
-        Err(_) => Ok(AiConfig::default()),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(AiConfig::default()),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -56,4 +57,27 @@ pub fn update_ai_config(db: &Database, config: &AiConfig) -> Result<bool, String
     .map_err(|e| e.to_string())?;
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_ai_config;
+    use crate::db::Database;
+
+    #[test]
+    fn schema_errors_are_not_reported_as_default_config() {
+        let db = Database::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TABLE ai_config;
+                 CREATE TABLE ai_config (id INTEGER PRIMARY KEY, provider TEXT);
+                 INSERT INTO ai_config VALUES (1, 'broken');",
+            )
+            .unwrap();
+        }
+
+        let error = get_ai_config(&db).unwrap_err();
+        assert!(error.contains("api_key") || error.contains("column"));
+    }
 }

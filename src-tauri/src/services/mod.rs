@@ -10,6 +10,7 @@ pub mod indicators;
 pub mod market_overview_service;
 pub mod option_review_service;
 pub mod performance_service;
+pub mod portfolio_mutation;
 pub mod quarterly_service;
 pub mod quote_provider_service;
 pub mod quote_service;

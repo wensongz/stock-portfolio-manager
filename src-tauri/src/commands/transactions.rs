@@ -1,133 +1,13 @@
 use crate::db::Database;
 use crate::models::Transaction;
+pub(crate) use crate::services::portfolio_mutation::{adjust_cash_holding, cash_delta};
+use crate::services::portfolio_mutation::{
+    create_transaction_in, validate_cash_withdrawal, validate_transaction_shares,
+    CreateTransactionInput,
+};
 use crate::services::quote_provider_service::market_adjusts_sell_pay_cost;
-use crate::services::quote_service::{cash_display_name, is_cash_symbol, CASH_SYMBOL_PREFIX};
+use crate::services::quote_service::is_cash_symbol;
 use tauri::State;
-
-fn validate_transaction_shares(
-    market: &str,
-    symbol: &str,
-    shares: f64,
-    transaction_type: &str,
-) -> Result<(), String> {
-    // PAY (dividend) and cash-symbol transactions don't require a positive share count
-    if transaction_type == "PAY" || is_cash_symbol(symbol) {
-        return Ok(());
-    }
-    if !shares.is_finite() || shares <= 0.0 {
-        return Err("Transaction shares must be a positive number".to_string());
-    }
-    if market != "US" && shares.fract().abs() > 1e-9 {
-        return Err("Only US transactions support fractional shares; CN and HK transactions must use whole shares".to_string());
-    }
-    Ok(())
-}
-
-/// Compute the cash delta for a transaction.
-/// BUY  → cash decreases by total_amount + commission (money leaves the account).
-/// SELL → cash increases by total_amount - commission (money enters the account).
-/// PAY  → cash increases by total_amount - commission (dividend net of fees).
-/// OPEN → no cash impact (initial position entry, not a real trade).
-/// Cash-symbol transactions (deposit/withdraw) flip the sign:
-///   BUY on $CASH-* → +(total_amount + commission)   (money in)
-///   SELL on $CASH-* → -(total_amount + commission)  (money out)
-/// Panics if `transaction_type` is not `"BUY"`, `"SELL"`, `"PAY"`, or `"OPEN"`.
-pub(crate) fn cash_delta(
-    transaction_type: &str,
-    symbol: &str,
-    total_amount: f64,
-    commission: f64,
-) -> f64 {
-    if is_cash_symbol(symbol) {
-        return match transaction_type {
-            "BUY" => total_amount + commission,
-            "SELL" => -(total_amount + commission),
-            _ => 0.0,
-        };
-    }
-    match transaction_type {
-        "BUY" => -(total_amount + commission),
-        "SELL" => total_amount - commission,
-        "PAY" => total_amount - commission,
-        "OPEN" => 0.0,
-        other => panic!("Unexpected transaction_type for cash_delta: {}", other),
-    }
-}
-
-/// Find or create the cash holding for the given account and currency,
-/// then adjust its `shares` (i.e. cash balance) by `delta`.
-/// `conn` must already be inside a SQLite transaction.
-pub(crate) fn adjust_cash_holding(
-    conn: &rusqlite::Connection,
-    account_id: &str,
-    currency: &str,
-    market: &str,
-    delta: f64,
-) -> Result<(), String> {
-    let cash_symbol = format!("{}{}", CASH_SYMBOL_PREFIX, currency);
-
-    let existing: Option<(String, f64)> = conn
-        .query_row(
-            "SELECT id, shares FROM holdings WHERE account_id = ?1 AND symbol = ?2",
-            rusqlite::params![account_id, cash_symbol],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .ok();
-
-    let updated_at = chrono::Utc::now().to_rfc3339();
-
-    if let Some((cash_id, current_shares)) = existing {
-        let new_shares = current_shares + delta;
-        conn.execute(
-            "UPDATE holdings SET shares = ?2, updated_at = ?3 WHERE id = ?1",
-            rusqlite::params![cash_id, new_shares, updated_at],
-        )
-        .map_err(|e| e.to_string())?;
-    } else {
-        // Cash holding does not exist yet – create it
-        let cash_id = uuid::Uuid::new_v4().to_string();
-        let cash_name = cash_display_name(&cash_symbol);
-        conn.execute(
-            "INSERT INTO holdings (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 1.0, ?7, ?8, ?9)",
-            rusqlite::params![
-                cash_id, account_id, cash_symbol, cash_name, market,
-                delta, currency, updated_at, updated_at
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-
-    Ok(())
-}
-
-/// Validate a cash-symbol withdrawal (SELL on $CASH-*): the amount must be
-/// finite and positive, and must not exceed the current cash balance. Returns
-/// Ok if valid, Err with a message otherwise.
-pub(crate) fn validate_cash_withdrawal(
-    conn: &rusqlite::Connection,
-    account_id: &str,
-    symbol: &str,
-    total_amount: f64,
-) -> Result<(), String> {
-    if !total_amount.is_finite() || total_amount <= 0.0 {
-        return Err(format!("Invalid cash amount: {}", total_amount));
-    }
-    let balance: f64 = conn
-        .query_row(
-            "SELECT shares FROM holdings WHERE account_id = ?1 AND UPPER(symbol) = UPPER(?2)",
-            rusqlite::params![account_id, symbol],
-            |row| row.get(0),
-        )
-        .unwrap_or(0.0);
-    if total_amount > balance {
-        return Err(format!(
-            "Cannot withdraw {}: only {} cash available",
-            total_amount, balance
-        ));
-    }
-    Ok(())
-}
 
 #[tauri::command(rename_all = "camelCase")]
 #[allow(clippy::too_many_arguments)]
@@ -146,160 +26,7 @@ pub fn create_transaction(
     traded_at: String,
     notes: Option<String>,
 ) -> Result<Transaction, String> {
-    validate_transaction_shares(&market, &symbol, shares, &transaction_type)?;
-
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-
-    // Wrap the entire operation in a SQLite transaction for atomicity
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|e| e.to_string())?;
-
-    let result = (|| -> Result<(Option<String>,), String> {
-        // Find existing holding for this symbol/account (case-insensitive)
-        let mut holding_id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM holdings WHERE account_id = ?1 AND UPPER(symbol) = UPPER(?2)",
-                rusqlite::params![account_id, symbol],
-                |row| row.get(0),
-            )
-            .ok();
-
-        // For a BUY with no existing holding, create a new one.
-        // Cash holdings are created by adjust_cash_holding below instead.
-        if !is_cash_symbol(&symbol) && holding_id.is_none() && transaction_type == "BUY" {
-            let new_hid = uuid::Uuid::new_v4().to_string();
-            let created_at = chrono::Utc::now().to_rfc3339();
-            conn.execute(
-                "INSERT INTO holdings (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0.0, 0.0, ?6, ?7, ?8)",
-                rusqlite::params![new_hid, account_id, symbol, name, market, currency, created_at, created_at],
-            )
-            .map_err(|e| e.to_string())?;
-            holding_id = Some(new_hid);
-        }
-
-        // Cash withdrawal (SELL on $CASH-*) must not exceed the cash balance.
-        // The generic SELL guard below compares `shares`, which is always 0
-        // for cash records, so check the amount explicitly.
-        if is_cash_symbol(&symbol) && transaction_type == "SELL" {
-            validate_cash_withdrawal(&conn, &account_id, &symbol, total_amount)?;
-        }
-
-        // Update holding shares and avg_cost based on transaction type.
-        // Cash balances are managed solely by adjust_cash_holding below, so
-        // skip the holdings update for cash symbols (keeps avg_cost at 1.0).
-        if !is_cash_symbol(&symbol) {
-            if let Some(ref hid) = holding_id {
-                let (current_shares, current_avg_cost): (f64, f64) = conn
-                    .query_row(
-                        "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
-                        rusqlite::params![hid],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .map_err(|e| e.to_string())?;
-
-                // Guard against selling more shares than currently held
-                if transaction_type == "SELL" && shares > current_shares {
-                    return Err(format!(
-                        "Cannot sell {} shares of {}: only {} shares held",
-                        shares, symbol, current_shares
-                    ));
-                }
-
-                let adjust = market_adjusts_sell_pay_cost(&conn, &market);
-
-                let (new_shares, new_avg_cost) = if transaction_type == "BUY" {
-                    let total_shares = current_shares + shares;
-                    let new_avg = if total_shares > 0.0 {
-                        (current_shares * current_avg_cost + shares * price + commission)
-                            / total_shares
-                    } else {
-                        price
-                    };
-                    (total_shares, new_avg)
-                } else if transaction_type == "PAY" {
-                    // Dividend: shares unchanged.  Net dividend = total_amount - commission
-                    // (the commission/fee is deducted from the gross dividend).
-                    // Adjust avg_cost only when the market setting is enabled.
-                    let net_amount = total_amount - commission;
-                    let new_avg = if adjust && current_shares > 0.0 {
-                        (current_shares * current_avg_cost - net_amount) / current_shares
-                    } else {
-                        current_avg_cost
-                    };
-                    (current_shares, new_avg)
-                } else {
-                    // SELL: shares always decrease.
-                    // Adjust avg_cost (net cost method) only when the market setting is enabled.
-                    // The commission paid on a sale is a trading cost, so net proceeds are
-                    // total_amount - commission. The remaining cost basis is reduced by net proceeds.
-                    let remaining = current_shares - shares;
-                    let new_avg = if adjust {
-                        if remaining > 0.0 {
-                            (current_shares * current_avg_cost - total_amount + commission)
-                                / remaining
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        current_avg_cost
-                    };
-                    (remaining, new_avg)
-                };
-
-                let updated_at = chrono::Utc::now().to_rfc3339();
-                conn.execute(
-                    "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
-                    rusqlite::params![hid, new_shares, new_avg_cost, updated_at],
-                )
-                .map_err(|e| e.to_string())?;
-            }
-        }
-
-        conn.execute(
-            "INSERT INTO transactions (id, holding_id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, notes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            rusqlite::params![
-                id, holding_id, account_id, symbol, name, market,
-                transaction_type, shares, price, total_amount, commission,
-                currency, traded_at, notes, now
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-
-        // Auto-update cash holding for the account
-        let delta = cash_delta(&transaction_type, &symbol, total_amount, commission);
-        adjust_cash_holding(&conn, &account_id, &currency, &market, delta)?;
-
-        Ok((holding_id,))
-    })();
-
-    // Commit or rollback based on result
-    match result {
-        Ok((holding_id,)) => {
-            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
-            let _ = holding_id; // used below
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(e);
-        }
-    }
-
-    // Re-fetch holding_id for the response (after commit)
-    let holding_id: Option<String> = conn
-        .query_row(
-            "SELECT id FROM holdings WHERE account_id = ?1 AND UPPER(symbol) = UPPER(?2)",
-            rusqlite::params![account_id, symbol],
-            |row| row.get(0),
-        )
-        .ok();
-
-    Ok(Transaction {
-        id,
-        holding_id,
+    let input = CreateTransactionInput {
         account_id,
         symbol,
         name,
@@ -312,8 +39,14 @@ pub fn create_transaction(
         currency,
         traded_at,
         notes,
-        created_at: now,
-    })
+    };
+    let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let created = create_transaction_in(&transaction, &input)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(created)
 }
 
 #[tauri::command(rename_all = "camelCase")]

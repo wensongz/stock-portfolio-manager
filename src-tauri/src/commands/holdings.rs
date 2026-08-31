@@ -1,27 +1,9 @@
 use crate::db::Database;
 use crate::models::Holding;
+use crate::services::portfolio_mutation::{
+    create_holding_in, validate_holding_values, CreateHoldingInput,
+};
 use tauri::State;
-
-fn validate_holding_values(
-    market: &str,
-    symbol: &str,
-    shares: f64,
-    avg_cost: f64,
-) -> Result<(), String> {
-    if !shares.is_finite() || shares < 0.0 {
-        return Err("Holding shares must be a non-negative number".to_string());
-    }
-    if !symbol.starts_with("$CASH-") && market != "US" && shares.fract().abs() > 1e-9 {
-        return Err(
-            "Only US holdings support fractional shares; CN and HK holdings must use whole shares"
-                .to_string(),
-        );
-    }
-    if !avg_cost.is_finite() || avg_cost < 0.0 {
-        return Err("Holding average cost must be a non-negative number".to_string());
-    }
-    Ok(())
-}
 
 #[tauri::command(rename_all = "camelCase")]
 #[allow(clippy::too_many_arguments)]
@@ -36,70 +18,7 @@ pub fn create_holding(
     avg_cost: f64,
     currency: String,
 ) -> Result<Holding, String> {
-    validate_holding_values(&market, &symbol, shares, avg_cost)?;
-
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-
-    // Reject duplicate: same symbol already held in this account.
-    let exists = match conn.query_row(
-        "SELECT 1 FROM holdings WHERE account_id = ?1 AND UPPER(symbol) = UPPER(?2) LIMIT 1",
-        rusqlite::params![account_id, symbol],
-        |_| Ok(()),
-    ) {
-        Ok(_) => true,
-        Err(rusqlite::Error::QueryReturnedNoRows) => false,
-        Err(e) => return Err(e.to_string()),
-    };
-    if exists {
-        return Err(format!(
-            "账户中已存在股票代码为「{}」的持仓记录。若需调整持仓数量，请前往「交易记录」页面新增买入或卖出记录，而非重复创建持仓。",
-            symbol
-        ));
-    }
-
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|e| e.to_string())?;
-
-    let result = (|| -> Result<(), String> {
-        conn.execute(
-            "INSERT INTO holdings (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            rusqlite::params![id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, now, now],
-        )
-        .map_err(|e| e.to_string())?;
-
-        // Insert an initial OPEN transaction to record the position entry.
-        // OPEN type signals a position-opening entry with no cash movement
-        // (unlike BUY which represents a real trade that decreases cash).
-        let txn_id = uuid::Uuid::new_v4().to_string();
-        let total_amount = shares * avg_cost;
-        conn.execute(
-            "INSERT INTO transactions (id, holding_id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, notes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'OPEN', ?7, ?8, ?9, 0.0, ?10, ?11, NULL, ?12)",
-            rusqlite::params![
-                txn_id, id, account_id, symbol, name, market,
-                shares, avg_cost, total_amount, currency, now, now
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-
-        Ok(())
-    })();
-
-    match result {
-        Ok(()) => {
-            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(e);
-        }
-    }
-
-    Ok(Holding {
-        id,
+    let input = CreateHoldingInput {
         account_id,
         symbol,
         name,
@@ -108,9 +27,14 @@ pub fn create_holding(
         shares,
         avg_cost,
         currency,
-        created_at: now.clone(),
-        updated_at: now,
-    })
+    };
+    let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let holding = create_holding_in(&transaction, &input)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(holding)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -191,7 +115,7 @@ pub fn update_holding(
     avg_cost: f64,
     currency: String,
 ) -> Result<Holding, String> {
-    validate_holding_values(&market, &symbol, shares, avg_cost)?;
+    validate_holding_values(&market, &symbol, shares, avg_cost, &currency)?;
 
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().to_rfc3339();
@@ -272,12 +196,12 @@ mod tests {
     #[test]
     fn validate_holding_values_rejects_invalid_average_cost() {
         for avg_cost in [-0.01, f64::NAN, f64::INFINITY] {
-            assert!(validate_holding_values("US", "AAPL", 1.0, avg_cost).is_err());
+            assert!(validate_holding_values("US", "AAPL", 1.0, avg_cost, "USD").is_err());
         }
     }
 
     #[test]
     fn validate_holding_values_accepts_zero_average_cost() {
-        assert!(validate_holding_values("US", "AAPL", 1.0, 0.0).is_ok());
+        assert!(validate_holding_values("US", "AAPL", 1.0, 0.0, "USD").is_ok());
     }
 }

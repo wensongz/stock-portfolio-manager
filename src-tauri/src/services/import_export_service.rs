@@ -2,11 +2,11 @@ use crate::db::Database;
 use crate::models::import_export::{
     ExportFilters, ImportError, ImportPreview, ImportResult, ImportSkipped,
 };
-use crate::services::quote_provider_service::market_adjusts_sell_pay_cost;
-use chrono::Utc;
+use crate::services::portfolio_mutation::{
+    create_holding_in, create_transaction_in, CreateHoldingInput, CreateTransactionInput,
+};
 use csv::WriterBuilder;
 use std::collections::{HashMap, HashSet};
-use uuid::Uuid;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Export
@@ -408,6 +408,28 @@ fn extract_str<'a>(row: &'a serde_json::Value, key: &str) -> &'a str {
     row.get(key).and_then(|v| v.as_str()).unwrap_or("").trim()
 }
 
+fn parse_number(row: &serde_json::Value, key: &str, row_number: usize) -> Result<f64, ImportError> {
+    let raw = extract_str(row, key);
+    raw.parse::<f64>().map_err(|_| ImportError {
+        row: row_number,
+        column: key.to_string(),
+        message: format!("第{row_number}行 {key} 必须是有效数字"),
+    })
+}
+
+fn parse_optional_number(
+    row: &serde_json::Value,
+    key: &str,
+    row_number: usize,
+) -> Result<f64, ImportError> {
+    let raw = extract_str(row, key);
+    if raw.is_empty() {
+        Ok(0.0)
+    } else {
+        parse_number(row, key, row_number)
+    }
+}
+
 /// Reparse and write every valid CSV row to the database.
 pub fn confirm_import(
     db: &Database,
@@ -416,359 +438,144 @@ pub fn confirm_import(
     account_id: &str,
 ) -> Result<ImportResult, String> {
     let parsed = parse_import_rows(content, data_type)?;
-    let conn = db.conn.lock().unwrap();
-    let now = Utc::now().to_rfc3339();
-    let mut imported_count = 0usize;
-    let mut skipped_count = 0usize;
-    let mut skipped_rows: Vec<ImportSkipped> = Vec::new();
-    let mut errors: Vec<ImportError> = Vec::new();
+    let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let mut result = ImportResult {
+        imported_count: 0,
+        skipped_count: 0,
+        skipped_rows: Vec::new(),
+        errors: Vec::new(),
+    };
 
     for parsed_row in &parsed.valid_rows {
         let row = &parsed_row.data;
-        let row_num = parsed_row.row_number;
+        let row_number = parsed_row.row_number;
+        let symbol = extract_str(row, "symbol").to_uppercase();
 
-        if data_type == "holdings" {
-            let symbol = extract_str(row, "symbol").to_uppercase();
-            let name = extract_str(row, "name").to_string();
-            let market = {
-                let m = extract_str(row, "market");
-                if m.is_empty() { "US" } else { m }.to_string()
+        let mutation_result = if data_type == "holdings" {
+            let market = match extract_str(row, "market") {
+                "" => "US".to_string(),
+                value => value.to_string(),
             };
-            let shares: f64 = extract_str(row, "shares").parse().unwrap_or(0.0);
-            let avg_cost: f64 = extract_str(row, "avg_cost").parse().unwrap_or(0.0);
-            let currency = {
-                let c = extract_str(row, "currency");
-                if c.is_empty() {
-                    if market == "CN" {
-                        "CNY"
-                    } else if market == "HK" {
-                        "HKD"
-                    } else {
-                        "USD"
-                    }
-                } else {
-                    c
-                }
-                .to_string()
+            let currency = match extract_str(row, "currency") {
+                "" if market == "CN" => "CNY".to_string(),
+                "" if market == "HK" => "HKD".to_string(),
+                "" => "USD".to_string(),
+                value => value.to_string(),
             };
-
-            if symbol.is_empty() {
-                errors.push(ImportError {
-                    row: row_num,
-                    column: "symbol".to_string(),
-                    message: format!("第{}行 symbol 为空", row_num),
-                });
-                skipped_rows.push(ImportSkipped {
-                    row: row_num,
-                    symbol: "(空)".to_string(),
-                    reason: "symbol 为空".to_string(),
-                });
-                skipped_count += 1;
-                continue;
-            }
-
-            // Check for duplicate holdings in the same account
-            let exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM holdings WHERE UPPER(symbol) = UPPER(?1) AND account_id = ?2",
-                    rusqlite::params![symbol, account_id],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map(|c| c > 0)
-                .unwrap_or(false);
-
-            if exists {
-                skipped_rows.push(ImportSkipped {
-                    row: row_num,
-                    symbol: symbol.clone(),
-                    reason: "该账户中已存在相同 symbol 的持仓".to_string(),
-                });
-                skipped_count += 1;
-                continue;
-            }
-
-            let id = Uuid::new_v4().to_string();
-            match conn.execute(
-                "INSERT INTO holdings (id, account_id, symbol, name, market, shares, avg_cost, currency, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                rusqlite::params![id, account_id, symbol, name, market, shares, avg_cost, currency, now, now],
-            ) {
-                Ok(_) => imported_count += 1,
-                Err(e) => {
-                    errors.push(ImportError {
-                        row: row_num,
-                        column: String::new(),
-                        message: e.to_string(),
-                    });
-                    skipped_rows.push(ImportSkipped {
-                        row: row_num,
+            let values = parse_number(row, "shares", row_number).and_then(|shares| {
+                parse_number(row, "avg_cost", row_number).map(|avg_cost| (shares, avg_cost))
+            });
+            match values {
+                Ok((shares, avg_cost)) => {
+                    let input = CreateHoldingInput {
+                        account_id: account_id.to_string(),
                         symbol: symbol.clone(),
-                        reason: format!("插入数据库失败: {}", e),
-                    });
-                    skipped_count += 1;
+                        name: extract_str(row, "name").to_string(),
+                        market,
+                        category_id: None,
+                        shares,
+                        avg_cost,
+                        currency,
+                    };
+                    let mut savepoint = conn.savepoint().map_err(|error| error.to_string())?;
+                    match create_holding_in(&savepoint, &input) {
+                        Ok(_) => savepoint
+                            .commit()
+                            .map(|_| ())
+                            .map_err(|error| (String::new(), error.to_string())),
+                        Err(error) => {
+                            savepoint.rollback().map_err(|rollback_error| {
+                                format!("导入回滚失败: {rollback_error}")
+                            })?;
+                            Err((String::new(), error))
+                        }
+                    }
                 }
+                Err(error) => Err((error.column, error.message)),
             }
-        } else if data_type == "transactions" {
-            let symbol = extract_str(row, "symbol").to_uppercase();
-            let name = extract_str(row, "name").to_string();
-            let market = {
-                let m = extract_str(row, "market");
-                if m.is_empty() { "US" } else { m }.to_string()
+        } else {
+            let market = match extract_str(row, "market") {
+                "" => "US".to_string(),
+                value => value.to_string(),
             };
-            let tx_type = extract_str(row, "transaction_type").to_uppercase();
-            let traded_at = extract_str(row, "traded_at").to_string();
-            let shares: f64 = extract_str(row, "shares").parse().unwrap_or(0.0);
-            let price: f64 = extract_str(row, "price").parse().unwrap_or(0.0);
-            let commission: f64 = extract_str(row, "commission").parse().unwrap_or(0.0);
-            let currency = {
-                let c = extract_str(row, "currency");
-                if c.is_empty() { "USD" } else { c }.to_string()
+            let currency = match extract_str(row, "currency") {
+                "" if market == "CN" => "CNY".to_string(),
+                "" if market == "HK" => "HKD".to_string(),
+                "" => "USD".to_string(),
+                value => value.to_string(),
             };
-            let notes: Option<String> = {
-                let n = extract_str(row, "notes").to_string();
-                if n.is_empty() {
-                    None
-                } else {
-                    Some(n)
+            let values = parse_number(row, "shares", row_number).and_then(|shares| {
+                parse_number(row, "price", row_number).and_then(|price| {
+                    parse_optional_number(row, "commission", row_number).and_then(|commission| {
+                        parse_optional_number(row, "total_amount", row_number)
+                            .map(|amount| (shares, price, commission, amount))
+                    })
+                })
+            });
+            match values {
+                Ok((shares, price, commission, amount)) => {
+                    let input = CreateTransactionInput {
+                        account_id: account_id.to_string(),
+                        symbol: symbol.clone(),
+                        name: extract_str(row, "name").to_string(),
+                        market,
+                        transaction_type: extract_str(row, "transaction_type").to_uppercase(),
+                        shares,
+                        price,
+                        total_amount: if amount.abs() > 0.0 {
+                            amount
+                        } else {
+                            shares * price
+                        },
+                        commission,
+                        currency,
+                        traded_at: extract_str(row, "traded_at").to_string(),
+                        notes: match extract_str(row, "notes") {
+                            "" => None,
+                            notes => Some(notes.to_string()),
+                        },
+                    };
+                    let mut savepoint = conn.savepoint().map_err(|error| error.to_string())?;
+                    match create_transaction_in(&savepoint, &input) {
+                        Ok(_) => savepoint
+                            .commit()
+                            .map(|_| ())
+                            .map_err(|error| (String::new(), error.to_string())),
+                        Err(error) => {
+                            savepoint.rollback().map_err(|rollback_error| {
+                                format!("导入回滚失败: {rollback_error}")
+                            })?;
+                            Err((String::new(), error))
+                        }
+                    }
                 }
-            };
-            // For PAY (dividend) rows the amount comes from the optional
-            // `total_amount` column; for other types fall back to shares * price.
-            let total_amount: f64 = {
-                let col_val: f64 = extract_str(row, "total_amount").parse().unwrap_or(0.0);
-                if col_val.abs() > 0.0 {
-                    col_val
-                } else {
-                    shares * price
-                }
-            };
+                Err(error) => Err((error.column, error.message)),
+            }
+        };
 
-            if symbol.is_empty() || traded_at.is_empty() {
-                skipped_rows.push(ImportSkipped {
-                    row: row_num,
+        match mutation_result {
+            Ok(()) => result.imported_count += 1,
+            Err((column, message)) => {
+                result.skipped_count += 1;
+                result.errors.push(ImportError {
+                    row: row_number,
+                    column,
+                    message: message.clone(),
+                });
+                result.skipped_rows.push(ImportSkipped {
+                    row: row_number,
                     symbol: if symbol.is_empty() {
                         "(空)".to_string()
                     } else {
-                        symbol.clone()
+                        symbol
                     },
-                    reason: if symbol.is_empty() && traded_at.is_empty() {
-                        "symbol 和 traded_at 均为空".to_string()
-                    } else if symbol.is_empty() {
-                        "symbol 为空".to_string()
-                    } else {
-                        "traded_at 为空".to_string()
-                    },
+                    reason: message,
                 });
-                skipped_count += 1;
-                continue;
-            }
-
-            // Look up existing holding for this symbol/account.
-            let holding_lookup: Result<Option<String>, String> = conn
-                .query_row(
-                    "SELECT id FROM holdings WHERE account_id = ?1 AND UPPER(symbol) = UPPER(?2)",
-                    rusqlite::params![account_id, symbol],
-                    |r| r.get(0),
-                )
-                .map(Some)
-                .or_else(|e| {
-                    if e == rusqlite::Error::QueryReturnedNoRows {
-                        Ok(None)
-                    } else {
-                        Err(e.to_string())
-                    }
-                });
-
-            let mut holding_id: Option<String> = match holding_lookup {
-                Ok(id) => id,
-                Err(e) => {
-                    errors.push(ImportError {
-                        row: row_num,
-                        column: String::new(),
-                        message: format!("查询持仓失败: {}", e),
-                    });
-                    skipped_rows.push(ImportSkipped {
-                        row: row_num,
-                        symbol: symbol.clone(),
-                        reason: format!("查询持仓失败: {}", e),
-                    });
-                    skipped_count += 1;
-                    continue;
-                }
-            };
-
-            if holding_id.is_none() && tx_type == "SELL" {
-                // Cannot sell a position that doesn't exist.
-                errors.push(ImportError {
-                    row: row_num,
-                    column: "transaction_type".to_string(),
-                    message: format!("第{}行 {} 没有持仓记录，无法导入卖出交易", row_num, symbol),
-                });
-                skipped_rows.push(ImportSkipped {
-                    row: row_num,
-                    symbol: symbol.clone(),
-                    reason: "没有持仓记录，无法导入卖出交易".to_string(),
-                });
-                skipped_count += 1;
-                continue;
-            }
-
-            // For BUY transactions with no existing holding, create a new one.
-            if holding_id.is_none() && tx_type == "BUY" {
-                let new_hid = Uuid::new_v4().to_string();
-                match conn.execute(
-                    "INSERT INTO holdings (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0.0, 0.0, ?6, ?7, ?8)",
-                    rusqlite::params![new_hid, account_id, symbol, name, market, currency, now, now],
-                ) {
-                    Ok(_) => holding_id = Some(new_hid),
-                    Err(e) => {
-                        errors.push(ImportError {
-                            row: row_num,
-                            column: String::new(),
-                            message: format!("创建持仓失败: {}", e),
-                        });
-                        skipped_rows.push(ImportSkipped {
-                            row: row_num,
-                            symbol: symbol.clone(),
-                            reason: format!("创建持仓失败: {}", e),
-                        });
-                        skipped_count += 1;
-                        continue;
-                    }
-                }
-            }
-
-            // Update holding shares and avg_cost to reflect this transaction.
-            if let Some(ref hid) = holding_id {
-                let holding_data: Result<(f64, f64), String> = conn
-                    .query_row(
-                        "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
-                        rusqlite::params![hid],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .map_err(|e| e.to_string());
-
-                let (cur_shares, cur_avg_cost) = match holding_data {
-                    Ok(data) => data,
-                    Err(e) => {
-                        errors.push(ImportError {
-                            row: row_num,
-                            column: String::new(),
-                            message: format!("读取持仓失败: {}", e),
-                        });
-                        skipped_rows.push(ImportSkipped {
-                            row: row_num,
-                            symbol: symbol.clone(),
-                            reason: format!("读取持仓失败: {}", e),
-                        });
-                        skipped_count += 1;
-                        continue;
-                    }
-                };
-
-                if tx_type == "SELL" && shares > cur_shares {
-                    errors.push(ImportError {
-                        row: row_num,
-                        column: "shares".to_string(),
-                        message: format!(
-                            "第{}行 {} 卖出数量({})超过当前持仓({})",
-                            row_num, symbol, shares, cur_shares
-                        ),
-                    });
-                    skipped_rows.push(ImportSkipped {
-                        row: row_num,
-                        symbol: symbol.clone(),
-                        reason: format!("卖出数量({})超过当前持仓({})", shares, cur_shares),
-                    });
-                    skipped_count += 1;
-                    continue;
-                }
-
-                let adjust = market_adjusts_sell_pay_cost(&conn, &market);
-
-                let (new_shares, new_avg_cost) = if tx_type == "BUY" {
-                    let total = cur_shares + shares;
-                    let avg = if total > 0.0 {
-                        (cur_shares * cur_avg_cost + shares * price + commission) / total
-                    } else {
-                        price
-                    };
-                    (total, avg)
-                } else if tx_type == "PAY" {
-                    // Dividend: shares unchanged.  Net = total_amount - commission.
-                    let net_amount = total_amount - commission;
-                    let new_avg = if adjust && cur_shares > 0.0 {
-                        (cur_shares * cur_avg_cost - net_amount) / cur_shares
-                    } else {
-                        cur_avg_cost
-                    };
-                    (cur_shares, new_avg)
-                } else {
-                    // SELL: shares always decrease.
-                    // Adjust avg_cost (net cost method) only when the market setting is enabled.
-                    let remaining = cur_shares - shares;
-                    let new_avg = if adjust {
-                        if remaining > 0.0 {
-                            (cur_shares * cur_avg_cost - total_amount) / remaining
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        cur_avg_cost
-                    };
-                    (remaining, new_avg)
-                };
-
-                if let Err(e) = conn.execute(
-                    "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
-                    rusqlite::params![hid, new_shares, new_avg_cost, now],
-                ) {
-                    errors.push(ImportError {
-                        row: row_num,
-                        column: String::new(),
-                        message: format!("更新持仓失败: {}", e),
-                    });
-                    skipped_rows.push(ImportSkipped {
-                        row: row_num,
-                        symbol: symbol.clone(),
-                        reason: format!("更新持仓失败: {}", e),
-                    });
-                    skipped_count += 1;
-                    continue;
-                }
-            }
-
-            let id = Uuid::new_v4().to_string();
-            match conn.execute(
-                "INSERT INTO transactions (id, holding_id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, notes, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                rusqlite::params![id, holding_id, account_id, symbol, name, market, tx_type, shares, price, total_amount, commission, currency, traded_at, notes, now],
-            ) {
-                Ok(_) => imported_count += 1,
-                Err(e) => {
-                    errors.push(ImportError {
-                        row: row_num,
-                        column: String::new(),
-                        message: e.to_string(),
-                    });
-                    skipped_rows.push(ImportSkipped {
-                        row: row_num,
-                        symbol: symbol.clone(),
-                        reason: format!("插入交易记录失败: {}", e),
-                    });
-                    skipped_count += 1;
-                }
             }
         }
     }
 
-    Ok(ImportResult {
-        imported_count,
-        skipped_count,
-        skipped_rows,
-        errors,
-    })
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -844,5 +651,136 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("不支持的导入数据类型"));
+    }
+
+    #[test]
+    fn imported_holding_creates_open_baseline_transaction() {
+        let db = database_with_account();
+        let csv = holdings_csv(1);
+
+        let result = confirm_import(&db, &csv, "holdings", "account-1").unwrap();
+
+        assert_eq!(result.imported_count, 1);
+        let transaction_type: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT transaction_type FROM transactions WHERE symbol = 'TEST01'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(transaction_type, "OPEN");
+    }
+
+    #[test]
+    fn imported_buy_applies_the_same_cash_impact_as_a_normal_transaction() {
+        let db = database_with_account();
+        let csv = concat!(
+            "traded_at,symbol,name,market,transaction_type,shares,price,total_amount,commission,currency,notes\n",
+            "2026-08-31,AAPL,Apple,US,BUY,2,50,100,3,USD,\n",
+        );
+
+        let result = confirm_import(&db, csv, "transactions", "account-1").unwrap();
+
+        assert_eq!(result.imported_count, 1);
+        let cash: f64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT shares FROM holdings WHERE symbol = '$CASH-USD'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0);
+        assert_eq!(cash, -103.0);
+    }
+
+    #[test]
+    fn imported_sell_uses_commission_adjusted_net_proceeds_for_cost_basis() {
+        let db = database_with_account();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, shares, avg_cost, currency, created_at, updated_at)
+                 VALUES ('holding-cn', 'account-1', 'sh600000', '浦发银行', 'CN', 10, 100, 'CNY', '2026-01-01', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+        }
+        let csv = concat!(
+            "traded_at,symbol,name,market,transaction_type,shares,price,total_amount,commission,currency,notes\n",
+            "2026-08-31,sh600000,浦发银行,CN,SELL,2,120,240,5,CNY,\n",
+        );
+
+        let result = confirm_import(&db, csv, "transactions", "account-1").unwrap();
+
+        assert_eq!(result.imported_count, 1);
+        let avg_cost: f64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT avg_cost FROM holdings WHERE id = 'holding-cn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!((avg_cost - 95.625).abs() < 1e-12, "got {avg_cost}");
+    }
+
+    #[test]
+    fn failed_import_row_rolls_back_holding_changes() {
+        let db = database_with_account();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_transaction_insert
+                 BEFORE INSERT ON transactions
+                 WHEN NEW.symbol = 'FAIL'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced transaction failure');
+                 END;",
+            )
+            .unwrap();
+        }
+        let csv = concat!(
+            "traded_at,symbol,name,market,transaction_type,shares,price,total_amount,commission,currency,notes\n",
+            "2026-08-31,FAIL,Failure,US,BUY,2,50,100,0,USD,\n",
+        );
+
+        let result = confirm_import(&db, csv, "transactions", "account-1").unwrap();
+
+        assert_eq!(result.imported_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        let holding_count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM holdings WHERE symbol = 'FAIL'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(holding_count, 0);
+    }
+
+    #[test]
+    fn invalid_numeric_holding_values_are_skipped_instead_of_becoming_zero() {
+        let db = database_with_account();
+        let csv = concat!(
+            "symbol,name,market,shares,avg_cost,currency\n",
+            "AAPL,Apple,US,not-a-number,100,USD\n",
+        );
+
+        let result = confirm_import(&db, csv, "holdings", "account-1").unwrap();
+
+        assert_eq!(result.imported_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(result.errors[0].column, "shares");
     }
 }

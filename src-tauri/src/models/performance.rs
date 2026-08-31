@@ -95,6 +95,16 @@ pub struct RiskMetrics {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PerformanceReport {
+    pub summary: PerformanceSummary,
+    pub drawdown: DrawdownAnalysis,
+    pub attribution: ReturnAttribution,
+    pub monthly_returns: Vec<MonthlyReturn>,
+    pub holding_performances: Vec<HoldingPerformance>,
+    pub risk_metrics: RiskMetrics,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BenchmarkDataPoint {
     pub date: String,
     pub close_price: f64,

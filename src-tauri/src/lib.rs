@@ -226,7 +226,7 @@ pub fn run() {
             commands::dividends::get_dividend_years,
             commands::statistics::get_statistics_by_category,
             commands::performance::get_performance_summary,
-            commands::performance::get_return_series,
+            commands::performance::get_performance_report,
             commands::performance::get_benchmark_return_series,
             commands::performance::get_return_attribution,
             commands::performance::get_monthly_returns,

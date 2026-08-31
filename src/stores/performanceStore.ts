@@ -4,6 +4,7 @@ import type {
   DrawdownAnalysis,
   HoldingPerformance,
   MonthlyReturn,
+  PerformanceReport,
   PerformanceSummary,
   ReturnAttribution,
   ReturnDataPoint,
@@ -95,7 +96,15 @@ interface PerformanceState {
   fetchBenchmark: (symbol: string) => Promise<void>;
 }
 
-export const usePerformanceStore = create<PerformanceState>((set, get) => ({
+export type PerformanceInvoke = <T>(
+  command: string,
+  args?: Record<string, unknown>,
+) => Promise<T>;
+
+export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
+  let latestRequestId = 0;
+
+  return create<PerformanceState>((set, get) => ({
   timeRange: "1M",
   customStart: null,
   customEnd: null,
@@ -136,6 +145,7 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
   },
 
   fetchAll: async (forceRefresh?: boolean) => {
+    const requestId = ++latestRequestId;
     set({ loading: true, error: null });
     try {
       const state = get();
@@ -164,7 +174,7 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
       // including transaction-aware adjustments. Otherwise only fill in dates
       // that have never been computed, so the page loads quickly from cache.
       try {
-        await invoke<number>("backfill_snapshots", {
+        await invokeFn<number>("backfill_snapshots", {
           startDate,
           endDate,
           force: forceRefresh ?? false,
@@ -173,40 +183,25 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
         console.warn("backfill_snapshots error (non-fatal):", err);
       }
 
-      const [summary, drawdown, attribution, monthlyReturns, holdingPerformances, riskMetrics] =
-        await Promise.allSettled([
-          invoke<PerformanceSummary>("get_performance_summary", { startDate, endDate, ...filterParams }),
-          invoke<DrawdownAnalysis>("get_drawdown_analysis", { startDate, endDate, ...filterParams }),
-          invoke<ReturnAttribution>("get_return_attribution", { startDate, endDate, ...filterParams }),
-          invoke<MonthlyReturn[]>("get_monthly_returns", { startDate, endDate, ...filterParams }),
-          invoke<HoldingPerformance[]>("get_holding_performance_ranking", {
-            startDate,
-            endDate,
-            // The chart independently selects the largest gains and losses by
-            // PnL, so request the complete practical universe in PnL units.
-            sortBy: "pnl",
-            limit: 10_000,
-            ...filterParams,
-          }),
-          invoke<RiskMetrics>("get_risk_metrics", { startDate, endDate, ...filterParams }),
-        ]);
+      if (requestId !== latestRequestId) return;
 
-      // Summary now includes return_series computed from the same single DB
-      // query, so both the summary card total_return and the cumulative-return
-      // chart are guaranteed to be consistent — no separate get_return_series
-      // call is needed.
-      const resolvedSummary = summary.status === "fulfilled" ? summary.value : null;
-      const resolvedSeries = resolvedSummary?.return_series ?? [];
+      const report = await invokeFn<PerformanceReport>("get_performance_report", {
+        startDate,
+        endDate,
+        rankingLimit: 10_000,
+        ...filterParams,
+      });
+
+      if (requestId !== latestRequestId) return;
 
       set({
-        summary: resolvedSummary,
-        returnSeries: resolvedSeries,
-        drawdown: drawdown.status === "fulfilled" ? drawdown.value : null,
-        attribution: attribution.status === "fulfilled" ? attribution.value : null,
-        monthlyReturns: monthlyReturns.status === "fulfilled" ? monthlyReturns.value : [],
-        holdingPerformances:
-          holdingPerformances.status === "fulfilled" ? holdingPerformances.value : [],
-        riskMetrics: riskMetrics.status === "fulfilled" ? riskMetrics.value : null,
+        summary: report.summary,
+        returnSeries: report.summary.return_series,
+        drawdown: report.drawdown,
+        attribution: report.attribution,
+        monthlyReturns: report.monthly_returns,
+        holdingPerformances: report.holding_performances,
+        riskMetrics: report.risk_metrics,
         loading: false,
       });
 
@@ -216,7 +211,9 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
         get().fetchBenchmark(sym);
       }
     } catch (err) {
-      set({ error: String(err), loading: false });
+      if (requestId === latestRequestId) {
+        set({ error: String(err), loading: false });
+      }
     }
   },
 
@@ -233,7 +230,7 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
       endDate = range.end;
     }
     try {
-      const series = await invoke<ReturnDataPoint[]>("get_benchmark_return_series", {
+      const series = await invokeFn<ReturnDataPoint[]>("get_benchmark_return_series", {
         symbol,
         startDate,
         endDate,
@@ -245,4 +242,7 @@ export const usePerformanceStore = create<PerformanceState>((set, get) => ({
       console.error("fetchBenchmark error:", err);
     }
   },
-}));
+  }));
+}
+
+export const usePerformanceStore = createPerformanceStore();

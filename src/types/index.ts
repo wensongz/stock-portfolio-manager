@@ -340,6 +340,15 @@ export interface RiskMetrics {
   calmar_ratio: number | null;
 }
 
+export interface PerformanceReport {
+  summary: PerformanceSummary;
+  drawdown: DrawdownAnalysis;
+  attribution: ReturnAttribution;
+  monthly_returns: MonthlyReturn[];
+  holding_performances: HoldingPerformance[];
+  risk_metrics: RiskMetrics;
+}
+
 export interface CreateTransactionPayload {
   accountId: string;
   symbol: string;

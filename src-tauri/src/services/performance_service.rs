@@ -7,8 +7,8 @@ const TRADING_DAYS_PER_YEAR: f64 = 252.0;
 const CACHE_COVERAGE_THRESHOLD: f64 = 0.5; // require 50% of expected days in cache to skip re-fetch
 use crate::models::performance::{
     annualise_return, AttributionItem, BenchmarkDataPoint, DrawdownAnalysis, DrawdownPoint,
-    HoldingPerformance, MonthlyReturn, PerformanceSummary, ReturnAttribution, ReturnDataPoint,
-    RiskMetrics,
+    HoldingPerformance, MonthlyReturn, PerformanceReport, PerformanceSummary, ReturnAttribution,
+    ReturnDataPoint, RiskMetrics,
 };
 use chrono::NaiveDate;
 
@@ -289,6 +289,21 @@ struct PerformanceCalculation {
     return_series: Vec<ReturnDataPoint>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static PERFORMANCE_LOAD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_performance_load_count() {
+    PERFORMANCE_LOAD_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn performance_load_count() -> usize {
+    PERFORMANCE_LOAD_COUNT.with(std::cell::Cell::get)
+}
+
 impl PerformanceCalculation {
     fn load(
         db: &Database,
@@ -296,6 +311,9 @@ impl PerformanceCalculation {
         end_date: NaiveDate,
         filter: &PerformanceFilter,
     ) -> Result<Self, String> {
+        #[cfg(test)]
+        PERFORMANCE_LOAD_COUNT.with(|count| count.set(count.get() + 1));
+
         let daily_values = fetch_daily_values(db, start_date, end_date, filter)?;
         if daily_values.is_empty() {
             return Ok(Self {
@@ -587,15 +605,6 @@ pub fn calculate_sharpe_from_daily_returns(
 // Public service functions called from commands
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub fn get_return_series(
-    db: &Database,
-    start_date: NaiveDate,
-    end_date: NaiveDate,
-    filter: &PerformanceFilter,
-) -> Result<Vec<ReturnDataPoint>, String> {
-    Ok(PerformanceCalculation::load(db, start_date, end_date, filter)?.return_series)
-}
-
 pub fn get_drawdown_analysis(
     db: &Database,
     start_date: NaiveDate,
@@ -603,10 +612,14 @@ pub fn get_drawdown_analysis(
     filter: &PerformanceFilter,
 ) -> Result<DrawdownAnalysis, String> {
     let calculation = PerformanceCalculation::load(db, start_date, end_date, filter)?;
-    Ok(calculate_max_drawdown(
+    Ok(drawdown_analysis_from(&calculation))
+}
+
+fn drawdown_analysis_from(calculation: &PerformanceCalculation) -> DrawdownAnalysis {
+    calculate_max_drawdown(
         &calculation.return_series,
         calculation.baseline.map(|(date, _)| date),
-    ))
+    )
 }
 
 pub fn get_performance_summary(
@@ -616,10 +629,18 @@ pub fn get_performance_summary(
     filter: &PerformanceFilter,
 ) -> Result<PerformanceSummary, String> {
     let calculation = PerformanceCalculation::load(db, start_date, end_date, filter)?;
+    Ok(performance_summary_from(&calculation, start_date, end_date))
+}
+
+fn performance_summary_from(
+    calculation: &PerformanceCalculation,
+    requested_start_date: NaiveDate,
+    requested_end_date: NaiveDate,
+) -> PerformanceSummary {
     if calculation.daily_values.is_empty() {
-        return Ok(PerformanceSummary {
-            start_date: start_date.format("%Y-%m-%d").to_string(),
-            end_date: end_date.format("%Y-%m-%d").to_string(),
+        return PerformanceSummary {
+            start_date: requested_start_date.format("%Y-%m-%d").to_string(),
+            end_date: requested_end_date.format("%Y-%m-%d").to_string(),
             start_value: 0.0,
             end_value: 0.0,
             total_return: 0.0,
@@ -629,7 +650,7 @@ pub fn get_performance_summary(
             volatility: 0.0,
             sharpe_ratio: None,
             return_series: vec![],
-        });
+        };
     }
 
     let start_value = calculation.start_value();
@@ -649,7 +670,7 @@ pub fn get_performance_summary(
     let (_daily_vol, ann_vol) = calculate_volatility(&daily_returns);
     let sharpe = calculate_sharpe_from_daily_returns(&daily_returns, RISK_FREE_RATE);
 
-    Ok(PerformanceSummary {
+    PerformanceSummary {
         start_date: actual_start_date.format("%Y-%m-%d").to_string(),
         end_date: actual_end_date.format("%Y-%m-%d").to_string(),
         start_value,
@@ -660,8 +681,8 @@ pub fn get_performance_summary(
         max_drawdown: dd_analysis.max_drawdown,
         volatility: ann_vol * 100.0,
         sharpe_ratio: sharpe,
-        return_series: calculation.return_series,
-    })
+        return_series: calculation.return_series.clone(),
+    }
 }
 
 pub fn get_risk_metrics(
@@ -671,15 +692,19 @@ pub fn get_risk_metrics(
     filter: &PerformanceFilter,
 ) -> Result<RiskMetrics, String> {
     let calculation = PerformanceCalculation::load(db, start_date, end_date, filter)?;
+    Ok(risk_metrics_from(&calculation))
+}
+
+fn risk_metrics_from(calculation: &PerformanceCalculation) -> RiskMetrics {
     if calculation.daily_values.is_empty() {
-        return Ok(RiskMetrics {
+        return RiskMetrics {
             daily_volatility: 0.0,
             annualized_volatility: 0.0,
             sharpe_ratio: None,
             risk_free_rate: 4.5,
             max_drawdown: 0.0,
             calmar_ratio: None,
-        });
+        };
     }
 
     let total_return = calculation.total_return();
@@ -699,14 +724,14 @@ pub fn get_risk_metrics(
         None
     };
 
-    Ok(RiskMetrics {
+    RiskMetrics {
         daily_volatility: daily_vol * 100.0,
         annualized_volatility: ann_vol * 100.0,
         sharpe_ratio: sharpe,
         risk_free_rate: RISK_FREE_RATE * 100.0,
         max_drawdown: dd_analysis.max_drawdown,
         calmar_ratio: calmar,
-    })
+    }
 }
 
 pub fn get_return_attribution(
@@ -716,6 +741,14 @@ pub fn get_return_attribution(
     filter: &PerformanceFilter,
 ) -> Result<ReturnAttribution, String> {
     let calculation = PerformanceCalculation::load(db, start_date, end_date, filter)?;
+    return_attribution_from(db, &calculation, filter)
+}
+
+fn return_attribution_from(
+    db: &Database,
+    calculation: &PerformanceCalculation,
+    filter: &PerformanceFilter,
+) -> Result<ReturnAttribution, String> {
     if calculation.daily_values.is_empty() {
         return Ok(ReturnAttribution {
             total_pnl: 0.0,
@@ -1114,8 +1147,12 @@ pub fn get_monthly_returns(
     filter: &PerformanceFilter,
 ) -> Result<Vec<MonthlyReturn>, String> {
     let calculation = PerformanceCalculation::load(db, start_date, end_date, filter)?;
+    Ok(monthly_returns_from(&calculation))
+}
+
+fn monthly_returns_from(calculation: &PerformanceCalculation) -> Vec<MonthlyReturn> {
     if calculation.daily_values.is_empty() {
-        return Ok(vec![]);
+        return vec![];
     }
 
     // Group the already cash-flow-adjusted daily returns by calendar month.
@@ -1163,7 +1200,7 @@ pub fn get_monthly_returns(
         period_start_value = month_end_value;
     }
 
-    Ok(result)
+    result
 }
 
 pub fn get_holding_performance_ranking(
@@ -1175,6 +1212,16 @@ pub fn get_holding_performance_ranking(
     filter: &PerformanceFilter,
 ) -> Result<Vec<HoldingPerformance>, String> {
     let calculation = PerformanceCalculation::load(db, start_date, end_date, filter)?;
+    holding_performance_ranking_from(db, &calculation, sort_by, limit, filter)
+}
+
+fn holding_performance_ranking_from(
+    db: &Database,
+    calculation: &PerformanceCalculation,
+    sort_by: &str,
+    limit: usize,
+    filter: &PerformanceFilter,
+) -> Result<Vec<HoldingPerformance>, String> {
     if calculation.daily_values.is_empty() {
         return Ok(vec![]);
     }
@@ -1514,6 +1561,40 @@ pub fn get_holding_performance_ranking(
     }
 
     Ok(performances.into_iter().take(limit).collect())
+}
+
+/// Build every performance-page section from one canonical data load.
+pub fn get_performance_report(
+    db: &Database,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+    ranking_sort_by: &str,
+    ranking_limit: usize,
+    filter: &PerformanceFilter,
+) -> Result<PerformanceReport, String> {
+    let started = std::time::Instant::now();
+    let calculation = PerformanceCalculation::load(db, start_date, end_date, filter)?;
+    let report = PerformanceReport {
+        summary: performance_summary_from(&calculation, start_date, end_date),
+        drawdown: drawdown_analysis_from(&calculation),
+        attribution: return_attribution_from(db, &calculation, filter)?,
+        monthly_returns: monthly_returns_from(&calculation),
+        holding_performances: holding_performance_ranking_from(
+            db,
+            &calculation,
+            ranking_sort_by,
+            ranking_limit,
+            filter,
+        )?,
+        risk_metrics: risk_metrics_from(&calculation),
+    };
+    tracing::debug!(
+        elapsed_ms = started.elapsed().as_millis(),
+        start_date = %start_date,
+        end_date = %end_date,
+        "built aggregate performance report"
+    );
+    Ok(report)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2120,6 +2201,51 @@ mod tests {
         assert_eq!(summary.end_date, "2024-01-03");
         assert!((summary.return_series[0].daily_return - 10.0).abs() < 1e-9);
         assert!((summary.return_series[1].daily_return - 4.545_454_545).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_performance_report_matches_individual_results_and_loads_once() {
+        let db = sold_holding_performance_db();
+        let start = parse_date("2024-01-02").unwrap();
+        let end = parse_date("2024-01-03").unwrap();
+        let filter = PerformanceFilter::default();
+
+        let expected_summary = get_performance_summary(&db, start, end, &filter).unwrap();
+        let expected_drawdown = get_drawdown_analysis(&db, start, end, &filter).unwrap();
+        let expected_attribution = get_return_attribution(&db, start, end, &filter).unwrap();
+        let expected_monthly_returns = get_monthly_returns(&db, start, end, &filter).unwrap();
+        let expected_holding_performances =
+            get_holding_performance_ranking(&db, start, end, "pnl", 10_000, &filter).unwrap();
+        let expected_risk_metrics = get_risk_metrics(&db, start, end, &filter).unwrap();
+
+        reset_performance_load_count();
+        let report = get_performance_report(&db, start, end, "pnl", 10_000, &filter).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(report.summary).unwrap(),
+            serde_json::to_value(expected_summary).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(report.drawdown).unwrap(),
+            serde_json::to_value(expected_drawdown).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(report.attribution).unwrap(),
+            serde_json::to_value(expected_attribution).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(report.monthly_returns).unwrap(),
+            serde_json::to_value(expected_monthly_returns).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(report.holding_performances).unwrap(),
+            serde_json::to_value(expected_holding_performances).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(report.risk_metrics).unwrap(),
+            serde_json::to_value(expected_risk_metrics).unwrap()
+        );
+        assert_eq!(performance_load_count(), 1);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::db::Database;
 use crate::models::performance::{
-    DrawdownAnalysis, HoldingPerformance, MonthlyReturn, PerformanceSummary, ReturnAttribution,
-    ReturnDataPoint, RiskMetrics,
+    DrawdownAnalysis, HoldingPerformance, MonthlyReturn, PerformanceReport, PerformanceSummary,
+    ReturnAttribution, ReturnDataPoint, RiskMetrics,
 };
 use crate::services::performance_service;
 use crate::services::performance_service::PerformanceFilter;
@@ -34,17 +34,25 @@ pub async fn get_performance_summary(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub async fn get_return_series(
+pub async fn get_performance_report(
     db: State<'_, Database>,
     start_date: String,
     end_date: String,
     market: Option<String>,
     account_id: Option<String>,
-) -> Result<Vec<ReturnDataPoint>, String> {
+    ranking_limit: u32,
+) -> Result<PerformanceReport, String> {
     let start = parse_date(&start_date)?;
     let end = parse_date(&end_date)?;
     let filter = build_filter(market, account_id);
-    performance_service::get_return_series(&db, start, end, &filter)
+    performance_service::get_performance_report(
+        &db,
+        start,
+        end,
+        "pnl",
+        ranking_limit as usize,
+        &filter,
+    )
 }
 
 #[tauri::command(rename_all = "camelCase")]

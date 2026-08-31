@@ -1094,9 +1094,8 @@ pub async fn chat_stream(
     if let Some(context) = &params.tool_context {
         let (arguments, content, _) = execute_prefilled_tool(&app, &tool_ctx, context)
             .await
-            .map_err(|error| {
+            .inspect_err(|error| {
                 emit_error(&app, error.clone());
-                error
             })?;
         messages.push(json!({
             "role": "assistant",

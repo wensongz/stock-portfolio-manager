@@ -1,3 +1,11 @@
+use crate::models::stock_operation_review::{
+    StockOperationEffect, StockOperationGroupSummary, StockOperationReviewSummary,
+    StockOperationSecuritySummary, StockPositionImpactSummary,
+};
+use crate::services::stock_operation_builder::{normalize_stock_market, normalize_stock_symbol};
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EndpointEffectInput {
     pub action_type: String,
@@ -368,30 +376,32 @@ mod tests {
         }
     }
 
-    fn action(
-        action_id: &str,
-        symbol: &str,
-        action_type: &str,
+    struct ActionFixture<'a> {
+        id: &'a str,
+        symbol: &'a str,
+        action_type: &'a str,
         notional_base: Option<f64>,
         effect_local: Option<f64>,
         effect_base: Option<f64>,
         excess: Option<f64>,
         weight_change: Option<f64>,
-    ) -> StockOperationEffect {
+    }
+
+    fn action(fixture: ActionFixture<'_>) -> StockOperationEffect {
         StockOperationEffect {
-            action_id: action_id.to_string(),
-            transaction_ids: vec![format!("tx-{action_id}")],
+            action_id: fixture.id.to_string(),
+            transaction_ids: vec![format!("tx-{}", fixture.id)],
             account_id: "account-1".to_string(),
             account_name: "账户一".to_string(),
-            symbol: symbol.to_string(),
+            symbol: fixture.symbol.to_string(),
             name: "测试股票".to_string(),
             market: "US".to_string(),
-            action_type: action_type.to_string(),
+            action_type: fixture.action_type.to_string(),
             trade_date: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
             quantity: 10.0,
             trade_price: 10.0,
-            trade_notional_local: notional_base.unwrap_or(100.0),
-            trade_notional_base: notional_base,
+            trade_notional_local: fixture.notional_base.unwrap_or(100.0),
+            trade_notional_base: fixture.notional_base,
             fee_local: 2.0,
             fee_base: Some(2.0),
             currency: "USD".to_string(),
@@ -401,18 +411,18 @@ mod tests {
             prior_nav_base: None,
             weight_before: None,
             weight_after: None,
-            weight_change,
+            weight_change: fixture.weight_change,
             operation_size_ratio: None,
             evaluation_date: Some(NaiveDate::from_ymd_opt(2026, 8, 29).unwrap()),
-            end_price: effect_local.map(|_| 11.0),
-            price_effect_local: effect_local,
-            price_effect_base: effect_base,
-            price_effect_percent: effect_local.map(|value| value / 100.0),
+            end_price: fixture.effect_local.map(|_| 11.0),
+            price_effect_local: fixture.effect_local,
+            price_effect_base: fixture.effect_base,
+            price_effect_percent: fixture.effect_local.map(|value| value / 100.0),
             benchmark_symbol: Some("^GSPC".to_string()),
             benchmark_start_date: Some(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()),
             benchmark_end_date: Some(NaiveDate::from_ymd_opt(2026, 8, 29).unwrap()),
-            benchmark_return: excess.map(|_| 0.05),
-            directional_excess_return: excess,
+            benchmark_return: fixture.excess.map(|_| 0.05),
+            directional_excess_return: fixture.excess,
             fact_labels: Vec::new(),
             issues: Vec::new(),
         }
@@ -480,38 +490,38 @@ mod tests {
 
     #[test]
     fn summaries_keep_buy_sell_and_position_impact_separate() {
-        let mut buy = action(
-            "buy",
-            "AAPL",
-            "open",
-            Some(1_000.0),
-            Some(100.0),
-            Some(100.0),
-            Some(0.10),
-            Some(0.04),
-        );
+        let mut buy = action(ActionFixture {
+            id: "buy",
+            symbol: "AAPL",
+            action_type: "open",
+            notional_base: Some(1_000.0),
+            effect_local: Some(100.0),
+            effect_base: Some(100.0),
+            excess: Some(0.10),
+            weight_change: Some(0.04),
+        });
         buy.quantity = 100.0;
-        let mut add = action(
-            "add",
-            "AAPL",
-            "add",
-            Some(500.0),
-            Some(-50.0),
-            Some(-50.0),
-            Some(-0.05),
-            None,
-        );
+        let mut add = action(ActionFixture {
+            id: "add",
+            symbol: "AAPL",
+            action_type: "add",
+            notional_base: Some(500.0),
+            effect_local: Some(-50.0),
+            effect_base: Some(-50.0),
+            excess: Some(-0.05),
+            weight_change: None,
+        });
         add.quantity = 50.0;
-        let mut sell = action(
-            "sell",
-            "AAPL",
-            "reduce",
-            Some(300.0),
-            Some(30.0),
-            Some(30.0),
-            Some(0.02),
-            Some(-0.06),
-        );
+        let mut sell = action(ActionFixture {
+            id: "sell",
+            symbol: "AAPL",
+            action_type: "reduce",
+            notional_base: Some(300.0),
+            effect_local: Some(30.0),
+            effect_base: Some(30.0),
+            excess: Some(0.02),
+            weight_change: Some(-0.06),
+        });
         sell.quantity = 30.0;
 
         let summary = summarize_actions(&[buy, add, sell]);
@@ -539,26 +549,26 @@ mod tests {
 
     #[test]
     fn missing_fx_hides_only_aggregate_amounts_that_would_be_partial() {
-        let converted = action(
-            "converted",
-            "AAPL",
-            "open",
-            Some(1_000.0),
-            Some(100.0),
-            Some(100.0),
-            Some(0.10),
-            Some(0.04),
-        );
-        let mut missing_fx = action(
-            "missing-fx",
-            "MSFT",
-            "add",
-            None,
-            Some(50.0),
-            None,
-            Some(0.05),
-            Some(0.02),
-        );
+        let converted = action(ActionFixture {
+            id: "converted",
+            symbol: "AAPL",
+            action_type: "open",
+            notional_base: Some(1_000.0),
+            effect_local: Some(100.0),
+            effect_base: Some(100.0),
+            excess: Some(0.10),
+            weight_change: Some(0.04),
+        });
+        let mut missing_fx = action(ActionFixture {
+            id: "missing-fx",
+            symbol: "MSFT",
+            action_type: "add",
+            notional_base: None,
+            effect_local: Some(50.0),
+            effect_base: None,
+            excess: Some(0.05),
+            weight_change: Some(0.02),
+        });
         missing_fx.fee_base = None;
         let summary = summarize_actions(&[converted, missing_fx]);
         assert_eq!(summary.total.price_effect_base, None);
@@ -570,26 +580,26 @@ mod tests {
 
     #[test]
     fn missing_endpoint_is_counted_but_excluded_from_calculable_sum() {
-        let calculated = action(
-            "calculated",
-            "AAPL",
-            "open",
-            Some(1_000.0),
-            Some(100.0),
-            Some(100.0),
-            Some(0.10),
-            Some(0.04),
-        );
-        let missing = action(
-            "missing",
-            "MSFT",
-            "add",
-            Some(500.0),
-            None,
-            None,
-            None,
-            Some(0.02),
-        );
+        let calculated = action(ActionFixture {
+            id: "calculated",
+            symbol: "AAPL",
+            action_type: "open",
+            notional_base: Some(1_000.0),
+            effect_local: Some(100.0),
+            effect_base: Some(100.0),
+            excess: Some(0.10),
+            weight_change: Some(0.04),
+        });
+        let missing = action(ActionFixture {
+            id: "missing",
+            symbol: "MSFT",
+            action_type: "add",
+            notional_base: Some(500.0),
+            effect_local: None,
+            effect_base: None,
+            excess: None,
+            weight_change: Some(0.02),
+        });
         let summary = summarize_actions(&[calculated, missing]);
         assert_eq!(summary.total.missing_effect_count, 1);
         assert_eq!(summary.total.price_effect_base, Some(100.0));
@@ -599,26 +609,26 @@ mod tests {
 
     #[test]
     fn securities_group_normalized_symbols_per_account() {
-        let first = action(
-            "first",
-            "aapl",
-            "open",
-            Some(1_000.0),
-            Some(100.0),
-            Some(100.0),
-            Some(0.10),
-            Some(0.04),
-        );
-        let mut second = action(
-            "second",
-            "AAPL",
-            "reduce",
-            Some(300.0),
-            Some(-20.0),
-            Some(-20.0),
-            Some(-0.02),
-            Some(-0.03),
-        );
+        let first = action(ActionFixture {
+            id: "first",
+            symbol: "aapl",
+            action_type: "open",
+            notional_base: Some(1_000.0),
+            effect_local: Some(100.0),
+            effect_base: Some(100.0),
+            excess: Some(0.10),
+            weight_change: Some(0.04),
+        });
+        let mut second = action(ActionFixture {
+            id: "second",
+            symbol: "AAPL",
+            action_type: "reduce",
+            notional_base: Some(300.0),
+            effect_local: Some(-20.0),
+            effect_base: Some(-20.0),
+            excess: Some(-0.02),
+            weight_change: Some(-0.03),
+        });
         second.name = "Apple".to_string();
         let securities = summarize_securities(&[first, second]);
         assert_eq!(securities.len(), 1);
@@ -628,10 +638,3 @@ mod tests {
         assert_eq!(securities[0].largest_absolute_weight_change, Some(0.04));
     }
 }
-use crate::models::stock_operation_review::{
-    StockOperationEffect, StockOperationGroupSummary, StockOperationReviewSummary,
-    StockOperationSecuritySummary, StockPositionImpactSummary,
-};
-use crate::services::stock_operation_builder::{normalize_stock_market, normalize_stock_symbol};
-use std::cmp::Ordering;
-use std::collections::BTreeMap;

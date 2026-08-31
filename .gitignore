@@ -37,7 +37,6 @@ yarn-error.log*
 tools/*/target/
 
 # Package manager lock files
-bun.lock
 package-lock.json
 
 # AI Assistant files

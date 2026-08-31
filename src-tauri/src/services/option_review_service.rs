@@ -678,7 +678,7 @@ fn median(values: &mut [f64]) -> Option<f64> {
     }
     values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
-    Some(if values.len() % 2 == 0 {
+    Some(if values.len().is_multiple_of(2) {
         (values[middle - 1] + values[middle]) / 2.0
     } else {
         values[middle]
@@ -902,23 +902,24 @@ mod tests {
         (db, account_id)
     }
 
-    fn insert_record(
-        db: &Database,
-        id: &str,
-        account_id: &str,
-        symbol: &str,
-        underlying: &str,
-        expiry: &str,
+    struct OptionRecordFixture<'a> {
+        id: &'a str,
+        account_id: &'a str,
+        symbol: &'a str,
+        underlying: &'a str,
+        expiry: &'a str,
         strike: f64,
-        option_type: &str,
-        action: &str,
-        code: &str,
+        option_type: &'a str,
+        action: &'a str,
+        code: &'a str,
         quantity: i64,
         amount: f64,
         commission: f64,
         fee: f64,
-        traded_at: Option<&str>,
-    ) {
+        traded_at: Option<&'a str>,
+    }
+
+    fn insert_record_fixture(db: &Database, record: OptionRecordFixture<'_>) {
         let conn = db.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO option_records
@@ -927,23 +928,51 @@ mod tests {
               traded_at, settled_at, created_at, contract_status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, ?13, ?14, NULL, '2026-01-01', 'active')",
             rusqlite::params![
-                id,
-                account_id,
-                symbol,
-                underlying,
-                expiry,
-                strike,
-                option_type,
-                action,
-                code,
-                quantity,
-                amount,
-                commission,
-                fee,
-                traded_at
+                record.id,
+                record.account_id,
+                record.symbol,
+                record.underlying,
+                record.expiry,
+                record.strike,
+                record.option_type,
+                record.action,
+                record.code,
+                record.quantity,
+                record.amount,
+                record.commission,
+                record.fee,
+                record.traded_at
             ],
         )
         .unwrap();
+    }
+
+    macro_rules! insert_record {
+        (
+            $db:expr, $id:expr, $account_id:expr, $symbol:expr, $underlying:expr,
+            $expiry:expr, $strike:expr, $option_type:expr, $action:expr, $code:expr,
+            $quantity:expr, $amount:expr, $commission:expr, $fee:expr, $traded_at:expr $(,)?
+        ) => {
+            insert_record_fixture(
+                $db,
+                OptionRecordFixture {
+                    id: $id,
+                    account_id: $account_id,
+                    symbol: $symbol,
+                    underlying: $underlying,
+                    expiry: $expiry,
+                    strike: $strike,
+                    option_type: $option_type,
+                    action: $action,
+                    code: $code,
+                    quantity: $quantity,
+                    amount: $amount,
+                    commission: $commission,
+                    fee: $fee,
+                    traded_at: $traded_at,
+                },
+            )
+        };
     }
 
     fn today() -> NaiveDate {
@@ -958,59 +987,85 @@ mod tests {
         get_option_review_at(db, account_id, period_days, today()).unwrap()
     }
 
-    fn insert_cycle(
-        db: &Database,
-        account_id: &str,
-        id: &str,
-        underlying: &str,
-        option_type: &str,
-        opened_at: &str,
-        ended_at: &str,
+    struct OptionCycleFixture<'a> {
+        id: &'a str,
+        underlying: &'a str,
+        option_type: &'a str,
+        opened_at: &'a str,
+        ended_at: &'a str,
         gross: f64,
         close_cost: f64,
-        close_code: &str,
-    ) {
-        let symbol = format!("{underlying} {id} {option_type}");
-        insert_record(
+        close_code: &'a str,
+    }
+
+    fn insert_cycle_fixture(db: &Database, account_id: &str, cycle: OptionCycleFixture<'_>) {
+        let symbol = format!("{} {} {}", cycle.underlying, cycle.id, cycle.option_type);
+        insert_record_fixture(
             db,
-            &format!("open-{id}"),
-            account_id,
-            &symbol,
-            underlying,
-            "31DEC26",
-            100.0,
-            option_type,
-            "SELL",
-            "O",
-            1,
-            gross,
-            0.0,
-            0.0,
-            Some(opened_at),
+            OptionRecordFixture {
+                id: &format!("open-{}", cycle.id),
+                account_id,
+                symbol: &symbol,
+                underlying: cycle.underlying,
+                expiry: "31DEC26",
+                strike: 100.0,
+                option_type: cycle.option_type,
+                action: "SELL",
+                code: "O",
+                quantity: 1,
+                amount: cycle.gross,
+                commission: 0.0,
+                fee: 0.0,
+                traded_at: Some(cycle.opened_at),
+            },
         );
-        insert_record(
+        insert_record_fixture(
             db,
-            &format!("close-{id}"),
-            account_id,
-            &symbol,
-            underlying,
-            "31DEC26",
-            100.0,
-            option_type,
-            "BUY",
-            close_code,
-            1,
-            close_cost,
-            0.0,
-            0.0,
-            Some(ended_at),
+            OptionRecordFixture {
+                id: &format!("close-{}", cycle.id),
+                account_id,
+                symbol: &symbol,
+                underlying: cycle.underlying,
+                expiry: "31DEC26",
+                strike: 100.0,
+                option_type: cycle.option_type,
+                action: "BUY",
+                code: cycle.close_code,
+                quantity: 1,
+                amount: cycle.close_cost,
+                commission: 0.0,
+                fee: 0.0,
+                traded_at: Some(cycle.ended_at),
+            },
         );
+    }
+
+    macro_rules! insert_cycle {
+        (
+            $db:expr, $account_id:expr, $id:expr, $underlying:expr, $option_type:expr,
+            $opened_at:expr, $ended_at:expr, $gross:expr, $close_cost:expr, $close_code:expr $(,)?
+        ) => {
+            insert_cycle_fixture(
+                $db,
+                $account_id,
+                OptionCycleFixture {
+                    id: $id,
+                    underlying: $underlying,
+                    option_type: $option_type,
+                    opened_at: $opened_at,
+                    ended_at: $ended_at,
+                    gross: $gross,
+                    close_cost: $close_cost,
+                    close_code: $close_code,
+                },
+            )
+        };
     }
 
     #[test]
     fn expired_put_keeps_premium_net_of_fees() {
         let (db, account_id) = db_with_account();
-        insert_record(
+        insert_record!(
             &db,
             "o1",
             &account_id,
@@ -1027,7 +1082,7 @@ mod tests {
             0.2,
             Some("2026-01-15"),
         );
-        insert_record(
+        insert_record!(
             &db,
             "c1",
             &account_id,
@@ -1061,7 +1116,7 @@ mod tests {
     #[test]
     fn losing_buyback_has_negative_retention() {
         let (db, account_id) = db_with_account();
-        insert_record(
+        insert_record!(
             &db,
             "loss-open",
             &account_id,
@@ -1078,7 +1133,7 @@ mod tests {
             0.3,
             Some("2026-01-01"),
         );
-        insert_record(
+        insert_record!(
             &db,
             "loss-close",
             &account_id,
@@ -1104,7 +1159,7 @@ mod tests {
     #[test]
     fn partial_close_allocates_amounts_and_fees_fifo() {
         let (db, account_id) = db_with_account();
-        insert_record(
+        insert_record!(
             &db,
             "partial-open",
             &account_id,
@@ -1125,7 +1180,7 @@ mod tests {
             ("partial-close-1", "2026-01-10", 50.0),
             ("partial-close-2", "2026-01-11", 70.0),
         ] {
-            insert_record(
+            insert_record!(
                 &db,
                 id,
                 &account_id,
@@ -1159,7 +1214,7 @@ mod tests {
     #[test]
     fn separate_open_records_remain_separate_campaigns_within_seven_days() {
         let (db, account_id) = db_with_account();
-        insert_cycle(
+        insert_cycle!(
             &db,
             &account_id,
             "roll-1",
@@ -1171,7 +1226,7 @@ mod tests {
             10.0,
             "C;P",
         );
-        insert_cycle(
+        insert_cycle!(
             &db,
             &account_id,
             "roll-2",
@@ -1194,7 +1249,7 @@ mod tests {
     #[test]
     fn cycles_after_eight_days_are_separate_campaigns() {
         let (db, account_id) = db_with_account();
-        insert_cycle(
+        insert_cycle!(
             &db,
             &account_id,
             "gap-1",
@@ -1206,7 +1261,7 @@ mod tests {
             0.0,
             "C;Ep",
         );
-        insert_cycle(
+        insert_cycle!(
             &db,
             &account_id,
             "gap-2",
@@ -1241,7 +1296,7 @@ mod tests {
             ("overlap-b", "2026-01-05", "2026-01-06", 200.0),
             ("overlap-c", "2026-01-25", "2026-01-26", 300.0),
         ] {
-            insert_cycle(
+            insert_cycle!(
                 &db,
                 &account_id,
                 id,
@@ -1269,7 +1324,7 @@ mod tests {
     #[test]
     fn assigned_put_and_later_call_remain_separate_campaigns() {
         let (db, account_id) = db_with_account();
-        insert_cycle(
+        insert_cycle!(
             &db,
             &account_id,
             "wheel-put",
@@ -1281,7 +1336,7 @@ mod tests {
             0.0,
             "A;C",
         );
-        insert_cycle(
+        insert_cycle!(
             &db,
             &account_id,
             "wheel-call",
@@ -1310,7 +1365,7 @@ mod tests {
     #[test]
     fn active_campaign_premium_is_included_but_completed_metrics_stay_completed_only() {
         let (db, account_id) = db_with_account();
-        insert_cycle(
+        insert_cycle!(
             &db,
             &account_id,
             "active-done",
@@ -1322,7 +1377,7 @@ mod tests {
             0.0,
             "C;Ep",
         );
-        insert_record(
+        insert_record!(
             &db,
             "active-open",
             &account_id,
@@ -1363,7 +1418,7 @@ mod tests {
     #[test]
     fn negative_buy_amount_is_treated_as_positive_close_cost() {
         let (db, account_id) = db_with_account();
-        insert_cycle(
+        insert_cycle!(
             &db,
             &account_id,
             "negative-close-amount",
@@ -1398,7 +1453,7 @@ mod tests {
     #[test]
     fn excel_serial_trade_date_closes_the_matching_campaign() {
         let (db, account_id) = db_with_account();
-        insert_record(
+        insert_record!(
             &db,
             "excel-open",
             &account_id,
@@ -1415,7 +1470,7 @@ mod tests {
             0.0,
             Some("2026-04-09, 01:47:36"),
         );
-        insert_record(
+        insert_record!(
             &db,
             "excel-close",
             &account_id,
@@ -1447,7 +1502,7 @@ mod tests {
     #[test]
     fn campaign_exposes_open_record_expiry_and_signed_quantity() {
         let (db, account_id) = db_with_account();
-        insert_record(
+        insert_record!(
             &db,
             "signed-open",
             &account_id,
@@ -1535,7 +1590,7 @@ mod tests {
             fixtures.into_iter().enumerate()
         {
             let symbol = format!("3690 {expiry} {strike} P");
-            insert_record(
+            insert_record!(
                 &db,
                 &format!("3690-open-{index}"),
                 &account_id,
@@ -1553,7 +1608,7 @@ mod tests {
                 Some(opened),
             );
             for (close_index, (ended, quantity)) in closes.iter().enumerate() {
-                insert_record(
+                insert_record!(
                     &db,
                     &format!("3690-close-{index}-{close_index}"),
                     &account_id,
@@ -1738,7 +1793,7 @@ mod tests {
         for (index, (expiry, strike, option_type, code, quantity, gross, commission, opened)) in
             opens.into_iter().enumerate()
         {
-            insert_record(
+            insert_record!(
                 &db,
                 &format!("857-open-{index}"),
                 &account_id,
@@ -1777,7 +1832,7 @@ mod tests {
             closes.into_iter().enumerate()
         {
             let (expiry, strike, option_type, _, _, _, _, _) = opens[open_index];
-            insert_record(
+            insert_record!(
                 &db,
                 &format!("857-close-{close_index}"),
                 &account_id,
@@ -1796,7 +1851,7 @@ mod tests {
             );
         }
 
-        insert_record(
+        insert_record!(
             &db,
             "other-active-open",
             &account_id,
@@ -1835,7 +1890,7 @@ mod tests {
     #[test]
     fn completed_period_filter_uses_end_date_but_keeps_active() {
         let (db, account_id) = db_with_account();
-        insert_cycle(
+        insert_cycle!(
             &db,
             &account_id,
             "old-done",
@@ -1847,7 +1902,7 @@ mod tests {
             0.0,
             "C;Ep",
         );
-        insert_record(
+        insert_record!(
             &db,
             "old-active",
             &account_id,
@@ -1874,7 +1929,7 @@ mod tests {
     #[test]
     fn missing_dates_and_unmatched_closes_are_reported() {
         let (db, account_id) = db_with_account();
-        insert_record(
+        insert_record!(
             &db,
             "missing-date",
             &account_id,
@@ -1891,7 +1946,7 @@ mod tests {
             0.0,
             None,
         );
-        insert_record(
+        insert_record!(
             &db,
             "orphan-close",
             &account_id,
@@ -1919,7 +1974,7 @@ mod tests {
     #[test]
     fn intraday_fifo_only_prioritizes_sell_at_the_same_timestamp() {
         let (db, account_id) = db_with_account();
-        insert_record(
+        insert_record!(
             &db,
             "earlier-close",
             &account_id,
@@ -1936,7 +1991,7 @@ mod tests {
             0.0,
             Some("2026-01-01, 09:00:00"),
         );
-        insert_record(
+        insert_record!(
             &db,
             "later-open",
             &account_id,
@@ -1963,7 +2018,7 @@ mod tests {
     #[test]
     fn mixed_supported_timestamp_formats_preserve_intraday_fifo() {
         let (db, account_id) = db_with_account();
-        insert_record(
+        insert_record!(
             &db,
             "mixed-earlier-close",
             &account_id,
@@ -1980,7 +2035,7 @@ mod tests {
             0.0,
             Some("2026/01/01 09:00"),
         );
-        insert_record(
+        insert_record!(
             &db,
             "mixed-later-open",
             &account_id,
@@ -2017,7 +2072,7 @@ mod tests {
             )
             .unwrap();
         }
-        insert_record(
+        insert_record!(
             &db,
             "byd-open-8",
             &account_id,
@@ -2034,7 +2089,7 @@ mod tests {
             0.8,
             Some("2024-10-14"),
         );
-        insert_record(
+        insert_record!(
             &db,
             "byd-open-4",
             &account_id,
@@ -2051,7 +2106,7 @@ mod tests {
             0.4,
             Some("2025-01-02"),
         );
-        insert_record(
+        insert_record!(
             &db,
             "byd-close-12",
             &account_id,
@@ -2119,7 +2174,7 @@ mod tests {
             )
             .unwrap();
         }
-        insert_record(
+        insert_record!(
             &db,
             "split-open",
             &account_id,
@@ -2136,7 +2191,7 @@ mod tests {
             0.2,
             Some("2023-05-01"),
         );
-        insert_record(
+        insert_record!(
             &db,
             "split-close",
             &account_id,
@@ -2185,7 +2240,7 @@ mod tests {
             )
             .unwrap();
         }
-        insert_record(
+        insert_record!(
             &db,
             "reverse-split-open",
             &account_id,
@@ -2202,7 +2257,7 @@ mod tests {
             0.4,
             Some("2026-05-01"),
         );
-        insert_record(
+        insert_record!(
             &db,
             "reverse-split-close",
             &account_id,
@@ -2251,7 +2306,7 @@ mod tests {
             )
             .unwrap();
         }
-        insert_record(
+        insert_record!(
             &db,
             "partial-split-open",
             &account_id,
@@ -2268,7 +2323,7 @@ mod tests {
             0.0,
             Some("2026-05-01"),
         );
-        insert_record(
+        insert_record!(
             &db,
             "partial-split-close",
             &account_id,
@@ -2320,7 +2375,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            insert_record(
+            insert_record!(
                 &db,
                 &format!("{case}-open"),
                 &account_id,
@@ -2337,7 +2392,7 @@ mod tests {
                 0.0,
                 Some("2026-05-01"),
             );
-            insert_record(
+            insert_record!(
                 &db,
                 &format!("{case}-close"),
                 &account_id,
@@ -2370,7 +2425,7 @@ mod tests {
     fn underlying_and_account_totals_equal_campaign_sums() {
         let (db, account_id) = db_with_account();
         for (underlying, prefix) in [("AAPL", "aapl"), ("MSFT", "msft")] {
-            insert_cycle(
+            insert_cycle!(
                 &db,
                 &account_id,
                 &format!("{prefix}-1"),
@@ -2382,7 +2437,7 @@ mod tests {
                 10.0,
                 "C;P",
             );
-            insert_cycle(
+            insert_cycle!(
                 &db,
                 &account_id,
                 &format!("{prefix}-2"),
@@ -2450,7 +2505,7 @@ mod tests {
 
     #[test]
     fn fact_flags_follow_threshold_boundaries() {
-        let high = vec![
+        let high = [
             completed_campaign("h1", 70.0),
             completed_campaign("h2", 70.0),
             completed_campaign("h3", 70.0),
@@ -2458,7 +2513,7 @@ mod tests {
         let high_refs: Vec<_> = high.iter().collect();
         assert!(fact_flags(3, 0, 210.0, Some(0.7), &high_refs).contains(&"高留存".to_string()));
 
-        let boundary = vec![
+        let boundary = [
             completed_campaign("b1", 40.0),
             completed_campaign("b2", 40.0),
             completed_campaign("b3", 40.0),
@@ -2466,7 +2521,7 @@ mod tests {
         let boundary_refs: Vec<_> = boundary.iter().collect();
         assert!(!fact_flags(3, 0, 120.0, Some(0.4), &boundary_refs).contains(&"低留存".to_string()));
 
-        let loss_at_boundary = vec![
+        let loss_at_boundary = [
             completed_campaign("p1", 100.0),
             completed_campaign("p2", 100.0),
             completed_campaign("l1", -300.0),
@@ -2477,7 +2532,7 @@ mod tests {
                 .contains(&"单次损失较大".to_string())
         );
 
-        let large_loss = vec![
+        let large_loss = [
             completed_campaign("p1", 100.0),
             completed_campaign("p2", 100.0),
             completed_campaign("l1", -300.01),

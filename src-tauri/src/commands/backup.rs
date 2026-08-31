@@ -1,5 +1,7 @@
 use crate::db::Database;
+use crate::services::backup_service::backup_database;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::PathBuf;
 use tauri::{Manager, State};
 use tracing::{info, warn};
@@ -38,7 +40,38 @@ fn load_config(app: &tauri::AppHandle) -> BackupConfig {
 fn save_config(app: &tauri::AppHandle, config: &BackupConfig) -> Result<(), String> {
     let path = config_path(app);
     let json = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())
+    atomic_write(&path, json.as_bytes())
+}
+
+fn atomic_write(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("配置文件没有父目录: {}", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary_path = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("backup_config"),
+        uuid::Uuid::new_v4()
+    ));
+    let write_result = (|| -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(|error| error.to_string())?;
+        file.write_all(contents)
+            .map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        drop(file);
+        std::fs::rename(&temporary_path, path).map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    write_result
 }
 
 /// Get file mtime as seconds since epoch, or None if unavailable.
@@ -49,14 +82,26 @@ fn file_mtime_secs(path: &str) -> Option<u64> {
     Some(dur.as_secs())
 }
 
-fn file_size(path: &str) -> Option<u64> {
-    std::fs::metadata(path).ok().map(|m| m.len())
+fn database_mtime_secs(path: &str) -> Option<u64> {
+    [path.to_string(), format!("{path}-wal")]
+        .iter()
+        .filter_map(|candidate| file_mtime_secs(candidate))
+        .max()
+}
+
+fn database_size(path: &str) -> Option<u64> {
+    let database_size = std::fs::metadata(path).ok()?.len();
+    let wal_size = std::fs::metadata(format!("{path}-wal"))
+        .ok()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    Some(database_size + wal_size)
 }
 
 /// Check if DB has changed since last backup.
 fn db_changed(db_path: &str, config: &BackupConfig) -> bool {
-    let mtime = file_mtime_secs(db_path);
-    let size = file_size(db_path);
+    let mtime = database_mtime_secs(db_path);
+    let size = database_size(db_path);
     mtime != config.last_backup_mtime || size != config.last_backup_size
 }
 
@@ -97,11 +142,11 @@ pub fn backup_database_now(
     let filename = format!("portfolio_{}.db", now.format("%Y-%m-%d_%H-%M-%S"));
     let dest = backup_dir.join(&filename);
 
-    std::fs::copy(db_path, &dest).map_err(|e| format!("备份失败: {}", e))?;
+    backup_database(&db, &dest).map_err(|e| format!("备份失败: {}", e))?;
 
     let mut new_config = config;
-    new_config.last_backup_mtime = file_mtime_secs(db_path);
-    new_config.last_backup_size = file_size(db_path);
+    new_config.last_backup_mtime = database_mtime_secs(db_path);
+    new_config.last_backup_size = database_size(db_path);
     new_config.last_backup_time = Some(now.to_rfc3339());
     save_config(&app, &new_config)?;
 
@@ -151,12 +196,13 @@ pub fn auto_backup_if_needed(app: &tauri::AppHandle) {
     let filename = format!("portfolio_{}.db", now.format("%Y-%m-%d_%H-%M-%S"));
     let dest = backup_dir.join(&filename);
 
-    match std::fs::copy(&db_path_str, &dest) {
-        Ok(_) => {
+    let db = app.state::<Database>();
+    match backup_database(&db, &dest) {
+        Ok(()) => {
             info!("[auto-backup] saved to {}", dest.display());
             let mut new_config = config;
-            new_config.last_backup_mtime = file_mtime_secs(&db_path_str);
-            new_config.last_backup_size = file_size(&db_path_str);
+            new_config.last_backup_mtime = database_mtime_secs(&db_path_str);
+            new_config.last_backup_size = database_size(&db_path_str);
             new_config.last_backup_time = Some(chrono::Utc::now().to_rfc3339());
             if let Err(e) = save_config(app, &new_config) {
                 warn!("[auto-backup] failed to save config: {}", e);

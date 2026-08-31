@@ -552,13 +552,6 @@ export interface ImportPreview {
   column_mapping: Record<string, string>;
 }
 
-export interface ImportData {
-  data_type: string;
-  rows: Record<string, unknown>[];
-  column_mapping: Record<string, string>;
-  account_id: string;
-}
-
 export interface ImportSkipped {
   row: number;
   symbol: string;

@@ -1,11 +1,11 @@
 use crate::db::Database;
 use crate::models::import_export::{
-    ExportFilters, ImportData, ImportError, ImportPreview, ImportResult, ImportSkipped,
+    ExportFilters, ImportError, ImportPreview, ImportResult, ImportSkipped,
 };
 use crate::services::quote_provider_service::market_adjusts_sell_pay_cost;
 use chrono::Utc;
 use csv::WriterBuilder;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -291,8 +291,19 @@ pub fn get_transactions_template() -> String {
 // Import / Parse
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Parse CSV content and return an ImportPreview (validate but don't write).
-pub fn parse_import_csv(content: &str, data_type: &str) -> Result<ImportPreview, String> {
+#[derive(Debug)]
+struct ParsedImportRow {
+    row_number: usize,
+    data: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct ParsedImport {
+    preview: ImportPreview,
+    valid_rows: Vec<ParsedImportRow>,
+}
+
+fn parse_import_rows(content: &str, data_type: &str) -> Result<ParsedImport, String> {
     let mut rdr = csv::Reader::from_reader(content.as_bytes());
 
     let headers: Vec<String> = rdr
@@ -306,17 +317,19 @@ pub fn parse_import_csv(content: &str, data_type: &str) -> Result<ImportPreview,
     let required_holdings = ["symbol", "shares", "avg_cost"];
     let required_transactions = ["traded_at", "symbol", "transaction_type", "shares", "price"];
 
-    let required_fields: &[&str] = if data_type == "holdings" {
-        &required_holdings
-    } else {
-        &required_transactions
+    let required_fields: &[&str] = match data_type {
+        "holdings" => &required_holdings,
+        "transactions" => &required_transactions,
+        _ => return Err(format!("不支持的导入数据类型: {data_type}")),
     };
 
     let column_mapping: HashMap<String, String> =
         headers.iter().map(|h| (h.clone(), h.clone())).collect();
 
     let mut preview_data: Vec<serde_json::Value> = Vec::new();
+    let mut valid_import_rows: Vec<ParsedImportRow> = Vec::new();
     let mut error_rows: Vec<ImportError> = Vec::new();
+    let mut invalid_row_numbers = HashSet::new();
     let mut total_rows = 0usize;
 
     for (i, result) in rdr.records().enumerate() {
@@ -340,6 +353,7 @@ pub fn parse_import_csv(content: &str, data_type: &str) -> Result<ImportPreview,
                     column: field.to_string(),
                     message: format!("第{}行 {} 字段不能为空", row_num, field),
                 });
+                invalid_row_numbers.insert(row_num);
                 has_error = true;
             }
         }
@@ -353,24 +367,40 @@ pub fn parse_import_csv(content: &str, data_type: &str) -> Result<ImportPreview,
                     column: "market".to_string(),
                     message: format!("第{}行 market 必须为 US/CN/HK", row_num),
                 });
+                invalid_row_numbers.insert(row_num);
                 has_error = true;
             }
         }
 
-        if !has_error && preview_data.len() < 20 {
-            preview_data.push(serde_json::Value::Object(row_map));
+        if !has_error {
+            let row = serde_json::Value::Object(row_map);
+            if preview_data.len() < 20 {
+                preview_data.push(row.clone());
+            }
+            valid_import_rows.push(ParsedImportRow {
+                row_number: row_num,
+                data: row,
+            });
         }
     }
 
-    let valid_rows = total_rows.saturating_sub(error_rows.len());
+    let valid_rows = total_rows.saturating_sub(invalid_row_numbers.len());
 
-    Ok(ImportPreview {
-        total_rows,
-        valid_rows,
-        error_rows,
-        preview_data,
-        column_mapping,
+    Ok(ParsedImport {
+        preview: ImportPreview {
+            total_rows,
+            valid_rows,
+            error_rows,
+            preview_data,
+            column_mapping,
+        },
+        valid_rows: valid_import_rows,
     })
+}
+
+/// Parse CSV content and return an ImportPreview (validate but don't write).
+pub fn parse_import_csv(content: &str, data_type: &str) -> Result<ImportPreview, String> {
+    Ok(parse_import_rows(content, data_type)?.preview)
 }
 
 /// Extract a string field value from a JSON row.
@@ -378,8 +408,14 @@ fn extract_str<'a>(row: &'a serde_json::Value, key: &str) -> &'a str {
     row.get(key).and_then(|v| v.as_str()).unwrap_or("").trim()
 }
 
-/// Confirm and write import data to the database.
-pub fn confirm_import(db: &Database, import_data: &ImportData) -> Result<ImportResult, String> {
+/// Reparse and write every valid CSV row to the database.
+pub fn confirm_import(
+    db: &Database,
+    content: &str,
+    data_type: &str,
+    account_id: &str,
+) -> Result<ImportResult, String> {
+    let parsed = parse_import_rows(content, data_type)?;
     let conn = db.conn.lock().unwrap();
     let now = Utc::now().to_rfc3339();
     let mut imported_count = 0usize;
@@ -387,10 +423,11 @@ pub fn confirm_import(db: &Database, import_data: &ImportData) -> Result<ImportR
     let mut skipped_rows: Vec<ImportSkipped> = Vec::new();
     let mut errors: Vec<ImportError> = Vec::new();
 
-    for (i, row) in import_data.rows.iter().enumerate() {
-        let row_num = i + 2;
+    for parsed_row in &parsed.valid_rows {
+        let row = &parsed_row.data;
+        let row_num = parsed_row.row_number;
 
-        if import_data.data_type == "holdings" {
+        if data_type == "holdings" {
             let symbol = extract_str(row, "symbol").to_uppercase();
             let name = extract_str(row, "name").to_string();
             let market = {
@@ -434,7 +471,7 @@ pub fn confirm_import(db: &Database, import_data: &ImportData) -> Result<ImportR
             let exists: bool = conn
                 .query_row(
                     "SELECT COUNT(*) FROM holdings WHERE UPPER(symbol) = UPPER(?1) AND account_id = ?2",
-                    rusqlite::params![symbol, import_data.account_id],
+                    rusqlite::params![symbol, account_id],
                     |r| r.get::<_, i64>(0),
                 )
                 .map(|c| c > 0)
@@ -454,7 +491,7 @@ pub fn confirm_import(db: &Database, import_data: &ImportData) -> Result<ImportR
             match conn.execute(
                 "INSERT INTO holdings (id, account_id, symbol, name, market, shares, avg_cost, currency, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                rusqlite::params![id, import_data.account_id, symbol, name, market, shares, avg_cost, currency, now, now],
+                rusqlite::params![id, account_id, symbol, name, market, shares, avg_cost, currency, now, now],
             ) {
                 Ok(_) => imported_count += 1,
                 Err(e) => {
@@ -471,7 +508,7 @@ pub fn confirm_import(db: &Database, import_data: &ImportData) -> Result<ImportR
                     skipped_count += 1;
                 }
             }
-        } else if import_data.data_type == "transactions" {
+        } else if data_type == "transactions" {
             let symbol = extract_str(row, "symbol").to_uppercase();
             let name = extract_str(row, "name").to_string();
             let market = {
@@ -530,7 +567,7 @@ pub fn confirm_import(db: &Database, import_data: &ImportData) -> Result<ImportR
             let holding_lookup: Result<Option<String>, String> = conn
                 .query_row(
                     "SELECT id FROM holdings WHERE account_id = ?1 AND UPPER(symbol) = UPPER(?2)",
-                    rusqlite::params![import_data.account_id, symbol],
+                    rusqlite::params![account_id, symbol],
                     |r| r.get(0),
                 )
                 .map(Some)
@@ -582,7 +619,7 @@ pub fn confirm_import(db: &Database, import_data: &ImportData) -> Result<ImportR
                 match conn.execute(
                     "INSERT INTO holdings (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0.0, 0.0, ?6, ?7, ?8)",
-                    rusqlite::params![new_hid, import_data.account_id, symbol, name, market, currency, now, now],
+                    rusqlite::params![new_hid, account_id, symbol, name, market, currency, now, now],
                 ) {
                     Ok(_) => holding_id = Some(new_hid),
                     Err(e) => {
@@ -706,7 +743,7 @@ pub fn confirm_import(db: &Database, import_data: &ImportData) -> Result<ImportR
             match conn.execute(
                 "INSERT INTO transactions (id, holding_id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, notes, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                rusqlite::params![id, holding_id, import_data.account_id, symbol, name, market, tx_type, shares, price, total_amount, commission, currency, traded_at, notes, now],
+                rusqlite::params![id, holding_id, account_id, symbol, name, market, tx_type, shares, price, total_amount, commission, currency, traded_at, notes, now],
             ) {
                 Ok(_) => imported_count += 1,
                 Err(e) => {
@@ -732,4 +769,80 @@ pub fn confirm_import(db: &Database, import_data: &ImportData) -> Result<ImportR
         skipped_rows,
         errors,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn database_with_account() -> Database {
+        let db = Database::new(":memory:").expect("in-memory database");
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, name, market, created_at, updated_at)
+                 VALUES ('account-1', 'Import', 'US', '2026-08-31', '2026-08-31')",
+                [],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    fn holdings_csv(row_count: usize) -> String {
+        let mut csv = String::from("symbol,name,market,shares,avg_cost,currency\n");
+        for index in 1..=row_count {
+            csv.push_str(&format!("TEST{index:02},Test {index},US,{index},10,USD\n"));
+        }
+        csv
+    }
+
+    #[test]
+    fn confirmation_imports_all_valid_rows_beyond_preview_limit() {
+        let db = database_with_account();
+        let csv = holdings_csv(25);
+        let parsed = parse_import_rows(&csv, "holdings").unwrap();
+        assert_eq!(parsed.preview.total_rows, 25);
+        assert_eq!(parsed.preview.valid_rows, 25);
+        assert_eq!(parsed.preview.preview_data.len(), 20);
+        assert_eq!(parsed.valid_rows.len(), 25);
+
+        let result = confirm_import(&db, &csv, "holdings", "account-1").unwrap();
+
+        assert_eq!(result.imported_count, 25);
+        let holding_count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM holdings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(holding_count, 25);
+    }
+
+    #[test]
+    fn valid_row_count_counts_invalid_rows_once_when_multiple_fields_are_missing() {
+        let csv = concat!(
+            "symbol,name,market,shares,avg_cost,currency\n",
+            "AAPL,Apple,US,10,100,USD\n",
+            ",Broken,US,,100,USD\n",
+        );
+
+        let preview = parse_import_csv(csv, "holdings").unwrap();
+
+        assert_eq!(preview.total_rows, 2);
+        assert_eq!(preview.valid_rows, 1);
+        assert_eq!(preview.error_rows.len(), 2);
+        assert!(preview.error_rows.iter().all(|error| error.row == 3));
+    }
+
+    #[test]
+    fn parser_rejects_unsupported_data_types() {
+        let error = parse_import_csv(
+            "traded_at,symbol,transaction_type,shares,price\n2026-01-01,AAPL,BUY,1,10\n",
+            "unknown",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("不支持的导入数据类型"));
+    }
 }

@@ -1,5 +1,5 @@
 use crate::db::Database;
-use crate::models::import_export::{ExportFilters, ImportData, ImportPreview, ImportResult};
+use crate::models::import_export::{ExportFilters, ImportPreview, ImportResult};
 use crate::services::import_export_service;
 use tauri::State;
 
@@ -39,7 +39,9 @@ pub async fn parse_import_csv(content: String, data_type: String) -> Result<Impo
 #[tauri::command(rename_all = "camelCase")]
 pub async fn confirm_import(
     db: State<'_, Database>,
-    import_data: ImportData,
+    content: String,
+    data_type: String,
+    account_id: String,
 ) -> Result<ImportResult, String> {
-    import_export_service::confirm_import(&db, &import_data)
+    import_export_service::confirm_import(&db, &content, &data_type, &account_id)
 }

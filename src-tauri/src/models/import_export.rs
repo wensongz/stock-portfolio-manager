@@ -25,14 +25,6 @@ pub struct ImportPreview {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImportData {
-    pub data_type: String, // "holdings" | "transactions"
-    pub rows: Vec<serde_json::Value>,
-    pub column_mapping: HashMap<String, String>,
-    pub account_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportSkipped {
     pub row: usize,
     pub symbol: String,

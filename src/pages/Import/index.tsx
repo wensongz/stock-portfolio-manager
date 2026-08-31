@@ -114,12 +114,9 @@ export default function ImportPage() {
         message.success(`成功导入 ${result.imported} 条记录`);
       } else {
         const result = await invoke<ImportResult>("confirm_import", {
-          importData: {
-            data_type: dataType,
-            rows: preview.preview_data,
-            column_mapping: preview.column_mapping,
-            account_id: selectedAccountId,
-          },
+          content: rawCsvContent,
+          dataType,
+          accountId: selectedAccountId,
         });
         setImportResult(result);
         setCurrentStep(2);

@@ -1,8 +1,8 @@
-import { Component, useEffect, type ReactNode } from "react";
+import { Component, lazy, Suspense, useEffect, type ReactNode } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Alert } from "antd";
+import { Alert, Spin } from "antd";
 
 /** Renders a readable error instead of a silent white screen when a page
  *  throws during render. */
@@ -30,23 +30,32 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
 }
 import { useQuoteStore } from "./stores/quoteStore";
 import MainLayout from "./components/Layout/MainLayout";
-import DashboardPage from "./pages/Dashboard";
-import AccountsPage from "./pages/Accounts";
-import HoldingsPage from "./pages/Holdings";
-import TransactionsPage from "./pages/Transactions";
-import StatisticsPage from "./pages/Statistics";
-import DividendsPage from "./pages/Dividends";
-import PerformancePage from "./pages/Performance";
-import QuarterlyPage from "./pages/Quarterly";
-import SnapshotDetail from "./pages/Quarterly/SnapshotDetail";
-import QuarterComparisonPage from "./pages/Quarterly/QuarterComparison";
-import TrendsPage from "./pages/Quarterly/TrendsPage";
-import ImportPage from "./pages/Import";
-import AlertsPage from "./pages/Alerts";
-import ReviewPage from "./pages/Review";
-import SettingsPage from "./pages/Settings";
-import OptionsPage from "./pages/Options";
-import AiAssistantPage from "./pages/AiAssistant";
+
+const DashboardPage = lazy(() => import("./pages/Dashboard"));
+const AccountsPage = lazy(() => import("./pages/Accounts"));
+const HoldingsPage = lazy(() => import("./pages/Holdings"));
+const TransactionsPage = lazy(() => import("./pages/Transactions"));
+const StatisticsPage = lazy(() => import("./pages/Statistics"));
+const DividendsPage = lazy(() => import("./pages/Dividends"));
+const PerformancePage = lazy(() => import("./pages/Performance"));
+const QuarterlyPage = lazy(() => import("./pages/Quarterly"));
+const SnapshotDetail = lazy(() => import("./pages/Quarterly/SnapshotDetail"));
+const QuarterComparisonPage = lazy(() => import("./pages/Quarterly/QuarterComparison"));
+const TrendsPage = lazy(() => import("./pages/Quarterly/TrendsPage"));
+const ImportPage = lazy(() => import("./pages/Import"));
+const AlertsPage = lazy(() => import("./pages/Alerts"));
+const ReviewPage = lazy(() => import("./pages/Review"));
+const SettingsPage = lazy(() => import("./pages/Settings"));
+const OptionsPage = lazy(() => import("./pages/Options"));
+const AiAssistantPage = lazy(() => import("./pages/AiAssistant"));
+
+function RouteFallback() {
+  return (
+    <div style={{ minHeight: 240, display: "grid", placeItems: "center" }}>
+      <Spin size="large" />
+    </div>
+  );
+}
 
 function App() {
   // quoteWarning in the global store is the single source of truth for the
@@ -132,26 +141,28 @@ function App() {
       )}
       <MainLayout>
         <ErrorBoundary>
-          <Routes>
-          <Route path="/" element={<Navigate to="/dashboard" replace />} />
-          <Route path="/dashboard" element={<DashboardPage />} />
-          <Route path="/statistics" element={<StatisticsPage />} />
-          <Route path="/dividends" element={<DividendsPage />} />
-          <Route path="/performance" element={<PerformancePage />} />
-          <Route path="/accounts" element={<AccountsPage />} />
-          <Route path="/holdings" element={<HoldingsPage />} />
-          <Route path="/transactions" element={<TransactionsPage />} />
-          <Route path="/quarterly" element={<QuarterlyPage />} />
-          <Route path="/quarterly/compare" element={<QuarterComparisonPage />} />
-          <Route path="/quarterly/trends" element={<TrendsPage />} />
-          <Route path="/quarterly/:snapshotId" element={<SnapshotDetail />} />
-          <Route path="/import" element={<ImportPage />} />
-          <Route path="/options" element={<OptionsPage />} />
-          <Route path="/alerts" element={<AlertsPage />} />
-          <Route path="/review" element={<ReviewPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-      <Route path="/ai-assistant" element={<AiAssistantPage />} />
-        </Routes>
+          <Suspense fallback={<RouteFallback />}>
+            <Routes>
+              <Route path="/" element={<Navigate to="/dashboard" replace />} />
+              <Route path="/dashboard" element={<DashboardPage />} />
+              <Route path="/statistics" element={<StatisticsPage />} />
+              <Route path="/dividends" element={<DividendsPage />} />
+              <Route path="/performance" element={<PerformancePage />} />
+              <Route path="/accounts" element={<AccountsPage />} />
+              <Route path="/holdings" element={<HoldingsPage />} />
+              <Route path="/transactions" element={<TransactionsPage />} />
+              <Route path="/quarterly" element={<QuarterlyPage />} />
+              <Route path="/quarterly/compare" element={<QuarterComparisonPage />} />
+              <Route path="/quarterly/trends" element={<TrendsPage />} />
+              <Route path="/quarterly/:snapshotId" element={<SnapshotDetail />} />
+              <Route path="/import" element={<ImportPage />} />
+              <Route path="/options" element={<OptionsPage />} />
+              <Route path="/alerts" element={<AlertsPage />} />
+              <Route path="/review" element={<ReviewPage />} />
+              <Route path="/settings" element={<SettingsPage />} />
+              <Route path="/ai-assistant" element={<AiAssistantPage />} />
+            </Routes>
+          </Suspense>
         </ErrorBoundary>
       </MainLayout>
     </>

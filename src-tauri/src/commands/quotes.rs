@@ -83,28 +83,10 @@ pub async fn get_holding_quotes(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
 
-        // For cleared (shares == 0) non-cash holdings, compute realized PnL from transactions:
-        //   realized_pnl = SUM(SELL total_amount - commission) - SUM((BUY|OPEN) total_amount + commission)
-        //   total_buy_cost = SUM((BUY|OPEN) total_amount + commission)  [used for % calculation]
-        // OPEN transactions are position-entry records (create_holding / backfill)
-        // with no cash impact, but their total_amount is the position's cost basis.
-        let is_cleared_position = |h: &crate::models::Holding| -> bool {
-            h.shares == 0.0 && !h.symbol.starts_with(CASH_SYMBOL_PREFIX)
-        };
-        let mut realized_pnl_map: std::collections::HashMap<String, (f64, f64)> =
-            std::collections::HashMap::new();
-        for h in &holdings {
-            if is_cleared_position(h) {
-                let pnl_data: (f64, f64) = match compute_realized_pnl(&conn, &h.id) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        warn!("Failed to compute realized PnL for holding {}: {}", h.id, e);
-                        (0.0, 0.0)
-                    }
-                };
-                realized_pnl_map.insert(h.id.clone(), pnl_data);
-            }
-        }
+        let realized_pnl_map = load_realized_pnl_by_holding(&conn).unwrap_or_else(|e| {
+            warn!("Failed to compute realized PnL for cleared holdings: {}", e);
+            std::collections::HashMap::new()
+        });
 
         (holdings, realized_pnl_map)
     };
@@ -234,32 +216,39 @@ pub async fn get_holding_quotes(
     Ok(result)
 }
 
-/// Compute realized PnL for a cleared (shares == 0) position from its
-/// transaction history.
+/// Load realized PnL for every cleared non-cash position in one grouped query.
 ///   realized_pnl = SUM(SELL total_amount - commission) - SUM((BUY|OPEN) total_amount + commission)
 ///   total_buy_cost = SUM((BUY|OPEN) total_amount + commission)  [used for % calculation]
 /// OPEN transactions are position-entry records (create_holding / backfill)
 /// with no cash impact, but their total_amount is the position's cost basis
 /// and must count toward realized PnL.
-fn compute_realized_pnl(
+fn load_realized_pnl_by_holding(
     conn: &rusqlite::Connection,
-    holding_id: &str,
-) -> Result<(f64, f64), rusqlite::Error> {
-    conn.query_row(
-        "SELECT
+) -> Result<std::collections::HashMap<String, (f64, f64)>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT h.id,
                 COALESCE(SUM(CASE
-                    WHEN transaction_type = 'SELL' THEN total_amount - commission
-                    WHEN transaction_type IN ('BUY', 'OPEN') THEN -(total_amount + commission)
+                    WHEN t.transaction_type = 'SELL' THEN t.total_amount - t.commission
+                    WHEN t.transaction_type IN ('BUY', 'OPEN') THEN -(t.total_amount + t.commission)
                     ELSE 0
                 END), 0.0),
                 COALESCE(SUM(CASE
-                    WHEN transaction_type IN ('BUY', 'OPEN') THEN total_amount + commission
+                    WHEN t.transaction_type IN ('BUY', 'OPEN') THEN t.total_amount + t.commission
                     ELSE 0
                 END), 0.0)
-             FROM transactions WHERE holding_id = ?1",
-        rusqlite::params![holding_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
+           FROM holdings h
+           LEFT JOIN transactions t ON t.holding_id = h.id
+          WHERE h.shares = 0.0
+            AND h.symbol NOT LIKE '$CASH-%'
+          GROUP BY h.id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            (row.get::<_, f64>(1)?, row.get::<_, f64>(2)?),
+        ))
+    })?;
+    rows.collect()
 }
 
 #[tauri::command]
@@ -415,7 +404,8 @@ mod tests {
     fn test_realized_pnl_includes_open_cost() {
         let (db, holding_id) = db_with_cleared_position();
         let conn = db.conn.lock().unwrap();
-        let (realized, total_buy_cost) = compute_realized_pnl(&conn, &holding_id).unwrap();
+        let pnl_by_holding = load_realized_pnl_by_holding(&conn).unwrap();
+        let (realized, total_buy_cost) = pnl_by_holding[&holding_id];
         // Cost basis: 930,000 @ 2.74 = 2,548,200 (stored as OPEN)
         assert_eq!(total_buy_cost, 2_548_200.0);
         // Sells: 330,155.00 - 557.91 = 329,597.09; realized = 329,597.09 - 2,548,200.00
@@ -463,12 +453,65 @@ mod tests {
             }
         }
         let conn = db.conn.lock().unwrap();
-        let (realized, total_buy_cost) = compute_realized_pnl(&conn, &holding_id).unwrap();
+        let pnl_by_holding = load_realized_pnl_by_holding(&conn).unwrap();
+        let (realized, total_buy_cost) = pnl_by_holding[&holding_id];
         assert_eq!(total_buy_cost, 1001.0);
         assert!(
             (realized - 197.8).abs() < 0.01,
             "realized PnL was {}",
             realized
         );
+    }
+
+    #[test]
+    fn test_load_realized_pnl_groups_every_cleared_holding() {
+        let (db, open_holding_id) = db_with_cleared_position();
+        let ts = now();
+        {
+            let conn = db.conn.lock().unwrap();
+            for (holding_id, symbol) in [("h-profit", "MSFT"), ("h-loss", "TSLA")] {
+                conn.execute(
+                    "INSERT INTO holdings (id, account_id, symbol, name, market, category_id,
+                            shares, avg_cost, currency, created_at, updated_at)
+                     VALUES (?1, 'a', ?2, ?2, 'US', NULL, 0.0, 10.0, 'USD', ?3, ?3)",
+                    rusqlite::params![holding_id, symbol, ts],
+                )
+                .unwrap();
+            }
+            for (id, holding_id, symbol, transaction_type, amount, commission) in [
+                ("profit-buy", "h-profit", "MSFT", "BUY", 1_000.0, 1.0),
+                ("profit-sell", "h-profit", "MSFT", "SELL", 1_250.0, 2.0),
+                ("loss-buy", "h-loss", "TSLA", "BUY", 2_000.0, 2.0),
+                ("loss-sell", "h-loss", "TSLA", "SELL", 1_500.0, 1.5),
+            ] {
+                conn.execute(
+                    "INSERT INTO transactions (id, holding_id, account_id, symbol, name, market,
+                            transaction_type, shares, price, total_amount, commission, currency,
+                            traded_at, notes, created_at)
+                     VALUES (?1, ?2, 'a', ?3, ?3, 'US', ?4, 100, 10, ?5, ?6,
+                             'USD', ?7, NULL, ?7)",
+                    rusqlite::params![
+                        id,
+                        holding_id,
+                        symbol,
+                        transaction_type,
+                        amount,
+                        commission,
+                        ts
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let conn = db.conn.lock().unwrap();
+        let realized = load_realized_pnl_by_holding(&conn).unwrap();
+
+        assert_eq!(realized.len(), 3);
+        assert_eq!(realized.get("h-profit"), Some(&(247.0, 1_001.0)));
+        assert_eq!(realized.get("h-loss"), Some(&(-503.5, 2_002.0)));
+        let (open_pnl, open_cost) = realized.get(&open_holding_id).copied().unwrap();
+        assert_eq!(open_cost, 2_548_200.0);
+        assert!((open_pnl - (-2_218_602.91)).abs() < 0.01);
     }
 }

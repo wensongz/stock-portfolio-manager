@@ -3,7 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { message as antdMessage } from "antd";
 import type {
-  ChatMessage,
   ChatMessageRecord,
   ChatMessageWithMeta,
   ChatUsage,
@@ -12,9 +11,19 @@ import type {
 } from "../types";
 import {
   consumeAiPrefillToolContext,
-  HOST_PREFILLED_TOOL_CALL_ID,
   readPersistedAiToolContext,
 } from "../pages/AiAssistant/prefill.ts";
+import {
+  buildHistory,
+  findLastIndex,
+  newId,
+  normalizeToolCallEvent,
+} from "./chat/protocol.ts";
+import { persistMessages } from "./chat/persistence.ts";
+import {
+  finalizeStreamMessages,
+  updateMessageById,
+} from "./chat/streamReducer.ts";
 
 interface ChatState {
   messages: ChatMessageWithMeta[];
@@ -148,167 +157,6 @@ let backgroundStream: BackgroundStream | null = null;
 // `editAndResend` so the selection only applies to the very next send. When
 // empty, the backend falls back to automatic trigger-based activation.
 
-// Use the browser's native UUID for client-side message ids so the same id
-// can round-trip through the database primary key without collision.
-const newId = () =>
-  typeof crypto !== "undefined" && "randomUUID" in crypto
-    ? crypto.randomUUID()
-    : `msg_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-
-/** Like Array.prototype.findIndex but scanning from the end. ES2023 adds this
- * on Array.prototype, but we target older runtimes so define our own. */
-function findLastIndex<T>(arr: T[], predicate: (item: T, index: number) => boolean): number {
-  for (let i = arr.length - 1; i >= 0; i--) {
-    if (predicate(arr[i], i)) return i;
-  }
-  return -1;
-}
-
-/**
- * Treat every lifecycle event as model-origin unless the Rust host explicitly
- * marks it as its prefill execution. Model ids are defensively moved out of
- * the single reserved host id even though current backends already namespace
- * them before emitting the event.
- */
-function normalizeToolCallEvent(toolCall: ToolCallInfo): ToolCallInfo {
-  const origin = toolCall.origin === "host_prefill" ? "host_prefill" : "model";
-  const id =
-    origin === "model" && toolCall.id === HOST_PREFILLED_TOOL_CALL_ID
-      ? `model:${toolCall.id}`
-      : toolCall.id;
-  return { ...toolCall, id, origin };
-}
-
-/**
- * Normalise the in-memory message list into a clean conversation history to
- * send to the LLM. The display list (`messages` state) can contain rows that
- * are illegal to send to an OpenAI-compatible endpoint and would cause the
- * provider to return an empty reply (HTTP 200 with no delta, then `[DONE]`),
- * which the user sees as "AI replied with an empty bubble".
- *
- * Three problems this fixes:
- *
- *  1. Empty-content rows — e.g. an assistant placeholder left behind when a
- *     stream was interrupted, or a degenerate empty reply that slipped past
- *     the `done` filter. Sending `{role:"assistant", content:""}` makes many
- *     providers reject the request silently.
- *  2. Failed (`error`) rows — a failed turn has empty content plus an error
- *     marker; it must never be replayed to the model.
- *  3. Non-alternating roles — OpenAI requires strict user/assistant
- *     alternation. Consecutive same-role rows (e.g. two user messages back to
- *     back, or user → empty-assistant → user) break this and trigger empty
- *     replies on several providers.
- *
- * The function ONLY shapes the outgoing request — the live `messages` state
- * is untouched (the user still sees their failed cards / placeholders).
- */
-function buildHistory(messages: ChatMessageWithMeta[]): ChatMessage[] {
-  // Step 1: keep only rows safe to send — non-empty content, no error marker,
-  // and a role the chat endpoint understands.
-  const cleaned = messages.filter(
-    (m) =>
-      (m.role === "user" || m.role === "assistant") &&
-      !m.error &&
-      m.content.trim().length > 0,
-  );
-
-  // Step 2: enforce strict role alternation by collapsing runs of the same
-  // role. For consecutive user turns we merge (so no user input is lost); for
-  // consecutive assistant turns we keep only the last (earlier ones are
-  // treated as superseded/partial). system rows don't appear here (filtered
-  // above) so we only deal with user/assistant.
-  const collapsed: ChatMessage[] = [];
-  for (const m of cleaned) {
-    const last = collapsed[collapsed.length - 1];
-    if (last && last.role === m.role) {
-      if (m.role === "user") {
-        // Preserve both inputs — join with a blank line for readability.
-        last.content = `${last.content}\n\n${m.content}`;
-      } else {
-        // Assistant: the newer reply supersedes the older one.
-        last.content = m.content;
-      }
-    } else {
-      collapsed.push({ role: m.role, content: m.content });
-    }
-  }
-
-  // Step 3: the conversation the model continues MUST end on a user turn
-  // (we're asking it to reply). If a stray assistant row is left at the tail,
-  // drop it — there's nothing to respond to.
-  while (collapsed.length > 0 && collapsed[collapsed.length - 1].role !== "user") {
-    collapsed.pop();
-  }
-
-  return collapsed;
-}
-
-/** Map client-side display messages into the persisted row shape. */
-function toRecords(
-  sessionId: string,
-  msgs: ChatMessageWithMeta[],
-): ChatMessageRecord[] {
-  return msgs.map((m) => ({
-    id: m.id,
-    session_id: sessionId,
-    role: m.role,
-    content: m.content,
-    prompt_tokens: m.usage?.promptTokens ?? 0,
-    completion_tokens: m.usage?.completionTokens ?? 0,
-    total_tokens: m.usage?.totalTokens ?? 0,
-    cached_tokens: m.usage?.cachedTokens ?? 0,
-    // Persist reasoning (chain-of-thought) and tool-call details so they
-    // survive a reload / session switch — assistant turns only. Tool calls are
-    // serialised to a JSON string (the column is TEXT). Empty values are
-    // omitted (undefined → NULL on the backend, skipped by serde).
-    ...(m.reasoning && m.reasoning.trim().length > 0
-      ? { reasoning: m.reasoning }
-      : {}),
-    ...(m.toolCalls && m.toolCalls.length > 0
-      ? { tool_calls: JSON.stringify(m.toolCalls) }
-      : {}),
-    // Persist as RFC3339 so backend `ORDER BY created_at ASC` sorts correctly.
-    created_at: new Date(m.createdAt).toISOString(),
-  }));
-}
-
-/**
- * Persist a snapshot of messages for a session (delete + insert).
- *
- * IMPORTANT: always pass an explicit snapshot (`msgs`) captured at the call
- * site — never read `get().messages` here. The persistence `await` can straddle
- * a session switch or `resetForSessionSwitch` call; if we re-read state after
- * the await we'd persist an empty array and overwrite the data we intended to
- * save. The caller owns the snapshot.
- */
-async function persistMessages(sessionId: string, msgs: ChatMessageWithMeta[]) {
-  if (msgs.length === 0) return;
-  try {
-    await invoke("save_chat_messages", {
-      sessionId,
-      messages: toRecords(sessionId, msgs),
-    });
-    await invoke("touch_chat_session", { id: sessionId });
-  } catch (err) {
-    // Persistence is best-effort: a failure shouldn't crash the chat UI.
-    console.error(`[chatStore] failed to persist messages for ${sessionId}`, err);
-  }
-}
-
-/**
- * Mark the currently-streaming assistant placeholder as failed: attach the
- * error message to the message row (so the UI can render an error card with a
- * retry button), clear the streaming bookkeeping, and flip `sending` off.
- *
- * Centralising this in one helper guarantees all three failure paths — the
- * `ai-chat-error` event, and the try/catch in `sendMessage` and
- * `editAndResend` — leave the store in exactly the same state. The error is
- * attached to the message itself (not the global `error` flag) so it follows
- * the conversation: switching away and back still shows which turn failed.
- *
- * A toast (`message.error`) is fired here so the user always sees the failure
- * even if the error card is scrolled out of view.
- */
 function failStreamingMessage(
   set: (partial: Partial<ChatState> | ((s: ChatState) => Partial<ChatState>)) => void,
   errorMsg: string,
@@ -348,15 +196,15 @@ function applyStreamUpdate(
   // Background stream: accumulate into the buffer, not the live state. The
   // live `messages` belongs to a different session and must not be touched.
   if (backgroundStream) {
-    backgroundStream.messages = backgroundStream.messages.map((m) =>
-      m.id === streamingId ? apply(m) : m,
+    backgroundStream.messages = updateMessageById(
+      backgroundStream.messages,
+      streamingId,
+      apply,
     );
     return;
   }
   set((state) => ({
-    messages: state.messages.map((m) =>
-      m.id === streamingId ? apply(m) : m,
-    ),
+    messages: updateMessageById(state.messages, streamingId!, apply),
   }));
 }
 
@@ -373,16 +221,9 @@ function finalizeTurnPersist(
   sessionId: string,
   sourceMessages: ChatMessageWithMeta[],
 ): ChatMessageWithMeta[] {
-  const isEmptyTurn = (m: ChatMessageWithMeta) =>
-    m.role === "assistant" &&
-    !m.error &&
-    m.content.trim().length === 0;
-  const filtered = sourceMessages.filter((m) => !isEmptyTurn(m));
-  // Exclude failed (error) rows from persistence — their error state is
-  // UI-only and must not be saved.
-  const toSave = filtered.filter((m) => !(m.role === "assistant" && m.error));
-  void persistMessages(sessionId, toSave);
-  return filtered;
+  const finalized = finalizeStreamMessages(sourceMessages);
+  void persistMessages(sessionId, finalized.persistable);
+  return finalized.visible;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({

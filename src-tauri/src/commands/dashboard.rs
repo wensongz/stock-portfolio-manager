@@ -173,14 +173,7 @@ pub async fn get_holdings_with_quotes(
 
     // Normalise market_value_usd so holdings across different currencies
     // are sorted on a common USD basis.
-    let rates = get_cached_rates(&cache, &db)
-        .await
-        .unwrap_or_else(|_| ExchangeRates {
-            usd_cny: 7.2,
-            usd_hkd: 7.8,
-            cny_hkd: 7.8 / 7.2,
-            updated_at: chrono::Utc::now().to_rfc3339(),
-        });
+    let rates = get_cached_rates(&cache, &db).await?;
     for d in &mut details {
         d.market_value_usd = to_usd_value(d.market_value, &d.currency, &rates);
     }
@@ -198,15 +191,7 @@ pub async fn get_dashboard_summary(
 ) -> Result<DashboardSummary, String> {
     let base = base_currency.unwrap_or_else(|| "USD".to_string());
 
-    let rates: ExchangeRates =
-        get_cached_rates(&cache, &db)
-            .await
-            .unwrap_or_else(|_| ExchangeRates {
-                usd_cny: 7.2,
-                usd_hkd: 7.8,
-                cny_hkd: 7.8 / 7.2,
-                updated_at: chrono::Utc::now().to_rfc3339(),
-            });
+    let rates: ExchangeRates = get_cached_rates(&cache, &db).await?;
 
     let details = build_holding_details(&db, &quote_cache, Some(&quote_state), false).await?;
 

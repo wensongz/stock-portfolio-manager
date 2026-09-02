@@ -11,6 +11,7 @@ use crate::models::performance::{
     ReturnDataPoint, RiskMetrics,
 };
 use chrono::NaiveDate;
+use rusqlite::OptionalExtension;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal DB helpers
@@ -44,6 +45,25 @@ impl PerformanceFilter {
             sql.push_str(&format!(" AND account_id = ?{}", params.len() + 1));
             params.push(Box::new(account_id.clone()));
         }
+    }
+}
+
+fn parse_required_exchange_rates(
+    json: Option<&str>,
+    context: &str,
+) -> Result<crate::models::ExchangeRates, String> {
+    let json = json.ok_or_else(|| format!("missing exchange rates for {context}"))?;
+    let rates = serde_json::from_str::<crate::models::ExchangeRates>(json)
+        .map_err(|error| format!("invalid exchange rates for {context}: {error}"))?;
+    if [rates.usd_cny, rates.usd_hkd, rates.cny_hkd]
+        .iter()
+        .all(|rate| rate.is_finite() && *rate > 0.0)
+    {
+        Ok(rates)
+    } else {
+        Err(format!(
+            "invalid exchange rates for {context}: expected positive finite values"
+        ))
     }
 }
 
@@ -165,13 +185,15 @@ fn fetch_previous_day_value(
             .query_row(&sql, param_refs.as_slice(), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
             })
-            .ok()
-            .and_then(|(date, value)| {
+            .optional()
+            .map_err(|error| error.to_string())?;
+        return result
+            .map(|(date, value)| {
                 NaiveDate::parse_from_str(&date, "%Y-%m-%d")
-                    .ok()
                     .map(|parsed| (parsed, value))
-            });
-        return Ok(result);
+                    .map_err(|error| format!("bad date '{date}': {error}"))
+            })
+            .transpose();
     }
     let result = conn
         .query_row(
@@ -179,13 +201,15 @@ fn fetch_previous_day_value(
             rusqlite::params![date_str],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
         )
-        .ok()
-        .and_then(|(date, value)| {
+        .optional()
+        .map_err(|error| error.to_string())?;
+    result
+        .map(|(date, value)| {
             NaiveDate::parse_from_str(&date, "%Y-%m-%d")
-                .ok()
                 .map(|parsed| (parsed, value))
-        });
-    Ok(result)
+                .map_err(|error| format!("bad date '{date}': {error}"))
+        })
+        .transpose()
 }
 
 /// Fetch external contributions/withdrawals between two valuations.
@@ -259,16 +283,8 @@ fn fetch_external_cash_flows(
         let amount = if filter.is_active() || currency == "USD" {
             signed_amount
         } else {
-            let rates = rates_json
-                .as_deref()
-                .and_then(|json| serde_json::from_str::<crate::models::ExchangeRates>(json).ok())
-                .filter(|rates| rates.usd_cny > 0.0 && rates.usd_hkd > 0.0)
-                .ok_or_else(|| {
-                    format!(
-                        "missing exchange rates for {} cash flow on {}",
-                        currency, date_str
-                    )
-                })?;
+            let context = format!("{} cash flow on {}", currency, date_str);
+            let rates = parse_required_exchange_rates(rates_json.as_deref(), &context)?;
             crate::services::exchange_rate_service::convert_currency(
                 signed_amount,
                 &currency,
@@ -977,14 +993,8 @@ fn return_attribution_from(
                 _ => continue,
             };
             let flow = if normalize_to_usd && currency != "USD" {
-                let rates = rates_json
-                    .as_deref()
-                    .and_then(|json| {
-                        serde_json::from_str::<crate::models::ExchangeRates>(json).ok()
-                    })
-                    .ok_or_else(|| {
-                        format!("missing exchange rates for {} transaction", currency)
-                    })?;
+                let context = format!("{} transaction", currency);
+                let rates = parse_required_exchange_rates(rates_json.as_deref(), &context)?;
                 crate::services::exchange_rate_service::convert_currency(
                     native_flow,
                     &currency,
@@ -1429,14 +1439,8 @@ fn holding_performance_ranking_from(
                 _ => continue,
             };
             let flow = if normalize_to_usd && currency != "USD" {
-                let rates = rates_json
-                    .as_deref()
-                    .and_then(|json| {
-                        serde_json::from_str::<crate::models::ExchangeRates>(json).ok()
-                    })
-                    .ok_or_else(|| {
-                        format!("missing exchange rates for {} transaction", currency)
-                    })?;
+                let context = format!("{} transaction", currency);
+                let rates = parse_required_exchange_rates(rates_json.as_deref(), &context)?;
                 crate::services::exchange_rate_service::convert_currency(
                     native_flow,
                     &currency,
@@ -1782,6 +1786,63 @@ pub fn benchmark_to_return_series(
 mod tests {
     use super::*;
     use crate::models::performance::parse_date;
+
+    #[test]
+    fn previous_value_lookup_distinguishes_missing_from_bad_dates() {
+        let db = Database::new(":memory:").unwrap();
+        let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        assert!(
+            fetch_previous_day_value(&db, cutoff, &PerformanceFilter::default())
+                .unwrap()
+                .is_none()
+        );
+
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO daily_portfolio_values (date, total_value)
+             VALUES ('2025-bad-date', 42)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error =
+            fetch_previous_day_value(&db, cutoff, &PerformanceFilter::default()).unwrap_err();
+        assert!(error.contains("bad date '2025-bad-date'"));
+    }
+
+    #[test]
+    fn filtered_previous_value_lookup_propagates_bad_dates() {
+        let db = Database::new(":memory:").unwrap();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO daily_holding_snapshots
+             (date, account_id, symbol, market, shares, avg_cost, close_price, market_value)
+             VALUES ('2025-bad-date', 'acct', 'AAPL', 'US', 1, 1, 42, 42)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let filter = PerformanceFilter {
+            market: Some("US".to_string()),
+            account_id: None,
+        };
+
+        let error =
+            fetch_previous_day_value(&db, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), &filter)
+                .unwrap_err();
+
+        assert!(error.contains("bad date '2025-bad-date'"));
+    }
+
+    #[test]
+    fn required_rate_parser_distinguishes_missing_from_malformed_json() {
+        let missing = parse_required_exchange_rates(None, "cash flow").unwrap_err();
+        assert!(missing.contains("missing exchange rates for cash flow"));
+
+        let malformed = parse_required_exchange_rates(Some("not-json"), "cash flow").unwrap_err();
+        assert!(malformed.contains("invalid exchange rates for cash flow"));
+    }
 
     fn cash_flow_performance_db() -> Database {
         let db = Database::new(":memory:").unwrap();

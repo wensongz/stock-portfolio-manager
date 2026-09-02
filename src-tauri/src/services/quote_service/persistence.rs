@@ -1,6 +1,7 @@
 use crate::db::Database;
 use crate::models::StockQuote;
 use chrono::Utc;
+use rusqlite::OptionalExtension;
 
 pub fn load_quotes_from_db(db: &Database) -> Result<Vec<StockQuote>, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
@@ -79,11 +80,11 @@ pub fn save_quote_refresh_time(db: &Database) -> Result<(), String> {
 /// Returns `None` if no refresh has been recorded yet.
 pub fn get_quote_refresh_time(db: &Database) -> Result<Option<String>, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare("SELECT updated_at FROM cached_quote_refresh_time WHERE id = 1")
-        .map_err(|e| e.to_string())?;
-    let mut rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| e.to_string())?;
-    Ok(rows.next().and_then(|r| r.ok()))
+    conn.query_row(
+        "SELECT updated_at FROM cached_quote_refresh_time WHERE id = 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
 }

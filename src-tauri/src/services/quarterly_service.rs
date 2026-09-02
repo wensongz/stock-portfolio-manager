@@ -452,19 +452,21 @@ pub fn check_missing_snapshots(db: &Database) -> Result<Vec<String>, String> {
     // Find the earliest transaction date
     let earliest: Option<String> = {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
-        conn.query_row("SELECT MIN(DATE(traded_at)) FROM transactions", [], |row| {
-            row.get(0)
+        conn.query_row("SELECT MIN(traded_at) FROM transactions", [], |row| {
+            row.get::<_, Option<String>>(0)
         })
-        .ok()
-        .flatten()
+        .map_err(|error| error.to_string())?
     };
 
     let Some(earliest_str) = earliest else {
         return Ok(vec![]);
     };
 
-    let earliest_date = NaiveDate::parse_from_str(&earliest_str, "%Y-%m-%d")
-        .map_err(|e| format!("Bad date: {}", e))?;
+    let date_part = earliest_str
+        .get(..10)
+        .ok_or_else(|| format!("Bad transaction date: {earliest_str}"))?;
+    let earliest_date = NaiveDate::parse_from_str(date_part, "%Y-%m-%d")
+        .map_err(|e| format!("Bad transaction date '{earliest_str}': {e}"))?;
     let today = Utc::now().date_naive();
 
     // Collect all quarters from earliest to current
@@ -528,7 +530,7 @@ pub async fn ensure_current_quarter_snapshot(
             |row| row.get::<_, i64>(0),
         )
         .map(|c| c > 0)
-        .unwrap_or(false)
+        .map_err(|error| error.to_string())?
     };
 
     if exists {
@@ -581,5 +583,29 @@ mod tests {
         assert!(previous_quarter("invalid").is_err());
         assert!(previous_quarter("2025-Q5").is_err());
         assert!(previous_quarter("2025-Q0").is_err());
+    }
+
+    #[test]
+    fn missing_snapshot_scan_propagates_malformed_transaction_dates() {
+        let db = Database::new(":memory:").unwrap();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, name, market, created_at, updated_at)
+             VALUES ('acct', 'Account', 'US', '2025-01-01', '2025-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transactions
+             (id, account_id, symbol, name, market, transaction_type, shares, price,
+              total_amount, commission, currency, traded_at, created_at)
+             VALUES ('tx', 'acct', 'AAPL', 'Apple', 'US', 'OPEN', 1, 1, 1, 0,
+                     'USD', X'FF', '2025-01-01')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(check_missing_snapshots(&db).is_err());
     }
 }

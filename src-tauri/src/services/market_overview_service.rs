@@ -42,7 +42,9 @@ pub struct MarketOverview {
     pub holdings_count: usize,
     /// Per-holding daily P&L (top 10 by absolute P&L) so the model can point at
     /// specific movers. Kept small to stay within the tool-result budget.
-    pub top_movers: Vec<MoverRow>,
+    pub top_movers: Option<Vec<MoverRow>>,
+    /// Explains why holding-derived USD fields are unavailable.
+    pub holdings_data_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,6 +53,65 @@ pub struct MoverRow {
     pub name: String,
     pub market: String,
     pub daily_pnl_usd: f64,
+}
+
+struct HoldingsSummary {
+    holdings_daily_pnl_usd: Option<f64>,
+    holdings_count: usize,
+    top_movers: Option<Vec<MoverRow>>,
+    error: Option<String>,
+}
+
+fn summarize_holdings(
+    details: &[crate::models::dashboard::HoldingDetail],
+    rates: Result<crate::models::quote::ExchangeRates, String>,
+) -> HoldingsSummary {
+    if details.is_empty() {
+        return HoldingsSummary {
+            holdings_daily_pnl_usd: None,
+            holdings_count: 0,
+            top_movers: Some(Vec::new()),
+            error: None,
+        };
+    }
+    let rates = match rates {
+        Ok(rates) => rates,
+        Err(error) => {
+            return HoldingsSummary {
+                holdings_daily_pnl_usd: None,
+                holdings_count: details.len(),
+                top_movers: None,
+                error: Some(error),
+            };
+        }
+    };
+    let total = details
+        .iter()
+        .map(|detail| convert_currency(detail.daily_pnl, &detail.currency, "USD", &rates))
+        .sum();
+    let mut movers = details
+        .iter()
+        .filter(|detail| detail.shares != 0.0)
+        .map(|detail| MoverRow {
+            symbol: detail.symbol.clone(),
+            name: detail.name.clone(),
+            market: detail.market.clone(),
+            daily_pnl_usd: convert_currency(detail.daily_pnl, &detail.currency, "USD", &rates),
+        })
+        .collect::<Vec<_>>();
+    movers.sort_by(|a, b| {
+        b.daily_pnl_usd
+            .abs()
+            .partial_cmp(&a.daily_pnl_usd.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    movers.truncate(10);
+    HoldingsSummary {
+        holdings_daily_pnl_usd: Some(total),
+        holdings_count: details.len(),
+        top_movers: Some(movers),
+        error: None,
+    }
 }
 
 /// Per-provider mapping for a single market index.
@@ -131,59 +192,26 @@ pub async fn get_market_overview(
     }
 
     // User holdings daily P&L, normalised to USD.
-    let (holdings_daily_pnl_usd, holdings_count, top_movers) =
-        match build_holding_details_pub(db, quote_cache, true).await {
-            Ok(details) => {
-                let rates = get_cached_rates(rate_cache, db).await.unwrap_or_else(|_| {
-                    crate::models::quote::ExchangeRates {
-                        usd_cny: 7.2,
-                        usd_hkd: 7.8,
-                        cny_hkd: 7.8 / 7.2,
-                        updated_at: Utc::now().to_rfc3339(),
-                    }
-                });
-                let total: f64 = details
-                    .iter()
-                    .map(|d| convert_currency(d.daily_pnl, &d.currency, "USD", &rates))
-                    .sum();
-                let mut movers: Vec<MoverRow> = details
-                    .iter()
-                    .filter(|d| d.shares != 0.0)
-                    .map(|d| MoverRow {
-                        symbol: d.symbol.clone(),
-                        name: d.name.clone(),
-                        market: d.market.clone(),
-                        daily_pnl_usd: convert_currency(d.daily_pnl, &d.currency, "USD", &rates),
-                    })
-                    .collect();
-                // Sort by absolute P&L so the most impactful movers surface first.
-                movers.sort_by(|a, b| {
-                    b.daily_pnl_usd
-                        .abs()
-                        .partial_cmp(&a.daily_pnl_usd.abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                movers.truncate(10);
-                (total, details.len(), movers)
+    let holdings = match build_holding_details_pub(db, quote_cache, true).await {
+        Ok(details) => summarize_holdings(&details, get_cached_rates(rate_cache, db).await),
+        Err(error) => {
+            warn!(target: "market_overview", "failed to build holdings: {error}");
+            HoldingsSummary {
+                holdings_daily_pnl_usd: None,
+                holdings_count: 0,
+                top_movers: None,
+                error: Some(error),
             }
-            Err(e) => {
-                warn!(target: "market_overview", "failed to build holdings: {e}");
-                (0.0, 0, Vec::new())
-            }
-        };
-
-    let holdings_daily_pnl_usd = if holdings_count == 0 {
-        None
-    } else {
-        Some(holdings_daily_pnl_usd)
+        }
     };
 
     Ok(MarketOverview {
         generated_at: Utc::now().to_rfc3339(),
         indices,
-        holdings_daily_pnl_usd,
-        holdings_count,
-        top_movers,
+        holdings_daily_pnl_usd: holdings.holdings_daily_pnl_usd,
+        holdings_count: holdings.holdings_count,
+        top_movers: holdings.top_movers,
+        holdings_data_error: holdings.error,
     })
 }
 
@@ -230,6 +258,7 @@ pub fn to_json_value(o: &MarketOverview) -> Value {
         "holdings_daily_pnl_usd": o.holdings_daily_pnl_usd,
         "holdings_count": o.holdings_count,
         "top_movers": o.top_movers,
+        "holdings_data_error": o.holdings_data_error,
     })
 }
 
@@ -276,5 +305,36 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing index {expected}");
         }
+    }
+
+    #[test]
+    fn unavailable_rates_keep_holdings_count_but_remove_usd_values() {
+        let details = vec![crate::models::dashboard::HoldingDetail {
+            id: "holding".to_string(),
+            account_id: "acct".to_string(),
+            account_name: "账户".to_string(),
+            symbol: "600000".to_string(),
+            name: "浦发银行".to_string(),
+            market: "CN".to_string(),
+            category_name: "分红股".to_string(),
+            category_color: "#fff".to_string(),
+            shares: 100.0,
+            avg_cost: 9.0,
+            current_price: 10.0,
+            market_value: 1000.0,
+            cost_value: 900.0,
+            pnl: 100.0,
+            pnl_percent: Some(11.11),
+            daily_pnl: 20.0,
+            currency: "CNY".to_string(),
+            market_value_usd: 0.0,
+        }];
+
+        let summary = summarize_holdings(&details, Err("offline".to_string()));
+
+        assert_eq!(summary.holdings_count, 1);
+        assert_eq!(summary.holdings_daily_pnl_usd, None);
+        assert!(summary.top_movers.is_none());
+        assert_eq!(summary.error.as_deref(), Some("offline"));
     }
 }

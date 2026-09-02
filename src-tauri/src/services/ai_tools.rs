@@ -19,6 +19,7 @@ use crate::commands::transactions::query_transactions_inner;
 use crate::db::Database;
 use crate::models::dashboard::DashboardSummary;
 use crate::models::option_review::OptionReviewReport;
+use crate::models::quote::ExchangeRates;
 use crate::models::stock_operation_review::StockOperationReviewQuery;
 use crate::services::ai_chat_service::build_portfolio_context;
 use crate::services::alert_service;
@@ -1105,18 +1106,20 @@ async fn tool_holding_ranking(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     }
 }
 
+fn dashboard_rates_or_error(
+    result: Result<ExchangeRates, String>,
+) -> Result<ExchangeRates, ToolResult> {
+    result.map_err(|error| ToolResult::err_json(format!("仪表盘总览失败：{error}")))
+}
+
 async fn tool_dashboard_summary(ctx: &ToolCtx<'_>) -> ToolResult {
     // Mirror get_dashboard_summary but with cache_only=true so tools never
     // trigger cascading network fetches (the model can call get_stock_quote
     // explicitly if it needs a fresh price).
-    let rates = get_cached_rates(ctx.cache, ctx.db)
-        .await
-        .unwrap_or_else(|_| crate::models::quote::ExchangeRates {
-            usd_cny: 7.2,
-            usd_hkd: 7.8,
-            cny_hkd: 7.8 / 7.2,
-            updated_at: Utc::now().to_rfc3339(),
-        });
+    let rates = match dashboard_rates_or_error(get_cached_rates(ctx.cache, ctx.db).await) {
+        Ok(rates) => rates,
+        Err(error) => return error,
+    };
     let base = "USD";
     match build_holding_details_pub(ctx.db, ctx.quote_cache, true).await {
         Ok(details) => {
@@ -1426,6 +1429,19 @@ async fn tool_stock_review(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashboard_tool_turns_unavailable_rates_into_explicit_error_data() {
+        let error =
+            dashboard_rates_or_error(Err("no verified exchange rates".to_string())).unwrap_err();
+
+        assert!(!error.ok);
+        let payload: Value = serde_json::from_str(&error.content).unwrap();
+        assert_eq!(
+            payload["error"],
+            "仪表盘总览失败：no verified exchange rates"
+        );
+    }
 
     fn option_review_fixture() -> crate::models::option_review::OptionReviewReport {
         use crate::models::option_review::{

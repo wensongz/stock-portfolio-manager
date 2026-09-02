@@ -2,6 +2,7 @@ use crate::db::Database;
 use crate::models::ExchangeRates;
 use crate::services::http_client;
 use chrono::Utc;
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -134,23 +135,21 @@ pub fn save_exchange_rates_to_db(db: &Database, rates: &ExchangeRates) -> Result
 /// Load persisted exchange rates from the database (returns None if none saved yet).
 pub fn load_exchange_rates_from_db(db: &Database) -> Result<Option<ExchangeRates>, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT usd_cny, usd_hkd, cny_hkd, updated_at
+    conn.query_row(
+        "SELECT usd_cny, usd_hkd, cny_hkd, updated_at
              FROM cached_exchange_rates WHERE id = 1",
-        )
-        .map_err(|e| e.to_string())?;
-    let mut rows = stmt
-        .query_map([], |row| {
+        [],
+        |row| {
             Ok(ExchangeRates {
                 usd_cny: row.get(0)?,
                 usd_hkd: row.get(1)?,
                 cny_hkd: row.get(2)?,
                 updated_at: row.get(3)?,
             })
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(rows.next().and_then(|r| r.ok()))
+        },
+    )
+    .optional()
+    .map_err(|e| e.to_string())
 }
 
 /// Get exchange rates, using the cache when fresh, and fetching if stale.
@@ -192,7 +191,10 @@ pub async fn get_cached_rates(
                     );
                     Ok(persisted)
                 }
-                _ => Err(e),
+                Ok(None) => Err(e),
+                Err(db_error) => Err(format!(
+                    "{e}; failed to read persisted exchange rates: {db_error}"
+                )),
             }
         }
     }
@@ -300,5 +302,23 @@ mod tests {
         // Stale should always return if set
         let stale = cache.get_stale().expect("should have stale rates");
         assert!((stale.usd_cny - 7.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn persisted_rate_lookup_distinguishes_missing_from_malformed_rows() {
+        let db = Database::new(":memory:").unwrap();
+        assert!(load_exchange_rates_from_db(&db).unwrap().is_none());
+
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO cached_exchange_rates
+             (id, usd_cny, usd_hkd, cny_hkd, updated_at)
+             VALUES (1, X'00', 7.8, 1.08, '2025-01-01')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(load_exchange_rates_from_db(&db).is_err());
     }
 }

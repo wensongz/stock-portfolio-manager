@@ -4,52 +4,29 @@ use super::*;
 // Portfolio context
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Assemble a Markdown snapshot of the current portfolio for the LLM prompt.
-///
-/// Uses cache-only quotes (no network) and pulls the last year of performance
-/// metrics. Every section is guarded so an empty portfolio still yields a
-/// short, valid context string rather than an error.
-pub async fn build_portfolio_context(
-    db: &Database,
-    cache: &ExchangeRateCache,
-    quote_cache: &QuoteCache,
-) -> Result<String, String> {
-    let details = build_holding_details_pub(db, quote_cache, true).await?;
-    let rates =
-        get_cached_rates(cache, db)
-            .await
-            .unwrap_or_else(|_| crate::models::quote::ExchangeRates {
-                usd_cny: 7.2,
-                usd_hkd: 7.8,
-                cny_hkd: 7.8 / 7.2,
-                updated_at: Utc::now().to_rfc3339(),
-            });
-
-    // Normalise every holding's market value to USD for cross-currency totals.
-    let to_usd = |amount: f64, currency: &str| {
-        crate::services::exchange_rate_service::convert_currency(amount, currency, "USD", &rates)
-    };
-    let total_market_value_usd: f64 = details
-        .iter()
-        .map(|d| to_usd(d.market_value, &d.currency))
-        .sum();
-    let total_cost_value_usd: f64 = details
-        .iter()
-        .map(|d| to_usd(d.cost_value, &d.currency))
-        .sum();
-    let total_daily_pnl_usd: f64 = details
-        .iter()
-        .map(|d| to_usd(d.daily_pnl, &d.currency))
-        .sum();
-
-    let mut out = String::new();
-    out.push_str("# 当前投资组合快照\n\n");
-
-    // ── Overview ───────────────────────────────────────────────────────────
-    out.push_str("## 账户总览（单位：USD）\n");
+fn render_holdings_context(
+    details: &[crate::models::dashboard::HoldingDetail],
+    rates: Result<&crate::models::quote::ExchangeRates, &str>,
+) -> String {
+    let mut out = String::from("# 当前投资组合快照\n\n## 账户总览（单位：USD）\n");
     if details.is_empty() {
         out.push_str("（暂无持仓）\n\n");
-    } else {
+    } else if let Ok(rates) = rates {
+        let to_usd = |amount: f64, currency: &str| {
+            crate::services::exchange_rate_service::convert_currency(amount, currency, "USD", rates)
+        };
+        let total_market_value_usd = details
+            .iter()
+            .map(|detail| to_usd(detail.market_value, &detail.currency))
+            .sum::<f64>();
+        let total_cost_value_usd = details
+            .iter()
+            .map(|detail| to_usd(detail.cost_value, &detail.currency))
+            .sum::<f64>();
+        let total_daily_pnl_usd = details
+            .iter()
+            .map(|detail| to_usd(detail.daily_pnl, &detail.currency))
+            .sum::<f64>();
         let total_pnl = total_market_value_usd - total_cost_value_usd;
         let total_pnl_pct = if total_cost_value_usd > 0.0 {
             total_pnl / total_cost_value_usd * 100.0
@@ -65,35 +42,101 @@ pub async fn build_portfolio_context(
             total_pnl_pct,
             total_daily_pnl_usd,
         ));
-    }
-
-    // ── Holdings table ─────────────────────────────────────────────────────
-    out.push_str("## 当前持仓\n");
-    out.push_str("| 代码 | 名称 | 市场 | 账户 | 类别 | 持仓 | 均价 | 现价 | 市值(USD) | 盈亏% |\n");
-    out.push_str("|------|------|------|------|------|------|------|------|-----------|-------|\n");
-    let mut sorted = details.clone();
-    sorted.sort_by(|a, b| {
-        to_usd(b.market_value, &b.currency)
-            .partial_cmp(&to_usd(a.market_value, &a.currency))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    for d in &sorted {
-        let pnl_pct = d.pnl_percent.unwrap_or(0.0);
+    } else if let Err(error) = rates {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {:.4} | {:.4} | {:.4} | {:.2} | {:.2} |\n",
-            d.symbol,
-            d.name,
-            d.market,
-            d.account_name,
-            d.category_name,
-            d.shares,
-            d.avg_cost,
-            d.current_price,
-            to_usd(d.market_value, &d.currency),
-            pnl_pct,
+            "- 持仓数量：{}\n- 汇率不可用，已省略跨币种汇总：{}\n\n",
+            details.len(),
+            error
         ));
     }
+
+    out.push_str("## 当前持仓\n");
+    let mut sorted = details.to_vec();
+    if let Ok(rates) = rates {
+        sorted.sort_by(|a, b| {
+            let to_usd = |amount: f64, currency: &str| {
+                crate::services::exchange_rate_service::convert_currency(
+                    amount, currency, "USD", rates,
+                )
+            };
+            to_usd(b.market_value, &b.currency)
+                .partial_cmp(&to_usd(a.market_value, &a.currency))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out.push_str(
+            "| 代码 | 名称 | 市场 | 账户 | 类别 | 持仓 | 均价 | 现价 | 市值(USD) | 盈亏% |\n",
+        );
+        out.push_str(
+            "|------|------|------|------|------|------|------|------|-----------|-------|\n",
+        );
+        for detail in &sorted {
+            let market_value_usd = crate::services::exchange_rate_service::convert_currency(
+                detail.market_value,
+                &detail.currency,
+                "USD",
+                rates,
+            );
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {:.4} | {:.4} | {:.4} | {:.2} | {:.2} |\n",
+                detail.symbol,
+                detail.name,
+                detail.market,
+                detail.account_name,
+                detail.category_name,
+                detail.shares,
+                detail.avg_cost,
+                detail.current_price,
+                market_value_usd,
+                detail.pnl_percent.unwrap_or(0.0),
+            ));
+        }
+    } else {
+        sorted.sort_by(|a, b| {
+            (&a.market, &a.symbol, &a.account_id).cmp(&(&b.market, &b.symbol, &b.account_id))
+        });
+        out.push_str(
+            "| 代码 | 名称 | 市场 | 账户 | 类别 | 持仓 | 均价 | 现价 | 市值(原币) | 盈亏% |\n",
+        );
+        out.push_str(
+            "|------|------|------|------|------|------|------|------|------------|-------|\n",
+        );
+        for detail in &sorted {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {:.4} | {:.4} | {:.4} | {:.2} {} | {:.2} |\n",
+                detail.symbol,
+                detail.name,
+                detail.market,
+                detail.account_name,
+                detail.category_name,
+                detail.shares,
+                detail.avg_cost,
+                detail.current_price,
+                detail.market_value,
+                detail.currency,
+                detail.pnl_percent.unwrap_or(0.0),
+            ));
+        }
+    }
     out.push('\n');
+    out
+}
+
+/// Assemble a Markdown snapshot of the current portfolio for the LLM prompt.
+///
+/// Uses cache-only quotes (no network) and pulls the last year of performance
+/// metrics. Every section is guarded so an empty portfolio still yields a
+/// short, valid context string rather than an error.
+pub async fn build_portfolio_context(
+    db: &Database,
+    cache: &ExchangeRateCache,
+    quote_cache: &QuoteCache,
+) -> Result<String, String> {
+    let details = build_holding_details_pub(db, quote_cache, true).await?;
+    let rates = get_cached_rates(cache, db).await;
+    let mut out = render_holdings_context(
+        &details,
+        rates.as_ref().map_err(std::string::String::as_str),
+    );
 
     // ── Recent transactions ────────────────────────────────────────────────
     out.push_str("## 近期交易（最近 20 条）\n");
@@ -186,4 +229,41 @@ fn fetch_recent_transactions(db: &Database, limit: usize) -> Result<Vec<TxnRow>,
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::dashboard::HoldingDetail;
+
+    #[test]
+    fn holdings_context_omits_cross_currency_totals_when_rates_are_unavailable() {
+        let details = vec![HoldingDetail {
+            id: "holding".to_string(),
+            account_id: "acct".to_string(),
+            account_name: "账户".to_string(),
+            symbol: "600000".to_string(),
+            name: "浦发银行".to_string(),
+            market: "CN".to_string(),
+            category_name: "分红股".to_string(),
+            category_color: "#fff".to_string(),
+            shares: 100.0,
+            avg_cost: 9.0,
+            current_price: 10.0,
+            market_value: 1000.0,
+            cost_value: 900.0,
+            pnl: 100.0,
+            pnl_percent: Some(11.11),
+            daily_pnl: 20.0,
+            currency: "CNY".to_string(),
+            market_value_usd: 0.0,
+        }];
+
+        let rendered = render_holdings_context(&details, Err("offline"));
+
+        assert!(rendered.contains("汇率不可用，已省略跨币种汇总：offline"));
+        assert!(rendered.contains("1000.00 CNY"));
+        assert!(!rendered.contains("总市值："));
+        assert!(!rendered.contains("市值(USD)"));
+    }
 }

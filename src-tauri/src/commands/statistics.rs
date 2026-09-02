@@ -7,10 +7,34 @@ use crate::services::exchange_rate_service::{
     convert_currency, get_cached_rates, ExchangeRateCache,
 };
 use crate::services::quote_service::QuoteCache;
+use rusqlite::OptionalExtension;
 use tauri::State;
 
 fn to_usd_value(amount: f64, currency: &str, rates: &crate::models::ExchangeRates) -> f64 {
     convert_currency(amount, currency, "USD", rates)
+}
+
+struct CategoryRow {
+    id: String,
+    name: String,
+    color: String,
+}
+
+fn load_category(db: &Database, category_id: &str) -> Result<Option<CategoryRow>, String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    conn.query_row(
+        "SELECT id, name, color FROM categories WHERE id = ?1",
+        rusqlite::params![category_id],
+        |row| {
+            Ok(CategoryRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                color: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -21,15 +45,7 @@ pub async fn get_statistics_overview(
     base_currency: Option<String>,
 ) -> Result<StatisticsOverview, String> {
     let base = base_currency.unwrap_or_else(|| "USD".to_string());
-    let rates =
-        get_cached_rates(&cache, &db)
-            .await
-            .unwrap_or_else(|_| crate::models::ExchangeRates {
-                usd_cny: 7.2,
-                usd_hkd: 7.8,
-                cny_hkd: 7.8 / 7.2,
-                updated_at: chrono::Utc::now().to_rfc3339(),
-            });
+    let rates = get_cached_rates(&cache, &db).await?;
 
     let details = build_holding_details_pub(&db, &quote_cache, true).await?;
 
@@ -413,38 +429,10 @@ pub async fn get_statistics_by_category(
     base_currency: Option<String>,
 ) -> Result<CategoryStatistics, String> {
     let base = base_currency.unwrap_or_else(|| "USD".to_string());
-    let rates =
-        get_cached_rates(&cache, &db)
-            .await
-            .unwrap_or_else(|_| crate::models::ExchangeRates {
-                usd_cny: 7.2,
-                usd_hkd: 7.8,
-                cny_hkd: 7.8 / 7.2,
-                updated_at: chrono::Utc::now().to_rfc3339(),
-            });
+    let rates = get_cached_rates(&cache, &db).await?;
 
-    // We need to look up holdings by category_id (not name), so query DB directly
-    struct CategoryRow {
-        id: String,
-        name: String,
-        color: String,
-    }
-
-    let cat: Option<CategoryRow> = {
-        let conn = db.conn.lock().map_err(|e| e.to_string())?;
-        conn.query_row(
-            "SELECT id, name, color FROM categories WHERE id = ?1",
-            rusqlite::params![category_id],
-            |row| {
-                Ok(CategoryRow {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    color: row.get(2)?,
-                })
-            },
-        )
-        .ok()
-    };
+    // We need to look up holdings by category_id (not name), so query DB directly.
+    let cat = load_category(&db, &category_id)?;
 
     let (cat_id, cat_name, cat_color) = match cat {
         Some(c) => (c.id, c.name, c.color),
@@ -520,4 +508,27 @@ pub async fn get_statistics_by_category(
         market_distribution,
         holdings: details,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn category_lookup_distinguishes_missing_from_malformed_rows() {
+        let db = Database::new(":memory:").unwrap();
+        assert!(load_category(&db, "missing").unwrap().is_none());
+
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO categories
+             (id, name, color, icon, is_system, sort_order, created_at)
+             VALUES ('broken', 'Broken', X'FF', '', 0, 0, '2025-01-01')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(load_category(&db, "broken").is_err());
+    }
 }

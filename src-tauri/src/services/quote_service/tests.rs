@@ -2,6 +2,22 @@ use super::*;
 use crate::services::http_client;
 
 #[test]
+fn quote_refresh_time_distinguishes_missing_from_malformed_rows() {
+    let db = crate::db::Database::new(":memory:").unwrap();
+    assert!(get_quote_refresh_time(&db).unwrap().is_none());
+
+    let conn = db.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO cached_quote_refresh_time (id, updated_at) VALUES (1, X'00')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(get_quote_refresh_time(&db).is_err());
+}
+
+#[test]
 fn quote_service_state_keeps_credentials_and_warnings_isolated() {
     let first = QuoteServiceState::new();
     let second = QuoteServiceState::new();

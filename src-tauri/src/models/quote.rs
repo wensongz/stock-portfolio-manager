@@ -65,6 +65,7 @@ pub struct ExchangeRates {
     pub updated_at: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DailyPortfolioValue {
     pub id: i64,

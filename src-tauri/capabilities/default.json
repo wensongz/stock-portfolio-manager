@@ -8,7 +8,6 @@
     "core:webview:allow-webview-close",
     "core:webview:allow-get-all-webviews",
     "core:window:allow-get-all-windows",
-    "shell:allow-open",
     "dialog:default"
   ]
 }

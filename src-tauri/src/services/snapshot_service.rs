@@ -1,10 +1,12 @@
 use crate::db::Database;
-use crate::models::{DailyHoldingSnapshot, DailyPortfolioValue};
+use crate::models::DailyHoldingSnapshot;
+#[cfg(test)]
+use crate::models::DailyPortfolioValue;
 use crate::services::exchange_rate_service::ExchangeRateCache;
 use crate::services::quote_provider_service;
-use crate::services::quote_service::{
-    fetch_quotes_batch_cached_with_providers, fetch_stock_history, QuoteCache,
-};
+use crate::services::quote_service::fetch_stock_history;
+#[cfg(test)]
+use crate::services::quote_service::{fetch_quotes_batch_cached_with_providers, QuoteCache};
 use chrono::{Datelike, NaiveDate, Timelike};
 use tracing::{info, warn};
 
@@ -45,6 +47,7 @@ pub fn last_closed_market_date() -> NaiveDate {
 
 /// Take a daily portfolio snapshot for the given date.
 /// This is idempotent: running it twice for the same date replaces the existing record.
+#[cfg(test)]
 pub async fn take_daily_snapshot(
     db: &Database,
     cache: &ExchangeRateCache,
@@ -236,6 +239,7 @@ pub async fn take_daily_snapshot(
 }
 
 /// Query daily portfolio values in a date range.
+#[cfg(test)]
 pub fn get_daily_values(
     db: &Database,
     start_date: NaiveDate,

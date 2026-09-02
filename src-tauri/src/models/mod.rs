@@ -25,9 +25,10 @@ pub use category::Category;
 pub use dashboard::{DashboardSummary, HoldingDetail};
 pub use holding::Holding;
 pub use option_review::*;
+#[cfg(test)]
+pub use quote::DailyPortfolioValue;
 pub use quote::{
-    DailyHoldingSnapshot, DailyPortfolioValue, ExchangeRates, FinancialReport, HoldingWithQuote,
-    PriceCandle, StockQuote,
+    DailyHoldingSnapshot, ExchangeRates, FinancialReport, HoldingWithQuote, PriceCandle, StockQuote,
 };
 pub use statistics::{
     AccountStatistics, CategoryStatistics, MarketStatistics, PieSlice, PnlItem, StatisticsOverview,

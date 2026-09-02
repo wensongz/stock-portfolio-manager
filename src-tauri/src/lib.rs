@@ -31,7 +31,6 @@ pub fn run() {
     init_tracing();
     tracing::info!("starting stock-portfolio-manager");
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .menu(menu::build_menu)
         .setup(|app| {
@@ -214,8 +213,6 @@ pub fn run() {
             commands::quotes::get_last_quote_refresh_time,
             commands::exchange_rates::get_exchange_rates,
             commands::exchange_rates::convert_amount,
-            commands::snapshots::take_snapshot,
-            commands::snapshots::get_portfolio_history,
             commands::snapshots::backfill_snapshots,
             commands::dashboard::get_dashboard_summary,
             commands::dashboard::get_holdings_with_quotes,

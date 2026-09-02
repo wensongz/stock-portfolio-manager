@@ -32,6 +32,7 @@ interface StatisticsState {
   marketStats: Record<string, MarketStatistics>;
   accountStats: Record<string, AccountStatistics>;
   categoryStats: Record<string, CategoryStatistics>;
+  resultRevisionByView: Record<string, number>;
   loadingByView: Record<string, boolean>;
   errorByView: Record<string, string | null>;
   fetchView: (
@@ -55,6 +56,7 @@ export const createStatisticsStore = (invokeFn: StatisticsInvoke = invoke) => {
   const inFlight = new Map<string, RequestEntry>();
   const queuedReloads = new Map<string, RequestEntry>();
   const latestTokenByView = new Map<string, symbol>();
+  let nextRequestRevision = 0;
 
   return create<StatisticsState>((set) => {
     const setLoading = (viewKey: string) => {
@@ -70,6 +72,7 @@ export const createStatisticsStore = (invokeFn: StatisticsInvoke = invoke) => {
       token: symbol,
       makeLatest: boolean,
     ): Promise<void> => {
+      const requestRevision = ++nextRequestRevision;
       if (makeLatest) latestTokenByView.set(viewKey, token);
       if (latestTokenByView.get(viewKey) === token) setLoading(viewKey);
       const request = (async () => {
@@ -86,6 +89,10 @@ export const createStatisticsStore = (invokeFn: StatisticsInvoke = invoke) => {
                       overviewByCurrency: {
                         ...state.overviewByCurrency,
                         [view.baseCurrency]: overview,
+                      },
+                      resultRevisionByView: {
+                        ...state.resultRevisionByView,
+                        [viewKey]: requestRevision,
                       },
                       loadingByView: {
                         ...state.loadingByView,
@@ -108,6 +115,10 @@ export const createStatisticsStore = (invokeFn: StatisticsInvoke = invoke) => {
                         ...state.marketStats,
                         [view.market]: statistics,
                       },
+                      resultRevisionByView: {
+                        ...state.resultRevisionByView,
+                        [viewKey]: requestRevision,
+                      },
                       loadingByView: {
                         ...state.loadingByView,
                         [viewKey]: false,
@@ -128,6 +139,10 @@ export const createStatisticsStore = (invokeFn: StatisticsInvoke = invoke) => {
                       accountStats: {
                         ...state.accountStats,
                         [view.accountId]: statistics,
+                      },
+                      resultRevisionByView: {
+                        ...state.resultRevisionByView,
+                        [viewKey]: requestRevision,
                       },
                       loadingByView: {
                         ...state.loadingByView,
@@ -152,6 +167,10 @@ export const createStatisticsStore = (invokeFn: StatisticsInvoke = invoke) => {
                       categoryStats: {
                         ...state.categoryStats,
                         [`${view.categoryId}:${view.baseCurrency}`]: statistics,
+                      },
+                      resultRevisionByView: {
+                        ...state.resultRevisionByView,
+                        [viewKey]: requestRevision,
                       },
                       loadingByView: {
                         ...state.loadingByView,
@@ -190,6 +209,7 @@ export const createStatisticsStore = (invokeFn: StatisticsInvoke = invoke) => {
       marketStats: {},
       accountStats: {},
       categoryStats: {},
+      resultRevisionByView: {},
       loadingByView: {},
       errorByView: {},
 

@@ -300,6 +300,7 @@ test("unknown target account holdings fall back to a full quote refresh before o
         ],
       },
     },
+    resultRevisionByView: { "account:acct-a": 1 },
   });
   const quoteRequests = [];
   let selection = {
@@ -344,6 +345,140 @@ test("unknown target account holdings fall back to a full quote refresh before o
     ["get_statistics_by_account", { accountId: "acct-b" }],
   ]);
   assert.equal(store.getState().accountStats["acct-b"].marker, "fresh");
+});
+
+test("real store and page adapter refresh from a newer overview instead of stale account holdings", async () => {
+  const staleAccount = deferred();
+  const newerOverview = deferred();
+  const invokedViews = [];
+  let accountCalls = 0;
+  const store = createStatisticsStore(async (command, args) => {
+    invokedViews.push([command, args]);
+    if (command === "get_statistics_overview") {
+      return newerOverview.promise;
+    }
+    accountCalls += 1;
+    if (accountCalls === 1) return staleAccount.promise;
+    return {
+      holdings: [
+        { account_id: "acct-a", symbol: "AAPL", market: "US" },
+        { account_id: "acct-a", symbol: "MSFT", market: "US" },
+      ],
+      marker: "fresh-account",
+    };
+  });
+
+  const accountLoad = store
+    .getState()
+    .fetchView({ kind: "account", accountId: "acct-a" });
+  const overviewLoad = store
+    .getState()
+    .fetchView({ kind: "overview", baseCurrency: "USD" });
+  staleAccount.resolve({
+    holdings: [
+      { account_id: "acct-a", symbol: "AAPL", market: "US" },
+    ],
+    marker: "stale-account",
+  });
+  await accountLoad;
+  newerOverview.resolve({
+    holdings: [
+      { account_id: "acct-a", symbol: "AAPL", market: "US" },
+      { account_id: "acct-a", symbol: "MSFT", market: "US" },
+    ],
+    marker: "newer-overview",
+  });
+  await overviewLoad;
+
+  const quoteRequests = [];
+  let selection = {
+    ...initialSelection,
+    activeTab: "account",
+    selectedAccountId: "acct-a",
+  };
+  const dispatcher = createStatisticsDispatcher({
+    getSelection: () => selection,
+    updateSelection: (next) => {
+      selection = next;
+    },
+    fetchView: store.getState().fetchView,
+    fetchHoldingQuotes: async (symbols) => {
+      quoteRequests.push(symbols);
+    },
+    getAccountHoldings: (accountId, currency) =>
+      resolveAccountHoldingsCoverage(store.getState(), accountId, currency),
+  });
+
+  const setupViewCount = invokedViews.length;
+  await dispatcher.refresh();
+
+  assert.deepEqual(quoteRequests, [[
+    ["AAPL", "US"],
+    ["MSFT", "US"],
+  ]]);
+  assert.deepEqual(invokedViews.slice(setupViewCount), [
+    ["get_statistics_by_account", { accountId: "acct-a" }],
+  ]);
+  assert.equal(store.getState().accountStats["acct-a"].marker, "fresh-account");
+});
+
+test("real store and page adapter retain account holdings when that result is newer", async () => {
+  const olderOverview = deferred();
+  const newerAccount = deferred();
+  let accountCalls = 0;
+  const store = createStatisticsStore(async (command) => {
+    if (command === "get_statistics_overview") {
+      return olderOverview.promise;
+    }
+    accountCalls += 1;
+    if (accountCalls === 1) return newerAccount.promise;
+    return { holdings: [], marker: "post-refresh" };
+  });
+
+  const overviewLoad = store
+    .getState()
+    .fetchView({ kind: "overview", baseCurrency: "USD" });
+  const accountLoad = store
+    .getState()
+    .fetchView({ kind: "account", accountId: "acct-a" });
+  olderOverview.resolve({
+    holdings: [
+      { account_id: "acct-a", symbol: "AAPL", market: "US" },
+    ],
+  });
+  await overviewLoad;
+  newerAccount.resolve({
+    holdings: [
+      { account_id: "acct-a", symbol: "TSLA", market: "US" },
+    ],
+  });
+  await accountLoad;
+
+  const quoteRequests = [];
+  let selection = {
+    ...initialSelection,
+    activeTab: "account",
+    selectedAccountId: "acct-a",
+  };
+  const dispatcher = createStatisticsDispatcher({
+    getSelection: () => selection,
+    updateSelection: (next) => {
+      selection = next;
+    },
+    fetchView: store.getState().fetchView,
+    fetchHoldingQuotes: async (symbols) => {
+      quoteRequests.push(symbols);
+    },
+    getAccountHoldings: (accountId, currency) =>
+      resolveAccountHoldingsCoverage(store.getState(), accountId, currency),
+  });
+
+  await dispatcher.refresh();
+
+  assert.deepEqual(quoteRequests, [[
+    ["TSLA", "US"],
+  ]]);
+  assert.equal(accountCalls, 2);
 });
 
 test("known-empty account holdings finish without quote provider calls or a coverage loop", async () => {

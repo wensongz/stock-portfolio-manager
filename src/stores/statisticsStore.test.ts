@@ -226,3 +226,55 @@ test("an overview failure is isolated from another currency success", async () =
     null,
   );
 });
+
+test("result revisions follow request start order and commit atomically", async () => {
+  const accountResponse = deferred();
+  const overviewResponse = deferred();
+  const store = createStatisticsStore(async (command) => {
+    if (command === "get_statistics_by_account") {
+      return accountResponse.promise;
+    }
+    return overviewResponse.promise;
+  });
+  const snapshots = [];
+  const unsubscribe = store.subscribe((state) => {
+    snapshots.push({
+      account: state.accountStats["acct-a"],
+      accountRevision:
+        state.resultRevisionByView?.["account:acct-a"],
+      overview: state.overviewByCurrency.USD,
+      overviewRevision: state.resultRevisionByView?.["overview:USD"],
+    });
+  });
+
+  const accountRequest = store
+    .getState()
+    .fetchView({ kind: "account", accountId: "acct-a" });
+  const overviewRequest = store
+    .getState()
+    .fetchView({ kind: "overview", baseCurrency: "USD" });
+
+  overviewResponse.resolve({ holdings: [], marker: "newer-overview" });
+  await overviewRequest;
+  accountResponse.resolve({ holdings: [], marker: "older-account" });
+  await accountRequest;
+  unsubscribe();
+
+  const state = store.getState();
+  assert.ok(
+    state.resultRevisionByView["account:acct-a"] <
+      state.resultRevisionByView["overview:USD"],
+  );
+  assert.equal(
+    snapshots.every(
+      ({ account, accountRevision }) => !account || accountRevision != null,
+    ),
+    true,
+  );
+  assert.equal(
+    snapshots.every(
+      ({ overview, overviewRevision }) => !overview || overviewRevision != null,
+    ),
+    true,
+  );
+});

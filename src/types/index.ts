@@ -829,33 +829,6 @@ export interface StockOperationDataQuality {
   notes: string[];
 }
 
-export interface QuarterlyHoldingStatus {
-  snapshot_id: string;
-  quarter: string;
-  shares: number;
-  avg_cost: number;
-  close_price: number;
-  pnl_percent: number | null;
-  notes: string | null;
-  decision_quality: "correct" | "wrong" | "pending" | null;
-}
-
-export interface HoldingReview {
-  symbol: string;
-  name: string;
-  market: Market;
-  is_current_holding: boolean;
-  quarterly_timeline: QuarterlyHoldingStatus[];
-}
-
-export interface DecisionStatistics {
-  total_decisions: number;
-  correct_count: number;
-  wrong_count: number;
-  pending_count: number;
-  accuracy_rate: number;
-}
-
 // Phase 6: AI Config
 export interface AiConfig {
   provider: string;

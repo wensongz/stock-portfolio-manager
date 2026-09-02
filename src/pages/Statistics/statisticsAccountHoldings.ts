@@ -17,6 +17,7 @@ interface AccountHoldingsState {
   overviewByCurrency: Partial<
     Record<Currency, Pick<StatisticsOverview, "holdings">>
   >;
+  resultRevisionByView: Record<string, number>;
 }
 
 export type AccountHoldingsCoverage =
@@ -30,12 +31,41 @@ export function resolveAccountHoldingsCoverage(
   currency: Currency,
 ): AccountHoldingsCoverage {
   const accountStatistics = state.accountStats[accountId];
-  const overview = state.overviewByCurrency[currency];
-  const holdings = accountStatistics
-    ? accountStatistics.holdings
-    : overview?.holdings.filter(
-        (holding) => holding.account_id === accountId,
-      );
+  const accountRevision =
+    state.resultRevisionByView[`account:${accountId}`];
+  let newestSource =
+    accountStatistics && accountRevision != null
+      ? {
+          revision: accountRevision,
+          holdings: accountStatistics.holdings,
+        }
+      : undefined;
+
+  const currencies: Currency[] = [
+    currency,
+    ...(["USD", "CNY", "HKD"] as Currency[]).filter(
+      (candidate) => candidate !== currency,
+    ),
+  ];
+  for (const candidateCurrency of currencies) {
+    const overview = state.overviewByCurrency[candidateCurrency];
+    const overviewRevision =
+      state.resultRevisionByView[`overview:${candidateCurrency}`];
+    if (
+      overview &&
+      overviewRevision != null &&
+      (!newestSource || overviewRevision > newestSource.revision)
+    ) {
+      newestSource = {
+        revision: overviewRevision,
+        holdings: overview.holdings.filter(
+          (holding) => holding.account_id === accountId,
+        ),
+      };
+    }
+  }
+
+  const holdings = newestSource?.holdings;
 
   if (!holdings) return { status: "unknown" };
   if (holdings.length === 0) return { status: "known-empty" };

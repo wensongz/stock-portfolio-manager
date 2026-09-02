@@ -23,7 +23,7 @@ use crate::services::ai_models_service::resolve_base_url;
 use crate::services::exchange_rate_service::{get_cached_rates, ExchangeRateCache};
 use crate::services::http_client;
 use crate::services::performance_service::{self, PerformanceFilter};
-use crate::services::quote_service::QuoteCache;
+use crate::services::quote_service::{QuoteCache, QuoteServiceState};
 use crate::services::skill_service::{self, build_skill_system_message};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -985,6 +985,7 @@ pub async fn chat_stream(
     db: &Database,
     cache: &ExchangeRateCache,
     quote_cache: &QuoteCache,
+    quote_state: &QuoteServiceState,
     params: ChatParams,
 ) -> Result<(), String> {
     // Anthropic uses the native Messages API, not OpenAI-compatible
@@ -993,7 +994,7 @@ pub async fn chat_stream(
         .map(|c| c.provider)
         .unwrap_or_default();
     if cfg_provider.eq_ignore_ascii_case("anthropic") {
-        return chat_stream_anthropic(app, db, cache, quote_cache, params).await;
+        return chat_stream_anthropic(app, db, cache, quote_cache, quote_state, params).await;
     }
 
     let emit_error = |app: &AppHandle, msg: String| {
@@ -1089,6 +1090,7 @@ pub async fn chat_stream(
         db,
         cache,
         quote_cache,
+        quote_state,
         latest_user_message(&params),
     );
     if let Some(context) = &params.tool_context {
@@ -1768,6 +1770,7 @@ async fn chat_stream_anthropic(
     db: &Database,
     cache: &ExchangeRateCache,
     quote_cache: &QuoteCache,
+    quote_state: &QuoteServiceState,
     params: ChatParams,
 ) -> Result<(), String> {
     let emit_error = |app: &AppHandle, msg: String| {
@@ -1839,6 +1842,7 @@ async fn chat_stream_anthropic(
         db,
         cache,
         quote_cache,
+        quote_state,
         latest_user_message(&params),
     );
     if let Some(context) = &params.tool_context {

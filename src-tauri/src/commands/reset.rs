@@ -3,7 +3,7 @@ use crate::db::{Database, SYSTEM_CATEGORIES};
 use crate::models::ai_config::AiConfig;
 use crate::models::quote_provider::QuoteProviderConfig;
 use crate::services::exchange_rate_service::ExchangeRateCache;
-use crate::services::quote_service::{self, QuoteCache};
+use crate::services::quote_service::{self, QuoteCache, QuoteServiceState};
 use chrono::Utc;
 use rusqlite::{Connection, Result as SqlResult, Transaction};
 use tauri::State;
@@ -130,6 +130,7 @@ pub fn factory_reset(
     app: tauri::AppHandle,
     db: State<'_, Database>,
     quote_cache: State<'_, QuoteCache>,
+    quote_state: State<'_, QuoteServiceState>,
     rate_cache: State<'_, ExchangeRateCache>,
 ) -> Result<(), String> {
     let mut conn = db.conn.lock().map_err(|e| e.to_string())?;
@@ -144,9 +145,9 @@ pub fn factory_reset(
 
     // Forget any user-supplied Xueqiu credentials and invalidate the session
     // token so the next fetch rebuilds state from the now-empty config.
-    quote_service::set_xueqiu_user_cookie(None);
-    quote_service::set_xueqiu_user_u(None);
-    quote_service::reset_xueqiu_token();
+    quote_service::set_xueqiu_user_cookie(&quote_state, None);
+    quote_service::set_xueqiu_user_u(&quote_state, None);
+    quote_service::reset_xueqiu_token(&quote_state);
 
     // Restore AI skills to the factory set. Best-effort: a failure here
     // shouldn't undo the otherwise-successful wipe.

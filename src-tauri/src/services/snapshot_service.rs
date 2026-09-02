@@ -4,9 +4,9 @@ use crate::models::DailyHoldingSnapshot;
 use crate::models::DailyPortfolioValue;
 use crate::services::exchange_rate_service::ExchangeRateCache;
 use crate::services::quote_provider_service;
-use crate::services::quote_service::fetch_stock_history;
 #[cfg(test)]
 use crate::services::quote_service::{fetch_quotes_batch_cached_with_providers, QuoteCache};
+use crate::services::quote_service::{fetch_stock_history, QuoteServiceState};
 use chrono::{Datelike, NaiveDate, Timelike};
 use tracing::{info, warn};
 
@@ -52,6 +52,7 @@ pub async fn take_daily_snapshot(
     db: &Database,
     cache: &ExchangeRateCache,
     quote_cache: &QuoteCache,
+    quote_state: &QuoteServiceState,
     date: NaiveDate,
 ) -> Result<(), String> {
     let date_str = date.format("%Y-%m-%d").to_string();
@@ -109,6 +110,7 @@ pub async fn take_daily_snapshot(
     let quotes = {
         let config = quote_provider_service::get_quote_provider_config(db)?;
         fetch_quotes_batch_cached_with_providers(
+            quote_state,
             quote_cache,
             symbols,
             &config.us_provider,
@@ -504,6 +506,7 @@ fn build_symbol_price_plan(
 pub async fn backfill_snapshots(
     db: &Database,
     cache: &ExchangeRateCache,
+    quote_state: &QuoteServiceState,
     start_date: NaiveDate,
     end_date: NaiveDate,
     force: bool,
@@ -515,7 +518,15 @@ pub async fn backfill_snapshots(
         end_date,
         force,
         |symbol, market, fetch_start, fetch_end, provider| async move {
-            fetch_stock_history(&symbol, &market, fetch_start, fetch_end, &provider).await
+            fetch_stock_history(
+                quote_state,
+                &symbol,
+                &market,
+                fetch_start,
+                fetch_end,
+                &provider,
+            )
+            .await
         },
     )
     .await
@@ -1721,7 +1732,8 @@ mod tests {
 
         let start = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
         let end = NaiveDate::from_ymd_opt(2024, 1, 3).unwrap();
-        backfill_snapshots(&db, &rate_cache, start, end, false)
+        let quote_state = QuoteServiceState::new();
+        backfill_snapshots(&db, &rate_cache, &quote_state, start, end, false)
             .await
             .unwrap();
 
@@ -1787,7 +1799,8 @@ mod tests {
 
         let start = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
         let end = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
-        backfill_snapshots(&db, &rate_cache, start, end, false)
+        let quote_state = QuoteServiceState::new();
+        backfill_snapshots(&db, &rate_cache, &quote_state, start, end, false)
             .await
             .unwrap();
 
@@ -1839,7 +1852,8 @@ mod tests {
         }
 
         let date = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
-        take_daily_snapshot(&db, &rate_cache, &quote_cache, date)
+        let quote_state = QuoteServiceState::new();
+        take_daily_snapshot(&db, &rate_cache, &quote_cache, &quote_state, date)
             .await
             .unwrap();
 

@@ -11,7 +11,9 @@
 //! A skill says "answer in this structure"; a tool says "here are real numbers".
 
 use crate::commands::dashboard::build_holding_details_pub;
-use crate::commands::ocr::{lookup_cn_stock_code, lookup_stock_name_by_symbol};
+use crate::commands::ocr::{
+    lookup_cn_stock_code_with_state, lookup_stock_name_by_symbol_with_state,
+};
 use crate::commands::options::get_option_contracts_inner;
 use crate::commands::transactions::query_transactions_inner;
 use crate::db::Database;
@@ -28,7 +30,7 @@ use crate::services::market_overview_service;
 use crate::services::option_review_service;
 use crate::services::performance_service::{self, PerformanceFilter};
 use crate::services::quote_provider_service;
-use crate::services::quote_service::{self, resolve_index_secid, QuoteCache};
+use crate::services::quote_service::{self, resolve_index_secid, QuoteCache, QuoteServiceState};
 use crate::services::stock_operation_builder::normalize_stock_symbol;
 use crate::services::stock_operation_review_service;
 use chrono::{Duration, NaiveDate, Utc};
@@ -479,6 +481,7 @@ pub struct ToolCtx<'a> {
     pub db: &'a Database,
     pub cache: &'a ExchangeRateCache,
     pub quote_cache: &'a QuoteCache,
+    pub quote_state: &'a QuoteServiceState,
 }
 
 impl<'a> ToolCtx<'a> {
@@ -487,12 +490,14 @@ impl<'a> ToolCtx<'a> {
         db: &'a Database,
         cache: &'a ExchangeRateCache,
         quote_cache: &'a QuoteCache,
+        quote_state: &'a QuoteServiceState,
         _user_turn: &str,
     ) -> Self {
         Self {
             db,
             cache,
             quote_cache,
+            quote_state,
         }
     }
 }
@@ -646,9 +651,30 @@ async fn tool_stock_quote(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         Err(e) => return ToolResult::err_json(format!("读取行情源配置失败：{e}")),
     };
     let quote = match market.as_str() {
-        "HK" => quote_service::fetch_hk_quote_with_provider(&symbol, &config.hk_provider).await,
-        "CN" => quote_service::fetch_cn_quote_with_provider(&symbol, &config.cn_provider).await,
-        _ => quote_service::fetch_us_quote_with_provider(&symbol, &config.us_provider).await,
+        "HK" => {
+            quote_service::fetch_hk_quote_with_provider(
+                ctx.quote_state,
+                &symbol,
+                &config.hk_provider,
+            )
+            .await
+        }
+        "CN" => {
+            quote_service::fetch_cn_quote_with_provider(
+                ctx.quote_state,
+                &symbol,
+                &config.cn_provider,
+            )
+            .await
+        }
+        _ => {
+            quote_service::fetch_us_quote_with_provider(
+                ctx.quote_state,
+                &symbol,
+                &config.us_provider,
+            )
+            .await
+        }
     };
     match quote {
         Ok(q) => {
@@ -694,9 +720,13 @@ async fn tool_stock_fundamentals(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult 
         Err(r) => return r,
     };
     let quote = match market.as_str() {
-        "HK" => quote_service::fetch_hk_quote_with_provider(&symbol, &provider).await,
-        "CN" => quote_service::fetch_cn_quote_with_provider(&symbol, &provider).await,
-        _ => quote_service::fetch_us_quote_with_provider(&symbol, &provider).await,
+        "HK" => {
+            quote_service::fetch_hk_quote_with_provider(ctx.quote_state, &symbol, &provider).await
+        }
+        "CN" => {
+            quote_service::fetch_cn_quote_with_provider(ctx.quote_state, &symbol, &provider).await
+        }
+        _ => quote_service::fetch_us_quote_with_provider(ctx.quote_state, &symbol, &provider).await,
     };
     match quote {
         Ok(q) => ToolResult::ok_json(json!({
@@ -728,11 +758,19 @@ async fn tool_technical_indicators(ctx: &ToolCtx<'_>, args: &Value) -> ToolResul
         .clamp(30, 365) as usize;
     let end = Utc::now().date_naive();
     let start = end - Duration::days((days as i64) * 2);
-    let candles =
-        match quote_service::fetch_stock_candles(&symbol, &market, start, end, &provider).await {
-            Ok(c) => c,
-            Err(e) => return ToolResult::err_json(format!("获取 {symbol} K线失败：{e}")),
-        };
+    let candles = match quote_service::fetch_stock_candles(
+        ctx.quote_state,
+        &symbol,
+        &market,
+        start,
+        end,
+        &provider,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => return ToolResult::err_json(format!("获取 {symbol} K线失败：{e}")),
+    };
     if candles.len() < 20 {
         return ToolResult::ok_json(json!({
             "symbol": symbol,
@@ -829,7 +867,16 @@ async fn tool_price_history(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     };
     let end = Utc::now().date_naive();
     let start = end - Duration::days(days as i64 * 2); // x2 to clear weekends/holidays
-    match quote_service::fetch_stock_history(&symbol, &market, start, end, provider).await {
+    match quote_service::fetch_stock_history(
+        ctx.quote_state,
+        &symbol,
+        &market,
+        start,
+        end,
+        provider,
+    )
+    .await
+    {
         Ok(history) => {
             // Trim to the last `days` points so we don't ship a year of rows
             // when the model only asked for a week.
@@ -905,7 +952,7 @@ async fn tool_performance_metrics(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult
 // New tools (batch 2)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn tool_search_stock(_ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+async fn tool_search_stock(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let query = match args.get("query").and_then(|v| v.as_str()) {
         Some(s) => s.trim().to_string(),
         None => return ToolResult::err_json("缺少参数 query"),
@@ -919,7 +966,8 @@ async fn tool_search_stock(_ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         .unwrap_or("name_to_symbol");
     match direction {
         "symbol_to_name" => {
-            let result = lookup_stock_name_by_symbol(query.clone()).await;
+            let result =
+                lookup_stock_name_by_symbol_with_state(ctx.quote_state, query.clone()).await;
             match result {
                 Ok(Some(name)) => ToolResult::ok_json(json!({ "symbol": query, "name": name })),
                 Ok(None) => ToolResult::ok_json(
@@ -929,7 +977,7 @@ async fn tool_search_stock(_ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
             }
         }
         _ => {
-            let result = lookup_cn_stock_code(query.clone()).await;
+            let result = lookup_cn_stock_code_with_state(ctx.quote_state, query.clone()).await;
             match result {
                 Ok(Some(code)) => {
                     // lookup returns lowercased code (e.g. "sh600519"); normalise to the
@@ -1343,7 +1391,10 @@ async fn tool_stock_review(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         Err(error) => return ToolResult::err_json(error),
     };
     let report = match stock_operation_review_service::get_stock_operation_review_with_refresh(
-        ctx.db, query, true,
+        ctx.db,
+        Some(ctx.quote_state),
+        query,
+        true,
     )
     .await
     {
@@ -1528,7 +1579,9 @@ mod tests {
         let db = Database::new(":memory:").unwrap();
         let cache = ExchangeRateCache::new();
         let quote_cache = QuoteCache::new();
-        let ctx = ToolCtx::for_untrusted_model_turn(&db, &cache, &quote_cache, "untrusted");
+        let quote_state = QuoteServiceState::new();
+        let ctx =
+            ToolCtx::for_untrusted_model_turn(&db, &cache, &quote_cache, &quote_state, "untrusted");
         let result = execute_tool(
             &ctx,
             "get_stock_review",
@@ -1551,7 +1604,9 @@ mod tests {
         let db = Database::new(":memory:").unwrap();
         let cache = ExchangeRateCache::new();
         let quote_cache = QuoteCache::new();
-        let ctx = ToolCtx::for_untrusted_model_turn(&db, &cache, &quote_cache, "untrusted");
+        let quote_state = QuoteServiceState::new();
+        let ctx =
+            ToolCtx::for_untrusted_model_turn(&db, &cache, &quote_cache, &quote_state, "untrusted");
 
         for (arguments, field) in [
             (

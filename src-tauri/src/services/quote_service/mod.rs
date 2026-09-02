@@ -27,11 +27,17 @@ pub use history::{fetch_stock_candles, fetch_stock_history};
 pub use persistence::{
     get_quote_refresh_time, load_quotes_from_db, save_quote_refresh_time, save_quotes_to_db,
 };
+#[cfg(test)]
+use xueqiu::{
+    build_xueqiu_cookie_header, parse_xueqiu_quote, to_xueqiu_cn_symbol, to_xueqiu_hk_symbol,
+    to_xueqiu_us_symbol, xueqiu_history_request_count, XueqiuData, XueqiuKlineResponse,
+    XueqiuQuote, XueqiuResponse, XUEQIU_API_FAILED_HINT,
+};
 #[allow(unused_imports)]
 pub use xueqiu::{
     clear_quote_warning, fetch_candles_xueqiu, fetch_stock_history_xueqiu, peek_quote_warning,
-    register_db_path, reset_xueqiu_token, set_xueqiu_user_cookie, set_xueqiu_user_u,
-    take_quote_warning, xueqiu_fetch,
+    reset_xueqiu_token, set_xueqiu_user_cookie, set_xueqiu_user_u, take_quote_warning,
+    xueqiu_fetch, QuoteServiceState,
 };
 #[allow(unused_imports)]
 pub(crate) use xueqiu::{
@@ -41,12 +47,7 @@ pub(crate) use xueqiu::{
 use xueqiu::{
     fetch_stock_history_xueqiu_outcome, fetch_xueqiu_cn_quote, fetch_xueqiu_hk_quote,
     fetch_xueqiu_us_quote, is_xueqiu_cookie_expired_error, is_xueqiu_request_error,
-    record_xueqiu_warning, LAST_QUOTE_WARNING, XUEQIU_API_FAILED_HINT, XUEQIU_COOKIE_EXPIRED_HINT,
-};
-#[cfg(test)]
-use xueqiu::{
-    parse_xueqiu_quote, to_xueqiu_cn_symbol, to_xueqiu_hk_symbol, to_xueqiu_us_symbol,
-    xueqiu_history_request_count, XueqiuData, XueqiuKlineResponse, XueqiuQuote, XueqiuResponse,
+    record_batch_warning, record_xueqiu_warning,
 };
 pub use yahoo::{fetch_stock_history_yahoo, fetch_yahoo_quote, to_yahoo_symbol};
 
@@ -115,8 +116,8 @@ pub fn make_cash_quote(symbol: &str, market: &str) -> StockQuote {
 
 /// Fetch a US stock quote using the configured provider.
 #[cfg(test)]
-pub async fn fetch_us_quote(symbol: &str) -> Result<StockQuote, String> {
-    fetch_us_quote_with_provider(symbol, "eastmoney").await
+pub async fn fetch_us_quote(state: &QuoteServiceState, symbol: &str) -> Result<StockQuote, String> {
+    fetch_us_quote_with_provider(state, symbol, "eastmoney").await
 }
 
 /// Fetch a US stock quote using the specified provider.
@@ -125,15 +126,16 @@ pub async fn fetch_us_quote(symbol: &str) -> Result<StockQuote, String> {
 /// Money, then to Yahoo — matching the resilient behaviour of
 /// [`fetch_stock_history`].
 pub async fn fetch_us_quote_with_provider(
+    state: &QuoteServiceState,
     symbol: &str,
     provider: &str,
 ) -> Result<StockQuote, String> {
     match provider {
         "eastmoney" => fetch_eastmoney_us_quote(symbol).await,
-        "xueqiu" => match fetch_xueqiu_us_quote(symbol).await {
+        "xueqiu" => match fetch_xueqiu_us_quote(state, symbol).await {
             Ok(q) => Ok(q),
             Err(e) => {
-                record_xueqiu_warning(&e);
+                record_xueqiu_warning(state, &e);
                 info!(
                     "fetch_us_quote: Xueqiu failed for {}: {}, falling back to eastmoney",
                     symbol, e
@@ -164,15 +166,16 @@ pub async fn fetch_us_quote_with_provider(
 /// Money, then to Yahoo — matching the resilient behaviour of
 /// [`fetch_stock_history`].
 pub async fn fetch_hk_quote_with_provider(
+    state: &QuoteServiceState,
     symbol: &str,
     provider: &str,
 ) -> Result<StockQuote, String> {
     match provider {
         "eastmoney" => fetch_eastmoney_hk_quote(symbol).await,
-        "xueqiu" => match fetch_xueqiu_hk_quote(symbol).await {
+        "xueqiu" => match fetch_xueqiu_hk_quote(state, symbol).await {
             Ok(q) => Ok(q),
             Err(e) => {
-                record_xueqiu_warning(&e);
+                record_xueqiu_warning(state, &e);
                 info!(
                     "fetch_hk_quote: Xueqiu failed for {}: {}, falling back to eastmoney",
                     symbol, e
@@ -207,8 +210,8 @@ pub async fn fetch_hk_quote_with_provider(
 
 /// Fetch a CN A-share stock quote using East Money.
 #[cfg(test)]
-pub async fn fetch_cn_quote(symbol: &str) -> Result<StockQuote, String> {
-    fetch_cn_quote_with_provider(symbol, "eastmoney").await
+pub async fn fetch_cn_quote(state: &QuoteServiceState, symbol: &str) -> Result<StockQuote, String> {
+    fetch_cn_quote_with_provider(state, symbol, "eastmoney").await
 }
 
 /// Fetch a CN A-share stock quote using the specified provider.
@@ -219,14 +222,15 @@ pub async fn fetch_cn_quote(symbol: &str) -> Result<StockQuote, String> {
 /// quotes keep working. This mirrors the resilient chain already used by
 /// [`fetch_stock_history`].
 pub async fn fetch_cn_quote_with_provider(
+    state: &QuoteServiceState,
     symbol: &str,
     provider: &str,
 ) -> Result<StockQuote, String> {
     match provider {
-        "xueqiu" => match fetch_xueqiu_cn_quote(symbol).await {
+        "xueqiu" => match fetch_xueqiu_cn_quote(state, symbol).await {
             Ok(q) => Ok(q),
             Err(e) => {
-                record_xueqiu_warning(&e);
+                record_xueqiu_warning(state, &e);
                 info!(
                     "fetch_cn_quote: Xueqiu failed for {}: {}, falling back to eastmoney",
                     symbol, e
@@ -243,6 +247,7 @@ pub async fn fetch_cn_quote_with_provider(
 /// Cash symbols return synthetic quotes (price = 1.0).
 /// Duplicate symbols are automatically deduplicated so that each symbol is fetched only once.
 pub async fn fetch_quotes_batch_with_providers(
+    state: &QuoteServiceState,
     symbols: Vec<(String, String)>,
     us_provider: &str,
     hk_provider: &str,
@@ -281,9 +286,9 @@ pub async fn fetch_quotes_batch_with_providers(
             continue;
         }
         let result = match market.as_str() {
-            "US" => fetch_us_quote_with_provider(&symbol, us_provider).await,
-            "HK" => fetch_hk_quote_with_provider(&symbol, hk_provider).await,
-            "CN" => fetch_cn_quote_with_provider(&symbol, cn_provider).await,
+            "US" => fetch_us_quote_with_provider(state, &symbol, us_provider).await,
+            "HK" => fetch_hk_quote_with_provider(state, &symbol, hk_provider).await,
+            "CN" => fetch_cn_quote_with_provider(state, &symbol, cn_provider).await,
             _ => Err(format!("Unknown market: {}", market)),
         };
         match result {
@@ -305,11 +310,7 @@ pub async fn fetch_quotes_batch_with_providers(
             }
         }
     }
-    if has_xueqiu_cookie_warning {
-        *LAST_QUOTE_WARNING.lock().unwrap() = Some(XUEQIU_COOKIE_EXPIRED_HINT.to_string());
-    } else if has_xueqiu_api_warning {
-        *LAST_QUOTE_WARNING.lock().unwrap() = Some(XUEQIU_API_FAILED_HINT.to_string());
-    }
+    record_batch_warning(state, has_xueqiu_cookie_warning, has_xueqiu_api_warning);
     Ok(quotes)
 }
 

@@ -3,6 +3,7 @@ use crate::models::review::{DecisionStatistics, HoldingReview};
 use crate::models::stock_operation_review::{
     StockOperationReviewQuery, StockOperationReviewReport,
 };
+use crate::services::quote_service::QuoteServiceState;
 use crate::services::{review_service, stock_operation_review_service};
 use chrono::NaiveDate;
 use tauri::State;
@@ -43,9 +44,10 @@ pub async fn get_stock_operation_review(
     market: Option<String>,
     base_currency: String,
     db: State<'_, Database>,
+    quote_state: State<'_, QuoteServiceState>,
 ) -> Result<StockOperationReviewReport, String> {
     let query = stock_operation_query(&start_date, &end_date, account_id, market, base_currency)?;
-    stock_operation_review_service::get_stock_operation_review(&db, query).await
+    stock_operation_review_service::get_stock_operation_review(&db, &quote_state, query).await
 }
 
 #[tauri::command(rename_all = "camelCase")]

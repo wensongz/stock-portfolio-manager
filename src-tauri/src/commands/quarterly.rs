@@ -5,7 +5,7 @@ use crate::models::quarterly::{
 };
 use crate::services::exchange_rate_service::ExchangeRateCache;
 use crate::services::quarterly_service;
-use crate::services::quote_service::QuoteCache;
+use crate::services::quote_service::{QuoteCache, QuoteServiceState};
 use tauri::State;
 
 #[tauri::command(rename_all = "camelCase")]
@@ -13,9 +13,11 @@ pub async fn create_quarterly_snapshot(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
     quote_cache: State<'_, QuoteCache>,
+    quote_state: State<'_, QuoteServiceState>,
     quarter: Option<String>,
 ) -> Result<QuarterlySnapshot, String> {
-    quarterly_service::create_quarterly_snapshot(&db, &cache, &quote_cache, quarter).await
+    quarterly_service::create_quarterly_snapshot(&db, &cache, &quote_cache, &quote_state, quarter)
+        .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -46,9 +48,17 @@ pub async fn refresh_quarterly_snapshot(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
     quote_cache: State<'_, QuoteCache>,
+    quote_state: State<'_, QuoteServiceState>,
     snapshot_id: String,
 ) -> Result<QuarterlySnapshotDetail, String> {
-    quarterly_service::refresh_quarterly_snapshot(&db, &cache, &quote_cache, &snapshot_id).await
+    quarterly_service::refresh_quarterly_snapshot(
+        &db,
+        &cache,
+        &quote_cache,
+        &quote_state,
+        &snapshot_id,
+    )
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -109,8 +119,10 @@ pub async fn ensure_current_quarter_snapshot(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
     quote_cache: State<'_, QuoteCache>,
+    quote_state: State<'_, QuoteServiceState>,
 ) -> Result<Option<QuarterlySnapshot>, String> {
-    quarterly_service::ensure_current_quarter_snapshot(&db, &cache, &quote_cache).await
+    quarterly_service::ensure_current_quarter_snapshot(&db, &cache, &quote_cache, &quote_state)
+        .await
 }
 
 #[tauri::command(rename_all = "camelCase")]

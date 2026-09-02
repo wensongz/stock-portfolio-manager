@@ -2,6 +2,27 @@ use super::*;
 use crate::services::http_client;
 
 #[test]
+fn quote_service_state_keeps_credentials_and_warnings_isolated() {
+    let first = QuoteServiceState::new();
+    let second = QuoteServiceState::new();
+
+    set_xueqiu_user_cookie(&first, Some(" token-a ".to_string()));
+    set_xueqiu_user_u(&first, Some(" user-a ".to_string()));
+    record_xueqiu_warning(&first, "Xueqiu request failed");
+
+    assert_eq!(
+        build_xueqiu_cookie_header(&first).as_deref(),
+        Some("xq_a_token=token-a; u=user-a")
+    );
+    assert_eq!(
+        take_quote_warning(&first).as_deref(),
+        Some(XUEQIU_API_FAILED_HINT)
+    );
+    assert_eq!(build_xueqiu_cookie_header(&second), None);
+    assert_eq!(take_quote_warning(&second), None);
+}
+
+#[test]
 fn resolve_index_secid_handles_common_forms() {
     // US indices — ^-prefixed, bare, and suffix-stripped.
     assert_eq!(resolve_index_secid("^GSPC").unwrap().0, "100.SPX");
@@ -526,8 +547,10 @@ fn test_fetch_quotes_batch_with_providers_deduplicates_symbols() {
         ("$CASH-HKD".to_string(), "HK".to_string()),
     ];
     let rt = tokio::runtime::Runtime::new().unwrap();
+    let state = QuoteServiceState::new();
     let quotes = rt
         .block_on(fetch_quotes_batch_with_providers(
+            &state,
             symbols,
             "eastmoney",
             "eastmoney",
@@ -553,8 +576,10 @@ fn test_fetch_quotes_batch_cached_deduplicates_symbols() {
         ("$CASH-CNY".to_string(), "CN".to_string()), // duplicate
     ];
     let rt = tokio::runtime::Runtime::new().unwrap();
+    let state = QuoteServiceState::new();
     let quotes = rt
         .block_on(fetch_quotes_batch_cached_with_providers(
+            &state,
             &cache,
             symbols,
             "eastmoney",
@@ -606,10 +631,12 @@ fn test_fetch_quotes_batch_cached_force_refresh() {
 
     let symbols = vec![("$CASH-USD".to_string(), "US".to_string())];
     let rt = tokio::runtime::Runtime::new().unwrap();
+    let state = QuoteServiceState::new();
 
     // With force_refresh=false, should return cached data
     let quotes = rt
         .block_on(fetch_quotes_batch_cached_with_providers(
+            &state,
             &cache,
             symbols.clone(),
             "eastmoney",
@@ -625,6 +652,7 @@ fn test_fetch_quotes_batch_cached_force_refresh() {
     // With force_refresh=true, should fetch fresh data (cash quote has price 1.0)
     let quotes = rt
         .block_on(fetch_quotes_batch_cached_with_providers(
+            &state,
             &cache,
             symbols,
             "eastmoney",
@@ -706,7 +734,9 @@ async fn test_batch_fetch_cash_symbols_no_network() {
         ("$CASH-CNY".to_string(), "CN".to_string()),
         ("$CASH-HKD".to_string(), "HK".to_string()),
     ];
-    let result = fetch_quotes_batch_with_providers(symbols, "yahoo", "yahoo", "eastmoney").await;
+    let state = QuoteServiceState::new();
+    let result =
+        fetch_quotes_batch_with_providers(&state, symbols, "yahoo", "yahoo", "eastmoney").await;
     assert!(result.is_ok());
     let quotes = result.unwrap();
     assert_eq!(quotes.len(), 3);
@@ -724,7 +754,8 @@ async fn test_batch_fetch_cash_symbols_no_network() {
 #[tokio::test]
 #[ignore]
 async fn test_integration_cn_eastmoney() {
-    let result = fetch_cn_quote("sh600519").await;
+    let state = QuoteServiceState::new();
+    let result = fetch_cn_quote(&state, "sh600519").await;
     match &result {
         Ok(quote) => {
             assert_eq!(quote.symbol, "sh600519");
@@ -743,7 +774,8 @@ async fn test_integration_cn_eastmoney() {
 #[tokio::test]
 #[ignore]
 async fn test_integration_us_yahoo() {
-    let result = fetch_us_quote("MSFT").await;
+    let state = QuoteServiceState::new();
+    let result = fetch_us_quote(&state, "MSFT").await;
     match &result {
         Ok(quote) => {
             assert!(quote.current_price > 0.0, "Price should be positive");
@@ -1121,12 +1153,16 @@ fn test_parse_xueqiu_quote_error_code() {
 
 #[test]
 fn test_record_xueqiu_warning_preserves_fallback_failure_for_frontend() {
-    clear_quote_warning();
+    let state = QuoteServiceState::new();
+    clear_quote_warning(&state);
 
-    record_xueqiu_warning("Network error fetching AAPL from Xueqiu: operation timed out");
+    record_xueqiu_warning(
+        &state,
+        "Network error fetching AAPL from Xueqiu: operation timed out",
+    );
 
     assert_eq!(
-        take_quote_warning().as_deref(),
+        take_quote_warning(&state).as_deref(),
         Some(XUEQIU_API_FAILED_HINT)
     );
 }
@@ -1276,7 +1312,8 @@ fn test_xueqiu_client_can_build_request() {
 #[tokio::test]
 #[ignore]
 async fn test_integration_cn_xueqiu() {
-    let result = fetch_xueqiu_cn_quote("sh600519").await;
+    let state = QuoteServiceState::new();
+    let result = fetch_xueqiu_cn_quote(&state, "sh600519").await;
     match &result {
         Ok(quote) => {
             assert_eq!(quote.symbol, "sh600519");
@@ -1295,7 +1332,8 @@ async fn test_integration_cn_xueqiu() {
 #[tokio::test]
 #[ignore]
 async fn test_integration_us_xueqiu() {
-    let result = fetch_xueqiu_us_quote("AAPL").await;
+    let state = QuoteServiceState::new();
+    let result = fetch_xueqiu_us_quote(&state, "AAPL").await;
     match &result {
         Ok(quote) => {
             assert_eq!(quote.market, "US");
@@ -1314,7 +1352,8 @@ async fn test_integration_us_xueqiu() {
 #[tokio::test]
 #[ignore]
 async fn test_integration_hk_xueqiu() {
-    let result = fetch_xueqiu_hk_quote("00700").await;
+    let state = QuoteServiceState::new();
+    let result = fetch_xueqiu_hk_quote(&state, "00700").await;
     match &result {
         Ok(quote) => {
             assert_eq!(quote.market, "HK");

@@ -10,7 +10,7 @@ use crate::services::exchange_rate_service::{
 };
 use crate::services::quote_provider_service;
 use crate::services::quote_service::{
-    fetch_quotes_batch_cached_with_providers, fetch_stock_history, QuoteCache,
+    fetch_quotes_batch_cached_with_providers, fetch_stock_history, QuoteCache, QuoteServiceState,
 };
 use chrono::{Datelike, NaiveDate, Utc};
 use std::collections::{HashMap, HashSet};
@@ -77,6 +77,7 @@ pub async fn create_quarterly_snapshot(
     db: &Database,
     cache: &ExchangeRateCache,
     quote_cache: &QuoteCache,
+    quote_state: &QuoteServiceState,
     quarter: Option<String>,
 ) -> Result<QuarterlySnapshot, String> {
     let today = Utc::now().date_naive();
@@ -147,6 +148,7 @@ pub async fn create_quarterly_snapshot(
     let price_map = get_prices_for_date(
         db,
         quote_cache,
+        quote_state,
         &rows.iter().map(|r| r.symbol.clone()).collect(),
         snapshot_date,
     )
@@ -330,6 +332,7 @@ pub async fn create_quarterly_snapshot(
 async fn get_prices_for_date(
     db: &Database,
     quote_cache: &QuoteCache,
+    quote_state: &QuoteServiceState,
     symbols: &Vec<String>,
     date: NaiveDate,
 ) -> Result<HashMap<String, f64>, String> {
@@ -391,6 +394,7 @@ async fn get_prices_for_date(
             let quotes = {
                 let config = quote_provider_service::get_quote_provider_config(db)?;
                 fetch_quotes_batch_cached_with_providers(
+                    quote_state,
                     quote_cache,
                     sym_market_pairs,
                     &config.us_provider,
@@ -790,6 +794,7 @@ pub async fn refresh_quarterly_snapshot(
     db: &Database,
     cache: &ExchangeRateCache,
     quote_cache: &QuoteCache,
+    quote_state: &QuoteServiceState,
     snapshot_id: &str,
 ) -> Result<QuarterlySnapshotDetail, String> {
     // 1. Read existing snapshot header
@@ -1207,6 +1212,7 @@ pub async fn refresh_quarterly_snapshot(
         if !sym_market_pairs.is_empty() {
             let config = quote_provider_service::get_quote_provider_config(db)?;
             let quotes = fetch_quotes_batch_cached_with_providers(
+                quote_state,
                 quote_cache,
                 sym_market_pairs,
                 &config.us_provider,
@@ -1251,8 +1257,15 @@ pub async fn refresh_quarterly_snapshot(
                 "HK" => &config.hk_provider,
                 _ => "yahoo",
             };
-            if let Ok(hist) =
-                fetch_stock_history(symbol, _market, lookback_start, fetch_end, provider).await
+            if let Ok(hist) = fetch_stock_history(
+                quote_state,
+                symbol,
+                _market,
+                lookback_start,
+                fetch_end,
+                provider,
+            )
+            .await
             {
                 if let Some((_date, price)) = hist.into_iter().rfind(|(d, _)| *d <= end_date) {
                     if price > 0.0 {
@@ -2393,6 +2406,7 @@ pub async fn ensure_current_quarter_snapshot(
     db: &Database,
     cache: &ExchangeRateCache,
     quote_cache: &QuoteCache,
+    quote_state: &QuoteServiceState,
 ) -> Result<Option<QuarterlySnapshot>, String> {
     let today = Utc::now().date_naive();
     let current_quarter = date_to_quarter(today);
@@ -2414,7 +2428,9 @@ pub async fn ensure_current_quarter_snapshot(
     }
 
     // No snapshot yet for this quarter — create one automatically
-    let snapshot = create_quarterly_snapshot(db, cache, quote_cache, Some(current_quarter)).await?;
+    let snapshot =
+        create_quarterly_snapshot(db, cache, quote_cache, quote_state, Some(current_quarter))
+            .await?;
     Ok(Some(snapshot))
 }
 

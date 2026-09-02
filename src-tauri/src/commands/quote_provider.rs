@@ -1,5 +1,6 @@
 use crate::db::Database;
 use crate::models::quote_provider::QuoteProviderConfig;
+use crate::services::quote_service::QuoteServiceState;
 use crate::services::{quote_provider_service, quote_service};
 use tauri::{Manager, State};
 
@@ -13,12 +14,13 @@ pub async fn get_quote_provider_config(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn update_quote_provider_config(
     db: State<'_, Database>,
+    quote_state: State<'_, QuoteServiceState>,
     config: QuoteProviderConfig,
 ) -> Result<bool, String> {
     // Apply the user-provided Xueqiu cookie and `u` value immediately so that
     // subsequent API requests use them without waiting for a restart.
-    quote_service::set_xueqiu_user_cookie(config.xueqiu_cookie.clone());
-    quote_service::set_xueqiu_user_u(config.xueqiu_u.clone());
+    quote_service::set_xueqiu_user_cookie(&quote_state, config.xueqiu_cookie.clone());
+    quote_service::set_xueqiu_user_u(&quote_state, config.xueqiu_u.clone());
 
     quote_provider_service::update_quote_provider_config(&db, &config)
 }
@@ -42,6 +44,7 @@ pub async fn update_quote_provider_config(
 pub async fn capture_xueqiu_cookies(
     app: tauri::AppHandle,
     db: State<'_, Database>,
+    quote_state: State<'_, QuoteServiceState>,
     close_window: Option<bool>,
 ) -> Result<QuoteProviderConfig, String> {
     let win = app.get_webview_window("xueqiu_login").ok_or_else(|| {
@@ -82,9 +85,9 @@ pub async fn capture_xueqiu_cookies(
             config.xueqiu_u = Some(u);
 
             // Apply to in-memory state immediately, then persist.
-            quote_service::set_xueqiu_user_cookie(config.xueqiu_cookie.clone());
-            quote_service::set_xueqiu_user_u(config.xueqiu_u.clone());
-            quote_service::reset_xueqiu_token();
+            quote_service::set_xueqiu_user_cookie(&quote_state, config.xueqiu_cookie.clone());
+            quote_service::set_xueqiu_user_u(&quote_state, config.xueqiu_u.clone());
+            quote_service::reset_xueqiu_token(&quote_state);
             quote_provider_service::update_quote_provider_config(&db, &config)?;
             Ok(config)
         }
@@ -117,6 +120,7 @@ pub async fn capture_xueqiu_cookies(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn parse_xueqiu_cookie_text(
     db: State<'_, Database>,
+    quote_state: State<'_, QuoteServiceState>,
     raw: String,
     existing: QuoteProviderConfig,
 ) -> Result<QuoteProviderConfig, String> {
@@ -129,9 +133,9 @@ pub async fn parse_xueqiu_cookie_text(
     if !trimmed.contains('=') {
         let mut config = existing;
         config.xueqiu_cookie = Some(trimmed.to_string());
-        quote_service::set_xueqiu_user_cookie(config.xueqiu_cookie.clone());
-        quote_service::set_xueqiu_user_u(config.xueqiu_u.clone());
-        quote_service::reset_xueqiu_token();
+        quote_service::set_xueqiu_user_cookie(&quote_state, config.xueqiu_cookie.clone());
+        quote_service::set_xueqiu_user_u(&quote_state, config.xueqiu_u.clone());
+        quote_service::reset_xueqiu_token(&quote_state);
         quote_provider_service::update_quote_provider_config(&db, &config)?;
         return Ok(config);
     }
@@ -163,9 +167,9 @@ pub async fn parse_xueqiu_cookie_text(
         config.xueqiu_u = u_value;
     }
 
-    quote_service::set_xueqiu_user_cookie(config.xueqiu_cookie.clone());
-    quote_service::set_xueqiu_user_u(config.xueqiu_u.clone());
-    quote_service::reset_xueqiu_token();
+    quote_service::set_xueqiu_user_cookie(&quote_state, config.xueqiu_cookie.clone());
+    quote_service::set_xueqiu_user_u(&quote_state, config.xueqiu_u.clone());
+    quote_service::reset_xueqiu_token(&quote_state);
     quote_provider_service::update_quote_provider_config(&db, &config)?;
     Ok(config)
 }

@@ -4,7 +4,7 @@ use crate::services::http_client;
 use chrono::Utc;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -12,89 +12,36 @@ use tracing::{info, warn};
 // Xueqiu (雪球) API
 // ---------------------------------------------------------------------------
 
-/// Whether the Xueqiu client has obtained a session cookie from the homepage.
-static XUEQIU_TOKEN_INITIALIZED: AtomicBool = AtomicBool::new(false);
-
-/// User-provided Xueqiu cookie string (e.g. `xq_a_token=xxx`).
-/// When set, this replaces the auto-obtained xq_a_token in API requests.
-static XUEQIU_USER_COOKIE: Mutex<Option<String>> = Mutex::new(None);
-
-/// User-provided Xueqiu `u` cookie value (user ID from a logged-in browser session).
-/// When set, it is appended alongside `xq_a_token` in the Cookie header
-/// to authenticate kline API requests.
-static XUEQIU_USER_U: Mutex<Option<String>> = Mutex::new(None);
-
-/// Path to the SQLite database file, registered at startup so that the
-/// Xueqiu cookie/u can be re-read from the `quote_provider_config` table when
-/// the in-memory copies are empty (e.g. right after an app restart, before any
-/// command has synced them). See [`load_xueqiu_creds_from_db`].
-static APP_DB_PATH: OnceLock<String> = OnceLock::new();
-
-/// Register the database path once at startup (called from `lib.rs`).
+/// Runtime-owned Xueqiu credentials, session token and warning state.
 ///
-/// This lets [`get_xueqiu_user_cookie`] / [`get_xueqiu_user_u`] fall back to
-/// the database when their in-memory statics are `None`, so that user-provided
-/// cookies work regardless of call path (quote commands, AI tools, background
-/// refresh) without each entry point having to call `set_xueqiu_user_cookie`.
-pub fn register_db_path(path: impl Into<String>) {
-    let _ = APP_DB_PATH.set(path.into());
+/// Tauri manages one instance for the application. Tests can create isolated
+/// instances, and quote requests no longer open a second SQLite connection or
+/// rely on process-wide mutable statics.
+pub struct QuoteServiceState {
+    token_initialized: AtomicBool,
+    user_cookie: Mutex<Option<String>>,
+    user_u: Mutex<Option<String>>,
+    auto_cookie: Mutex<Option<String>>,
+    last_quote_warning: Mutex<Option<String>>,
 }
 
-/// Read the Xueqiu cookie and `u` value straight from the
-/// `quote_provider_config` table. Returns `(None, None)` when the DB path is
-/// unknown or the row/columns are absent. Uses a fresh short-lived read-only
-/// connection so it never contends with the main connection for long.
-fn load_xueqiu_creds_from_db() -> (Option<String>, Option<String>) {
-    let path = match APP_DB_PATH.get() {
-        Some(p) => p,
-        None => return (None, None),
-    };
-    let conn = match rusqlite::Connection::open(path) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("load_xueqiu_creds_from_db: failed to open DB: {e}");
-            return (None, None);
-        }
-    };
-    let row = conn.query_row(
-        "SELECT xueqiu_cookie, xueqiu_u FROM quote_provider_config WHERE id = 1",
-        [],
-        |r| {
-            let cookie: Option<String> = r.get(0).ok().flatten();
-            let u_val: Option<String> = r.get(1).ok().flatten();
-            Ok((cookie, u_val))
-        },
-    );
-    match row {
-        Ok(pair) => normalize_creds(pair),
-        Err(rusqlite::Error::QueryReturnedNoRows) => (None, None),
-        Err(e) => {
-            warn!("load_xueqiu_creds_from_db: query failed: {e}");
-            (None, None)
+impl QuoteServiceState {
+    pub fn new() -> Self {
+        Self {
+            token_initialized: AtomicBool::new(false),
+            user_cookie: Mutex::new(None),
+            user_u: Mutex::new(None),
+            auto_cookie: Mutex::new(None),
+            last_quote_warning: Mutex::new(None),
         }
     }
 }
 
-/// Trim and drop empty strings, mirroring [`set_xueqiu_user_cookie`].
-fn normalize_creds(pair: (Option<String>, Option<String>)) -> (Option<String>, Option<String>) {
-    let norm = |s: Option<String>| {
-        s.as_deref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-    };
-    (norm(pair.0), norm(pair.1))
+impl Default for QuoteServiceState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
-
-/// Auto-obtained `xq_a_token` value extracted from the homepage response.
-///
-/// The Xueqiu cookie jar may not send cookies set by `xueqiu.com` to the
-/// API subdomain `stock.xueqiu.com` if the cookie lacks a `Domain` attribute
-/// (RFC 6265 restricts such cookies to the exact host).  By storing the token
-/// explicitly we can attach it via the `Cookie` header on every API request,
-/// guaranteeing it reaches the API regardless of cookie-jar domain matching.
-static XUEQIU_AUTO_COOKIE: Mutex<Option<String>> = Mutex::new(None);
-pub(super) static LAST_QUOTE_WARNING: Mutex<Option<String>> = Mutex::new(None);
 
 pub(super) const XUEQIU_COOKIE_EXPIRED_HINT: &str =
     "雪球 Cookie 可能已经过期，请到设置页面更新雪球 Cookie。";
@@ -111,7 +58,7 @@ pub(super) fn is_xueqiu_request_error(err: &str) -> bool {
     err.contains("Xueqiu") || err.contains("xueqiu.com") || err.contains("stock.xueqiu.com")
 }
 
-pub(super) fn record_xueqiu_warning(err: &str) {
+pub(super) fn record_xueqiu_warning(state: &QuoteServiceState, err: &str) {
     let warning = if is_xueqiu_cookie_expired_error(err) {
         XUEQIU_COOKIE_EXPIRED_HINT
     } else if is_xueqiu_request_error(err) {
@@ -120,7 +67,7 @@ pub(super) fn record_xueqiu_warning(err: &str) {
         return;
     };
 
-    let mut current = LAST_QUOTE_WARNING.lock().unwrap();
+    let mut current = state.last_quote_warning.lock().unwrap();
     if current.as_deref() != Some(XUEQIU_COOKIE_EXPIRED_HINT)
         || warning == XUEQIU_COOKIE_EXPIRED_HINT
     {
@@ -128,70 +75,72 @@ pub(super) fn record_xueqiu_warning(err: &str) {
     }
 }
 
-pub fn clear_quote_warning() {
-    *LAST_QUOTE_WARNING.lock().unwrap() = None;
+pub(super) fn record_batch_warning(
+    state: &QuoteServiceState,
+    has_cookie_warning: bool,
+    has_api_warning: bool,
+) {
+    let warning = if has_cookie_warning {
+        Some(XUEQIU_COOKIE_EXPIRED_HINT)
+    } else if has_api_warning {
+        Some(XUEQIU_API_FAILED_HINT)
+    } else {
+        None
+    };
+    if let Some(warning) = warning {
+        *state.last_quote_warning.lock().unwrap() = Some(warning.to_string());
+    }
 }
 
-pub fn take_quote_warning() -> Option<String> {
-    LAST_QUOTE_WARNING.lock().unwrap().take()
+pub fn clear_quote_warning(state: &QuoteServiceState) {
+    *state.last_quote_warning.lock().unwrap() = None;
+}
+
+pub fn take_quote_warning(state: &QuoteServiceState) -> Option<String> {
+    state.last_quote_warning.lock().unwrap().take()
 }
 
 /// Return the current warning without consuming it, so the value remains
 /// available for the fallback `take_quote_warning` invocation from the frontend.
-pub fn peek_quote_warning() -> Option<String> {
-    LAST_QUOTE_WARNING.lock().unwrap().clone()
+pub fn peek_quote_warning(state: &QuoteServiceState) -> Option<String> {
+    state.last_quote_warning.lock().unwrap().clone()
 }
 
 /// Set (or clear) the user-provided Xueqiu cookie string.
-pub fn set_xueqiu_user_cookie(cookie: Option<String>) {
+pub fn set_xueqiu_user_cookie(state: &QuoteServiceState, cookie: Option<String>) {
     let cookie = cookie
         .as_deref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    *XUEQIU_USER_COOKIE.lock().unwrap() = cookie;
+    *state.user_cookie.lock().unwrap() = cookie;
 }
 
 /// Return a clone of the current user-provided Xueqiu cookie, if any.
-///
-/// Falls back to reading the `quote_provider_config` table from the database
-/// when the in-memory copy is `None` (e.g. right after an app restart). This
-/// guarantees that user-configured cookies are honoured regardless of which
-/// entry point triggers a quote request.
-fn get_xueqiu_user_cookie() -> Option<String> {
-    let cached = XUEQIU_USER_COOKIE.lock().unwrap().clone();
-    if cached.is_some() {
-        return cached;
-    }
-    load_xueqiu_creds_from_db().0
+fn get_xueqiu_user_cookie(state: &QuoteServiceState) -> Option<String> {
+    state.user_cookie.lock().unwrap().clone()
 }
 
 /// Set (or clear) the user-provided Xueqiu `u` cookie value.
-pub fn set_xueqiu_user_u(u_value: Option<String>) {
+pub fn set_xueqiu_user_u(state: &QuoteServiceState, u_value: Option<String>) {
     let u_value = u_value
         .as_deref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    *XUEQIU_USER_U.lock().unwrap() = u_value;
+    *state.user_u.lock().unwrap() = u_value;
 }
 
 /// Return a clone of the current user-provided Xueqiu `u` cookie value, if any.
-///
-/// Falls back to the database like [`get_xueqiu_user_cookie`].
-fn get_xueqiu_user_u() -> Option<String> {
-    let cached = XUEQIU_USER_U.lock().unwrap().clone();
-    if cached.is_some() {
-        return cached;
-    }
-    load_xueqiu_creds_from_db().1
+fn get_xueqiu_user_u(state: &QuoteServiceState) -> Option<String> {
+    state.user_u.lock().unwrap().clone()
 }
 
 /// Ensure the Xueqiu HTTP client has a valid session token.
 ///
 /// Xueqiu requires an `xq_a_token` cookie which is set when visiting the
 /// homepage.  This function visits `https://xueqiu.com` once to acquire the
-/// cookie, and remembers the result via [`XUEQIU_TOKEN_INITIALIZED`].
+/// cookie, and remembers the result in [`QuoteServiceState`].
 ///
 /// The homepage request uses browser page-load headers (`Accept: text/html`)
 /// rather than API-style headers to ensure the server returns a full page
@@ -200,16 +149,16 @@ fn get_xueqiu_user_u() -> Option<String> {
 /// If a user-provided cookie is configured, the homepage visit is skipped
 /// entirely because authentication is handled via the explicit `Cookie` header
 /// added in [`send_xueqiu_request`].
-async fn ensure_xueqiu_token() -> Result<(), String> {
-    if XUEQIU_TOKEN_INITIALIZED.load(Ordering::SeqCst) {
+async fn ensure_xueqiu_token(state: &QuoteServiceState) -> Result<(), String> {
+    if state.token_initialized.load(Ordering::SeqCst) {
         return Ok(());
     }
 
     // If a user-provided cookie is configured, skip the homepage visit
     // entirely – authentication is handled via the explicit Cookie header
     // built in build_xueqiu_cookie_header().
-    if get_xueqiu_user_cookie().is_some() {
-        XUEQIU_TOKEN_INITIALIZED.store(true, Ordering::SeqCst);
+    if get_xueqiu_user_cookie(state).is_some() {
+        state.token_initialized.store(true, Ordering::SeqCst);
         return Ok(());
     }
 
@@ -227,7 +176,7 @@ async fn ensure_xueqiu_token() -> Result<(), String> {
     let status = resp.status();
 
     // Extract `xq_a_token` from Set-Cookie headers so we can attach it
-    // explicitly to API requests (see XUEQIU_AUTO_COOKIE doc comment).
+    // explicitly to API requests through the managed runtime state.
     let mut auto_token: Option<String> = None;
     for header_val in resp.headers().get_all(reqwest::header::SET_COOKIE).iter() {
         if let Ok(s) = header_val.to_str() {
@@ -254,7 +203,7 @@ async fn ensure_xueqiu_token() -> Result<(), String> {
     }
 
     if let Some(ref token) = auto_token {
-        *XUEQIU_AUTO_COOKIE.lock().unwrap() = Some(token.clone());
+        *state.auto_cookie.lock().unwrap() = Some(token.clone());
     }
 
     // Only mark the token as initialized when we actually obtained a token.
@@ -266,7 +215,7 @@ async fn ensure_xueqiu_token() -> Result<(), String> {
     // proceed and fall back to other providers; a later call will retry the
     // homepage visit.
     if auto_token.is_some() {
-        XUEQIU_TOKEN_INITIALIZED.store(true, Ordering::SeqCst);
+        state.token_initialized.store(true, Ordering::SeqCst);
         Ok(())
     } else if status.is_success() || status.is_redirection() {
         warn!(
@@ -288,9 +237,9 @@ async fn ensure_xueqiu_token() -> Result<(), String> {
 /// Made `pub` so that callers which overwrite the user-provided cookie (e.g.
 /// the embedded login flow and the paste-cookie command) can force the next
 /// request to use the freshly stored value instead of any cached state.
-pub fn reset_xueqiu_token() {
-    XUEQIU_TOKEN_INITIALIZED.store(false, Ordering::SeqCst);
-    *XUEQIU_AUTO_COOKIE.lock().unwrap() = None;
+pub fn reset_xueqiu_token(state: &QuoteServiceState) {
+    state.token_initialized.store(false, Ordering::SeqCst);
+    *state.auto_cookie.lock().unwrap() = None;
 }
 
 /// Build the cookie header for Xueqiu API requests.
@@ -302,10 +251,10 @@ pub fn reset_xueqiu_token() {
 /// The user may enter either the raw `xq_a_token` value (e.g. `6a7dc04b...`)
 /// or a full cookie string (e.g. `xq_a_token=6a7dc04b...`).  Both forms are
 /// handled correctly.
-fn build_xueqiu_cookie_header() -> Option<String> {
-    let user_cookie = get_xueqiu_user_cookie();
-    let auto_token = XUEQIU_AUTO_COOKIE.lock().unwrap().clone();
-    let u_value = get_xueqiu_user_u();
+pub(super) fn build_xueqiu_cookie_header(state: &QuoteServiceState) -> Option<String> {
+    let user_cookie = get_xueqiu_user_cookie(state);
+    let auto_token = state.auto_cookie.lock().unwrap().clone();
+    let u_value = get_xueqiu_user_u(state);
 
     // Start with the base cookie: prefer user-provided, fall back to auto.
     let base = if let Some(ref uc) = user_cookie {
@@ -341,8 +290,12 @@ const XUEQIU_MAX_RETRIES: u32 = 2;
 ///
 /// If the initial request returns HTTP 400 (which indicates an expired or
 /// missing session token), the token is refreshed and the request is retried.
-async fn send_xueqiu_request(url: &str, symbol: &str) -> Result<reqwest::Response, String> {
-    ensure_xueqiu_token().await?;
+async fn send_xueqiu_request(
+    state: &QuoteServiceState,
+    url: &str,
+    symbol: &str,
+) -> Result<reqwest::Response, String> {
+    ensure_xueqiu_token(state).await?;
 
     let client = http_client::xueqiu_client();
     let mut last_err = String::new();
@@ -350,7 +303,7 @@ async fn send_xueqiu_request(url: &str, symbol: &str) -> Result<reqwest::Respons
     for attempt in 0..=XUEQIU_MAX_RETRIES {
         let mut req = client.get(url);
 
-        if let Some(cookie) = build_xueqiu_cookie_header() {
+        if let Some(cookie) = build_xueqiu_cookie_header(state) {
             req = req.header(reqwest::header::COOKIE, cookie);
         }
 
@@ -361,16 +314,16 @@ async fn send_xueqiu_request(url: &str, symbol: &str) -> Result<reqwest::Respons
                     && attempt < XUEQIU_MAX_RETRIES =>
             {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                reset_xueqiu_token();
-                ensure_xueqiu_token().await?;
+                reset_xueqiu_token(state);
+                ensure_xueqiu_token(state).await?;
             }
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 last_err = format!("Network error fetching {} from Xueqiu: {}", symbol, e);
                 if attempt < XUEQIU_MAX_RETRIES {
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    reset_xueqiu_token();
-                    ensure_xueqiu_token().await?;
+                    reset_xueqiu_token(state);
+                    ensure_xueqiu_token(state).await?;
                 }
             }
         }
@@ -383,8 +336,11 @@ async fn send_xueqiu_request(url: &str, symbol: &str) -> Result<reqwest::Respons
 /// This is a public thin wrapper around [`send_xueqiu_request`] for use by
 /// other modules (e.g. OCR stock-code lookup) that need Xueqiu API access
 /// but are outside the quote service module.
-pub async fn xueqiu_fetch(url: &str) -> Result<reqwest::Response, String> {
-    send_xueqiu_request(url, "lookup").await
+pub async fn xueqiu_fetch(
+    state: &QuoteServiceState,
+    url: &str,
+) -> Result<reqwest::Response, String> {
+    send_xueqiu_request(state, url, "lookup").await
 }
 
 /// Maximum number of characters to include in error messages as a response
@@ -695,14 +651,17 @@ pub(super) fn to_xueqiu_hk_symbol(symbol: &str) -> Result<String, String> {
 }
 
 /// Fetch a CN A-share stock quote from Xueqiu (雪球).
-pub(super) async fn fetch_xueqiu_cn_quote(symbol: &str) -> Result<StockQuote, String> {
+pub(super) async fn fetch_xueqiu_cn_quote(
+    state: &QuoteServiceState,
+    symbol: &str,
+) -> Result<StockQuote, String> {
     let xueqiu_symbol = to_xueqiu_cn_symbol(symbol)?;
     let url = format!(
         "https://stock.xueqiu.com/v5/stock/quote.json?symbol={}&extend=detail",
         xueqiu_symbol
     );
 
-    let response = send_xueqiu_request(&url, symbol).await?;
+    let response = send_xueqiu_request(state, &url, symbol).await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -729,14 +688,17 @@ pub(super) async fn fetch_xueqiu_cn_quote(symbol: &str) -> Result<StockQuote, St
 }
 
 /// Fetch a US stock quote from Xueqiu (雪球).
-pub(super) async fn fetch_xueqiu_us_quote(symbol: &str) -> Result<StockQuote, String> {
+pub(super) async fn fetch_xueqiu_us_quote(
+    state: &QuoteServiceState,
+    symbol: &str,
+) -> Result<StockQuote, String> {
     let xueqiu_symbol = to_xueqiu_us_symbol(symbol);
     let url = format!(
         "https://stock.xueqiu.com/v5/stock/quote.json?symbol={}&extend=detail",
         xueqiu_symbol
     );
 
-    let response = send_xueqiu_request(&url, symbol).await?;
+    let response = send_xueqiu_request(state, &url, symbol).await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -763,14 +725,17 @@ pub(super) async fn fetch_xueqiu_us_quote(symbol: &str) -> Result<StockQuote, St
 }
 
 /// Fetch a HK stock quote from Xueqiu (雪球).
-pub(super) async fn fetch_xueqiu_hk_quote(symbol: &str) -> Result<StockQuote, String> {
+pub(super) async fn fetch_xueqiu_hk_quote(
+    state: &QuoteServiceState,
+    symbol: &str,
+) -> Result<StockQuote, String> {
     let xueqiu_symbol = to_xueqiu_hk_symbol(symbol)?;
     let url = format!(
         "https://stock.xueqiu.com/v5/stock/quote.json?symbol={}&extend=detail",
         xueqiu_symbol
     );
 
-    let response = send_xueqiu_request(&url, symbol).await?;
+    let response = send_xueqiu_request(state, &url, symbol).await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -801,6 +766,7 @@ pub(super) async fn fetch_xueqiu_hk_quote(symbol: &str) -> Result<StockQuote, St
 /// Mirrors [`fetch_stock_history_xueqiu`] but retains open/high/low/close/volume
 /// for technical-analysis indicators.
 pub async fn fetch_candles_xueqiu(
+    state: &QuoteServiceState,
     symbol: &str,
     market: &str,
     start_date: chrono::NaiveDate,
@@ -823,7 +789,7 @@ pub async fn fetch_candles_xueqiu(
         xueqiu_symbol, begin, window_ms / 86_400_000 + 10
     );
 
-    let resp = send_xueqiu_request(&url, symbol).await?;
+    let resp = send_xueqiu_request(state, &url, symbol).await?;
     if !resp.status().is_success() {
         return Err(format!(
             "fetch_candles_xueqiu: HTTP {} for {}",
@@ -887,12 +853,13 @@ pub async fn fetch_candles_xueqiu(
 /// Returns a list of (date, close_price) pairs sorted by date ascending.
 #[allow(dead_code)] // Retained as the provider-specific API for callers that do not want fallback.
 pub async fn fetch_stock_history_xueqiu(
+    state: &QuoteServiceState,
     symbol: &str,
     market: &str,
     start_date: chrono::NaiveDate,
     end_date: chrono::NaiveDate,
 ) -> Result<Vec<(chrono::NaiveDate, f64)>, String> {
-    match fetch_stock_history_xueqiu_outcome(symbol, market, start_date, end_date).await? {
+    match fetch_stock_history_xueqiu_outcome(state, symbol, market, start_date, end_date).await? {
         XueqiuHistoryOutcome::Prices(prices) => Ok(prices),
         XueqiuHistoryOutcome::StartsAfterRange { .. } | XueqiuHistoryOutcome::Empty => {
             Ok(Vec::new())
@@ -901,6 +868,7 @@ pub async fn fetch_stock_history_xueqiu(
 }
 
 pub(super) async fn fetch_stock_history_xueqiu_outcome(
+    state: &QuoteServiceState,
     symbol: &str,
     market: &str,
     start_date: chrono::NaiveDate,
@@ -912,17 +880,20 @@ pub(super) async fn fetch_stock_history_xueqiu_outcome(
         _ => to_xueqiu_us_symbol(symbol),
     };
 
-    fetch_history_xueqiu_api_symbol(&xueqiu_symbol, symbol, market, start_date, end_date).await
+    fetch_history_xueqiu_api_symbol(state, &xueqiu_symbol, symbol, market, start_date, end_date)
+        .await
 }
 
 #[allow(dead_code)] // Called by the Task 2 live calendar adapter, wired by Task 3.
 pub(crate) async fn fetch_index_history_xueqiu(
+    state: &QuoteServiceState,
     api_symbol: &str,
     market: &str,
     start_date: chrono::NaiveDate,
     end_date: chrono::NaiveDate,
 ) -> Result<XueqiuHistoryOutcome, String> {
-    fetch_history_xueqiu_api_symbol(api_symbol, api_symbol, market, start_date, end_date).await
+    fetch_history_xueqiu_api_symbol(state, api_symbol, api_symbol, market, start_date, end_date)
+        .await
 }
 
 pub(super) fn xueqiu_history_request_count(
@@ -933,6 +904,7 @@ pub(super) fn xueqiu_history_request_count(
 }
 
 async fn fetch_history_xueqiu_api_symbol(
+    state: &QuoteServiceState,
     api_symbol: &str,
     display_symbol: &str,
     market: &str,
@@ -962,7 +934,7 @@ async fn fetch_history_xueqiu_api_symbol(
         api_symbol, begin_ts, count
     );
 
-    let response = send_xueqiu_request(&url, display_symbol).await?;
+    let response = send_xueqiu_request(state, &url, display_symbol).await?;
 
     if !response.status().is_success() {
         let status = response.status();

@@ -4,7 +4,7 @@ use crate::services::quote_provider_service;
 use crate::services::quote_service::{
     fetch_cn_quote_with_provider, fetch_hk_quote_with_provider,
     fetch_quotes_batch_cached_with_providers, fetch_us_quote_with_provider, get_quote_refresh_time,
-    save_quote_refresh_time, save_quotes_to_db, QuoteCache, CASH_SYMBOL_PREFIX,
+    save_quote_refresh_time, save_quotes_to_db, QuoteCache, QuoteServiceState, CASH_SYMBOL_PREFIX,
 };
 use tauri::State;
 use tracing::warn;
@@ -13,12 +13,14 @@ use tracing::warn;
 pub async fn get_real_time_quotes(
     db: State<'_, Database>,
     quote_cache: State<'_, QuoteCache>,
+    quote_state: State<'_, QuoteServiceState>,
     symbols: Vec<(String, String)>,
     force_refresh: Option<bool>,
 ) -> Result<Vec<StockQuote>, String> {
     let config = quote_provider_service::get_quote_provider_config(&db)?;
-    crate::services::quote_service::clear_quote_warning();
+    crate::services::quote_service::clear_quote_warning(&quote_state);
     let quotes = fetch_quotes_batch_cached_with_providers(
+        &quote_state,
         &quote_cache,
         symbols,
         &config.us_provider,
@@ -41,6 +43,7 @@ pub async fn get_real_time_quotes(
 pub async fn get_holding_quotes(
     db: State<'_, Database>,
     quote_cache: State<'_, QuoteCache>,
+    quote_state: State<'_, QuoteServiceState>,
     refresh_symbols: Option<Vec<(String, String)>>,
 ) -> Result<Vec<HoldingWithQuote>, String> {
     let config = quote_provider_service::get_quote_provider_config(&db)?;
@@ -49,7 +52,7 @@ pub async fn get_holding_quotes(
         None => true,
     };
     if should_refresh_from_api {
-        crate::services::quote_service::clear_quote_warning();
+        crate::services::quote_service::clear_quote_warning(&quote_state);
     }
     // Load holdings from DB (synchronous) and pre-compute realized PnL for cleared positions.
     // realized_pnl_map: holding_id -> (realized_pnl, total_buy_cost)
@@ -104,6 +107,7 @@ pub async fn get_holding_quotes(
         Some(ref symbols) if !symbols.is_empty() => {
             // Targeted refresh: force-refresh only the specified symbols
             fetch_quotes_batch_cached_with_providers(
+                &quote_state,
                 &quote_cache,
                 symbols.clone(),
                 &config.us_provider,
@@ -114,6 +118,7 @@ pub async fn get_holding_quotes(
             .await?;
             // Then load all quotes from cache (the refreshed ones are now fresh)
             fetch_quotes_batch_cached_with_providers(
+                &quote_state,
                 &quote_cache,
                 all_symbols,
                 &config.us_provider,
@@ -126,6 +131,7 @@ pub async fn get_holding_quotes(
         Some(_) => {
             // Empty list: no refresh needed, just use cache
             fetch_quotes_batch_cached_with_providers(
+                &quote_state,
                 &quote_cache,
                 all_symbols,
                 &config.us_provider,
@@ -138,6 +144,7 @@ pub async fn get_holding_quotes(
         None => {
             // No list provided: full refresh of all symbols
             fetch_quotes_batch_cached_with_providers(
+                &quote_state,
                 &quote_cache,
                 all_symbols,
                 &config.us_provider,
@@ -252,21 +259,22 @@ fn load_realized_pnl_by_holding(
 }
 
 #[tauri::command]
-pub fn take_quote_warning() -> Option<String> {
-    crate::services::quote_service::take_quote_warning()
+pub fn take_quote_warning(quote_state: State<'_, QuoteServiceState>) -> Option<String> {
+    crate::services::quote_service::take_quote_warning(&quote_state)
 }
 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_us_quote(
     db: State<'_, Database>,
     quote_cache: State<'_, QuoteCache>,
+    quote_state: State<'_, QuoteServiceState>,
     symbol: String,
 ) -> Result<StockQuote, String> {
     if let Some(cached) = quote_cache.get(&symbol) {
         return Ok(cached);
     }
     let config = quote_provider_service::get_quote_provider_config(&db)?;
-    let quote = fetch_us_quote_with_provider(&symbol, &config.us_provider).await?;
+    let quote = fetch_us_quote_with_provider(&quote_state, &symbol, &config.us_provider).await?;
     quote_cache.set(quote.clone());
     if let Err(e) = save_quotes_to_db(&db, std::slice::from_ref(&quote)) {
         warn!("Failed to persist quote to DB: {}", e);
@@ -281,13 +289,14 @@ pub async fn get_us_quote(
 pub async fn get_hk_quote(
     db: State<'_, Database>,
     quote_cache: State<'_, QuoteCache>,
+    quote_state: State<'_, QuoteServiceState>,
     symbol: String,
 ) -> Result<StockQuote, String> {
     if let Some(cached) = quote_cache.get(&symbol) {
         return Ok(cached);
     }
     let config = quote_provider_service::get_quote_provider_config(&db)?;
-    let quote = fetch_hk_quote_with_provider(&symbol, &config.hk_provider).await?;
+    let quote = fetch_hk_quote_with_provider(&quote_state, &symbol, &config.hk_provider).await?;
     quote_cache.set(quote.clone());
     if let Err(e) = save_quotes_to_db(&db, std::slice::from_ref(&quote)) {
         warn!("Failed to persist quote to DB: {}", e);
@@ -302,13 +311,14 @@ pub async fn get_hk_quote(
 pub async fn get_cn_quote(
     db: State<'_, Database>,
     quote_cache: State<'_, QuoteCache>,
+    quote_state: State<'_, QuoteServiceState>,
     symbol: String,
 ) -> Result<StockQuote, String> {
     if let Some(cached) = quote_cache.get(&symbol) {
         return Ok(cached);
     }
     let config = quote_provider_service::get_quote_provider_config(&db)?;
-    let quote = fetch_cn_quote_with_provider(&symbol, &config.cn_provider).await?;
+    let quote = fetch_cn_quote_with_provider(&quote_state, &symbol, &config.cn_provider).await?;
     quote_cache.set(quote.clone());
     if let Err(e) = save_quotes_to_db(&db, std::slice::from_ref(&quote)) {
         warn!("Failed to persist quote to DB: {}", e);

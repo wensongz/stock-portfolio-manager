@@ -200,13 +200,23 @@ async fn lookup_name_via_eastmoney(symbol: &str) -> Result<Option<String>, Strin
 /// A-share result is found, and `Err(…)` only when both backends fail with a
 /// network / API error.
 #[tauri::command(rename_all = "camelCase")]
-pub async fn lookup_cn_stock_code(name: String) -> Result<Option<String>, String> {
+pub async fn lookup_cn_stock_code(
+    quote_state: tauri::State<'_, quote_service::QuoteServiceState>,
+    name: String,
+) -> Result<Option<String>, String> {
+    lookup_cn_stock_code_with_state(&quote_state, name).await
+}
+
+pub async fn lookup_cn_stock_code_with_state(
+    quote_state: &quote_service::QuoteServiceState,
+    name: String,
+) -> Result<Option<String>, String> {
     // Primary: East Money (auth-free).
     if let Ok(Some(code)) = lookup_via_eastmoney(&name).await {
         return Ok(Some(code));
     }
     // Fallback: Xueqiu (requires session token).
-    match lookup_via_xueqiu(&name).await {
+    match lookup_via_xueqiu(quote_state, &name).await {
         Ok(r) => Ok(r),
         Err(e) => Err(format!("股票代码查询失败: {e}")),
     }
@@ -217,13 +227,16 @@ pub async fn lookup_cn_stock_code(name: String) -> Result<Option<String>, String
 /// Uses the shared Xueqiu session (including `xq_a_token` cookie management)
 /// from the quote service so that the search API is called with valid
 /// authentication and returns real results.
-async fn lookup_via_xueqiu(name: &str) -> Result<Option<String>, String> {
+async fn lookup_via_xueqiu(
+    quote_state: &quote_service::QuoteServiceState,
+    name: &str,
+) -> Result<Option<String>, String> {
     let url = format!(
         "https://xueqiu.com/query/v1/search/stock.json?code={}",
         urlencoding::encode(name)
     );
 
-    let resp = quote_service::xueqiu_fetch(&url)
+    let resp = quote_service::xueqiu_fetch(quote_state, &url)
         .await
         .map_err(|e| format!("查询雪球失败: {}", e))?;
 
@@ -263,13 +276,23 @@ async fn lookup_via_xueqiu(name: &str) -> Result<Option<String>, String> {
 /// to Xueqiu (covers US/HK/CN). Returns `Ok(None)` when neither backend finds
 /// a name, and `Err(…)` only when both fail with a network / API error.
 #[tauri::command(rename_all = "camelCase")]
-pub async fn lookup_stock_name_by_symbol(symbol: String) -> Result<Option<String>, String> {
+pub async fn lookup_stock_name_by_symbol(
+    quote_state: tauri::State<'_, quote_service::QuoteServiceState>,
+    symbol: String,
+) -> Result<Option<String>, String> {
+    lookup_stock_name_by_symbol_with_state(&quote_state, symbol).await
+}
+
+pub async fn lookup_stock_name_by_symbol_with_state(
+    quote_state: &quote_service::QuoteServiceState,
+    symbol: String,
+) -> Result<Option<String>, String> {
     // Primary: East Money (auth-free).
     if let Ok(Some(name)) = lookup_name_via_eastmoney(&symbol).await {
         return Ok(Some(name));
     }
     // Fallback: Xueqiu (covers US/HK/CN; requires session token).
-    match lookup_name_via_xueqiu(&symbol).await {
+    match lookup_name_via_xueqiu(quote_state, &symbol).await {
         Ok(r) => Ok(r),
         Err(e) => Err(format!("股票名称查询失败: {e}")),
     }
@@ -280,13 +303,16 @@ pub async fn lookup_stock_name_by_symbol(symbol: String) -> Result<Option<String
 /// Prefers the result whose code suffix exactly matches the requested symbol
 /// (e.g. "NYSE:AAPL" → suffix "AAPL").  If no exact suffix match is found,
 /// returns the first result's name as a best-effort fallback.
-async fn lookup_name_via_xueqiu(symbol: &str) -> Result<Option<String>, String> {
+async fn lookup_name_via_xueqiu(
+    quote_state: &quote_service::QuoteServiceState,
+    symbol: &str,
+) -> Result<Option<String>, String> {
     let url = format!(
         "https://xueqiu.com/query/v1/search/stock.json?code={}",
         urlencoding::encode(symbol)
     );
 
-    let resp = quote_service::xueqiu_fetch(&url)
+    let resp = quote_service::xueqiu_fetch(quote_state, &url)
         .await
         .map_err(|e| format!("查询雪球失败: {}", e))?;
 

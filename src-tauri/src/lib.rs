@@ -6,7 +6,7 @@ mod services;
 
 use db::Database;
 use services::exchange_rate_service::ExchangeRateCache;
-use services::quote_service::QuoteCache;
+use services::quote_service::{QuoteCache, QuoteServiceState};
 use tauri::{Emitter, Manager};
 use tracing::warn;
 
@@ -47,13 +47,15 @@ pub fn run() {
             let db_path = app_dir.join("portfolio.db");
             let db =
                 Database::new(db_path.to_str().unwrap()).expect("failed to initialize database");
-            // Register the DB path so quote_service can fall back to reading
-            // the user-configured Xueqiu cookie from the database when the
-            // in-memory copy is empty (e.g. right after a restart).
-            services::quote_service::register_db_path(db_path.to_str().unwrap().to_string());
+            let quote_state = QuoteServiceState::new();
+            if let Ok(config) = services::quote_provider_service::get_quote_provider_config(&db) {
+                services::quote_service::set_xueqiu_user_cookie(&quote_state, config.xueqiu_cookie);
+                services::quote_service::set_xueqiu_user_u(&quote_state, config.xueqiu_u);
+            }
             app.manage(db);
             app.manage(ExchangeRateCache::new());
             app.manage(QuoteCache::new());
+            app.manage(quote_state);
 
             // Load persisted quote cache from the database so the UI can
             // render immediately with the last-known prices.
@@ -111,6 +113,7 @@ pub fn run() {
 
                 let db = handle.state::<Database>();
                 let cache = handle.state::<QuoteCache>();
+                let quote_state = handle.state::<QuoteServiceState>();
 
                 // Collect all holding symbols.
                 let symbols: Vec<(String, String)> = {
@@ -151,11 +154,15 @@ pub fn run() {
 
                 // Load user-provided Xueqiu cookie and `u` value (if any) so that
                 // API requests from the background refresh can use them.
-                services::quote_service::set_xueqiu_user_cookie(config.xueqiu_cookie.clone());
-                services::quote_service::set_xueqiu_user_u(config.xueqiu_u.clone());
+                services::quote_service::set_xueqiu_user_cookie(
+                    &quote_state,
+                    config.xueqiu_cookie.clone(),
+                );
+                services::quote_service::set_xueqiu_user_u(&quote_state, config.xueqiu_u.clone());
 
                 // Force-refresh all holding quotes from the upstream API.
                 match services::quote_service::fetch_quotes_batch_cached_with_providers(
+                    &quote_state,
                     &cache,
                     symbols,
                     &config.us_provider,
@@ -171,10 +178,12 @@ pub fn run() {
                         let _ = services::quote_service::save_quote_refresh_time(&db);
                         // Peek at any warning (without consuming it) so we can
                         // include it in the quote-warning event.  The warning stays
-                        // in LAST_QUOTE_WARNING so the frontend's take_quote_warning
+                        // in managed state so the frontend's take_quote_warning
                         // command can still read it as a fallback if the event is
                         // missed, e.g. due to listener registration timing.
-                        if let Some(warning) = services::quote_service::peek_quote_warning() {
+                        if let Some(warning) =
+                            services::quote_service::peek_quote_warning(&quote_state)
+                        {
                             let _ = handle.emit("quote-warning", warning);
                         }
                         // Notify the frontend so it can re-render with fresh prices.

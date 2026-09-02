@@ -4,7 +4,9 @@ use crate::services::exchange_rate_service::{
     convert_currency, get_cached_rates, ExchangeRateCache,
 };
 use crate::services::quote_provider_service;
-use crate::services::quote_service::{fetch_quotes_batch_cached_with_providers, QuoteCache};
+use crate::services::quote_service::{
+    fetch_quotes_batch_cached_with_providers, QuoteCache, QuoteServiceState,
+};
 use tauri::State;
 
 fn to_usd_value(amount: f64, currency: &str, rates: &ExchangeRates) -> f64 {
@@ -23,12 +25,13 @@ pub async fn build_holding_details_pub(
     quote_cache: &QuoteCache,
     cache_only: bool,
 ) -> Result<Vec<HoldingDetail>, String> {
-    build_holding_details(db, quote_cache, cache_only).await
+    build_holding_details(db, quote_cache, None, cache_only).await
 }
 
 async fn build_holding_details(
     db: &Database,
     quote_cache: &QuoteCache,
+    quote_state: Option<&QuoteServiceState>,
     cache_only: bool,
 ) -> Result<Vec<HoldingDetail>, String> {
     // Load holdings and lookup data in one DB operation
@@ -99,7 +102,11 @@ async fn build_holding_details(
         cached
     } else {
         let config = quote_provider_service::get_quote_provider_config(db)?;
+        let quote_state = quote_state.ok_or_else(|| {
+            "quote service state is required when refreshing holding details".to_string()
+        })?;
         fetch_quotes_batch_cached_with_providers(
+            quote_state,
             quote_cache,
             symbols,
             &config.us_provider,
@@ -160,8 +167,9 @@ pub async fn get_holdings_with_quotes(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
     quote_cache: State<'_, QuoteCache>,
+    quote_state: State<'_, QuoteServiceState>,
 ) -> Result<Vec<HoldingDetail>, String> {
-    let mut details = build_holding_details(&db, &quote_cache, false).await?;
+    let mut details = build_holding_details(&db, &quote_cache, Some(&quote_state), false).await?;
 
     // Normalise market_value_usd so holdings across different currencies
     // are sorted on a common USD basis.
@@ -185,6 +193,7 @@ pub async fn get_dashboard_summary(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
     quote_cache: State<'_, QuoteCache>,
+    quote_state: State<'_, QuoteServiceState>,
     base_currency: Option<String>,
 ) -> Result<DashboardSummary, String> {
     let base = base_currency.unwrap_or_else(|| "USD".to_string());
@@ -199,7 +208,7 @@ pub async fn get_dashboard_summary(
                 updated_at: chrono::Utc::now().to_rfc3339(),
             });
 
-    let details = build_holding_details(&db, &quote_cache, false).await?;
+    let details = build_holding_details(&db, &quote_cache, Some(&quote_state), false).await?;
 
     let mut us_market_value = 0.0f64;
     let mut cn_market_value = 0.0f64;

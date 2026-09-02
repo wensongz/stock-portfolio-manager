@@ -1,5 +1,6 @@
 use crate::db::Database;
 use crate::services::exchange_rate_service::ExchangeRateCache;
+use crate::services::quote_service::QuoteServiceState;
 use chrono::NaiveDate;
 use tauri::State;
 
@@ -13,6 +14,7 @@ use tauri::State;
 pub async fn backfill_snapshots(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
+    quote_state: State<'_, QuoteServiceState>,
     start_date: String,
     end_date: String,
     force: Option<bool>,
@@ -25,6 +27,7 @@ pub async fn backfill_snapshots(
     crate::services::snapshot_service::backfill_snapshots(
         &db,
         &cache,
+        &quote_state,
         start,
         end,
         force.unwrap_or(false),

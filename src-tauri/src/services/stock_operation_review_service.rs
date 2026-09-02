@@ -731,6 +731,7 @@ fn stock_history_request_range(
 
 async fn load_stock_histories(
     db: &Database,
+    quote_state: Option<&quote_service::QuoteServiceState>,
     actions: &[StockOperationEffect],
     report_end: NaiveDate,
     refresh: bool,
@@ -762,7 +763,11 @@ async fn load_stock_histories(
                 latest_closed_market_date,
             ) {
                 let provider = provider_for_market(&config, &market);
+                let quote_state = quote_state.ok_or_else(|| {
+                    "quote service state is required when refreshing stock history".to_string()
+                })?;
                 if let Ok(prices) = quote_service::fetch_stock_history(
+                    quote_state,
                     &symbol,
                     &market,
                     fetch_start,
@@ -819,6 +824,7 @@ async fn load_benchmark_histories(
 
 pub(crate) async fn get_stock_operation_review_with_refresh(
     db: &Database,
+    quote_state: Option<&quote_service::QuoteServiceState>,
     query: StockOperationReviewQuery,
     refresh_market_data: bool,
 ) -> Result<StockOperationReviewReport, String> {
@@ -826,8 +832,14 @@ pub(crate) async fn get_stock_operation_review_with_refresh(
     let account_names = load_account_names(db, query.account_id.as_deref())?;
     let transactions = load_transactions_through(db, query.end_date)?;
     let actions = project_action_seeds(&transactions, &account_names, &query);
-    let stock_histories =
-        load_stock_histories(db, &actions, query.end_date, refresh_market_data).await?;
+    let stock_histories = load_stock_histories(
+        db,
+        quote_state,
+        &actions,
+        query.end_date,
+        refresh_market_data,
+    )
+    .await?;
     let benchmark_histories =
         load_benchmark_histories(db, &actions, query.end_date, refresh_market_data).await?;
     assemble_report(db, query, actions, &stock_histories, &benchmark_histories)
@@ -835,9 +847,10 @@ pub(crate) async fn get_stock_operation_review_with_refresh(
 
 pub async fn get_stock_operation_review(
     db: &Database,
+    quote_state: &quote_service::QuoteServiceState,
     query: StockOperationReviewQuery,
 ) -> Result<StockOperationReviewReport, String> {
-    get_stock_operation_review_with_refresh(db, query, true).await
+    get_stock_operation_review_with_refresh(db, Some(quote_state), query, true).await
 }
 
 #[cfg(test)]
@@ -1330,7 +1343,7 @@ mod tests {
     #[tokio::test]
     async fn orchestration_returns_empty_report_without_refreshing_network_data() {
         let db = Database::new(":memory:").unwrap();
-        let report = get_stock_operation_review_with_refresh(&db, query(), false)
+        let report = get_stock_operation_review_with_refresh(&db, None, query(), false)
             .await
             .unwrap();
         assert!(report.actions.is_empty());
@@ -1365,7 +1378,7 @@ mod tests {
             )
             .unwrap();
 
-        let report = get_stock_operation_review_with_refresh(&db, query(), false)
+        let report = get_stock_operation_review_with_refresh(&db, None, query(), false)
             .await
             .unwrap();
         assert_eq!(report.actions.len(), 1);
@@ -1378,7 +1391,7 @@ mod tests {
         insert_account(&db, "known", "US");
         let mut selected = query();
         selected.account_id = Some("missing".to_string());
-        let error = get_stock_operation_review_with_refresh(&db, selected, false)
+        let error = get_stock_operation_review_with_refresh(&db, None, selected, false)
             .await
             .unwrap_err();
         assert!(error.contains("账户"));

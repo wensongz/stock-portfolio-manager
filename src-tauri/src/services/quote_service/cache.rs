@@ -1,4 +1,4 @@
-use super::fetch_quotes_batch_with_providers;
+use super::{fetch_quotes_batch_with_providers, QuoteServiceState};
 use crate::models::StockQuote;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -106,6 +106,7 @@ pub(super) fn deduplicate_symbols(symbols: Vec<(String, String)>) -> Vec<(String
 /// When `force_refresh` is true the cache is bypassed and all symbols are
 /// fetched from the upstream API.
 pub async fn fetch_quotes_batch_cached_with_providers(
+    state: &QuoteServiceState,
     cache: &QuoteCache,
     symbols: Vec<(String, String)>,
     us_provider: &str,
@@ -119,6 +120,7 @@ pub async fn fetch_quotes_batch_cached_with_providers(
     if force_refresh {
         // Force refresh: fetch all symbols from the upstream API.
         let fresh = fetch_quotes_batch_with_providers(
+            state,
             unique_symbols.clone(),
             us_provider,
             hk_provider,
@@ -147,9 +149,14 @@ pub async fn fetch_quotes_batch_cached_with_providers(
         return Ok(result);
     }
 
-    let fresh =
-        fetch_quotes_batch_with_providers(missing.clone(), us_provider, hk_provider, cn_provider)
-            .await?;
+    let fresh = fetch_quotes_batch_with_providers(
+        state,
+        missing.clone(),
+        us_provider,
+        hk_provider,
+        cn_provider,
+    )
+    .await?;
     cache.set_batch(&fresh);
     result.extend(fresh);
 

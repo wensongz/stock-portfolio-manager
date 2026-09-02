@@ -4,7 +4,7 @@ use crate::services::ai_chat_service::{self, ChatParams, PrefilledToolContext};
 use crate::services::ai_config_service;
 use crate::services::ai_models_service::{self, FetchModelsParams};
 use crate::services::exchange_rate_service::ExchangeRateCache;
-use crate::services::quote_service::QuoteCache;
+use crate::services::quote_service::{QuoteCache, QuoteServiceState};
 use serde::Deserialize;
 use tauri::{AppHandle, State};
 
@@ -79,6 +79,7 @@ pub async fn chat_with_ai(
     db: State<'_, Database>,
     cache: State<'_, ExchangeRateCache>,
     quote_cache: State<'_, QuoteCache>,
+    quote_state: State<'_, QuoteServiceState>,
     req: ChatRequest,
 ) -> Result<(), String> {
     ai_chat_service::chat_stream(
@@ -86,6 +87,7 @@ pub async fn chat_with_ai(
         &db,
         &cache,
         &quote_cache,
+        &quote_state,
         ChatParams {
             messages: req.messages,
             include_context: req.include_context,

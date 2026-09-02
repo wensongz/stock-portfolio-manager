@@ -1,6 +1,7 @@
 use super::{
     fetch_candles_eastmoney, fetch_candles_xueqiu, fetch_stock_history_eastmoney,
     fetch_stock_history_xueqiu_outcome, fetch_stock_history_yahoo, resolve_xueqiu_history_outcome,
+    QuoteServiceState,
 };
 use crate::models::PriceCandle;
 use tracing::warn;
@@ -11,6 +12,7 @@ use tracing::warn;
 /// [`fetch_stock_history`]: xueqiu → eastmoney → yahoo (yahoo path returns
 /// close-only candles when OHLCV is unavailable).
 pub async fn fetch_stock_candles(
+    state: &QuoteServiceState,
     symbol: &str,
     market: &str,
     start_date: chrono::NaiveDate,
@@ -18,7 +20,7 @@ pub async fn fetch_stock_candles(
     provider: &str,
 ) -> Result<Vec<PriceCandle>, String> {
     match provider {
-        "xueqiu" => match fetch_candles_xueqiu(symbol, market, start_date, end_date).await {
+        "xueqiu" => match fetch_candles_xueqiu(state, symbol, market, start_date, end_date).await {
             Ok(c) if !c.is_empty() => Ok(c),
             Ok(_) | Err(_) => {
                 match fetch_candles_eastmoney(symbol, market, start_date, end_date).await {
@@ -40,6 +42,7 @@ pub async fn fetch_stock_candles(
 /// East Money is used as an automatic fallback. A first trading date after
 /// the requested range is treated as a valid pre-listing response.
 pub async fn fetch_stock_history(
+    state: &QuoteServiceState,
     symbol: &str,
     market: &str,
     start_date: chrono::NaiveDate,
@@ -49,7 +52,8 @@ pub async fn fetch_stock_history(
     match provider {
         "xueqiu" => {
             let outcome =
-                fetch_stock_history_xueqiu_outcome(symbol, market, start_date, end_date).await;
+                fetch_stock_history_xueqiu_outcome(state, symbol, market, start_date, end_date)
+                    .await;
             resolve_xueqiu_history_outcome(
                 symbol,
                 market,

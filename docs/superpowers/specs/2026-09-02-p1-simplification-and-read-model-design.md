@@ -82,6 +82,7 @@
 
 - 图表：`LineChart`、`BarChart`、`PieChart`
 - 组件：`TitleComponent`、`TooltipComponent`、`LegendComponent`、`GridComponent`、`DataZoomComponent`、`MarkAreaComponent`
+- 特性：`LabelLayout`（保留饼图 `avoidLabelOverlap`）
 - 渲染器：`CanvasRenderer`
 
 现有图表组件只把 `option`、尺寸和 renderer 参数传给共享包装器。业务数据转换、颜色、tooltip、缩放和图例配置保持原样。

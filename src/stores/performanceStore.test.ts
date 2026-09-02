@@ -111,3 +111,75 @@ test("a failed refresh preserves the last successful report", async () => {
   assert.match(store.getState().error ?? "", /refresh failed/);
   assert.equal(store.getState().loading, false);
 });
+
+test("the latest request for one benchmark wins when responses arrive out of order", async () => {
+  const oldResponse = deferred();
+  const newResponse = deferred();
+  let benchmarkAttempt = 0;
+  const invoke = async (command) => {
+    assert.equal(command, "get_benchmark_return_series");
+    benchmarkAttempt += 1;
+    return benchmarkAttempt === 1 ? oldResponse.promise : newResponse.promise;
+  };
+  const store = createPerformanceStore(invoke);
+
+  const oldFetch = store.getState().fetchBenchmark("^GSPC");
+  const newFetch = store.getState().fetchBenchmark("^GSPC");
+
+  newResponse.resolve([{ date: "new", cumulative_return: 2 }]);
+  await newFetch;
+  oldResponse.resolve([{ date: "old", cumulative_return: 1 }]);
+  await oldFetch;
+
+  assert.equal(store.getState().benchmarkSeries["^GSPC"]?.[0]?.date, "new");
+});
+
+test("changing the time range clears benchmark series immediately", async () => {
+  const invoke = async (command) => {
+    assert.equal(command, "get_benchmark_return_series");
+    return [{ date: "saved", cumulative_return: 1 }];
+  };
+  const store = createPerformanceStore(invoke);
+
+  await store.getState().fetchBenchmark("^GSPC");
+  store.getState().setTimeRange("CUSTOM", "2025-02-01", "2025-02-28");
+
+  assert.deepEqual(store.getState().benchmarkSeries, {});
+});
+
+test("changing the time range invalidates an in-flight benchmark response", async () => {
+  const oldResponse = deferred();
+  const invoke = async (command) => {
+    assert.equal(command, "get_benchmark_return_series");
+    return oldResponse.promise;
+  };
+  const store = createPerformanceStore(invoke);
+
+  const oldFetch = store.getState().fetchBenchmark("^GSPC");
+  store.getState().setTimeRange("CUSTOM", "2025-02-01", "2025-02-28");
+  oldResponse.resolve([{ date: "old", cumulative_return: 1 }]);
+  await oldFetch;
+
+  assert.equal(store.getState().benchmarkSeries["^GSPC"], undefined);
+});
+
+test("different benchmark symbols can finish independently", async () => {
+  const sp500Response = deferred();
+  const nasdaqResponse = deferred();
+  const invoke = async (command, args) => {
+    assert.equal(command, "get_benchmark_return_series");
+    return args.symbol === "^GSPC" ? sp500Response.promise : nasdaqResponse.promise;
+  };
+  const store = createPerformanceStore(invoke);
+
+  const sp500Fetch = store.getState().fetchBenchmark("^GSPC");
+  const nasdaqFetch = store.getState().fetchBenchmark("^IXIC");
+
+  nasdaqResponse.resolve([{ date: "nasdaq", cumulative_return: 2 }]);
+  await nasdaqFetch;
+  sp500Response.resolve([{ date: "sp500", cumulative_return: 1 }]);
+  await sp500Fetch;
+
+  assert.equal(store.getState().benchmarkSeries["^GSPC"]?.[0]?.date, "sp500");
+  assert.equal(store.getState().benchmarkSeries["^IXIC"]?.[0]?.date, "nasdaq");
+});

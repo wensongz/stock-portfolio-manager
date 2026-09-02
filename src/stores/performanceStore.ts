@@ -103,6 +103,8 @@ export type PerformanceInvoke = <T>(
 
 export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
   let latestRequestId = 0;
+  let nextBenchmarkRequestId = 0;
+  const latestBenchmarkRequestIds = new Map<string, number>();
 
   return create<PerformanceState>((set, get) => ({
   timeRange: "1M",
@@ -125,10 +127,22 @@ export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
   error: null,
 
   setTimeRange: (range, start, end) => {
+    const nextCustomStart = start ?? null;
+    const nextCustomEnd = end ?? null;
+    const state = get();
+    const rangeChanged =
+      state.timeRange !== range ||
+      state.customStart !== nextCustomStart ||
+      state.customEnd !== nextCustomEnd;
+
+    if (rangeChanged) {
+      latestBenchmarkRequestIds.clear();
+    }
     set({
       timeRange: range,
-      customStart: start ?? null,
-      customEnd: end ?? null,
+      customStart: nextCustomStart,
+      customEnd: nextCustomEnd,
+      ...(rangeChanged ? { benchmarkSeries: {} } : {}),
     });
   },
 
@@ -218,6 +232,8 @@ export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
   },
 
   fetchBenchmark: async (symbol) => {
+    const requestId = ++nextBenchmarkRequestId;
+    latestBenchmarkRequestIds.set(symbol, requestId);
     const state = get();
     let startDate: string;
     let endDate: string;
@@ -235,11 +251,14 @@ export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
         startDate,
         endDate,
       });
+      if (latestBenchmarkRequestIds.get(symbol) !== requestId) return;
       set((s) => ({
         benchmarkSeries: { ...s.benchmarkSeries, [symbol]: series },
       }));
     } catch (err) {
-      console.error("fetchBenchmark error:", err);
+      if (latestBenchmarkRequestIds.get(symbol) === requestId) {
+        console.error("fetchBenchmark error:", err);
+      }
     }
   },
   }));

@@ -1,4 +1,4 @@
-import ReactECharts from "echarts-for-react";
+import EChart from "../../components/charts/EChart";
 import { Card, Col, Row } from "antd";
 import type { QuarterlyTrends } from "../../types";
 
@@ -142,27 +142,27 @@ export default function TrendCharts({ trends, height = 300 }: Props) {
     <Row gutter={[16, 16]}>
       <Col xs={24} lg={12}>
         <Card size="small">
-          <ReactECharts option={valueOption} style={{ height, width: "100%" }} />
+          <EChart option={valueOption} style={{ height, width: "100%" }} />
         </Card>
       </Col>
       <Col xs={24} lg={12}>
         <Card size="small">
-          <ReactECharts option={marketOption} style={{ height, width: "100%" }} />
+          <EChart option={marketOption} style={{ height, width: "100%" }} />
         </Card>
       </Col>
       <Col xs={24} lg={12}>
         <Card size="small">
-          <ReactECharts option={categoryOption} style={{ height, width: "100%" }} />
+          <EChart option={categoryOption} style={{ height, width: "100%" }} />
         </Card>
       </Col>
       <Col xs={24} lg={12}>
         <Card size="small">
-          <ReactECharts option={pnlOption} style={{ height, width: "100%" }} />
+          <EChart option={pnlOption} style={{ height, width: "100%" }} />
         </Card>
       </Col>
       <Col xs={24} lg={12}>
         <Card size="small">
-          <ReactECharts option={countOption} style={{ height, width: "100%" }} />
+          <EChart option={countOption} style={{ height, width: "100%" }} />
         </Card>
       </Col>
     </Row>

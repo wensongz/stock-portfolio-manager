@@ -1,4 +1,4 @@
-import ReactECharts from "echarts-for-react";
+import EChart from "./EChart";
 import { usePnlColor } from "../../hooks/usePnlColor";
 
 interface BarItem {
@@ -72,7 +72,7 @@ export default function BarChart({
   };
 
   return (
-    <ReactECharts
+    <EChart
       option={option}
       style={{ height, width: "100%" }}
       opts={{ renderer: "canvas" }}

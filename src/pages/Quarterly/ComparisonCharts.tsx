@@ -1,4 +1,4 @@
-import ReactECharts from "echarts-for-react";
+import EChart from "../../components/charts/EChart";
 import type { QuarterComparison } from "../../types";
 
 interface Props {
@@ -67,10 +67,10 @@ export default function ComparisonCharts({ comparison, height = 320 }: Props) {
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
       <div className="rounded p-2 border" style={{ backgroundColor: "var(--color-bg-card)", borderColor: "var(--color-border)" }}>
-        <ReactECharts option={barOption} style={{ height, width: "100%" }} />
+        <EChart option={barOption} style={{ height, width: "100%" }} />
       </div>
       <div className="rounded p-2 border" style={{ backgroundColor: "var(--color-bg-card)", borderColor: "var(--color-border)" }}>
-        <ReactECharts option={pnlOption} style={{ height, width: "100%" }} />
+        <EChart option={pnlOption} style={{ height, width: "100%" }} />
       </div>
     </div>
   );

@@ -1,4 +1,4 @@
-import ReactECharts from "echarts-for-react";
+import EChart from "./EChart";
 import type { DailyPortfolioValue } from "../../types";
 
 interface LineChartProps {
@@ -89,7 +89,7 @@ export default function LineChart({ data, title, height = 350, showMarkets = fal
   };
 
   return (
-    <ReactECharts
+    <EChart
       option={option}
       style={{ height, width: "100%" }}
       opts={{ renderer: "canvas" }}

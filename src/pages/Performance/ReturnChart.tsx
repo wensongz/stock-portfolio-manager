@@ -1,4 +1,4 @@
-import ReactECharts from "echarts-for-react";
+import EChart from "../../components/charts/EChart";
 import { Select, Space, Typography } from "antd";
 import type { ReturnDataPoint } from "../../types";
 import { BENCHMARK_SYMBOLS } from "../../stores/performanceStore";
@@ -104,7 +104,7 @@ export default function ReturnChart({
           <Text type="secondary">暂无数据，正在自动计算历史持仓市值…</Text>
         </div>
       ) : (
-        <ReactECharts
+        <EChart
           option={option}
           style={{ height, width: "100%" }}
           opts={{ renderer: "canvas" }}

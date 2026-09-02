@@ -1,4 +1,4 @@
-import ReactECharts from "echarts-for-react";
+import EChart from "../../components/charts/EChart";
 import { Typography } from "antd";
 import type { HoldingPerformance } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
@@ -124,7 +124,7 @@ export default function RankingChart({ gainers, losers, height = 340, currency =
           最差表现
         </Text>
       </div>
-      <ReactECharts
+      <EChart
         option={option}
         style={{ height, width: "100%" }}
         opts={{ renderer: "canvas" }}

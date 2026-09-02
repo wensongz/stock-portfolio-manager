@@ -1,0 +1,16 @@
+.markdown-preview { color: var(--color-text); line-height: 1.7; overflow-wrap: anywhere; }
+.markdown-preview > :first-child { margin-top: 0; }
+.markdown-preview > :last-child { margin-bottom: 0; }
+.markdown-preview h1, .markdown-preview h2, .markdown-preview h3 { font-weight: 600; line-height: 1.35; margin: 1em 0 0.5em; }
+.markdown-preview h1 { font-size: 1.5em; }
+.markdown-preview h2 { font-size: 1.3em; }
+.markdown-preview h3 { font-size: 1.15em; }
+.markdown-preview p, .markdown-preview ul, .markdown-preview ol, .markdown-preview blockquote { margin: 0.65em 0; }
+.markdown-preview ul, .markdown-preview ol { padding-left: 1.5em; }
+.markdown-preview ul { list-style: disc; }
+.markdown-preview ol { list-style: decimal; }
+.markdown-preview blockquote { border-left: 3px solid var(--color-border); color: var(--color-text-secondary); padding-left: 0.8em; }
+.markdown-preview code { background: color-mix(in srgb, var(--color-text) 8%, transparent); border-radius: 3px; padding: 0.1em 0.3em; }
+.markdown-preview pre { background: color-mix(in srgb, var(--color-text) 8%, transparent); border-radius: 6px; overflow-x: auto; padding: 0.75em; }
+.markdown-preview table { border-collapse: collapse; width: 100%; }
+.markdown-preview th, .markdown-preview td { border: 1px solid var(--color-border); padding: 0.35em 0.55em; text-align: left; }

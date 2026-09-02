@@ -1,4 +1,4 @@
-import ReactECharts from "echarts-for-react";
+import EChart from "../../components/charts/EChart";
 import { Tabs, Typography } from "antd";
 import type { ReturnAttribution, AttributionItem } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
@@ -58,7 +58,7 @@ export default function AttributionChart({ attribution, height = 300, currency =
       key: "market",
       label: "按市场",
       children: (
-        <ReactECharts
+        <EChart
           option={makeWaterfallOption(attribution.by_market, "市场收益贡献", pnlColorDark, currency)}
           style={{ height, width: "100%" }}
           opts={{ renderer: "canvas" }}
@@ -69,7 +69,7 @@ export default function AttributionChart({ attribution, height = 300, currency =
       key: "category",
       label: "按类别",
       children: (
-        <ReactECharts
+        <EChart
           option={makeWaterfallOption(attribution.by_category, "类别收益贡献", pnlColorDark, currency)}
           style={{ height, width: "100%" }}
           opts={{ renderer: "canvas" }}
@@ -80,7 +80,7 @@ export default function AttributionChart({ attribution, height = 300, currency =
       key: "holding",
       label: "按个股",
       children: (
-        <ReactECharts
+        <EChart
           option={makeWaterfallOption(attribution.by_holding.slice(0, 20), "个股收益贡献 (Top 20)", pnlColorDark, currency)}
           style={{ height, width: "100%" }}
           opts={{ renderer: "canvas" }}

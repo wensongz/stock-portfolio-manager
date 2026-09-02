@@ -1,4 +1,4 @@
-import ReactECharts from "echarts-for-react";
+import EChart from "./EChart";
 import type { PieSlice } from "../../types";
 
 interface PieChartProps {
@@ -70,7 +70,7 @@ export default function PieChart({ data, title, centerText, height = 300, curren
   };
 
   return (
-    <ReactECharts
+    <EChart
       option={option}
       style={{ height, width: "100%" }}
       opts={{ renderer: "canvas" }}

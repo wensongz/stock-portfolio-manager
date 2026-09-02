@@ -1,4 +1,4 @@
-import ReactECharts from "echarts-for-react";
+import EChart from "../../components/charts/EChart";
 import { Typography, Descriptions } from "antd";
 import type { DrawdownAnalysis } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
@@ -70,7 +70,7 @@ export default function DrawdownChart({ drawdown, height = 280 }: Props) {
   return (
     <div>
       <Text strong>📉 回撤分析</Text>
-      <ReactECharts
+      <EChart
         option={option}
         style={{ height, width: "100%" }}
         opts={{ renderer: "canvas" }}

@@ -1,10 +1,12 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { Button, Descriptions, Divider, Modal, Space, Spin, Tag, Timeline, Typography } from "antd";
 import { invoke } from "@tauri-apps/api/core";
-import MDEditor from "@uiw/react-md-editor";
 import type { HoldingNoteHistory, QuarterlyHoldingSnapshot } from "../../types";
 import { useQuarterlyStore } from "../../stores/quarterlyStore";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import MarkdownPreview from "../../components/markdown/MarkdownPreview";
+
+const HoldingMarkdownEditor = lazy(() => import("./HoldingMarkdownEditor"));
 
 const { Text } = Typography;
 
@@ -139,7 +141,7 @@ export default function HoldingNotesEditor({
 
       <Divider />
 
-      {mode === "edit" && (
+      {open && mode === "edit" && (
         <>
           {!notes && (
             <Button
@@ -150,14 +152,9 @@ export default function HoldingNotesEditor({
               使用模板
             </Button>
           )}
-          <div data-color-mode="light">
-            <MDEditor
-              value={notes}
-              onChange={(v) => setNotes(v ?? "")}
-              height={300}
-              preview="edit"
-            />
-          </div>
+          <Suspense fallback={<Spin size="small" />}>
+            <HoldingMarkdownEditor value={notes} onChange={setNotes} />
+          </Suspense>
         </>
       )}
 
@@ -183,9 +180,7 @@ export default function HoldingNotesEditor({
                       </span>
                     </div>
                     {h.notes ? (
-                      <div data-color-mode="light">
-                        <MDEditor.Markdown source={h.notes} style={{ background: "transparent" }} />
-                      </div>
+                      <MarkdownPreview source={h.notes} />
                     ) : (
                       <Text type="secondary">（无思考记录）</Text>
                     )}

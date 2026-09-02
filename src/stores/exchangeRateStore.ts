@@ -8,7 +8,6 @@ interface ExchangeRateState {
   loading: boolean;
   error: string | null;
   fetchRates: () => Promise<void>;
-  convertAmount: (amount: number, from: Currency, to: Currency) => Promise<number>;
   setBaseCurrency: (currency: Currency) => void;
   convertWithCachedRates: (amount: number, from: Currency, to: Currency) => number;
 }
@@ -34,18 +33,6 @@ export const useExchangeRateStore = create<ExchangeRateState>((set, get) => ({
       set({ rates, loading: false });
     } catch (err) {
       set({ error: String(err), loading: false });
-    }
-  },
-
-  convertAmount: async (amount: number, from: Currency, to: Currency) => {
-    try {
-      return await invoke<number>("convert_amount", {
-        amount,
-        fromCurrency: from,
-        toCurrency: to,
-      });
-    } catch {
-      return amount;
     }
   },
 

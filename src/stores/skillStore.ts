@@ -8,7 +8,6 @@ interface SkillState {
   error: string | null;
 
   fetchSkills: () => Promise<void>;
-  getSkill: (id: string) => Promise<Skill | null>;
   saveSkill: (skill: Skill) => Promise<boolean>;
   deleteSkill: (id: string) => Promise<boolean>;
   resetSkills: () => Promise<boolean>;
@@ -32,15 +31,6 @@ export const useSkillStore = create<SkillState>((set, get) => ({
       set({ skills, loading: false });
     } catch (err) {
       set({ error: String(err), loading: false });
-    }
-  },
-
-  getSkill: async (id) => {
-    try {
-      return await invoke<Skill>("get_skill", { id });
-    } catch (err) {
-      set({ error: String(err) });
-      return null;
     }
   },
 

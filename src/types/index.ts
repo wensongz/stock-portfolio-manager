@@ -1045,26 +1045,6 @@ export interface QuoteProviderConfig {
 }
 
 // Options Management types
-export interface OptionRecord {
-  id: string;
-  account_id: string;
-  option_symbol: string;
-  underlying: string;
-  expiry_date: string;
-  strike_price: number;
-  option_type: "P" | "C";
-  action: "SELL" | "BUY";
-  code: string;
-  quantity: number;
-  price: number;
-  amount: number;
-  commission: number;
-  fee: number;
-  traded_at: string | null;
-  settled_at: string | null;
-  created_at: string;
-}
-
 export interface OptionContract {
   id: string;
   option_symbol: string;

@@ -13,12 +13,6 @@ pub fn list_skills(app: AppHandle) -> Result<Vec<Skill>, String> {
     skill_service::list_skills(&app)
 }
 
-/// Load a single skill by id (file stem). Errors if the file is missing.
-#[tauri::command(rename_all = "camelCase")]
-pub fn get_skill(app: AppHandle, id: String) -> Result<Skill, String> {
-    skill_service::get_skill(&app, &id)
-}
-
 /// Create or update a skill. The `id` field selects the file name; saving
 /// always writes to `{id}.md` and drops the builtin marker so subsequent
 /// reads report the skill as `source: "user"`.

@@ -13,7 +13,6 @@ pub mod performance;
 pub mod quarterly;
 pub mod quote;
 pub mod quote_provider;
-pub mod review;
 pub mod skill;
 pub mod statistics;
 pub mod stock_operation_review;

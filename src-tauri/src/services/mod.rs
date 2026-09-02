@@ -15,7 +15,6 @@ pub mod portfolio_mutation;
 pub mod quarterly_service;
 pub mod quote_provider_service;
 pub mod quote_service;
-pub mod review_service;
 pub mod skill_service;
 pub mod snapshot_service;
 pub mod stock_operation_builder;

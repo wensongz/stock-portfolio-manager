@@ -139,7 +139,7 @@ fn import_options_csv_inner(
     account_id: &str,
     csv_content: &str,
 ) -> Result<ImportOptionsResult, String> {
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let mut conn = db.conn.lock().map_err(|e| e.to_string())?;
 
     // Strip UTF-8 BOM if present
     let content = csv_content.strip_prefix('\u{feff}').unwrap_or(csv_content);
@@ -238,40 +238,56 @@ fn import_options_csv_inner(
             ],
         )
         .unwrap_or_default();
-        let quantity: i64 = parse_quantity(&quantity_str);
+        let quantity = match parse_quantity(&quantity_str) {
+            Ok(quantity) => quantity,
+            Err(error) => {
+                errors.push(format!("Row {}: {}", i + 2, error));
+                continue;
+            }
+        };
 
-        if quantity == 0 {
-            skipped += 1;
-            continue;
-        }
+        let price_str =
+            get_field(&record, &headers, &["价格", "price", "Price"]).unwrap_or_default();
+        let price = match parse_required_decimal(&price_str, "price") {
+            Ok(price) => price,
+            Err(error) => {
+                errors.push(format!("Row {}: {}", i + 2, error));
+                continue;
+            }
+        };
 
-        let price: f64 = get_field(&record, &headers, &["价格", "price", "Price"])
-            .unwrap_or_default()
-            .replace(',', "")
-            .parse()
-            .unwrap_or(0.0);
+        let amount_str = get_field(&record, &headers, &["金额", "amount", "Amount", "Proceeds"])
+            .unwrap_or_default();
+        let amount = match parse_decimal(&amount_str, "amount") {
+            Ok(amount) => amount,
+            Err(error) => {
+                errors.push(format!("Row {}: {}", i + 2, error));
+                continue;
+            }
+        };
 
-        let amount: f64 = get_field(&record, &headers, &["金额", "amount", "Amount", "Proceeds"])
-            .unwrap_or_default()
-            .replace(',', "")
-            .parse()
-            .unwrap_or(0.0);
-
-        let commission: f64 = get_field(
+        let commission_str = get_field(
             &record,
             &headers,
             &["佣金", "commission", "Commission", "Comm"],
         )
-        .unwrap_or_default()
-        .replace(',', "")
-        .parse()
-        .unwrap_or(0.0);
+        .unwrap_or_default();
+        let commission = match parse_decimal(&commission_str, "commission") {
+            Ok(commission) => commission,
+            Err(error) => {
+                errors.push(format!("Row {}: {}", i + 2, error));
+                continue;
+            }
+        };
 
-        let fee: f64 = get_field(&record, &headers, &["费用", "fee", "Fee"])
-            .unwrap_or_default()
-            .replace(',', "")
-            .parse()
-            .unwrap_or(0.0);
+        let fee_str = get_field(&record, &headers, &["费用", "fee", "Fee"]).unwrap_or_default();
+        let fee = match parse_decimal(&fee_str, "fee") {
+            Ok(fee) => fee,
+            Err(error) => {
+                errors.push(format!("Row {}: {}", i + 2, error));
+                continue;
+            }
+        };
 
         let traded_at = get_field(
             &record,
@@ -309,11 +325,15 @@ fn import_options_csv_inner(
         });
     }
 
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+
     // ---- Boundary check: load existing DB state ----
     // Remaining open quantity per option symbol (open qty minus close qty).
     // Only symbols with remaining > 0 can back an imported close record.
     let mut available_by_symbol: std::collections::HashMap<String, i64> = {
-        let mut stmt = conn
+        let mut stmt = transaction
             .prepare(
                 "SELECT option_symbol,
                         COALESCE(SUM(CASE WHEN action = 'SELL' AND code LIKE 'O%' THEN ABS(quantity) ELSE 0 END), 0)
@@ -340,7 +360,7 @@ fn import_options_csv_inner(
     // Opens in the DB (SELL + O*) whose group still has remaining quantity,
     // eligible for cross-symbol split matching.
     let mut open_pool: Vec<OpenDetail> = {
-        let mut stmt = conn
+        let mut stmt = transaction
             .prepare(
                 "SELECT option_symbol, underlying, expiry_date, strike_price, option_type
                  FROM option_records
@@ -372,7 +392,7 @@ fn import_options_csv_inner(
 
     // Stock splits config, used for cross-symbol matching of split-affected contracts
     let splits: Vec<StockSplit> = {
-        let mut stmt = conn
+        let mut stmt = transaction
             .prepare(
                 "SELECT id, stock_code, split_date, ratio_from, ratio_to, created_at
                  FROM stock_splits",
@@ -446,7 +466,7 @@ fn import_options_csv_inner(
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
-        conn.execute(
+        transaction.execute(
             "INSERT INTO option_records (id, account_id, option_symbol, underlying, expiry_date, strike_price, option_type, action, code, quantity, price, amount, commission, fee, traded_at, settled_at, created_at, contract_status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 'active')",
             rusqlite::params![
@@ -481,11 +501,12 @@ fn import_options_csv_inner(
         }
     }
 
-    // Recompute contract statuses after import
-    drop(conn); // release lock before recompute
+    // Recompute statuses before committing so any DB failure rolls back the
+    // entire accepted subset of this import.
     if imported > 0 {
-        let _ = recompute_option_statuses(db, account_id);
+        recompute_option_statuses_in(&transaction, account_id)?;
     }
+    transaction.commit().map_err(|e| e.to_string())?;
 
     Ok(ImportOptionsResult {
         imported,
@@ -498,8 +519,18 @@ fn import_options_csv_inner(
 /// Pairs open (SELL+O) and close (BUY+C/C;Ep/A;C/C;P) records by option_symbol,
 /// and handles cross-symbol split-affected contract matching.
 fn recompute_option_statuses(db: &Database, account_id: &str) -> Result<(), String> {
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let mut conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    recompute_option_statuses_in(&transaction, account_id)?;
+    transaction.commit().map_err(|e| e.to_string())
+}
 
+fn recompute_option_statuses_in(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+) -> Result<(), String> {
     // Load full records for this account
     let mut stmt = conn
         .prepare(
@@ -543,10 +574,11 @@ fn recompute_option_statuses(db: &Database, account_id: &str) -> Result<(), Stri
         .map_err(|e| e.to_string())?;
 
     // Reset all contract_status to 'active' first
-    let _ = conn.execute(
+    conn.execute(
         "UPDATE option_records SET contract_status = 'active' WHERE account_id = ?1",
         rusqlite::params![account_id],
-    );
+    )
+    .map_err(|e| e.to_string())?;
 
     // Group by option_symbol
     let mut groups: std::collections::HashMap<String, Vec<&Rec>> = std::collections::HashMap::new();
@@ -607,10 +639,11 @@ fn recompute_option_statuses(db: &Database, account_id: &str) -> Result<(), Stri
                         "C;P" | "C" => "closed",
                         _ => "expired",
                     };
-                    let _ = conn.execute(
+                    conn.execute(
                         "UPDATE option_records SET contract_status = ?1 WHERE id = ?2",
                         rusqlite::params![status, *open_id],
-                    );
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
             }
         }
@@ -721,10 +754,11 @@ fn recompute_option_statuses(db: &Database, account_id: &str) -> Result<(), Stri
                             Some("C;P") | Some("C") => "closed",
                             _ => "expired",
                         };
-                        let _ = conn.execute(
+                        conn.execute(
                             "UPDATE option_records SET contract_status = ?1 WHERE id = ?2",
                             rusqlite::params![status, ao.id],
-                        );
+                        )
+                        .map_err(|e| e.to_string())?;
                         break 'split_loop;
                     }
                 }
@@ -1214,12 +1248,43 @@ fn normalize_action(raw: &str) -> String {
     }
 }
 
-/// Parse quantity string to number of contracts directly (no conversion).
-fn parse_quantity(s: &str) -> i64 {
-    s.replace(',', "")
+/// Parse an optional decimal CSV field. Blank fields retain the importer's
+/// historical default of zero; malformed and non-finite values are errors.
+fn parse_decimal(s: &str, field: &str) -> Result<f64, String> {
+    let normalized = s.trim().replace(',', "");
+    if normalized.is_empty() {
+        return Ok(0.0);
+    }
+
+    let value = normalized
         .parse::<f64>()
-        .map(|v| v as i64)
-        .unwrap_or(0)
+        .map_err(|_| format!("invalid {} '{}'", field, s))?;
+    if !value.is_finite() {
+        return Err(format!("invalid {} '{}'", field, s));
+    }
+    Ok(value)
+}
+
+fn parse_required_decimal(s: &str, field: &str) -> Result<f64, String> {
+    if s.trim().is_empty() {
+        return Err(format!("invalid {} '{}'", field, s));
+    }
+    parse_decimal(s, field)
+}
+
+/// Parse quantity as a whole number of contracts without silently truncating.
+fn parse_quantity(s: &str) -> Result<i64, String> {
+    const I64_MIN_AS_F64: f64 = -9_223_372_036_854_775_808.0;
+    const I64_MAX_EXCLUSIVE_AS_F64: f64 = 9_223_372_036_854_775_808.0;
+
+    let value = parse_required_decimal(s, "quantity")?;
+    if value == 0.0
+        || value.fract() != 0.0
+        || !(I64_MIN_AS_F64..I64_MAX_EXCLUSIVE_AS_F64).contains(&value)
+    {
+        return Err(format!("invalid quantity '{}'", s));
+    }
+    Ok(value as i64)
 }
 
 /// Whether a code on a BUY record terminates an open (SELL + O*) position.
@@ -1527,6 +1592,157 @@ Total, ,,,,,,,,,,,
             "expected no errors, got: {:?}",
             result.errors
         );
+    }
+
+    #[test]
+    fn test_import_rejects_malformed_price() {
+        let (db, account_id) = db_with_account();
+        let csv = "账户,股票,交易时间,交割时间,交易所,操作,股票数量,价格,金额,佣金,费用,类型,代码
+a,AAPL 20FEB26 100 P,2026-01-15,,SMART,卖出,1,oops,200.00,0,0,LMT,O
+";
+
+        let result =
+            import_options_csv_inner(&db, &account_id, csv).expect("row error should be reported");
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("Row 2"));
+        assert!(result.errors[0].contains("price"));
+        let count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM option_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_import_rejects_blank_price() {
+        let (db, account_id) = db_with_account();
+        let csv = "账户,股票,交易时间,交割时间,交易所,操作,股票数量,价格,金额,佣金,费用,类型,代码
+a,AAPL 20FEB26 100 P,2026-01-15,,SMART,卖出,1,,200.00,0,0,LMT,O
+";
+
+        let result =
+            import_options_csv_inner(&db, &account_id, csv).expect("row error should be reported");
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("price"));
+    }
+
+    #[test]
+    fn test_import_rejects_non_finite_amount() {
+        let (db, account_id) = db_with_account();
+        let csv = "账户,股票,交易时间,交割时间,交易所,操作,股票数量,价格,金额,佣金,费用,类型,代码
+a,AAPL 20FEB26 100 P,2026-01-15,,SMART,卖出,1,2.00,NaN,0,0,LMT,O
+";
+
+        let result =
+            import_options_csv_inner(&db, &account_id, csv).expect("row error should be reported");
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("Row 2"));
+        assert!(result.errors[0].contains("amount"));
+    }
+
+    #[test]
+    fn test_import_rejects_malformed_quantity() {
+        let (db, account_id) = db_with_account();
+        let csv = "账户,股票,交易时间,交割时间,交易所,操作,股票数量,价格,金额,佣金,费用,类型,代码
+a,AAPL 20FEB26 100 P,2026-01-15,,SMART,卖出,1.5,2.00,200.00,0,0,LMT,O
+";
+
+        let result =
+            import_options_csv_inner(&db, &account_id, csv).expect("row error should be reported");
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("Row 2"));
+        assert!(result.errors[0].contains("quantity"));
+    }
+
+    #[test]
+    fn test_import_rejects_zero_quantity() {
+        let (db, account_id) = db_with_account();
+        let csv = "账户,股票,交易时间,交割时间,交易所,操作,股票数量,价格,金额,佣金,费用,类型,代码
+a,AAPL 20FEB26 100 P,2026-01-15,,SMART,卖出,0,2.00,200.00,0,0,LMT,O
+";
+
+        let result =
+            import_options_csv_inner(&db, &account_id, csv).expect("row error should be reported");
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("quantity"));
+    }
+
+    #[test]
+    fn test_import_rolls_back_all_rows_when_insert_fails() {
+        let (db, account_id) = db_with_account();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_second_option
+                 BEFORE INSERT ON option_records
+                 WHEN NEW.option_symbol = 'MSFT 20FEB26 100 P'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced option insert failure');
+                 END;",
+            )
+            .unwrap();
+        }
+        let csv = "账户,股票,交易时间,交割时间,交易所,操作,股票数量,价格,金额,佣金,费用,类型,代码
+a,AAPL 20FEB26 100 P,2026-01-15,,SMART,卖出,1,2.00,200.00,0,0,LMT,O
+a,MSFT 20FEB26 100 P,2026-01-15,,SMART,卖出,1,3.00,300.00,0,0,LMT,O
+";
+
+        let error = import_options_csv_inner(&db, &account_id, csv)
+            .expect_err("database failure should abort the import");
+
+        assert!(error.contains("forced option insert failure"));
+        let count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM option_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "the first insert must be rolled back too");
+    }
+
+    #[test]
+    fn test_import_rolls_back_rows_when_status_recompute_fails() {
+        let (db, account_id) = db_with_account();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_option_status_update
+                 BEFORE UPDATE OF contract_status ON option_records
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced option status failure');
+                 END;",
+            )
+            .unwrap();
+        }
+        let csv = "账户,股票,交易时间,交割时间,交易所,操作,股票数量,价格,金额,佣金,费用,类型,代码
+a,AAPL 20FEB26 100 P,2026-01-15,,SMART,卖出,1,2.00,200.00,0,0,LMT,O
+";
+
+        let error = import_options_csv_inner(&db, &account_id, csv)
+            .expect_err("status failure should abort the import");
+
+        assert!(error.contains("forced option status failure"));
+        let count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM option_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "insert must roll back with status updates");
     }
 
     #[test]

@@ -4,6 +4,7 @@ import type { ColumnsType } from "antd/es/table";
 import { EditOutlined, HistoryOutlined } from "@ant-design/icons";
 import type { QuarterlyHoldingSnapshot, QuarterlySnapshot } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { useTablePageSize } from "../../hooks/tablePageSize";
 import HoldingNotesEditor from "./HoldingNotesEditor";
 import { aggregateSnapshotHoldings, parseSnapshotExchangeRates, type AggregatedSnapshotHolding } from "./aggregateSnapshotHoldings";
 
@@ -24,6 +25,7 @@ export default function SnapshotHoldingsTable({ holdings, snapshotId, loading, s
   const [notesTarget, setNotesTarget] = useState<QuarterlyHoldingSnapshot | null>(null);
   const [historyTarget, setHistoryTarget] = useState<QuarterlyHoldingSnapshot | null>(null);
   const { pnlColorDark } = usePnlColor();
+  const { pageSize, onShowSizeChange } = useTablePageSize();
 
   const snapshotRates = useMemo(() => parseSnapshotExchangeRates(snap?.exchange_rates), [snap?.exchange_rates]);
   const rows = useMemo(() => aggregateSnapshotHoldings(holdings, snapshotRates), [holdings, snapshotRates]);
@@ -54,7 +56,7 @@ export default function SnapshotHoldingsTable({ holdings, snapshotId, loading, s
   ];
 
   return <>
-    <Table dataSource={rows} columns={stockColumns} rowKey="symbol" loading={loading} size="small" className="account-detail-table" pagination={{ pageSize: 20, showSizeChanger: true }} scroll={{ x: 1100 }} expandable={{ expandedRowRender: (row) => <Table columns={accountColumns} dataSource={row.accountRows} rowKey="id" size="small" pagination={false} className="account-sub-table quarterly-holding-sub-table" />, rowExpandable: (row) => row.accountRows.length > 0 }} />
+    <Table dataSource={rows} columns={stockColumns} rowKey="symbol" loading={loading} size="small" className="account-detail-table" pagination={{ pageSize, showSizeChanger: true, onShowSizeChange }} scroll={{ x: 1100 }} expandable={{ expandedRowRender: (row) => <Table columns={accountColumns} dataSource={row.accountRows} rowKey="id" size="small" pagination={false} className="account-sub-table quarterly-holding-sub-table" />, rowExpandable: (row) => row.accountRows.length > 0 }} />
     {notesTarget && <HoldingNotesEditor holding={notesTarget} snapshotId={snapshotId} open onClose={() => setNotesTarget(null)} showHistory={false} />}
     {historyTarget && <HoldingNotesEditor holding={historyTarget} snapshotId={snapshotId} open onClose={() => setHistoryTarget(null)} showHistory />}
   </>;

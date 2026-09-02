@@ -9,6 +9,7 @@ import type { Currency } from "../../types";
 import SummaryCards from "./SummaryCards";
 import HoldingsTable from "./HoldingsTable";
 import QuickCharts from "./QuickCharts";
+import { refreshDashboardQuotes } from "./dashboardRefresh";
 import dayjs from "dayjs";
 
 const { Title, Text } = Typography;
@@ -39,9 +40,12 @@ export default function DashboardPage() {
   };
 
   const handleRefreshQuotes = useCallback(async () => {
-    await fetchHoldingQuotes();
-    await fetchReport(baseCurrency);
-  }, [fetchHoldingQuotes, fetchReport, baseCurrency]);
+    await refreshDashboardQuotes({
+      fetchHoldingQuotes,
+      fetchReport,
+      getBaseCurrency: () => useExchangeRateStore.getState().baseCurrency,
+    });
+  }, [fetchHoldingQuotes, fetchReport]);
 
   return (
     <div>

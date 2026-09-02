@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Typography, Tabs, Button, Select } from "antd";
 import { ReloadOutlined, BarChartOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
@@ -19,6 +19,7 @@ import {
   resolveStatisticsView,
   type StatisticsSelection,
 } from "./statisticsView";
+import { createStatisticsDispatcher } from "./statisticsDispatcher";
 
 const { Title, Text } = Typography;
 
@@ -42,14 +43,65 @@ export default function StatisticsPage() {
 
   const { baseCurrency, setBaseCurrency } = useExchangeRateStore();
   const {
-    overview,
-    accountStats,
+    overviewByCurrency,
     loadingByView,
     fetchView,
   } = useStatisticsStore();
   const { accounts, fetchAccounts } = useAccountStore();
   const { categories, fetchCategories } = useCategoryStore();
   const { fetchHoldingQuotes, lastUpdatedAt } = useQuoteStore();
+  const overview = overviewByCurrency[baseCurrency] ?? null;
+
+  const selectionRef = useRef<StatisticsSelection>({
+    activeTab,
+    baseCurrency,
+    selectedMarket,
+    selectedAccountId,
+    selectedCategoryId,
+  });
+  selectionRef.current = {
+    activeTab,
+    baseCurrency,
+    selectedMarket,
+    selectedAccountId,
+    selectedCategoryId,
+  };
+
+  const updateSelection = useCallback(
+    (selection: StatisticsSelection) => {
+      selectionRef.current = selection;
+      setActiveTab(selection.activeTab);
+      setSelectedMarket(selection.selectedMarket);
+      setSelectedAccountId(selection.selectedAccountId);
+      setSelectedCategoryId(selection.selectedCategoryId);
+      setBaseCurrency(selection.baseCurrency);
+    },
+    [setBaseCurrency],
+  );
+
+  const getAccountHoldings = useCallback(
+    (accountId: string, currency: Currency) => {
+      const state = useStatisticsStore.getState();
+      return (
+        state.accountStats[accountId]?.holdings ??
+        state.overviewByCurrency[currency]?.holdings ??
+        []
+      );
+    },
+    [],
+  );
+
+  const dispatcher = useMemo(
+    () =>
+      createStatisticsDispatcher({
+        getSelection: () => selectionRef.current,
+        updateSelection,
+        fetchView,
+        fetchHoldingQuotes,
+        getAccountHoldings,
+      }),
+    [fetchView, fetchHoldingQuotes, getAccountHoldings, updateSelection],
+  );
 
   const availableMarkets = useMemo(() => {
     const markets = new Set(
@@ -58,37 +110,13 @@ export default function StatisticsPage() {
     return VALID_MARKETS.filter((market) => markets.has(market as Market));
   }, [overview]);
 
-  const loadCurrentView = useCallback(
-    (overrides: Partial<StatisticsSelection> = {}) => {
-      const view = resolveStatisticsView({
-        activeTab,
-        baseCurrency,
-        selectedMarket,
-        selectedAccountId,
-        selectedCategoryId,
-        ...overrides,
-      });
-      return view ? fetchView(view) : Promise.resolve();
-    }, [
-      activeTab,
-      baseCurrency,
-      selectedMarket,
-      selectedAccountId,
-      selectedCategoryId,
-      fetchView,
-    ],
-  );
-
   useEffect(() => {
     void Promise.all([
       fetchAccounts(),
       fetchCategories(),
-      fetchView({
-        kind: "overview",
-        baseCurrency: useExchangeRateStore.getState().baseCurrency,
-      }),
+      dispatcher.initialize(),
     ]);
-  }, [fetchAccounts, fetchCategories, fetchView]);
+  }, [dispatcher, fetchAccounts, fetchCategories]);
 
   useEffect(() => {
     if (
@@ -97,90 +125,50 @@ export default function StatisticsPage() {
       selectedMarket !== availableMarkets[0]
     ) {
       const market = availableMarkets[0];
-      setSelectedMarket(market);
-      if (activeTab === "market") {
-        void loadCurrentView({ selectedMarket: market });
-      }
+      void dispatcher.changeMarket(market);
     }
-  }, [availableMarkets, selectedMarket, activeTab, loadCurrentView]);
+  }, [availableMarkets, selectedMarket, dispatcher]);
 
   useEffect(() => {
     if (accounts.length > 0 && !selectedAccountId) {
       const accountId = accounts[0].id;
-      setSelectedAccountId(accountId);
-      if (activeTab === "account") {
-        void loadCurrentView({ selectedAccountId: accountId });
-      }
+      void dispatcher.changeAccount(accountId);
     }
-  }, [accounts, selectedAccountId, activeTab, loadCurrentView]);
+  }, [accounts, selectedAccountId, dispatcher]);
 
   useEffect(() => {
     if (categories.length > 0 && !selectedCategoryId) {
       const categoryId = categories[0].id;
-      setSelectedCategoryId(categoryId);
-      if (activeTab === "category") {
-        void loadCurrentView({ selectedCategoryId: categoryId });
-      }
+      void dispatcher.changeCategory(categoryId);
     }
-  }, [categories, selectedCategoryId, activeTab, loadCurrentView]);
+  }, [categories, selectedCategoryId, dispatcher]);
 
   const handleTabChange = (tab: string) => {
     const nextTab = tab as StatisticsSelection["activeTab"];
-    setActiveTab(nextTab);
-    void loadCurrentView({ activeTab: nextTab });
+    void dispatcher.changeTab(nextTab);
   };
 
   const handleMarketChange = (market: string) => {
     localStorage.setItem(MARKET_STORAGE_KEY, market);
-    setSelectedMarket(market);
-    if (activeTab === "market") {
-      void loadCurrentView({ selectedMarket: market });
-    }
+    void dispatcher.changeMarket(market);
   };
 
   const handleAccountChange = (accountId: string) => {
-    setSelectedAccountId(accountId);
-    if (activeTab === "account") {
-      void loadCurrentView({ selectedAccountId: accountId });
-    }
+    void dispatcher.changeAccount(accountId);
   };
 
   const handleCategoryChange = (categoryId: string) => {
-    setSelectedCategoryId(categoryId);
-    if (activeTab === "category") {
-      void loadCurrentView({ selectedCategoryId: categoryId });
-    }
+    void dispatcher.changeCategory(categoryId);
   };
 
   const handleCurrencyChange = (currency: Currency) => {
-    setBaseCurrency(currency);
-    if (activeTab === "overview" || activeTab === "category") {
-      void loadCurrentView({ baseCurrency: currency });
-    }
+    void dispatcher.changeCurrency(currency);
   };
 
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
-      if (activeTab === "account" && selectedAccountId) {
-        const accountHoldings =
-          accountStats[selectedAccountId]?.holdings ?? overview?.holdings ?? [];
-        const seen = new Set<string>();
-        const symbols: [string, string][] = [];
-        for (const holding of accountHoldings) {
-          if (
-            holding.account_id === selectedAccountId &&
-            !seen.has(holding.symbol)
-          ) {
-            seen.add(holding.symbol);
-            symbols.push([holding.symbol, holding.market]);
-          }
-        }
-        await fetchHoldingQuotes(symbols);
-      } else {
-        await fetchHoldingQuotes();
-      }
-      await loadCurrentView();
+      await dispatcher.refresh();
     } finally {
       setRefreshing(false);
     }

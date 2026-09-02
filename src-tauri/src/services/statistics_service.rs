@@ -487,6 +487,40 @@ mod tests {
         assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
     }
 
+    fn with_category(
+        mut detail: HoldingDetail,
+        category_name: &str,
+        category_color: &str,
+    ) -> HoldingDetail {
+        detail.category_name = category_name.to_string();
+        detail.category_color = category_color.to_string();
+        detail
+    }
+
+    fn ranked_holding(
+        id: &str,
+        account_id: &str,
+        symbol: &str,
+        cost: f64,
+        pnl: f64,
+    ) -> HoldingDetail {
+        let mut detail = holding(
+            id,
+            account_id,
+            account_id,
+            symbol,
+            "US",
+            1.0,
+            cost,
+            cost + pnl,
+            "USD",
+        );
+        if cost == 0.0 {
+            detail.pnl_percent = None;
+        }
+        detail
+    }
+
     #[test]
     fn overview_preserves_cross_currency_totals_and_exposes_same_holdings() {
         let (model, rates) = fixture();
@@ -558,5 +592,195 @@ mod tests {
             .find(|item| item.market == "CN")
             .unwrap();
         assert_close(cn.market_value_usd, 200.0);
+    }
+
+    #[test]
+    fn distributions_preserve_multiple_markets_accounts_and_categories() {
+        let model = PortfolioReadModel::from_holdings_for_test(vec![
+            with_category(
+                holding(
+                    "us-growth",
+                    "acct-us-growth",
+                    "US Growth",
+                    "USG",
+                    "US",
+                    1.0,
+                    10.0,
+                    20.0,
+                    "USD",
+                ),
+                "成长",
+                "#1677ff",
+            ),
+            with_category(
+                holding(
+                    "us-income",
+                    "acct-us-income",
+                    "US Income",
+                    "USI",
+                    "US",
+                    1.0,
+                    5.0,
+                    15.0,
+                    "USD",
+                ),
+                "收益",
+                "#52c41a",
+            ),
+            with_category(
+                holding(
+                    "cn-growth",
+                    "acct-cn",
+                    "CN Broker",
+                    "CNG",
+                    "CN",
+                    1.0,
+                    10.0,
+                    20.0,
+                    "CNY",
+                ),
+                "成长",
+                "#1677ff",
+            ),
+            with_category(
+                holding(
+                    "hk-income",
+                    "acct-hk",
+                    "HK Broker",
+                    "HKI",
+                    "HK",
+                    1.0,
+                    4.0,
+                    12.0,
+                    "HKD",
+                ),
+                "收益",
+                "#52c41a",
+            ),
+        ]);
+        let rates = ExchangeRates {
+            usd_cny: 2.0,
+            usd_hkd: 4.0,
+            cny_hkd: 2.0,
+            updated_at: "2026-09-02T09:30:00Z".to_string(),
+        };
+
+        let result = overview(&model, &rates, "USD");
+
+        assert_close(result.total_market_value, 48.0);
+        assert_close(result.total_cost, 21.0);
+        assert_close(result.total_pnl, 27.0);
+        assert_eq!(
+            result
+                .market_distribution
+                .iter()
+                .map(|slice| (slice.name.as_str(), slice.value))
+                .collect::<Vec<_>>(),
+            vec![("🇺🇸 美股", 35.0), ("🇨🇳 A股", 10.0), ("🇭🇰 港股", 3.0)]
+        );
+        assert_eq!(
+            result
+                .category_distribution
+                .iter()
+                .map(|slice| (slice.name.as_str(), slice.value, slice.color.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("成长", 30.0, Some("#1677ff")),
+                ("收益", 18.0, Some("#52c41a")),
+            ]
+        );
+        assert_eq!(
+            result
+                .account_distribution
+                .iter()
+                .map(|slice| (slice.name.as_str(), slice.value))
+                .collect::<Vec<_>>(),
+            vec![
+                ("US Growth", 20.0),
+                ("US Income", 15.0),
+                ("CN Broker", 10.0),
+                ("HK Broker", 3.0),
+            ]
+        );
+
+        let us = by_market(&model, "US");
+        assert_close(us.total_market_value, 35.0);
+        assert_close(us.total_cost, 15.0);
+        assert_eq!(us.account_distribution[0].name, "US Growth");
+        assert_close(us.account_distribution[0].value, 20.0);
+
+        let growth = by_category(&model, &rates, "USD", "growth", "成长", "#1677ff");
+        assert_close(growth.total_market_value, 30.0);
+        assert_close(growth.total_cost, 15.0);
+        assert_eq!(growth.holdings.len(), 2);
+        let cn = growth
+            .holdings
+            .iter()
+            .find(|holding| holding.market == "CN")
+            .unwrap();
+        assert_close(cn.market_value, 20.0);
+        assert_close(cn.market_value_usd, 10.0);
+    }
+
+    #[test]
+    fn overview_aggregates_symbols_and_filters_sorted_top_five_by_sign() {
+        let model = PortfolioReadModel::from_holdings_for_test(vec![
+            ranked_holding("dup-a", "acct-a", "DUP", 100.0, 8.0),
+            ranked_holding("dup-b", "acct-b", "DUP", 100.0, 7.0),
+            ranked_holding("g2", "acct-a", "G2", 100.0, 14.0),
+            ranked_holding("g3", "acct-a", "G3", 100.0, 13.0),
+            ranked_holding("g4", "acct-a", "G4", 100.0, 12.0),
+            ranked_holding("g5", "acct-a", "G5", 100.0, 11.0),
+            ranked_holding("g6", "acct-a", "G6", 100.0, 10.0),
+            ranked_holding("free", "acct-a", "FREE", 0.0, 16.0),
+            ranked_holding("l1", "acct-a", "L1", 100.0, -15.0),
+            ranked_holding("l2", "acct-a", "L2", 100.0, -14.0),
+            ranked_holding("l3", "acct-a", "L3", 100.0, -13.0),
+            ranked_holding("l4", "acct-a", "L4", 100.0, -12.0),
+            ranked_holding("l5", "acct-a", "L5", 100.0, -11.0),
+            ranked_holding("l6", "acct-a", "L6", 100.0, -10.0),
+        ]);
+        let rates = ExchangeRates {
+            usd_cny: 5.0,
+            usd_hkd: 7.8,
+            cny_hkd: 1.56,
+            updated_at: "2026-09-02T09:30:00Z".to_string(),
+        };
+
+        let result = overview(&model, &rates, "USD");
+
+        assert_eq!(
+            result
+                .top_gainers
+                .iter()
+                .map(|item| item.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["FREE", "DUP", "G2", "G3", "G4"]
+        );
+        assert_eq!(
+            result
+                .top_losers
+                .iter()
+                .map(|item| item.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["L1", "L2", "L3", "L4", "L5"]
+        );
+        assert!(result.top_gainers.iter().all(|item| item.pnl > 0.0));
+        assert!(result.top_losers.iter().all(|item| item.pnl < 0.0));
+
+        let free = &result.top_gainers[0];
+        assert_close(free.pnl, 16.0);
+        assert_eq!(free.pnl_percent, None);
+        assert_close(free.market_value, 16.0);
+
+        let duplicate = &result.top_gainers[1];
+        assert_close(duplicate.pnl, 15.0);
+        assert_eq!(duplicate.pnl_percent, Some(7.5));
+        assert_close(duplicate.market_value, 215.0);
+
+        let largest_loss = &result.top_losers[0];
+        assert_close(largest_loss.pnl, -15.0);
+        assert_eq!(largest_loss.pnl_percent, Some(-15.0));
+        assert_close(largest_loss.market_value, 85.0);
     }
 }

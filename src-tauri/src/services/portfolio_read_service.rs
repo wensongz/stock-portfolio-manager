@@ -237,7 +237,7 @@ mod tests {
     use super::{PortfolioReadModel, QuoteReadMode};
     use crate::db::Database;
     use crate::models::{ExchangeRates, StockQuote};
-    use crate::services::quote_service::QuoteCache;
+    use crate::services::quote_service::{QuoteCache, QuoteServiceState};
 
     fn seeded_db() -> Database {
         let db = Database::new(":memory:").unwrap();
@@ -308,6 +308,93 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("quote service state is required"));
+    }
+
+    #[tokio::test]
+    async fn refresh_missing_succeeds_without_network_when_every_quote_is_cached() {
+        let db = seeded_db();
+        let cache = QuoteCache::new();
+        cache.set(cached_aapl());
+        let quote_state = QuoteServiceState::new();
+
+        let model = PortfolioReadModel::load(
+            &db,
+            &cache,
+            Some(&quote_state),
+            QuoteReadMode::RefreshMissing,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(model.holdings().len(), 1);
+        assert_eq!(model.holdings()[0].current_price, 12.0);
+        assert_eq!(model.holdings()[0].daily_pnl, 10.0);
+    }
+
+    #[tokio::test]
+    async fn loader_preserves_missing_quote_category_order_and_zero_cost_semantics() {
+        let db = seeded_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, name, market, description, created_at, updated_at)
+                 VALUES ('acct-cn', 'CN Broker', 'CN', '', '2026-01-01', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
+                 VALUES ('holding-cn-missing', 'acct-cn', '600000', 'Pudong Bank', 'CN', NULL, 10, 8, 'CNY', '2026-01-01', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
+                 VALUES ('holding-free', 'acct-us', 'FREE', 'Free Lot', 'US', 'growth', 10, 0, 'USD', '2026-01-01', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+        }
+        let cache = QuoteCache::new();
+        cache.set(cached_aapl());
+        cache.set(StockQuote {
+            symbol: "FREE".to_string(),
+            name: "Free Lot".to_string(),
+            market: "US".to_string(),
+            current_price: 5.0,
+            change: 0.5,
+            ..StockQuote::default()
+        });
+
+        let model = PortfolioReadModel::load(&db, &cache, None, QuoteReadMode::CacheOnly)
+            .await
+            .unwrap();
+        let holdings = model.holdings();
+
+        assert_eq!(
+            holdings
+                .iter()
+                .map(|holding| holding.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["600000", "AAPL", "FREE"]
+        );
+        let missing = &holdings[0];
+        assert_eq!(missing.category_name, "未分类");
+        assert_eq!(missing.category_color, "#8B8B8B");
+        assert_eq!(missing.current_price, 0.0);
+        assert_eq!(missing.market_value, 0.0);
+        assert_eq!(missing.pnl, -80.0);
+        assert_eq!(missing.pnl_percent, Some(-100.0));
+        assert_eq!(missing.daily_pnl, 0.0);
+
+        let free = &holdings[2];
+        assert_eq!(free.cost_value, 0.0);
+        assert_eq!(free.market_value, 50.0);
+        assert_eq!(free.pnl, 50.0);
+        assert_eq!(free.pnl_percent, None);
+        assert_eq!(free.daily_pnl, 5.0);
     }
 
     #[tokio::test]

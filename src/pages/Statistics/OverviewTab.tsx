@@ -60,7 +60,9 @@ export default function OverviewTab({ baseCurrency }: Props) {
   const { pageSize, onShowSizeChange } = useTablePageSize();
   const { pnlColor } = usePnlColor();
   const currency = currencySymbol[baseCurrency] ?? "$";
-  const { overview, loadingByView, errorByView } = useStatisticsStore();
+  const { overviewByCurrency, loadingByView, errorByView } =
+    useStatisticsStore();
+  const overview = overviewByCurrency[baseCurrency] ?? null;
   const viewKey = statisticsViewKey({ kind: "overview", baseCurrency });
   const loading = loadingByView[viewKey] ?? false;
   const error = errorByView[viewKey] ?? null;

@@ -20,6 +20,16 @@ const responses = {
   get_statistics_by_category: { result: "category" },
 };
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 test("each statistics view invokes exactly one matching command", async () => {
   const calls = [];
   const store = createStatisticsStore(async (command, args) => {
@@ -57,7 +67,7 @@ test("a failed view preserves every cached result and records only its error", a
   await store.getState().fetchView(views[3]);
 
   const after = store.getState();
-  assert.equal(after.overview, before.overview);
+  assert.equal(after.overviewByCurrency.USD, before.overviewByCurrency.USD);
   assert.equal(after.marketStats.US, before.marketStats.US);
   assert.equal(after.accountStats["acct-us"], before.accountStats["acct-us"]);
   assert.equal(after.categoryStats["growth:CNY"], before.categoryStats["growth:CNY"]);
@@ -65,4 +75,82 @@ test("a failed view preserves every cached result and records only its error", a
   assert.equal(after.errorByView[statisticsViewKey(views[0])] ?? null, null);
   assert.equal(after.errorByView[statisticsViewKey(views[1])] ?? null, null);
   assert.equal(after.errorByView[statisticsViewKey(views[2])] ?? null, null);
+});
+
+test("same statistics view key shares one in-flight command", async () => {
+  const pending = deferred();
+  let calls = 0;
+  const store = createStatisticsStore(async () => {
+    calls += 1;
+    return pending.promise;
+  });
+  const view = { kind: "overview", baseCurrency: "USD" };
+
+  const first = store.getState().fetchView(view);
+  const second = store.getState().fetchView(view);
+  pending.resolve({ currency: "USD" });
+  await Promise.all([first, second]);
+
+  assert.equal(calls, 1);
+  assert.equal(store.getState().loadingByView[statisticsViewKey(view)], false);
+
+  await store.getState().fetchView(view);
+  assert.equal(calls, 2);
+});
+
+test("out-of-order overviews remain cached under their requested currencies", async () => {
+  const requests = new Map([
+    ["USD", deferred()],
+    ["CNY", deferred()],
+  ]);
+  const store = createStatisticsStore(async (_command, args) =>
+    requests.get(args.baseCurrency).promise,
+  );
+
+  const usd = store
+    .getState()
+    .fetchView({ kind: "overview", baseCurrency: "USD" });
+  const cny = store
+    .getState()
+    .fetchView({ kind: "overview", baseCurrency: "CNY" });
+  requests.get("CNY").resolve({ currency: "CNY" });
+  await cny;
+  requests.get("USD").resolve({ currency: "USD" });
+  await usd;
+
+  assert.deepEqual(store.getState().overviewByCurrency, {
+    USD: { currency: "USD" },
+    CNY: { currency: "CNY" },
+  });
+});
+
+test("an overview failure is isolated from another currency success", async () => {
+  const requests = new Map([
+    ["USD", deferred()],
+    ["CNY", deferred()],
+  ]);
+  const store = createStatisticsStore(async (_command, args) =>
+    requests.get(args.baseCurrency).promise,
+  );
+  const usdView = { kind: "overview", baseCurrency: "USD" };
+  const cnyView = { kind: "overview", baseCurrency: "CNY" };
+
+  const usd = store.getState().fetchView(usdView);
+  const cny = store.getState().fetchView(cnyView);
+  requests.get("CNY").resolve({ currency: "CNY" });
+  await cny;
+  requests.get("USD").reject(new Error("USD offline"));
+  await usd;
+
+  assert.deepEqual(store.getState().overviewByCurrency, {
+    CNY: { currency: "CNY" },
+  });
+  assert.match(
+    store.getState().errorByView[statisticsViewKey(usdView)] ?? "",
+    /USD offline/,
+  );
+  assert.equal(
+    store.getState().errorByView[statisticsViewKey(cnyView)] ?? null,
+    null,
+  );
 });

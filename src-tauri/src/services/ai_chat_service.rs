@@ -14,7 +14,6 @@
 //! All supported providers (OpenAI / Ollama / OpenRouter / Kimi / GLM / MiMo)
 //! expose the same `/chat/completions` shape, so the request logic is uniform.
 
-use crate::commands::dashboard::build_holding_details_pub;
 use crate::db::Database;
 use crate::models::ai_config::ChatMessage;
 use crate::models::skill::Skill;
@@ -23,6 +22,7 @@ use crate::services::ai_models_service::resolve_base_url;
 use crate::services::exchange_rate_service::{get_cached_rates, ExchangeRateCache};
 use crate::services::http_client;
 use crate::services::performance_service::{self, PerformanceFilter};
+use crate::services::portfolio_read_service::{PortfolioReadModel, QuoteReadMode};
 use crate::services::quote_service::{QuoteCache, QuoteServiceState};
 use crate::services::skill_service::{self, build_skill_system_message};
 use chrono::{Duration, Utc};

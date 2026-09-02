@@ -21,7 +21,7 @@ pub mod transaction;
 
 pub use account::Account;
 pub use category::Category;
-pub use dashboard::{DashboardSummary, HoldingDetail};
+pub use dashboard::{DashboardReport, DashboardSummary, HoldingDetail};
 pub use holding::Holding;
 pub use option_review::*;
 #[cfg(test)]

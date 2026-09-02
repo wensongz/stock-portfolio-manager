@@ -131,12 +131,11 @@ pub async fn build_portfolio_context(
     cache: &ExchangeRateCache,
     quote_cache: &QuoteCache,
 ) -> Result<String, String> {
-    let details = build_holding_details_pub(db, quote_cache, true).await?;
+    let model = PortfolioReadModel::load(db, quote_cache, None, QuoteReadMode::CacheOnly).await?;
+    let details = model.holdings();
     let rates = get_cached_rates(cache, db).await;
-    let mut out = render_holdings_context(
-        &details,
-        rates.as_ref().map_err(std::string::String::as_str),
-    );
+    let mut out =
+        render_holdings_context(details, rates.as_ref().map_err(std::string::String::as_str));
 
     // ── Recent transactions ────────────────────────────────────────────────
     out.push_str("## 近期交易（最近 20 条）\n");

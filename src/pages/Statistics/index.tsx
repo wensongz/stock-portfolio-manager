@@ -1,11 +1,13 @@
-import { useState, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Typography, Tabs, Button, Select } from "antd";
 import { ReloadOutlined, BarChartOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
-import { useStatisticsStore } from "../../stores/dashboardStore";
+import {
+  statisticsViewKey,
+  useStatisticsStore,
+} from "../../stores/statisticsStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { useCategoryStore } from "../../stores/categoryStore";
-import { useHoldingStore } from "../../stores/holdingStore";
 import { useQuoteStore } from "../../stores/quoteStore";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
 import type { Currency, Market } from "../../types";
@@ -13,6 +15,10 @@ import OverviewTab from "./OverviewTab";
 import MarketTab from "./MarketTab";
 import AccountTab from "./AccountTab";
 import CategoryTab from "./CategoryTab";
+import {
+  resolveStatisticsView,
+  type StatisticsSelection,
+} from "./statisticsView";
 
 const { Title, Text } = Typography;
 
@@ -25,115 +31,177 @@ function loadSelectedMarket(): string | null {
 }
 
 export default function StatisticsPage() {
-  const [activeTab, setActiveTab] = useState("overview");
+  const [activeTab, setActiveTab] =
+    useState<StatisticsSelection["activeTab"]>("overview");
   const [selectedAccountId, setSelectedAccountId] = useState("");
   const [selectedCategoryId, setSelectedCategoryId] = useState("");
+  const [selectedMarket, setSelectedMarket] = useState(
+    () => loadSelectedMarket() ?? "CN",
+  );
   const [refreshing, setRefreshing] = useState(false);
 
   const { baseCurrency, setBaseCurrency } = useExchangeRateStore();
-
   const {
-    overview, loadingOverview,
-    fetchOverview, fetchMarketStats, fetchAccountStats, fetchCategoryStats,
+    overview,
+    accountStats,
+    loadingByView,
+    fetchView,
   } = useStatisticsStore();
   const { accounts, fetchAccounts } = useAccountStore();
   const { categories, fetchCategories } = useCategoryStore();
-  const { holdings, fetchHoldings } = useHoldingStore();
   const { fetchHoldingQuotes, lastUpdatedAt } = useQuoteStore();
 
-  // Derive available markets from holdings
   const availableMarkets = useMemo(() => {
-    const marketSet = new Set(holdings.map((h) => h.market));
-    return VALID_MARKETS.filter((m) => marketSet.has(m as Market));
-  }, [holdings]);
+    const markets = new Set(
+      (overview?.holdings ?? []).map((holding) => holding.market),
+    );
+    return VALID_MARKETS.filter((market) => markets.has(market as Market));
+  }, [overview]);
 
-  // Determine the initial selected market: prefer saved value, then first market with holdings
-  const [selectedMarket, setSelectedMarket] = useState<string>(() => {
-    return loadSelectedMarket() ?? "CN";
-  });
+  const loadCurrentView = useCallback(
+    (overrides: Partial<StatisticsSelection> = {}) => {
+      const view = resolveStatisticsView({
+        activeTab,
+        baseCurrency,
+        selectedMarket,
+        selectedAccountId,
+        selectedCategoryId,
+        ...overrides,
+      });
+      return view ? fetchView(view) : Promise.resolve();
+    }, [
+      activeTab,
+      baseCurrency,
+      selectedMarket,
+      selectedAccountId,
+      selectedCategoryId,
+      fetchView,
+    ],
+  );
 
-  // Once holdings are loaded, if no saved preference exists, pick the first available market
   useEffect(() => {
-    if (availableMarkets.length > 0 && !loadSelectedMarket()) {
-      setSelectedMarket(availableMarkets[0]);
+    void Promise.all([
+      fetchAccounts(),
+      fetchCategories(),
+      fetchView({
+        kind: "overview",
+        baseCurrency: useExchangeRateStore.getState().baseCurrency,
+      }),
+    ]);
+  }, [fetchAccounts, fetchCategories, fetchView]);
+
+  useEffect(() => {
+    if (
+      availableMarkets.length > 0 &&
+      !loadSelectedMarket() &&
+      selectedMarket !== availableMarkets[0]
+    ) {
+      const market = availableMarkets[0];
+      setSelectedMarket(market);
+      if (activeTab === "market") {
+        void loadCurrentView({ selectedMarket: market });
+      }
     }
-  }, [availableMarkets]);
+  }, [availableMarkets, selectedMarket, activeTab, loadCurrentView]);
+
+  useEffect(() => {
+    if (accounts.length > 0 && !selectedAccountId) {
+      const accountId = accounts[0].id;
+      setSelectedAccountId(accountId);
+      if (activeTab === "account") {
+        void loadCurrentView({ selectedAccountId: accountId });
+      }
+    }
+  }, [accounts, selectedAccountId, activeTab, loadCurrentView]);
+
+  useEffect(() => {
+    if (categories.length > 0 && !selectedCategoryId) {
+      const categoryId = categories[0].id;
+      setSelectedCategoryId(categoryId);
+      if (activeTab === "category") {
+        void loadCurrentView({ selectedCategoryId: categoryId });
+      }
+    }
+  }, [categories, selectedCategoryId, activeTab, loadCurrentView]);
+
+  const handleTabChange = (tab: string) => {
+    const nextTab = tab as StatisticsSelection["activeTab"];
+    setActiveTab(nextTab);
+    void loadCurrentView({ activeTab: nextTab });
+  };
 
   const handleMarketChange = (market: string) => {
     localStorage.setItem(MARKET_STORAGE_KEY, market);
     setSelectedMarket(market);
+    if (activeTab === "market") {
+      void loadCurrentView({ selectedMarket: market });
+    }
+  };
+
+  const handleAccountChange = (accountId: string) => {
+    setSelectedAccountId(accountId);
+    if (activeTab === "account") {
+      void loadCurrentView({ selectedAccountId: accountId });
+    }
+  };
+
+  const handleCategoryChange = (categoryId: string) => {
+    setSelectedCategoryId(categoryId);
+    if (activeTab === "category") {
+      void loadCurrentView({ selectedCategoryId: categoryId });
+    }
   };
 
   const handleCurrencyChange = (currency: Currency) => {
     setBaseCurrency(currency);
-    fetchOverview(currency);
-    if (selectedCategoryId) fetchCategoryStats(selectedCategoryId, currency);
+    if (activeTab === "overview" || activeTab === "category") {
+      void loadCurrentView({ baseCurrency: currency });
+    }
   };
-
-  useEffect(() => {
-    fetchAccounts();
-    fetchCategories();
-    fetchHoldings();
-    // Load holding quotes from cache so the OverviewTab's "个股明细" table
-    // can render merged positions with market values immediately.
-    fetchHoldingQuotes([]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    fetchOverview(baseCurrency);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [baseCurrency]);
-
-  // Preselect first account and category
-  useEffect(() => {
-    if (accounts.length > 0 && !selectedAccountId) {
-      setSelectedAccountId(accounts[0].id);
-    }
-  }, [accounts, selectedAccountId]);
-
-  useEffect(() => {
-    if (categories.length > 0 && !selectedCategoryId) {
-      setSelectedCategoryId(categories[0].id);
-    }
-  }, [categories, selectedCategoryId]);
 
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
-      // When the "By Account" tab is active with a selected account, only
-      // force-refresh the quotes for that account's holdings.
       if (activeTab === "account" && selectedAccountId) {
+        const accountHoldings =
+          accountStats[selectedAccountId]?.holdings ?? overview?.holdings ?? [];
         const seen = new Set<string>();
         const symbols: [string, string][] = [];
-        for (const h of holdings) {
-          if (h.account_id === selectedAccountId && !seen.has(h.symbol)) {
-            seen.add(h.symbol);
-            symbols.push([h.symbol, h.market]);
+        for (const holding of accountHoldings) {
+          if (
+            holding.account_id === selectedAccountId &&
+            !seen.has(holding.symbol)
+          ) {
+            seen.add(holding.symbol);
+            symbols.push([holding.symbol, holding.market]);
           }
         }
         await fetchHoldingQuotes(symbols);
       } else {
-        // Force-refresh all quotes from the API
         await fetchHoldingQuotes();
       }
-      // Re-fetch all statistics data using the now-fresh cache.
-      // Since the backend reads from cache only, these are fast.
-      const promises: Promise<void>[] = [fetchOverview(baseCurrency)];
-      promises.push(fetchMarketStats(selectedMarket));
-      if (selectedAccountId) promises.push(fetchAccountStats(selectedAccountId));
-      if (selectedCategoryId) promises.push(fetchCategoryStats(selectedCategoryId, baseCurrency));
-      await Promise.all(promises);
+      await loadCurrentView();
     } finally {
       setRefreshing(false);
     }
   };
 
+  const currentView = resolveStatisticsView({
+    activeTab,
+    baseCurrency,
+    selectedMarket,
+    selectedAccountId,
+    selectedCategoryId,
+  });
+  const currentLoading = currentView
+    ? (loadingByView[statisticsViewKey(currentView)] ?? false)
+    : false;
+
   const tabs = [
     {
       key: "overview",
       label: "整体统计",
-      children: <OverviewTab overview={overview} loading={loadingOverview} baseCurrency={baseCurrency} />,
+      children: <OverviewTab baseCurrency={baseCurrency} />,
     },
     {
       key: "market",
@@ -151,7 +219,7 @@ export default function StatisticsPage() {
       children: (
         <AccountTab
           selectedAccountId={selectedAccountId}
-          onAccountChange={setSelectedAccountId}
+          onAccountChange={handleAccountChange}
         />
       ),
     },
@@ -161,7 +229,7 @@ export default function StatisticsPage() {
       children: (
         <CategoryTab
           selectedCategoryId={selectedCategoryId}
-          onCategoryChange={setSelectedCategoryId}
+          onCategoryChange={handleCategoryChange}
           baseCurrency={baseCurrency}
         />
       ),
@@ -178,7 +246,7 @@ export default function StatisticsPage() {
           <Button
             icon={<ReloadOutlined />}
             onClick={handleRefresh}
-            loading={refreshing || loadingOverview}
+            loading={refreshing || currentLoading}
             size="small"
           >
             刷新
@@ -199,7 +267,7 @@ export default function StatisticsPage() {
 
       <Tabs
         activeKey={activeTab}
-        onChange={setActiveTab}
+        onChange={handleTabChange}
         items={tabs}
         destroyOnHidden={false}
         tabBarExtraContent={

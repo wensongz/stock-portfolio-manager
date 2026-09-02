@@ -10,7 +10,6 @@
 //! *instructions* into the prompt; tools let the model *fetch data* on demand.
 //! A skill says "answer in this structure"; a tool says "here are real numbers".
 
-use crate::commands::dashboard::build_holding_details_pub;
 use crate::commands::ocr::{
     lookup_cn_stock_code_with_state, lookup_stock_name_by_symbol_with_state,
 };
@@ -30,6 +29,7 @@ use crate::services::indicators;
 use crate::services::market_overview_service;
 use crate::services::option_review_service;
 use crate::services::performance_service::{self, PerformanceFilter};
+use crate::services::portfolio_read_service::{PortfolioReadModel, QuoteReadMode};
 use crate::services::quote_provider_service;
 use crate::services::quote_service::{self, resolve_index_secid, QuoteCache, QuoteServiceState};
 use crate::services::stock_operation_builder::normalize_stock_symbol;
@@ -910,8 +910,8 @@ async fn tool_portfolio_overview(ctx: &ToolCtx<'_>) -> ToolResult {
 async fn tool_holdings_detail(ctx: &ToolCtx<'_>) -> ToolResult {
     // cache_only = true: tools should not trigger cascading network fetches.
     // The model can call get_stock_quote explicitly for fresh prices.
-    match build_holding_details_pub(ctx.db, ctx.quote_cache, true).await {
-        Ok(details) => ToolResult::ok_json(json!({ "holdings": details })),
+    match PortfolioReadModel::load(ctx.db, ctx.quote_cache, None, QuoteReadMode::CacheOnly).await {
+        Ok(model) => ToolResult::ok_json(json!({ "holdings": model.holdings() })),
         Err(e) => ToolResult::err_json(format!("获取持仓明细失败：{e}")),
     }
 }
@@ -1121,14 +1121,14 @@ async fn tool_dashboard_summary(ctx: &ToolCtx<'_>) -> ToolResult {
         Err(error) => return error,
     };
     let base = "USD";
-    match build_holding_details_pub(ctx.db, ctx.quote_cache, true).await {
-        Ok(details) => {
+    match PortfolioReadModel::load(ctx.db, ctx.quote_cache, None, QuoteReadMode::CacheOnly).await {
+        Ok(model) => {
             let mut us_mv = 0.0f64;
             let mut cn_mv = 0.0f64;
             let mut hk_mv = 0.0f64;
             let mut total_cost = 0.0f64;
             let mut daily_pnl = 0.0f64;
-            for d in &details {
+            for d in model.holdings() {
                 let mv = convert_currency(d.market_value, &d.currency, base, &rates);
                 let cv = convert_currency(d.cost_value, &d.currency, base, &rates);
                 daily_pnl += convert_currency(d.daily_pnl, &d.currency, base, &rates);

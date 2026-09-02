@@ -1,6 +1,6 @@
 import { useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Typography, Select, Divider, Card, Row, Col, Statistic, Spin, Alert, Button, Tooltip } from "antd";
+import { Typography, Select, Divider, Card, Row, Col, Statistic, Spin, Button, Tooltip } from "antd";
 import { ReloadOutlined, SyncOutlined, DashboardOutlined } from "@ant-design/icons";
 import { useDashboardStore } from "../../stores/dashboardStore";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
@@ -14,40 +14,34 @@ import dayjs from "dayjs";
 const { Title, Text } = Typography;
 
 export default function DashboardPage() {
-  const { summary, holdingDetails, loadingSummary, loadingHoldings, errorSummary, fetchSummary, fetchHoldingDetails } =
-    useDashboardStore();
-  const { rates, loading: ratesLoading, error: ratesError, baseCurrency, fetchRates, setBaseCurrency } =
-    useExchangeRateStore();
+  const { summary, holdingDetails, loading, error, fetchReport } = useDashboardStore();
+  const { baseCurrency, setBaseCurrency } = useExchangeRateStore();
   const { loading: quotesLoading, lastUpdatedAt, fetchHoldingQuotes, setQuoteWarning } = useQuoteStore();
+  const rates = summary?.exchange_rates ?? null;
 
   useEffect(() => {
-    // Run all initial data loads in parallel, then check whether any of
-    // them triggered a Xueqiu error.  This is the most reliable delivery
+    // Load one atomic report, then check whether the request triggered a
+    // Xueqiu error. This is the most reliable delivery
     // path for the Dashboard because it does not depend on Tauri event
     // timing: the check runs immediately after the Rust commands that may
     // have set LAST_QUOTE_WARNING return.
     const init = async () => {
-      await Promise.allSettled([
-        fetchRates(),
-        fetchSummary(baseCurrency),
-        fetchHoldingDetails(),
-      ]);
+      await fetchReport(useExchangeRateStore.getState().baseCurrency);
       const w = await invoke<string | null>("take_quote_warning").catch(() => null);
       if (w) setQuoteWarning(w);
     };
     init();
-  }, [fetchRates, fetchSummary, fetchHoldingDetails, baseCurrency, setQuoteWarning]);
+  }, [fetchReport, setQuoteWarning]);
 
   const handleCurrencyChange = (currency: Currency) => {
     setBaseCurrency(currency);
-    fetchSummary(currency);
+    fetchReport(currency);
   };
 
   const handleRefreshQuotes = useCallback(async () => {
     await fetchHoldingQuotes();
-    fetchSummary(baseCurrency);
-    fetchHoldingDetails();
-  }, [fetchHoldingQuotes, fetchSummary, fetchHoldingDetails, baseCurrency]);
+    await fetchReport(baseCurrency);
+  }, [fetchHoldingQuotes, fetchReport, baseCurrency]);
 
   return (
     <div>
@@ -81,7 +75,7 @@ export default function DashboardPage() {
       </div>
 
       {/* Summary Cards */}
-      <SummaryCards summary={summary} loading={loadingSummary} error={errorSummary} />
+      <SummaryCards summary={summary} loading={loading} error={error} />
 
       {/* Quick market distribution chart */}
       <QuickCharts summary={summary} />
@@ -92,7 +86,7 @@ export default function DashboardPage() {
           <Card
             title="💱 实时汇率"
             extra={
-              ratesLoading ? (
+              loading ? (
                 <Spin size="small" />
               ) : rates ? (
                 <Text type="secondary" style={{ fontSize: 12 }}>
@@ -101,14 +95,6 @@ export default function DashboardPage() {
               ) : null
             }
           >
-            {ratesError && (
-              <Alert
-                title="汇率获取失败，请检查网络连接"
-                type="warning"
-                showIcon
-                style={{ marginBottom: 16 }}
-              />
-            )}
             {rates ? (
               <Row gutter={[32, 0]}>
                 <Col>
@@ -131,7 +117,7 @@ export default function DashboardPage() {
                 </Col>
               </Row>
             ) : (
-              !ratesLoading && <Text type="secondary">暂无汇率数据</Text>
+              !loading && <Text type="secondary">暂无汇率数据</Text>
             )}
           </Card>
         </Col>
@@ -140,7 +126,7 @@ export default function DashboardPage() {
       <Divider>持仓概览</Divider>
 
       {/* Holdings Detail Table */}
-      <HoldingsTable holdings={holdingDetails} loading={loadingHoldings} />
+      <HoldingsTable holdings={holdingDetails} loading={loading} />
     </div>
   );
 }

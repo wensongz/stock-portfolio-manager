@@ -28,6 +28,7 @@ pub struct StatisticsOverview {
     pub stock_distribution: Vec<PieSlice>,
     pub top_gainers: Vec<PnlItem>,
     pub top_losers: Vec<PnlItem>,
+    pub holdings: Vec<crate::models::dashboard::HoldingDetail>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -1,9 +1,8 @@
-import { useEffect } from "react";
-import { Row, Col, Card, Spin, Empty, Select } from "antd";
+import { Alert, Row, Col, Card, Spin, Empty, Select } from "antd";
 import PieChart from "../../components/charts/PieChart";
 import StatCard from "../../components/charts/StatCard";
 import HoldingsTable from "../Dashboard/HoldingsTable";
-import { useStatisticsStore } from "../../stores/dashboardStore";
+import { statisticsViewKey, useStatisticsStore } from "../../stores/statisticsStore";
 import { useAccountStore } from "../../stores/accountStore";
 import type { AccountStatistics } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
@@ -21,18 +20,13 @@ const marketCurrency: Record<string, { code: string; symbol: string }> = {
 
 export default function AccountTab({ selectedAccountId, onAccountChange }: Props) {
   const { pnlColor } = usePnlColor();
-  const { accountStats, fetchAccountStats } = useStatisticsStore();
-  const { accounts, fetchAccounts } = useAccountStore();
-
-  useEffect(() => {
-    fetchAccounts();
-  }, [fetchAccounts]);
-
-  useEffect(() => {
-    if (selectedAccountId) {
-      fetchAccountStats(selectedAccountId);
-    }
-  }, [selectedAccountId, fetchAccountStats]);
+  const { accountStats, loadingByView, errorByView } = useStatisticsStore();
+  const { accounts } = useAccountStore();
+  const viewKey = selectedAccountId
+    ? statisticsViewKey({ kind: "account", accountId: selectedAccountId })
+    : null;
+  const loading = viewKey ? (loadingByView[viewKey] ?? false) : false;
+  const error = viewKey ? (errorByView[viewKey] ?? null) : null;
 
   const stats: AccountStatistics | undefined = accountStats[selectedAccountId];
   const currencyCode = stats ? (marketCurrency[stats.market]?.code ?? "USD") : "USD";
@@ -55,12 +49,16 @@ export default function AccountTab({ selectedAccountId, onAccountChange }: Props
         </Select>
       </div>
 
+      {error && <Alert title={error} type="error" showIcon className="mb-4" />}
+
       {!selectedAccountId ? (
         <Empty description="请选择账户" />
-      ) : !stats ? (
+      ) : loading && !stats ? (
         <div className="flex justify-center py-16">
           <Spin size="large" />
         </div>
+      ) : !stats ? (
+        <Empty description="暂无账户统计数据" />
       ) : stats.holdings.length === 0 ? (
         <Empty description="该账户暂无持仓" />
       ) : (
@@ -100,7 +98,7 @@ export default function AccountTab({ selectedAccountId, onAccountChange }: Props
           </Row>
 
           <Card title="持仓明细">
-            <HoldingsTable holdings={stats.holdings} loading={false} hideAccountMarket />
+            <HoldingsTable holdings={stats.holdings} loading={loading} hideAccountMarket />
           </Card>
         </>
       )}

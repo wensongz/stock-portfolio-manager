@@ -8,12 +8,12 @@
 //! null entry rather than failing the whole call, so the model still gets
 //! *most* of the picture.
 
-use crate::commands::dashboard::build_holding_details_pub;
 use crate::db::Database;
 use crate::models::quote::StockQuote;
 use crate::services::exchange_rate_service::{
     convert_currency, get_cached_rates, ExchangeRateCache,
 };
+use crate::services::portfolio_read_service::{PortfolioReadModel, QuoteReadMode};
 use crate::services::quote_service::{self, QuoteCache};
 use chrono::Utc;
 use serde::Serialize;
@@ -192,8 +192,10 @@ pub async fn get_market_overview(
     }
 
     // User holdings daily P&L, normalised to USD.
-    let holdings = match build_holding_details_pub(db, quote_cache, true).await {
-        Ok(details) => summarize_holdings(&details, get_cached_rates(rate_cache, db).await),
+    let holdings = match PortfolioReadModel::load(db, quote_cache, None, QuoteReadMode::CacheOnly)
+        .await
+    {
+        Ok(model) => summarize_holdings(model.holdings(), get_cached_rates(rate_cache, db).await),
         Err(error) => {
             warn!(target: "market_overview", "failed to build holdings: {error}");
             HoldingsSummary {

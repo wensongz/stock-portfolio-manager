@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Row, Col, Card, Spin, Empty, Select, Tag, Table, Typography, Button } from "antd";
+import { useCallback, useMemo, useState } from "react";
+import { Alert, Row, Col, Card, Spin, Empty, Select, Tag, Table, Typography, Button } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import PieChart from "../../components/charts/PieChart";
 import StatCard from "../../components/charts/StatCard";
-import { useStatisticsStore } from "../../stores/dashboardStore";
+import { statisticsViewKey, useStatisticsStore } from "../../stores/statisticsStore";
 import { useCategoryStore } from "../../stores/categoryStore";
 import type { CategoryStatistics, HoldingDetail } from "../../types";
 import type { Currency } from "../../types";
@@ -38,8 +38,8 @@ interface AggregatedStock extends HoldingDetail {
 export default function CategoryTab({ selectedCategoryId, onCategoryChange, baseCurrency }: Props) {
   const { pageSize, onShowSizeChange } = useTablePageSize();
   const { pnlColor } = usePnlColor();
-  const { categoryStats, fetchCategoryStats } = useStatisticsStore();
-  const { categories, fetchCategories } = useCategoryStore();
+  const { categoryStats, loadingByView, errorByView } = useStatisticsStore();
+  const { categories } = useCategoryStore();
   const symbol = currencySymbol[baseCurrency] ?? "$";
   const [txnModal, setTxnModal] = useState<{
     accountId: string;
@@ -48,18 +48,13 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
     stockName: string;
   } | null>(null);
 
-  useEffect(() => {
-    fetchCategories();
-  }, [fetchCategories]);
-
-  useEffect(() => {
-    if (selectedCategoryId) {
-      fetchCategoryStats(selectedCategoryId, baseCurrency);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedCategoryId, baseCurrency]);
-
-  const stats: CategoryStatistics | undefined = categoryStats[selectedCategoryId];
+  const stats: CategoryStatistics | undefined =
+    categoryStats[`${selectedCategoryId}:${baseCurrency}`];
+  const viewKey = selectedCategoryId
+    ? statisticsViewKey({ kind: "category", categoryId: selectedCategoryId, baseCurrency })
+    : null;
+  const loading = viewKey ? (loadingByView[viewKey] ?? false) : false;
+  const error = viewKey ? (errorByView[viewKey] ?? null) : null;
 
   const aggregatedStocks = useMemo((): AggregatedStock[] => {
     if (!stats) return [];
@@ -158,12 +153,16 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
         </Select>
       </div>
 
+      {error && <Alert title={error} type="error" showIcon className="mb-4" />}
+
       {!selectedCategoryId ? (
         <Empty description="请选择投资类别" />
-      ) : !stats ? (
+      ) : loading && !stats ? (
         <div className="flex justify-center py-16">
           <Spin size="large" />
         </div>
+      ) : !stats ? (
+        <Empty description="暂无类别统计数据" />
       ) : stats.holdings.length === 0 ? (
         <Empty description="该类别暂无持仓" />
       ) : (
@@ -203,6 +202,7 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
                     columns={stockColumns}
                     dataSource={aggregatedStocks}
                     rowKey="symbol"
+                    loading={loading}
                     size="small"
                     className="account-detail-table"
                     scroll={{ x: 1200 }}

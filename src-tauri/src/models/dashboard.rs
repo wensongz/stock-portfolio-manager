@@ -16,6 +16,12 @@ pub struct DashboardSummary {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DashboardReport {
+    pub summary: DashboardSummary,
+    pub holdings: Vec<HoldingDetail>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HoldingDetail {
     pub id: String,
     pub account_id: String,

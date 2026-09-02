@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
-import { Row, Col, Card, Spin, Empty, Select, Table, Tag, Typography, Button } from "antd";
+import { useMemo, useState, useCallback } from "react";
+import { Alert, Row, Col, Card, Spin, Empty, Select, Table, Tag, Typography, Button } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import PieChart from "../../components/charts/PieChart";
 import StatCard from "../../components/charts/StatCard";
-import { useStatisticsStore } from "../../stores/dashboardStore";
+import { statisticsViewKey, useStatisticsStore } from "../../stores/statisticsStore";
 import type { MarketStatistics } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
 import { useTablePageSize } from "../../hooks/tablePageSize";
@@ -85,11 +85,10 @@ interface StockAccumulator {
 export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
   const { pageSize, onShowSizeChange } = useTablePageSize();
   const { pnlColor } = usePnlColor();
-  const { marketStats, fetchMarketStats } = useStatisticsStore();
-
-  useEffect(() => {
-    fetchMarketStats(selectedMarket);
-  }, [selectedMarket, fetchMarketStats]);
+  const { marketStats, loadingByView, errorByView } = useStatisticsStore();
+  const viewKey = statisticsViewKey({ kind: "market", market: selectedMarket });
+  const loading = loadingByView[viewKey] ?? false;
+  const error = errorByView[viewKey] ?? null;
 
   const stats: MarketStatistics | undefined = marketStats[selectedMarket];
   const currencySymbol = marketCurrency[selectedMarket]?.symbol ?? "$";
@@ -434,10 +433,14 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
         </Select>
       </div>
 
-      {!stats ? (
+      {error && <Alert title={error} type="error" showIcon />}
+
+      {loading && !stats ? (
         <div className="flex justify-center py-16">
           <Spin size="large" />
         </div>
+      ) : !stats ? (
+        <Empty description="暂无市场统计数据" />
       ) : stats.holdings.length === 0 ? (
         <Empty description="该市场暂无持仓" />
       ) : (
@@ -488,7 +491,7 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
               columns={stockColumns}
               dataSource={aggregatedStocks}
               rowKey="symbol"
-              loading={false}
+              loading={loading}
               className="account-detail-table"
               scroll={{ x: 1200 }}
               size="small"

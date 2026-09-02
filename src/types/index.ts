@@ -142,6 +142,11 @@ export interface HoldingDetail {
   market_value_usd: number;
 }
 
+export interface DashboardReport {
+  summary: DashboardSummary;
+  holdings: HoldingDetail[];
+}
+
 // Phase 3: Statistics types
 export interface PieSlice {
   name: string;
@@ -168,6 +173,7 @@ export interface StatisticsOverview {
   stock_distribution: PieSlice[];
   top_gainers: PnlItem[];
   top_losers: PnlItem[];
+  holdings: HoldingDetail[];
 }
 
 export interface MarketStatistics {

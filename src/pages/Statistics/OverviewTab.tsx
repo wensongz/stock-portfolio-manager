@@ -1,17 +1,13 @@
 import { useMemo, useState, useCallback } from "react";
-import { Row, Col, Card, Spin, Empty, Table, Tag, Typography, Button } from "antd";
+import { Alert, Row, Col, Card, Spin, Empty, Table, Tag, Typography, Button } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import PieChart from "../../components/charts/PieChart";
 import BarChart from "../../components/charts/BarChart";
 import StatCard from "../../components/charts/StatCard";
-import type { StatisticsOverview } from "../../types";
 import type { Currency } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
 import { useTablePageSize } from "../../hooks/tablePageSize";
-import { useQuoteStore } from "../../stores/quoteStore";
-import { useExchangeRateStore } from "../../stores/exchangeRateStore";
-import { useCategoryStore } from "../../stores/categoryStore";
-import { useAccountStore } from "../../stores/accountStore";
+import { statisticsViewKey, useStatisticsStore } from "../../stores/statisticsStore";
 import AccountStockTransactionsModal from "./AccountStockTransactionsModal";
 
 const { Text } = Typography;
@@ -33,7 +29,7 @@ interface AggregatedStock {
   current_price: number;
   currency: string;
   market_value: number;
-  market_value_base: number;
+  market_value_usd: number;
   pnl: number;
   pnl_percent: number | null;
   /** Per-account breakdown for the expandable sub-table. Not named
@@ -49,7 +45,7 @@ interface AccountHoldingRow {
   shares: number;
   avg_cost: number;
   market_value: number;
-  market_value_base: number;
+  market_value_usd: number;
   position_pct: number;
   pnl: number;
   pnl_percent: number | null;
@@ -57,35 +53,22 @@ interface AccountHoldingRow {
 }
 
 interface Props {
-  overview: StatisticsOverview | null;
-  loading: boolean;
   baseCurrency: Currency;
 }
 
-export default function OverviewTab({ overview, loading, baseCurrency }: Props) {
+export default function OverviewTab({ baseCurrency }: Props) {
   const { pageSize, onShowSizeChange } = useTablePageSize();
   const { pnlColor } = usePnlColor();
   const currency = currencySymbol[baseCurrency] ?? "$";
-  const holdingQuotes = useQuoteStore((s) => s.holdingQuotes);
-  const { convertWithCachedRates } = useExchangeRateStore();
-  const categories = useCategoryStore((s) => s.categories);
-  const accounts = useAccountStore((s) => s.accounts);
-
-  // Build a category lookup map: category_id → { name, color }
-  const categoryMap = useMemo(() => {
-    const map = new Map<string, { name: string; color: string }>();
-    for (const c of categories) {
-      map.set(c.id, { name: c.name, color: c.color });
-    }
-    return map;
-  }, [categories]);
+  const { overview, loadingByView, errorByView } = useStatisticsStore();
+  const viewKey = statisticsViewKey({ kind: "overview", baseCurrency });
+  const loading = loadingByView[viewKey] ?? false;
+  const error = errorByView[viewKey] ?? null;
 
   // Aggregate holdings by symbol across all accounts/markets, matching the
   // MarketTab table structure, and keep the per-account breakdown for each
   // symbol so the row can be expanded into an account-level sub-table.
   const aggregatedStocks = useMemo((): AggregatedStock[] => {
-    // account_id -> account name
-    const accountNameMap = new Map(accounts.map((a) => [a.id, a.name]));
     const map = new Map<string, {
       symbol: string;
       name: string;
@@ -95,94 +78,101 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
       shares: number;
       cost_value: number;
       market_value: number;
-      market_value_base: number;
+      market_value_usd: number;
       pnl: number;
       current_price: number;
       currency: string;
       byAccount: Map<string, {
+        account_name: string;
         shares: number;
         cost_value: number;
         market_value: number;
-        market_value_base: number;
+        market_value_usd: number;
         pnl: number;
         currency: string;
       }>;
     }>();
-    for (const hq of holdingQuotes) {
-      if (hq.symbol.startsWith("$CASH-")) continue;
+    for (const holding of overview?.holdings ?? []) {
+      if (holding.symbol.startsWith("$CASH-")) continue;
       // Skip cleared positions (shares == 0): they have no market value and
       // belong only in the holdings page's "已清仓股票" view, not in the
       // per-stock detail table (consistent with market statistics, which
       // filter WHERE h.shares > 0).
-      if (hq.shares <= 0) continue;
-      const key = hq.symbol;
+      if (holding.shares <= 0) continue;
+      const key = holding.symbol;
       const existing = map.get(key);
-      const mvNative = hq.market_value ?? 0;
-      const mvBase = convertWithCachedRates(mvNative, hq.currency as Currency, baseCurrency);
-      const costNative = hq.total_cost ?? hq.shares * hq.avg_cost;
+      const mvNative = holding.market_value;
+      const mvUsd = holding.market_value_usd;
+      const costNative = holding.cost_value;
       if (existing) {
-        existing.shares += hq.shares;
+        existing.shares += holding.shares;
         existing.cost_value += costNative;
         existing.market_value += mvNative;
-        existing.market_value_base += mvBase;
-        existing.pnl += hq.unrealized_pnl ?? (mvNative - costNative);
-        existing.current_price = hq.quote?.current_price ?? existing.current_price;
+        existing.market_value_usd += mvUsd;
+        existing.pnl += holding.pnl;
+        existing.current_price = holding.current_price;
         // Accumulate the per-account entry.
-        const acct = existing.byAccount.get(hq.account_id);
+        const acct = existing.byAccount.get(holding.account_id);
         if (acct) {
-          acct.shares += hq.shares;
+          acct.shares += holding.shares;
           acct.cost_value += costNative;
           acct.market_value += mvNative;
-          acct.market_value_base += mvBase;
-          acct.pnl += hq.unrealized_pnl ?? (mvNative - costNative);
+          acct.market_value_usd += mvUsd;
+          acct.pnl += holding.pnl;
         } else {
-          existing.byAccount.set(hq.account_id, {
-            shares: hq.shares,
+          existing.byAccount.set(holding.account_id, {
+            account_name: holding.account_name,
+            shares: holding.shares,
             cost_value: costNative,
             market_value: mvNative,
-            market_value_base: mvBase,
-            pnl: hq.unrealized_pnl ?? (mvNative - costNative),
-            currency: hq.currency,
+            market_value_usd: mvUsd,
+            pnl: holding.pnl,
+            currency: holding.currency,
           });
         }
       } else {
         const byAccount = new Map<string, {
+          account_name: string;
           shares: number;
           cost_value: number;
           market_value: number;
-          market_value_base: number;
+          market_value_usd: number;
           pnl: number;
           currency: string;
         }>();
-        byAccount.set(hq.account_id, {
-          shares: hq.shares,
+        byAccount.set(holding.account_id, {
+          account_name: holding.account_name,
+          shares: holding.shares,
           cost_value: costNative,
           market_value: mvNative,
-          market_value_base: mvBase,
-          pnl: hq.unrealized_pnl ?? (mvNative - costNative),
-          currency: hq.currency,
+          market_value_usd: mvUsd,
+          pnl: holding.pnl,
+          currency: holding.currency,
         });
         map.set(key, {
-          symbol: hq.symbol,
-          name: hq.name,
-          market: hq.market,
-          category_name: categoryMap.get(hq.category_id ?? "")?.name ?? "未分类",
-          category_color: categoryMap.get(hq.category_id ?? "")?.color ?? "#8B8B8B",
-          shares: hq.shares,
+          symbol: holding.symbol,
+          name: holding.name,
+          market: holding.market,
+          category_name: holding.category_name,
+          category_color: holding.category_color,
+          shares: holding.shares,
           cost_value: costNative,
           market_value: mvNative,
-          market_value_base: mvBase,
-          pnl: hq.unrealized_pnl ?? (mvNative - costNative),
-          current_price: hq.quote?.current_price ?? 0,
-          currency: hq.currency,
+          market_value_usd: mvUsd,
+          pnl: holding.pnl,
+          current_price: holding.current_price,
+          currency: holding.currency,
           byAccount,
         });
       }
     }
 
-    // Total market value (base currency) across all aggregated stocks, used
+    // Total market value (USD) across all aggregated stocks, used
     // for the per-account position percentage in the sub-table.
-    const totalBase = Array.from(map.values()).reduce((s, v) => s + v.market_value_base, 0);
+    const totalUsd = Array.from(map.values()).reduce(
+      (sum, value) => sum + value.market_value_usd,
+      0,
+    );
 
     return Array.from(map.values())
       .map((v) => {
@@ -193,20 +183,20 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
               a.cost_value > 0 ? (a.pnl / a.cost_value) * 100 : null;
             return {
               key: accountId,
-              accountName: accountNameMap.get(accountId) ?? accountId,
+              accountName: a.account_name,
               account_id: accountId,
               symbol: v.symbol,
               shares: a.shares,
               avg_cost: a.shares > 0 ? a.cost_value / a.shares : 0,
               market_value: a.market_value,
-              market_value_base: a.market_value_base,
-              position_pct: totalBase > 0 ? (a.market_value_base / totalBase) * 100 : 0,
+              market_value_usd: a.market_value_usd,
+              position_pct: totalUsd > 0 ? (a.market_value_usd / totalUsd) * 100 : 0,
               pnl: a.pnl,
               pnl_percent: acctPnlPercent,
               currency: a.currency,
             };
           })
-          .sort((a, b) => b.market_value_base - a.market_value_base);
+          .sort((a, b) => b.market_value_usd - a.market_value_usd);
 
         return {
           symbol: v.symbol,
@@ -219,14 +209,14 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
           current_price: v.current_price,
           currency: v.currency,
           market_value: v.market_value,
-          market_value_base: v.market_value_base,
+          market_value_usd: v.market_value_usd,
           pnl: v.pnl,
           pnl_percent: v.cost_value > 0 ? (v.pnl / v.cost_value) * 100 : null,
           accountRows,
         };
       })
-      .sort((a, b) => b.market_value_base - a.market_value_base);
-  }, [holdingQuotes, baseCurrency, convertWithCachedRates, categoryMap, accounts]);
+      .sort((a, b) => b.market_value_usd - a.market_value_usd);
+  }, [overview]);
 
   // Columns matching the MarketTab table.
   const stockColumns: ColumnsType<AggregatedStock> = useMemo(() => [
@@ -291,7 +281,7 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
       title: "市值",
       dataIndex: "market_value",
       key: "market_value",
-      sorter: (a, b) => a.market_value_base - b.market_value_base,
+      sorter: (a, b) => a.market_value_usd - b.market_value_usd,
       defaultSortOrder: "descend" as const,
       render: (value: number, record: AggregatedStock) => {
         const sym = currencySymbol[record.currency] ?? "";
@@ -303,10 +293,10 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
     {
       title: "仓位%",
       key: "position_pct",
-      sorter: (a, b) => a.market_value_base - b.market_value_base,
+      sorter: (a, b) => a.market_value_usd - b.market_value_usd,
       render: (_: unknown, record: AggregatedStock) => {
-        const total = aggregatedStocks.reduce((s, r) => s + r.market_value_base, 0);
-        const pct = total > 0 ? (record.market_value_base / total) * 100 : 0;
+        const total = aggregatedStocks.reduce((s, r) => s + r.market_value_usd, 0);
+        const pct = total > 0 ? (record.market_value_usd / total) * 100 : 0;
         return `${pct.toFixed(2)}%`;
       },
       align: "right" as const,
@@ -468,7 +458,11 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
     );
   }
   if (!overview) {
-    return <Empty description="暂无数据" />;
+    return error ? (
+      <Alert title={error} type="error" showIcon />
+    ) : (
+      <Empty description="暂无数据" />
+    );
   }
 
   const totalPnlPos = overview.total_pnl >= 0;
@@ -484,6 +478,8 @@ export default function OverviewTab({ overview, loading, baseCurrency }: Props) 
 
   return (
     <div>
+      {error && <Alert title={error} type="error" showIcon className="mb-4" />}
+
       {/* Summary stats */}
       <Row gutter={[16, 16]} className="mb-4">
         <Col xs={24} sm={8}>

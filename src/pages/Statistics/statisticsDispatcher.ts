@@ -7,11 +7,7 @@ import {
   resolveStatisticsView,
   type StatisticsSelection,
 } from "./statisticsView.ts";
-
-interface RefreshHolding {
-  symbol: string;
-  market: string;
-}
+import type { AccountHoldingsCoverage } from "./statisticsAccountHoldings";
 
 interface StatisticsDispatcherDependencies {
   getSelection: () => StatisticsSelection;
@@ -24,7 +20,7 @@ interface StatisticsDispatcherDependencies {
   getAccountHoldings: (
     accountId: string,
     baseCurrency: Currency,
-  ) => RefreshHolding[];
+  ) => AccountHoldingsCoverage;
 }
 
 export function createStatisticsDispatcher({
@@ -42,19 +38,27 @@ export function createStatisticsDispatcher({
     return view ? fetchView(view, mode) : Promise.resolve();
   };
 
-  const accountSymbols = (selection: StatisticsSelection) => {
-    const seen = new Set<string>();
-    const symbols: [string, string][] = [];
-    for (const holding of getAccountHoldings(
+  const refreshAccountQuotes = async (selection: StatisticsSelection) => {
+    const coverage = getAccountHoldings(
       selection.selectedAccountId,
       selection.baseCurrency,
-    )) {
+    );
+    if (coverage.status === "unknown") {
+      await fetchHoldingQuotes();
+      return "all" as const;
+    }
+    if (coverage.status === "known-empty") return "account" as const;
+
+    const seen = new Set<string>();
+    const symbols: [string, string][] = [];
+    for (const holding of coverage.holdings) {
       if (!seen.has(holding.symbol)) {
         seen.add(holding.symbol);
         symbols.push([holding.symbol, holding.market]);
       }
     }
-    return symbols;
+    await fetchHoldingQuotes(symbols);
+    return "account" as const;
   };
 
   const changeSelection = (
@@ -106,8 +110,12 @@ export function createStatisticsDispatcher({
         initialSelection.activeTab === "account" &&
         initialSelection.selectedAccountId
       ) {
-        await fetchHoldingQuotes(accountSymbols(initialSelection));
-        refreshedAccountIds.add(initialSelection.selectedAccountId);
+        const coverage = await refreshAccountQuotes(initialSelection);
+        if (coverage === "all") {
+          hasFullCoverage = true;
+        } else {
+          refreshedAccountIds.add(initialSelection.selectedAccountId);
+        }
       } else {
         await fetchHoldingQuotes();
         hasFullCoverage = true;
@@ -123,8 +131,12 @@ export function createStatisticsDispatcher({
           break;
         }
         if (selection.activeTab === "account" && selection.selectedAccountId) {
-          await fetchHoldingQuotes(accountSymbols(selection));
-          refreshedAccountIds.add(selection.selectedAccountId);
+          const coverage = await refreshAccountQuotes(selection);
+          if (coverage === "all") {
+            hasFullCoverage = true;
+          } else {
+            refreshedAccountIds.add(selection.selectedAccountId);
+          }
         } else {
           await fetchHoldingQuotes();
           hasFullCoverage = true;

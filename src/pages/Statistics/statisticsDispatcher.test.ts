@@ -2,6 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createStatisticsStore } from "../../stores/statisticsStore.ts";
+import { resolveAccountHoldingsCoverage } from "./statisticsAccountHoldings.ts";
 import { createStatisticsDispatcher } from "./statisticsDispatcher.ts";
 
 function deferred() {
@@ -29,7 +30,9 @@ function createHarness(initialSelection, options = {}) {
     fetchHoldingQuotes: options.fetchHoldingQuotes ?? (async (symbols) => {
       quoteRequests.push(symbols);
     }),
-    getAccountHoldings: options.getAccountHoldings ?? (() => []),
+    getAccountHoldings: options.getAccountHoldings ?? (() => ({
+      status: "known-empty",
+    })),
   });
   return {
     dispatcher,
@@ -102,11 +105,14 @@ test("statistics refresh resolves its view from the latest post-quote selection"
         quoteRequests.push(symbols);
         await quoteRefresh.promise;
       },
-      getAccountHoldings: () => [
-        { symbol: "AAPL", market: "US" },
-        { symbol: "AAPL", market: "US" },
-        { symbol: "MSFT", market: "US" },
-      ],
+      getAccountHoldings: () => ({
+        status: "known-with-symbols",
+        holdings: [
+          { symbol: "AAPL", market: "US" },
+          { symbol: "AAPL", market: "US" },
+          { symbol: "MSFT", market: "US" },
+        ],
+      }),
     },
   );
 
@@ -186,7 +192,12 @@ for (const scenario of [
             await firstQuoteRefresh.promise;
           }
         },
-        getAccountHoldings: (accountId) => accountSymbols[accountId] ?? [],
+        getAccountHoldings: (accountId) => {
+          const holdings = accountSymbols[accountId] ?? [];
+          return holdings.length > 0
+            ? { status: "known-with-symbols", holdings }
+            : { status: "known-empty" };
+        },
       },
     );
 
@@ -237,7 +248,7 @@ test("real statistics store shares StrictMode initialization but post-refresh re
     },
     fetchView: store.getState().fetchView,
     fetchHoldingQuotes: () => quoteRefresh.promise,
-    getAccountHoldings: () => [],
+    getAccountHoldings: () => ({ status: "known-empty" }),
   });
 
   const firstMount = dispatcher.initialize();
@@ -268,4 +279,102 @@ test("real statistics store shares StrictMode initialization but post-refresh re
   assert.deepEqual(store.getState().overviewByCurrency.USD, {
     currency: "fresh-USD",
   });
+});
+
+test("unknown target account holdings fall back to a full quote refresh before only the active account is reloaded", async () => {
+  const firstQuoteRefresh = deferred();
+  const accountResponses = [deferred(), deferred()];
+  const invokedViews = [];
+  let accountCalls = 0;
+  const store = createStatisticsStore(async (command, args) => {
+    invokedViews.push([command, args]);
+    const response = accountResponses[accountCalls];
+    accountCalls += 1;
+    return response.promise;
+  });
+  store.setState({
+    accountStats: {
+      "acct-a": {
+        holdings: [
+          { account_id: "acct-a", symbol: "AAPL", market: "US" },
+        ],
+      },
+    },
+  });
+  const quoteRequests = [];
+  let selection = {
+    ...initialSelection,
+    activeTab: "account",
+    selectedAccountId: "acct-a",
+  };
+  const dispatcher = createStatisticsDispatcher({
+    getSelection: () => selection,
+    updateSelection: (next) => {
+      selection = next;
+    },
+    fetchView: store.getState().fetchView,
+    fetchHoldingQuotes: async (symbols) => {
+      quoteRequests.push(symbols);
+      if (quoteRequests.length === 1) await firstQuoteRefresh.promise;
+    },
+    getAccountHoldings: (accountId, currency) =>
+      resolveAccountHoldingsCoverage(store.getState(), accountId, currency),
+  });
+
+  const refreshing = dispatcher.refresh();
+  const switching = dispatcher.changeAccount("acct-b");
+  firstQuoteRefresh.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  accountResponses[0].resolve({ holdings: [], marker: "stale" });
+  await switching;
+  await Promise.resolve();
+
+  assert.equal(accountCalls, 2);
+  accountResponses[1].resolve({ holdings: [], marker: "fresh" });
+  await refreshing;
+
+  assert.deepEqual(quoteRequests, [
+    [["AAPL", "US"]],
+    undefined,
+  ]);
+  assert.equal(quoteRequests.some((symbols) => symbols?.length === 0), false);
+  assert.deepEqual(invokedViews, [
+    ["get_statistics_by_account", { accountId: "acct-b" }],
+    ["get_statistics_by_account", { accountId: "acct-b" }],
+  ]);
+  assert.equal(store.getState().accountStats["acct-b"].marker, "fresh");
+});
+
+test("known-empty account holdings finish without quote provider calls or a coverage loop", async () => {
+  const requestedViews = [];
+  const quoteRequests = [];
+  let selection = {
+    ...initialSelection,
+    activeTab: "account",
+    selectedAccountId: "acct-empty",
+  };
+  const dispatcher = createStatisticsDispatcher({
+    getSelection: () => selection,
+    updateSelection: (next) => {
+      selection = next;
+    },
+    fetchView: async (view, mode) => {
+      requestedViews.push([view, mode]);
+    },
+    fetchHoldingQuotes: async (symbols) => {
+      quoteRequests.push(symbols);
+    },
+    getAccountHoldings: () => ({ status: "known-empty" }),
+  });
+
+  await dispatcher.refresh();
+
+  assert.deepEqual(quoteRequests, []);
+  assert.deepEqual(requestedViews, [
+    [
+      { kind: "account", accountId: "acct-empty" },
+      "reload-after-in-flight",
+    ],
+  ]);
 });

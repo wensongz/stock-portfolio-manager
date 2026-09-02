@@ -20,6 +20,7 @@ import {
   type StatisticsSelection,
 } from "./statisticsView";
 import { createStatisticsDispatcher } from "./statisticsDispatcher";
+import { resolveAccountHoldingsCoverage } from "./statisticsAccountHoldings";
 
 const { Title, Text } = Typography;
 
@@ -81,11 +82,10 @@ export default function StatisticsPage() {
 
   const getAccountHoldings = useCallback(
     (accountId: string, currency: Currency) => {
-      const state = useStatisticsStore.getState();
-      const accountHoldings = state.accountStats[accountId]?.holdings;
-      if (accountHoldings) return accountHoldings;
-      return (state.overviewByCurrency[currency]?.holdings ?? []).filter(
-        (holding) => holding.account_id === accountId,
+      return resolveAccountHoldingsCoverage(
+        useStatisticsStore.getState(),
+        accountId,
+        currency,
       );
     },
     [],

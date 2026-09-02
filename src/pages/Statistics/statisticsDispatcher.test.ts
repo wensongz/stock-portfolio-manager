@@ -1,6 +1,7 @@
 // @ts-nocheck
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createStatisticsStore } from "../../stores/statisticsStore.ts";
 import { createStatisticsDispatcher } from "./statisticsDispatcher.ts";
 
 function deferred() {
@@ -14,15 +15,17 @@ function deferred() {
 function createHarness(initialSelection, options = {}) {
   let selection = initialSelection;
   const requestedViews = [];
+  const requestModes = [];
   const quoteRequests = [];
   const dispatcher = createStatisticsDispatcher({
     getSelection: () => selection,
     updateSelection: (next) => {
       selection = next;
     },
-    fetchView: async (view) => {
+    fetchView: options.fetchView ?? (async (view, mode) => {
       requestedViews.push(view);
-    },
+      requestModes.push(mode);
+    }),
     fetchHoldingQuotes: options.fetchHoldingQuotes ?? (async (symbols) => {
       quoteRequests.push(symbols);
     }),
@@ -31,6 +34,7 @@ function createHarness(initialSelection, options = {}) {
   return {
     dispatcher,
     requestedViews,
+    requestModes,
     quoteRequests,
     getSelection: () => selection,
   };
@@ -115,7 +119,7 @@ test("statistics refresh resolves its view from the latest post-quote selection"
   assert.deepEqual(quoteRequests, [[
     ["AAPL", "US"],
     ["MSFT", "US"],
-  ]]);
+  ], undefined]);
   assert.deepEqual(harness.requestedViews, [
     { kind: "category", categoryId: "growth", baseCurrency: "USD" },
     { kind: "category", categoryId: "growth", baseCurrency: "CNY" },
@@ -125,4 +129,143 @@ test("statistics refresh resolves its view from the latest post-quote selection"
     harness.requestedViews.some((view) => view.kind === "account"),
     false,
   );
+  assert.equal(harness.requestModes.at(-1), "reload-after-in-flight");
+});
+
+for (const scenario of [
+  {
+    name: "overview",
+    transition: (dispatcher) => dispatcher.changeTab("overview"),
+    expectedView: { kind: "overview", baseCurrency: "USD" },
+    expectedSupplement: undefined,
+  },
+  {
+    name: "category",
+    transition: (dispatcher) => dispatcher.changeTab("category"),
+    expectedView: {
+      kind: "category",
+      categoryId: "growth",
+      baseCurrency: "USD",
+    },
+    expectedSupplement: undefined,
+  },
+  {
+    name: "market",
+    transition: (dispatcher) => dispatcher.changeTab("market"),
+    expectedView: { kind: "market", market: "US" },
+    expectedSupplement: undefined,
+  },
+  {
+    name: "another account",
+    transition: (dispatcher) => dispatcher.changeAccount("acct-hk"),
+    expectedView: { kind: "account", accountId: "acct-hk" },
+    expectedSupplement: [["0700.HK", "HK"]],
+  },
+]) {
+  test(`account quote refresh supplements ${scenario.name} coverage and reloads only that active view`, async () => {
+    const firstQuoteRefresh = deferred();
+    const accountSymbols = {
+      "acct-us": [
+        { symbol: "AAPL", market: "US" },
+        { symbol: "AAPL", market: "US" },
+        { symbol: "MSFT", market: "US" },
+      ],
+      "acct-hk": [{ symbol: "0700.HK", market: "HK" }],
+    };
+    const harness = createHarness(
+      {
+        ...initialSelection,
+        activeTab: "account",
+        selectedAccountId: "acct-us",
+        selectedCategoryId: "growth",
+      },
+      {
+        fetchHoldingQuotes: async (symbols) => {
+          harness.quoteRequests.push(symbols);
+          if (harness.quoteRequests.length === 1) {
+            await firstQuoteRefresh.promise;
+          }
+        },
+        getAccountHoldings: (accountId) => accountSymbols[accountId] ?? [],
+      },
+    );
+
+    const refreshing = harness.dispatcher.refresh();
+    await scenario.transition(harness.dispatcher);
+    firstQuoteRefresh.resolve();
+    await refreshing;
+
+    assert.deepEqual(harness.quoteRequests, [
+      [
+        ["AAPL", "US"],
+        ["MSFT", "US"],
+      ],
+      scenario.expectedSupplement,
+    ]);
+    assert.deepEqual(harness.requestedViews, [
+      scenario.expectedView,
+      scenario.expectedView,
+    ]);
+    assert.deepEqual(harness.requestModes, [
+      "join-in-flight",
+      "reload-after-in-flight",
+    ]);
+  });
+}
+
+test("real statistics store shares StrictMode initialization but post-refresh reload wins after selection changes", async () => {
+  const staleOverview = deferred();
+  const freshOverview = deferred();
+  const overviewResponses = [staleOverview, freshOverview];
+  const invokedViews = [];
+  let overviewCalls = 0;
+  const store = createStatisticsStore(async (command, args) => {
+    invokedViews.push([command, args]);
+    if (command === "get_statistics_overview") {
+      const response = overviewResponses[overviewCalls];
+      overviewCalls += 1;
+      return response.promise;
+    }
+    return { market: args.market };
+  });
+  const quoteRefresh = deferred();
+  let selection = { ...initialSelection };
+  const dispatcher = createStatisticsDispatcher({
+    getSelection: () => selection,
+    updateSelection: (next) => {
+      selection = next;
+    },
+    fetchView: store.getState().fetchView,
+    fetchHoldingQuotes: () => quoteRefresh.promise,
+    getAccountHoldings: () => [],
+  });
+
+  const firstMount = dispatcher.initialize();
+  const strictModeMount = dispatcher.initialize();
+  assert.equal(overviewCalls, 1);
+
+  const refreshing = dispatcher.refresh();
+  await dispatcher.changeTab("market");
+  const switchedBack = dispatcher.changeTab("overview");
+  quoteRefresh.resolve();
+  await Promise.resolve();
+
+  staleOverview.resolve({ currency: "stale-USD" });
+  await Promise.all([firstMount, strictModeMount, switchedBack]);
+  await Promise.resolve();
+
+  assert.equal(overviewCalls, 2);
+  assert.equal(
+    invokedViews.filter(([command]) => command === "get_statistics_by_market")
+      .length,
+    1,
+  );
+  assert.equal(store.getState().overviewByCurrency.USD, undefined);
+
+  freshOverview.resolve({ currency: "fresh-USD" });
+  await refreshing;
+
+  assert.deepEqual(store.getState().overviewByCurrency.USD, {
+    currency: "fresh-USD",
+  });
 });

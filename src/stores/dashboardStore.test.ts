@@ -90,6 +90,73 @@ test("same-currency concurrent dashboard loads share one in-flight command", asy
   assert.equal(calls, 2);
 });
 
+test("reload-after-in-flight starts a new dashboard generation and ignores the stale result", async () => {
+  const firstResponse = deferred();
+  const secondResponse = deferred();
+  const responses = [firstResponse, secondResponse];
+  let calls = 0;
+  const store = createDashboardStore(async () => {
+    const response = responses[calls];
+    calls += 1;
+    return response.promise;
+  });
+
+  const initial = store.getState().fetchReport("USD");
+  const refreshed = store
+    .getState()
+    .fetchReport("USD", "reload-after-in-flight");
+
+  assert.equal(calls, 1);
+  firstResponse.resolve(report("stale-USD"));
+  await initial;
+  await Promise.resolve();
+
+  assert.equal(calls, 2);
+  assert.equal(store.getState().summary, null);
+  assert.equal(store.getState().loading, true);
+  assert.equal(store.getState().error, null);
+
+  secondResponse.resolve(report("fresh-USD"));
+  await refreshed;
+
+  assert.equal(store.getState().summary?.base_currency, "fresh-USD");
+  assert.equal(store.getState().holdingDetails[0]?.id, "holding-fresh-USD");
+  assert.equal(store.getState().loading, false);
+  assert.equal(store.getState().error, null);
+});
+
+test("a dashboard reload requested after the queued generation starts schedules another generation", async () => {
+  const responses = [deferred(), deferred(), deferred()];
+  let calls = 0;
+  const store = createDashboardStore(async () => {
+    const response = responses[calls];
+    calls += 1;
+    return response.promise;
+  });
+
+  const initial = store.getState().fetchReport("USD");
+  const firstRefresh = store
+    .getState()
+    .fetchReport("USD", "reload-after-in-flight");
+  responses[0].resolve(report("initial"));
+  await initial;
+  await Promise.resolve();
+  assert.equal(calls, 2);
+
+  const secondRefresh = store
+    .getState()
+    .fetchReport("USD", "reload-after-in-flight");
+  responses[1].resolve(report("superseded-refresh"));
+  await firstRefresh;
+  await Promise.resolve();
+
+  assert.equal(calls, 3);
+  assert.equal(store.getState().summary, null);
+  responses[2].resolve(report("latest-refresh"));
+  await secondRefresh;
+  assert.equal(store.getState().summary?.base_currency, "latest-refresh");
+});
+
 test("latest dashboard currency wins when successes resolve out of order", async () => {
   const requests = new Map([
     ["USD", deferred()],

@@ -98,6 +98,78 @@ test("same statistics view key shares one in-flight command", async () => {
   assert.equal(calls, 2);
 });
 
+test("reload-after-in-flight starts a fresh statistics generation after a stale failure", async () => {
+  const firstResponse = deferred();
+  const secondResponse = deferred();
+  const responses = [firstResponse, secondResponse];
+  let calls = 0;
+  const store = createStatisticsStore(async () => {
+    const response = responses[calls];
+    calls += 1;
+    return response.promise;
+  });
+  const view = { kind: "overview", baseCurrency: "USD" };
+  const viewKey = statisticsViewKey(view);
+
+  const initial = store.getState().fetchView(view);
+  const refreshed = store
+    .getState()
+    .fetchView(view, "reload-after-in-flight");
+
+  assert.equal(calls, 1);
+  firstResponse.reject(new Error("stale offline"));
+  await initial;
+  await Promise.resolve();
+
+  assert.equal(calls, 2);
+  assert.equal(store.getState().loadingByView[viewKey], true);
+  assert.equal(store.getState().errorByView[viewKey], null);
+
+  secondResponse.resolve({ currency: "fresh-USD" });
+  await refreshed;
+
+  assert.deepEqual(store.getState().overviewByCurrency.USD, {
+    currency: "fresh-USD",
+  });
+  assert.equal(store.getState().loadingByView[viewKey], false);
+  assert.equal(store.getState().errorByView[viewKey], null);
+});
+
+test("a statistics reload requested after the queued generation starts schedules another generation", async () => {
+  const responses = [deferred(), deferred(), deferred()];
+  let calls = 0;
+  const store = createStatisticsStore(async () => {
+    const response = responses[calls];
+    calls += 1;
+    return response.promise;
+  });
+  const view = { kind: "overview", baseCurrency: "USD" };
+
+  const initial = store.getState().fetchView(view);
+  const firstRefresh = store
+    .getState()
+    .fetchView(view, "reload-after-in-flight");
+  responses[0].resolve({ currency: "initial" });
+  await initial;
+  await Promise.resolve();
+  assert.equal(calls, 2);
+
+  const secondRefresh = store
+    .getState()
+    .fetchView(view, "reload-after-in-flight");
+  responses[1].resolve({ currency: "superseded-refresh" });
+  await firstRefresh;
+  await Promise.resolve();
+
+  assert.equal(calls, 3);
+  assert.equal(store.getState().overviewByCurrency.USD, undefined);
+  responses[2].resolve({ currency: "latest-refresh" });
+  await secondRefresh;
+  assert.deepEqual(store.getState().overviewByCurrency.USD, {
+    currency: "latest-refresh",
+  });
+});
+
 test("out-of-order overviews remain cached under their requested currencies", async () => {
   const requests = new Map([
     ["USD", deferred()],

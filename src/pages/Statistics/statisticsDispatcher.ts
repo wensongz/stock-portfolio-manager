@@ -1,5 +1,8 @@
 import type { Currency } from "../../types";
-import type { StatisticsView } from "../../stores/statisticsStore";
+import type {
+  StatisticsRequestMode,
+  StatisticsView,
+} from "../../stores/statisticsStore";
 import {
   resolveStatisticsView,
   type StatisticsSelection,
@@ -13,7 +16,10 @@ interface RefreshHolding {
 interface StatisticsDispatcherDependencies {
   getSelection: () => StatisticsSelection;
   updateSelection: (selection: StatisticsSelection) => void;
-  fetchView: (view: StatisticsView) => Promise<void>;
+  fetchView: (
+    view: StatisticsView,
+    mode?: StatisticsRequestMode,
+  ) => Promise<void>;
   fetchHoldingQuotes: (symbols?: [string, string][]) => Promise<unknown>;
   getAccountHoldings: (
     accountId: string,
@@ -28,9 +34,27 @@ export function createStatisticsDispatcher({
   fetchHoldingQuotes,
   getAccountHoldings,
 }: StatisticsDispatcherDependencies) {
-  const requestSelection = (selection: StatisticsSelection) => {
+  const requestSelection = (
+    selection: StatisticsSelection,
+    mode: StatisticsRequestMode = "join-in-flight",
+  ) => {
     const view = resolveStatisticsView(selection);
-    return view ? fetchView(view) : Promise.resolve();
+    return view ? fetchView(view, mode) : Promise.resolve();
+  };
+
+  const accountSymbols = (selection: StatisticsSelection) => {
+    const seen = new Set<string>();
+    const symbols: [string, string][] = [];
+    for (const holding of getAccountHoldings(
+      selection.selectedAccountId,
+      selection.baseCurrency,
+    )) {
+      if (!seen.has(holding.symbol)) {
+        seen.add(holding.symbol);
+        symbols.push([holding.symbol, holding.market]);
+      }
+    }
+    return symbols;
   };
 
   const changeSelection = (
@@ -75,24 +99,39 @@ export function createStatisticsDispatcher({
           selection.activeTab === "category",
       ),
     refresh: async () => {
-      const selection = getSelection();
-      if (selection.activeTab === "account" && selection.selectedAccountId) {
-        const seen = new Set<string>();
-        const symbols: [string, string][] = [];
-        for (const holding of getAccountHoldings(
-          selection.selectedAccountId,
-          selection.baseCurrency,
-        )) {
-          if (!seen.has(holding.symbol)) {
-            seen.add(holding.symbol);
-            symbols.push([holding.symbol, holding.market]);
-          }
-        }
-        await fetchHoldingQuotes(symbols);
+      const refreshedAccountIds = new Set<string>();
+      let hasFullCoverage = false;
+      const initialSelection = getSelection();
+      if (
+        initialSelection.activeTab === "account" &&
+        initialSelection.selectedAccountId
+      ) {
+        await fetchHoldingQuotes(accountSymbols(initialSelection));
+        refreshedAccountIds.add(initialSelection.selectedAccountId);
       } else {
         await fetchHoldingQuotes();
+        hasFullCoverage = true;
       }
-      await requestSelection(getSelection());
+
+      while (!hasFullCoverage) {
+        const selection = getSelection();
+        if (
+          selection.activeTab === "account" &&
+          selection.selectedAccountId &&
+          refreshedAccountIds.has(selection.selectedAccountId)
+        ) {
+          break;
+        }
+        if (selection.activeTab === "account" && selection.selectedAccountId) {
+          await fetchHoldingQuotes(accountSymbols(selection));
+          refreshedAccountIds.add(selection.selectedAccountId);
+        } else {
+          await fetchHoldingQuotes();
+          hasFullCoverage = true;
+        }
+      }
+
+      await requestSelection(getSelection(), "reload-after-in-flight");
     },
   };
 }

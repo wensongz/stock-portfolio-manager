@@ -11,8 +11,15 @@ interface DashboardState {
   holdingDetails: HoldingDetail[];
   loading: boolean;
   error: string | null;
-  fetchReport: (baseCurrency?: string) => Promise<void>;
+  fetchReport: (
+    baseCurrency?: string,
+    mode?: DashboardRequestMode,
+  ) => Promise<void>;
 }
+
+export type DashboardRequestMode =
+  | "join-in-flight"
+  | "reload-after-in-flight";
 
 export type DashboardInvoke = <T>(
   command: string,
@@ -20,25 +27,24 @@ export type DashboardInvoke = <T>(
 ) => Promise<T>;
 
 export const createDashboardStore = (invokeFn: DashboardInvoke = invoke) => {
-  let latestRequestKey: string | null = null;
-  const inFlight = new Map<string, Promise<void>>();
+  type RequestEntry = { token: symbol; promise: Promise<void> };
 
-  return create<DashboardState>((set) => ({
-    summary: null,
-    holdingDetails: [],
-    loading: false,
-    error: null,
+  let latestRequestToken: symbol | null = null;
+  const inFlight = new Map<string, RequestEntry>();
+  const queuedReloads = new Map<string, RequestEntry>();
 
-    fetchReport: (baseCurrency) => {
-      const requestKey = baseCurrency ?? "USD";
-      latestRequestKey = requestKey;
-      const existing = inFlight.get(requestKey);
-      if (existing) {
+  return create<DashboardState>((set) => {
+    const startRequest = (
+      baseCurrency: string | undefined,
+      requestKey: string,
+      token: symbol,
+      makeLatest: boolean,
+    ): Promise<void> => {
+      if (makeLatest) latestRequestToken = token;
+      if (latestRequestToken === token) {
         set({ loading: true, error: null });
-        return existing;
       }
 
-      set({ loading: true, error: null });
       const request = (async () => {
         try {
           const report = await invokeFn<DashboardReport>(
@@ -47,7 +53,7 @@ export const createDashboardStore = (invokeFn: DashboardInvoke = invoke) => {
               baseCurrency: baseCurrency ?? null,
             },
           );
-          if (latestRequestKey === requestKey) {
+          if (latestRequestToken === token) {
             set({
               summary: report.summary,
               holdingDetails: report.holdings,
@@ -55,20 +61,75 @@ export const createDashboardStore = (invokeFn: DashboardInvoke = invoke) => {
             });
           }
         } catch (err) {
-          if (latestRequestKey === requestKey) {
+          if (latestRequestToken === token) {
             set({ loading: false, error: String(err) });
           }
         }
       })();
-      inFlight.set(requestKey, request);
+      const entry = { token, promise: request };
+      inFlight.set(requestKey, entry);
       void request.finally(() => {
-        if (inFlight.get(requestKey) === request) {
+        if (inFlight.get(requestKey) === entry) {
           inFlight.delete(requestKey);
         }
       });
       return request;
-    },
-  }));
+    };
+
+    return {
+      summary: null,
+      holdingDetails: [],
+      loading: false,
+      error: null,
+
+      fetchReport: (
+        baseCurrency,
+        mode: DashboardRequestMode = "join-in-flight",
+      ) => {
+        const requestKey = baseCurrency ?? "USD";
+        const queued = queuedReloads.get(requestKey);
+        if (queued) {
+          latestRequestToken = queued.token;
+          set({ loading: true, error: null });
+          return queued.promise;
+        }
+
+        const existing = inFlight.get(requestKey);
+        if (existing && mode === "join-in-flight") {
+          latestRequestToken = existing.token;
+          set({ loading: true, error: null });
+          return existing.promise;
+        }
+
+        if (existing) {
+          const token = Symbol(requestKey);
+          latestRequestToken = token;
+          set({ loading: true, error: null });
+          const promise = existing.promise.then(() => {
+            if (queuedReloads.get(requestKey)?.token === token) {
+              queuedReloads.delete(requestKey);
+            }
+            return startRequest(baseCurrency, requestKey, token, false);
+          });
+          const entry = { token, promise };
+          queuedReloads.set(requestKey, entry);
+          void promise.finally(() => {
+            if (queuedReloads.get(requestKey) === entry) {
+              queuedReloads.delete(requestKey);
+            }
+          });
+          return promise;
+        }
+
+        return startRequest(
+          baseCurrency,
+          requestKey,
+          Symbol(requestKey),
+          true,
+        );
+      },
+    };
+  });
 };
 
 export const useDashboardStore = createDashboardStore();

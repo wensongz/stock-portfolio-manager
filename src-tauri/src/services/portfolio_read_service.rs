@@ -332,6 +332,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_missing_fetches_only_uncached_symbols_and_writes_fresh_quotes_to_cache() {
+        let db = seeded_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
+                 VALUES ('holding-cash-usd', 'acct-us', '$CASH-USD', 'USD Cash', 'US', NULL, 2, 1, 'USD', '2026-01-01', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
+                 VALUES ('holding-cash-cny', 'acct-us', '$CASH-CNY', 'CNY Cash', 'CN', NULL, 3, 1, 'CNY', '2026-01-01', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+        }
+        let cache = QuoteCache::new();
+        cache.set(cached_aapl());
+        cache.set(StockQuote {
+            symbol: "$CASH-USD".to_string(),
+            name: "cached USD cash".to_string(),
+            market: "US".to_string(),
+            current_price: 7.0,
+            ..StockQuote::default()
+        });
+        let quote_state = QuoteServiceState::new();
+
+        let model = PortfolioReadModel::load(
+            &db,
+            &cache,
+            Some(&quote_state),
+            QuoteReadMode::RefreshMissing,
+        )
+        .await
+        .unwrap();
+
+        let cached_cash = model
+            .holdings()
+            .iter()
+            .find(|holding| holding.symbol == "$CASH-USD")
+            .unwrap();
+        let fetched_cash = model
+            .holdings()
+            .iter()
+            .find(|holding| holding.symbol == "$CASH-CNY")
+            .unwrap();
+        assert_eq!(cached_cash.current_price, 7.0);
+        assert_eq!(cached_cash.market_value, 14.0);
+        assert_eq!(fetched_cash.current_price, 1.0);
+        assert_eq!(fetched_cash.market_value, 3.0);
+        assert_eq!(cache.get("$CASH-USD").unwrap().current_price, 7.0);
+        assert_eq!(cache.get("$CASH-CNY").unwrap().current_price, 1.0);
+        assert_eq!(cache.get("AAPL").unwrap().current_price, 12.0);
+    }
+
+    #[tokio::test]
     async fn loader_preserves_missing_quote_category_order_and_zero_cost_semantics() {
         let db = seeded_db();
         {

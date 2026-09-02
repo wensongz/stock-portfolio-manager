@@ -1,4 +1,5 @@
 use crate::models::{Holding, Transaction};
+use crate::services::position_replay::{rebuild_position_group, PositionKey};
 use crate::services::quote_provider_service::market_adjusts_sell_pay_cost;
 use crate::services::quote_service::{cash_display_name, is_cash_symbol, CASH_SYMBOL_PREFIX};
 use rusqlite::{Connection, OptionalExtension};
@@ -466,10 +467,185 @@ pub fn create_transaction_in(
     })
 }
 
+fn transaction_by_id(conn: &Connection, id: &str) -> Result<Transaction, String> {
+    conn.query_row(
+        "SELECT id, holding_id, account_id, symbol, name, market, transaction_type,
+                shares, price, total_amount, commission, currency, traded_at, notes, created_at
+         FROM transactions WHERE id = ?1",
+        rusqlite::params![id],
+        |row| {
+            Ok(Transaction {
+                id: row.get(0)?,
+                holding_id: row.get(1)?,
+                account_id: row.get(2)?,
+                symbol: row.get(3)?,
+                name: row.get(4)?,
+                market: row.get(5)?,
+                transaction_type: row.get(6)?,
+                shares: row.get(7)?,
+                price: row.get(8)?,
+                total_amount: row.get(9)?,
+                commission: row.get(10)?,
+                currency: row.get(11)?,
+                traded_at: row.get(12)?,
+                notes: row.get(13)?,
+                created_at: row.get(14)?,
+            })
+        },
+    )
+    .map_err(|error| format!("Transaction not found: {error}"))
+}
+
+fn require_caller_transaction(conn: &Connection) -> Result<(), String> {
+    if conn.is_autocommit() {
+        return Err(
+            "Transaction mutation requires a caller-owned database transaction".to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn update_transaction_in(
+    conn: &Connection,
+    id: &str,
+    input: &CreateTransactionInput,
+) -> Result<Transaction, String> {
+    require_caller_transaction(conn)?;
+    validate_transaction_values(input)?;
+    let old_transaction = transaction_by_id(conn, id)?;
+    if old_transaction.transaction_type == "OPEN" {
+        return Err("Cannot edit the initial position-opening record".to_string());
+    }
+
+    let old_key = (!is_cash_symbol(&old_transaction.symbol))
+        .then(|| PositionKey::new(&old_transaction.account_id, &old_transaction.symbol));
+    let new_key = (!is_cash_symbol(&input.symbol))
+        .then(|| PositionKey::new(&input.account_id, &input.symbol));
+
+    let old_cash_delta = cash_delta(
+        &old_transaction.transaction_type,
+        &old_transaction.symbol,
+        old_transaction.total_amount,
+        old_transaction.commission,
+    );
+    adjust_cash_holding(
+        conn,
+        &old_transaction.account_id,
+        &old_transaction.currency,
+        &old_transaction.market,
+        -old_cash_delta,
+    )?;
+
+    if is_cash_symbol(&input.symbol) && input.transaction_type == "SELL" {
+        validate_cash_withdrawal(conn, &input.account_id, &input.symbol, input.total_amount)?;
+    }
+
+    let existing_cash_holding: Option<String> = if is_cash_symbol(&input.symbol) {
+        conn.query_row(
+            "SELECT id FROM holdings WHERE account_id = ?1 AND UPPER(symbol) = UPPER(?2)",
+            rusqlite::params![input.account_id, input.symbol],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+
+    conn.execute(
+        "UPDATE transactions
+         SET holding_id = ?2, account_id = ?3, symbol = ?4, name = ?5, market = ?6,
+             transaction_type = ?7, shares = ?8, price = ?9, total_amount = ?10,
+             commission = ?11, currency = ?12, traded_at = ?13, notes = ?14
+         WHERE id = ?1",
+        rusqlite::params![
+            id,
+            existing_cash_holding,
+            input.account_id,
+            input.symbol,
+            input.name,
+            input.market,
+            input.transaction_type,
+            input.shares,
+            input.price,
+            input.total_amount,
+            input.commission,
+            input.currency,
+            input.traded_at,
+            input.notes
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+
+    let new_cash_delta = cash_delta(
+        &input.transaction_type,
+        &input.symbol,
+        input.total_amount,
+        input.commission,
+    );
+    adjust_cash_holding(
+        conn,
+        &input.account_id,
+        &input.currency,
+        &input.market,
+        new_cash_delta,
+    )?;
+
+    if let Some(key) = old_key.as_ref() {
+        rebuild_position_group(conn, key)?;
+    }
+    if let Some(key) = new_key
+        .as_ref()
+        .filter(|key| old_key.as_ref() != Some(*key))
+    {
+        rebuild_position_group(conn, key)?;
+    }
+
+    transaction_by_id(conn, id)
+}
+
+pub(crate) fn delete_transaction_in(conn: &Connection, id: &str) -> Result<(), String> {
+    require_caller_transaction(conn)?;
+    let transaction = transaction_by_id(conn, id)?;
+    if transaction.transaction_type == "OPEN" {
+        return Err("Cannot delete the initial position-opening record".to_string());
+    }
+
+    conn.execute(
+        "DELETE FROM transactions WHERE id = ?1",
+        rusqlite::params![id],
+    )
+    .map_err(|error| error.to_string())?;
+
+    let delta = cash_delta(
+        &transaction.transaction_type,
+        &transaction.symbol,
+        transaction.total_amount,
+        transaction.commission,
+    );
+    adjust_cash_holding(
+        conn,
+        &transaction.account_id,
+        &transaction.currency,
+        &transaction.market,
+        -delta,
+    )?;
+
+    if !is_cash_symbol(&transaction.symbol) {
+        rebuild_position_group(
+            conn,
+            &PositionKey::new(&transaction.account_id, &transaction.symbol),
+        )?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        create_holding_in, create_transaction_in, CreateHoldingInput, CreateTransactionInput,
+        create_holding_in, create_transaction_in, delete_transaction_in, update_transaction_in,
+        CreateHoldingInput, CreateTransactionInput,
     };
     use crate::db::Database;
 
@@ -485,6 +661,68 @@ mod tests {
             .unwrap();
         }
         db
+    }
+
+    fn stock_transaction(
+        transaction_type: &str,
+        shares: f64,
+        price: f64,
+        total_amount: f64,
+        traded_at: &str,
+    ) -> CreateTransactionInput {
+        CreateTransactionInput {
+            account_id: "account-1".to_string(),
+            symbol: "AAPL".to_string(),
+            name: "Apple".to_string(),
+            market: "US".to_string(),
+            transaction_type: transaction_type.to_string(),
+            shares,
+            price,
+            total_amount,
+            commission: 0.0,
+            currency: "USD".to_string(),
+            traded_at: traded_at.to_string(),
+            notes: None,
+        }
+    }
+
+    fn seed_buy_then_sell(database: &Database) -> (String, String) {
+        let mut connection = database.conn.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let buy = create_transaction_in(
+            &transaction,
+            &stock_transaction("BUY", 10.0, 10.0, 100.0, "2026-01-01"),
+        )
+        .unwrap();
+        let sell = create_transaction_in(
+            &transaction,
+            &stock_transaction("SELL", 10.0, 12.0, 120.0, "2026-01-02"),
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        (buy.id, sell.id)
+    }
+
+    fn portfolio_counts(database: &Database) -> (i64, f64, f64) {
+        let connection = database.conn.lock().unwrap();
+        let transaction_count = connection
+            .query_row("SELECT COUNT(*) FROM transactions", [], |row| row.get(0))
+            .unwrap();
+        let stock_shares = connection
+            .query_row(
+                "SELECT shares FROM holdings WHERE symbol = 'AAPL'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let cash_shares = connection
+            .query_row(
+                "SELECT shares FROM holdings WHERE symbol = '$CASH-USD'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (transaction_count, stock_shares, cash_shares)
     }
 
     #[test]
@@ -559,5 +797,98 @@ mod tests {
         assert_eq!(shares, 2.0);
         assert_eq!(avg_cost, 51.5);
         assert_eq!(cash, -103.0);
+    }
+
+    #[test]
+    fn deleting_an_earlier_buy_cannot_leave_a_historical_sell_unfunded() {
+        let database = database_with_account();
+        let (buy_id, _) = seed_buy_then_sell(&database);
+        let before = portfolio_counts(&database);
+
+        let error = {
+            let mut connection = database.conn.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let error = delete_transaction_in(&transaction, &buy_id).unwrap_err();
+            transaction.rollback().unwrap();
+            error
+        };
+
+        assert!(error.contains("historical position"), "got: {error}");
+        assert_eq!(portfolio_counts(&database), before);
+    }
+
+    #[test]
+    fn shrinking_an_earlier_buy_rolls_back_when_later_sells_exceed_it() {
+        let database = database_with_account();
+        let (buy_id, _) = seed_buy_then_sell(&database);
+        let before = portfolio_counts(&database);
+
+        let error = {
+            let mut connection = database.conn.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let error = update_transaction_in(
+                &transaction,
+                &buy_id,
+                &stock_transaction("BUY", 5.0, 10.0, 50.0, "2026-01-01"),
+            )
+            .unwrap_err();
+            transaction.rollback().unwrap();
+            error
+        };
+
+        assert!(error.contains("historical position"), "got: {error}");
+        assert_eq!(portfolio_counts(&database), before);
+    }
+
+    #[test]
+    fn moving_a_sell_to_a_symbol_without_a_position_rolls_back() {
+        let database = database_with_account();
+        let (_, sell_id) = seed_buy_then_sell(&database);
+        let before = portfolio_counts(&database);
+        let mut moved_sell = stock_transaction("SELL", 10.0, 12.0, 120.0, "2026-01-02");
+        moved_sell.symbol = "MSFT".to_string();
+        moved_sell.name = "Microsoft".to_string();
+
+        let error = {
+            let mut connection = database.conn.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let error = update_transaction_in(&transaction, &sell_id, &moved_sell).unwrap_err();
+            transaction.rollback().unwrap();
+            error
+        };
+
+        assert!(error.contains("historical position"), "got: {error}");
+        assert_eq!(portfolio_counts(&database), before);
+        let msft_transactions: i64 = database
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE symbol = 'MSFT'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(msft_transactions, 0);
+    }
+
+    #[test]
+    fn a_valid_historical_buy_edit_rebuilds_holding_and_cash() {
+        let database = database_with_account();
+        let (buy_id, _) = seed_buy_then_sell(&database);
+
+        {
+            let mut connection = database.conn.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            update_transaction_in(
+                &transaction,
+                &buy_id,
+                &stock_transaction("BUY", 12.0, 10.0, 120.0, "2026-01-01"),
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        assert_eq!(portfolio_counts(&database), (2, 2.0, 0.0));
     }
 }

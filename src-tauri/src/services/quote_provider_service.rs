@@ -1,10 +1,15 @@
 use crate::db::Database;
 use crate::models::quote_provider::QuoteProviderConfig;
+use crate::services::position_replay::rebuild_all_position_groups;
 use chrono::Utc;
+use rusqlite::Connection;
 
 pub fn get_quote_provider_config(db: &Database) -> Result<QuoteProviderConfig, String> {
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    get_quote_provider_config_in(&conn)
+}
 
+fn get_quote_provider_config_in(conn: &Connection) -> Result<QuoteProviderConfig, String> {
     let result = conn.query_row(
         "SELECT us_provider, hk_provider, cn_provider, xueqiu_cookie, xueqiu_u,
                 cn_adjust_sell_pay_cost, us_adjust_sell_pay_cost, hk_adjust_sell_pay_cost
@@ -31,11 +36,7 @@ pub fn get_quote_provider_config(db: &Database) -> Result<QuoteProviderConfig, S
     }
 }
 
-pub fn update_quote_provider_config(
-    db: &Database,
-    config: &QuoteProviderConfig,
-) -> Result<bool, String> {
-    // Validate provider values
+fn validate_quote_provider_config(config: &QuoteProviderConfig) -> Result<(), String> {
     match config.us_provider.as_str() {
         "yahoo" | "eastmoney" | "xueqiu" => {}
         _ => return Err(format!("Invalid US provider: {}", config.us_provider)),
@@ -53,23 +54,27 @@ pub fn update_quote_provider_config(
             ))
         }
     }
+    Ok(())
+}
 
-    let conn = db.conn.lock().unwrap();
+fn persist_quote_provider_config(
+    conn: &Connection,
+    config: &QuoteProviderConfig,
+) -> Result<(), String> {
     let now = Utc::now().to_rfc3339();
 
-    // Normalize empty / whitespace-only values to NULL.
     let xueqiu_cookie = config
         .xueqiu_cookie
         .as_deref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let xueqiu_u = config
         .xueqiu_u
         .as_deref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     conn.execute(
         "INSERT INTO quote_provider_config
@@ -98,7 +103,29 @@ pub fn update_quote_provider_config(
             now
         ],
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn update_quote_provider_config(
+    db: &Database,
+    config: &QuoteProviderConfig,
+) -> Result<bool, String> {
+    validate_quote_provider_config(config)?;
+    let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let previous = get_quote_provider_config_in(&transaction)?;
+    let cost_policy_changed = previous.cn_adjust_sell_pay_cost != config.cn_adjust_sell_pay_cost
+        || previous.us_adjust_sell_pay_cost != config.us_adjust_sell_pay_cost
+        || previous.hk_adjust_sell_pay_cost != config.hk_adjust_sell_pay_cost;
+
+    persist_quote_provider_config(&transaction, config)?;
+    if cost_policy_changed {
+        rebuild_all_position_groups(&transaction)?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
 
     Ok(true)
 }
@@ -130,8 +157,9 @@ pub fn market_adjusts_sell_pay_cost(conn: &rusqlite::Connection, market: &str) -
 
 #[cfg(test)]
 mod tests {
-    use super::get_quote_provider_config;
+    use super::{get_quote_provider_config, update_quote_provider_config};
     use crate::db::Database;
+    use crate::services::portfolio_mutation::{create_transaction_in, CreateTransactionInput};
 
     #[test]
     fn schema_errors_are_not_reported_as_default_config() {
@@ -148,5 +176,89 @@ mod tests {
 
         let error = get_quote_provider_config(&db).unwrap_err();
         assert!(error.contains("hk_provider") || error.contains("column"));
+    }
+
+    #[test]
+    fn cost_policy_update_rolls_back_config_when_position_rebuild_fails() {
+        let db = Database::new(":memory:").unwrap();
+        {
+            let mut conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, name, market, created_at, updated_at)
+                 VALUES ('account-1', 'Portfolio', 'US', '2026-01-01', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+            let transaction = conn.transaction().unwrap();
+            for input in [
+                CreateTransactionInput {
+                    account_id: "account-1".to_string(),
+                    symbol: "AAPL".to_string(),
+                    name: "Apple".to_string(),
+                    market: "US".to_string(),
+                    transaction_type: "BUY".to_string(),
+                    shares: 10.0,
+                    price: 10.0,
+                    total_amount: 100.0,
+                    commission: 0.0,
+                    currency: "USD".to_string(),
+                    traded_at: "2026-01-01".to_string(),
+                    notes: None,
+                },
+                CreateTransactionInput {
+                    account_id: "account-1".to_string(),
+                    symbol: "AAPL".to_string(),
+                    name: "Apple".to_string(),
+                    market: "US".to_string(),
+                    transaction_type: "SELL".to_string(),
+                    shares: 4.0,
+                    price: 20.0,
+                    total_amount: 80.0,
+                    commission: 0.0,
+                    currency: "USD".to_string(),
+                    traded_at: "2026-01-02".to_string(),
+                    notes: None,
+                },
+            ] {
+                create_transaction_in(&transaction, &input).unwrap();
+            }
+            transaction.commit().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_cost_rebuild
+                 BEFORE UPDATE OF shares, avg_cost ON holdings
+                 WHEN OLD.symbol = 'AAPL'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced holding rebuild failure');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let mut updated = get_quote_provider_config(&db).unwrap();
+        assert!(!updated.us_adjust_sell_pay_cost);
+        updated.us_adjust_sell_pay_cost = true;
+
+        let error = update_quote_provider_config(&db, &updated).unwrap_err();
+
+        assert!(
+            error.contains("forced holding rebuild failure"),
+            "got: {error}"
+        );
+        assert!(
+            !get_quote_provider_config(&db)
+                .unwrap()
+                .us_adjust_sell_pay_cost
+        );
+        let holding: (f64, f64) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT shares, avg_cost FROM holdings WHERE symbol = 'AAPL'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(holding, (6.0, 10.0));
     }
 }

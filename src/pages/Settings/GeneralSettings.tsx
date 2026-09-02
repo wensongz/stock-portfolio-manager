@@ -5,6 +5,7 @@ import { useExchangeRateStore } from "../../stores/exchangeRateStore";
 import { useSettingsStore, type ColorScheme, type ThemeMode } from "../../stores/settingsStore";
 import { useXueqiuLogin } from "../../hooks/useXueqiuLogin";
 import type { QuoteProviderConfig } from "../../types";
+import { updateCostAdjustmentPolicy, type CostAdjustmentKey } from "./costAdjustment";
 
 const { Paragraph } = Typography;
 
@@ -182,16 +183,13 @@ export default function GeneralSettings() {
   };
 
   const handleCostAdjustChange = async (
-    key: "cn_adjust_sell_pay_cost" | "us_adjust_sell_pay_cost" | "hk_adjust_sell_pay_cost",
+    key: CostAdjustmentKey,
     checked: boolean
   ) => {
-    const updated = { ...providerConfig, [key]: checked };
+    setRecalculating(true);
     try {
-      await invoke("update_quote_provider_config", { config: updated });
+      const updated = await updateCostAdjustmentPolicy(invoke, providerConfig, key, checked);
       setProviderConfig(updated);
-      // Recalculate all holding cost bases from scratch with the new setting.
-      setRecalculating(true);
-      await invoke("recalculate_holdings_cost");
       message.success("持仓成本已根据新设置重新计算");
     } catch (err) {
       message.error("更新失败: " + String(err));

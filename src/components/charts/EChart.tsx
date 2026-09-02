@@ -1,4 +1,4 @@
-import ReactEChartsCore from "echarts-for-react/lib/core";
+import ReactEChartsCore from "echarts-for-react/esm/core.js";
 import type { EChartsReactProps } from "echarts-for-react";
 import * as echarts from "echarts/core";
 import {

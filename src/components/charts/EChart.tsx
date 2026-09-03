@@ -1,10 +1,6 @@
-import ReactEChartsCore from "echarts-for-react/esm/core.js";
-import type { EChartsReactProps } from "echarts-for-react";
-import * as echarts from "echarts/core";
 import {
-  BarChart as EChartsBarChart,
-  LineChart as EChartsLineChart,
-  PieChart as EChartsPieChart,
+  BarChart,
+  LineChart,
 } from "echarts/charts";
 import {
   DataZoomComponent,
@@ -14,25 +10,19 @@ import {
   TitleComponent,
   TooltipComponent,
 } from "echarts/components";
-import { LabelLayout } from "echarts/features";
-import { CanvasRenderer } from "echarts/renderers";
+import EChartCore, { echarts, type EChartProps } from "./EChartCore";
 
 echarts.use([
-  EChartsBarChart,
-  EChartsLineChart,
-  EChartsPieChart,
+  BarChart,
+  LineChart,
   DataZoomComponent,
   GridComponent,
   LegendComponent,
   MarkAreaComponent,
-  LabelLayout,
   TitleComponent,
   TooltipComponent,
-  CanvasRenderer,
 ]);
 
-type Props = Omit<EChartsReactProps, "echarts">;
-
-export default function EChart(props: Props) {
-  return <ReactEChartsCore echarts={echarts} {...props} />;
+export default function EChart(props: EChartProps) {
+  return <EChartCore {...props} />;
 }

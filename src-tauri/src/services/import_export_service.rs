@@ -12,9 +12,99 @@ use std::collections::{HashMap, HashSet};
 // Export
 // ─────────────────────────────────────────────────────────────────────────────
 
+struct HoldingExportRow {
+    account_name: Option<String>,
+    symbol: String,
+    name: String,
+    market: String,
+    category_name: Option<String>,
+    shares: f64,
+    avg_cost: f64,
+    currency: String,
+}
+
+impl HoldingExportRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            account_name: row.get(0)?,
+            symbol: row.get(1)?,
+            name: row.get(2)?,
+            market: row.get(3)?,
+            category_name: row.get(4)?,
+            shares: row.get(5)?,
+            avg_cost: row.get(6)?,
+            currency: row.get(7)?,
+        })
+    }
+
+    fn into_record(self) -> [String; 8] {
+        [
+            self.account_name.unwrap_or_default(),
+            self.symbol,
+            self.name,
+            self.market,
+            self.category_name.unwrap_or_default(),
+            self.shares.to_string(),
+            self.avg_cost.to_string(),
+            self.currency,
+        ]
+    }
+}
+
+struct TransactionExportRow {
+    traded_at: String,
+    account_name: Option<String>,
+    symbol: String,
+    name: String,
+    market: String,
+    transaction_type: String,
+    shares: f64,
+    price: f64,
+    total_amount: f64,
+    commission: f64,
+    currency: String,
+    notes: Option<String>,
+}
+
+impl TransactionExportRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            traded_at: row.get(0)?,
+            account_name: row.get(1)?,
+            symbol: row.get(2)?,
+            name: row.get(3)?,
+            market: row.get(4)?,
+            transaction_type: row.get(5)?,
+            shares: row.get(6)?,
+            price: row.get(7)?,
+            total_amount: row.get(8)?,
+            commission: row.get(9)?,
+            currency: row.get(10)?,
+            notes: row.get(11)?,
+        })
+    }
+
+    fn into_record(self) -> [String; 12] {
+        [
+            self.traded_at,
+            self.account_name.unwrap_or_default(),
+            self.symbol,
+            self.name,
+            self.market,
+            self.transaction_type,
+            self.shares.to_string(),
+            self.price.to_string(),
+            self.total_amount.to_string(),
+            self.commission.to_string(),
+            self.currency,
+            self.notes.unwrap_or_default(),
+        ]
+    }
+}
+
 /// Export holdings to CSV and return the CSV string content.
 pub fn export_holdings_csv(db: &Database, filters: &ExportFilters) -> Result<String, String> {
-    let conn = db.conn.lock().unwrap();
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
 
     // Build parameterized query
     let mut conditions = Vec::new();
@@ -72,34 +162,15 @@ pub fn export_holdings_csv(db: &Database, filters: &ExportFilters) -> Result<Str
     .map_err(|e| e.to_string())?;
 
     let rows = stmt
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok((
-                row.get::<_, String>(0).unwrap_or_default(),
-                row.get::<_, String>(1).unwrap_or_default(),
-                row.get::<_, String>(2).unwrap_or_default(),
-                row.get::<_, String>(3).unwrap_or_default(),
-                row.get::<_, String>(4).unwrap_or_default(),
-                row.get::<_, f64>(5).unwrap_or(0.0),
-                row.get::<_, f64>(6).unwrap_or(0.0),
-                row.get::<_, String>(7).unwrap_or_default(),
-            ))
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
+        .query_map(
+            rusqlite::params_from_iter(params.iter()),
+            HoldingExportRow::from_row,
+        )
         .map_err(|e| e.to_string())?;
 
-    for (account, symbol, name, market, category, shares, avg_cost, currency) in rows {
-        wtr.write_record(&[
-            account,
-            symbol,
-            name,
-            market,
-            category,
-            shares.to_string(),
-            avg_cost.to_string(),
-            currency,
-        ])
-        .map_err(|e| e.to_string())?;
+    for row in rows {
+        wtr.write_record(row.map_err(|e| e.to_string())?.into_record())
+            .map_err(|e| e.to_string())?;
     }
 
     let data = wtr.into_inner().map_err(|e| e.to_string())?;
@@ -113,7 +184,7 @@ pub fn export_transactions_csv(
     end_date: &str,
     filters: &ExportFilters,
 ) -> Result<String, String> {
-    let conn = db.conn.lock().unwrap();
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
 
     let mut conditions = Vec::new();
     let mut params: Vec<String> = Vec::new();
@@ -176,58 +247,15 @@ pub fn export_transactions_csv(
     .map_err(|e| e.to_string())?;
 
     let rows = stmt
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok((
-                row.get::<_, String>(0).unwrap_or_default(),
-                row.get::<_, String>(1).unwrap_or_default(),
-                row.get::<_, String>(2).unwrap_or_default(),
-                row.get::<_, String>(3).unwrap_or_default(),
-                row.get::<_, String>(4).unwrap_or_default(),
-                row.get::<_, String>(5).unwrap_or_default(),
-                row.get::<_, f64>(6).unwrap_or(0.0),
-                row.get::<_, f64>(7).unwrap_or(0.0),
-                row.get::<_, f64>(8).unwrap_or(0.0),
-                row.get::<_, f64>(9).unwrap_or(0.0),
-                row.get::<_, String>(10).unwrap_or_default(),
-                row.get::<_, Option<String>>(11)
-                    .unwrap_or(None)
-                    .unwrap_or_default(),
-            ))
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
+        .query_map(
+            rusqlite::params_from_iter(params.iter()),
+            TransactionExportRow::from_row,
+        )
         .map_err(|e| e.to_string())?;
 
-    for (
-        traded_at,
-        account,
-        symbol,
-        name,
-        market,
-        tx_type,
-        shares,
-        price,
-        amount,
-        comm,
-        currency,
-        notes,
-    ) in rows
-    {
-        wtr.write_record(&[
-            traded_at,
-            account,
-            symbol,
-            name,
-            market,
-            tx_type,
-            shares.to_string(),
-            price.to_string(),
-            amount.to_string(),
-            comm.to_string(),
-            currency,
-            notes,
-        ])
-        .map_err(|e| e.to_string())?;
+    for row in rows {
+        wtr.write_record(row.map_err(|e| e.to_string())?.into_record())
+            .map_err(|e| e.to_string())?;
     }
 
     let data = wtr.into_inner().map_err(|e| e.to_string())?;
@@ -602,6 +630,92 @@ mod tests {
             csv.push_str(&format!("TEST{index:02},Test {index},US,{index},10,USD\n"));
         }
         csv
+    }
+
+    fn no_filters() -> ExportFilters {
+        ExportFilters {
+            market: None,
+            account_id: None,
+            category_id: None,
+        }
+    }
+
+    #[test]
+    fn holdings_export_rejects_invalid_numeric_database_values() {
+        let db = database_with_account();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, shares, avg_cost, currency,
+                  created_at, updated_at)
+                 VALUES ('broken-holding', 'account-1', 'BROKEN', 'Broken', 'US',
+                         'not-a-number', 10, 'USD', '2026-09-03', '2026-09-03')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let error = export_holdings_csv(&db, &no_filters()).unwrap_err();
+        assert!(error.contains("Invalid column type"), "{error}");
+    }
+
+    #[test]
+    fn transactions_export_rejects_invalid_numeric_database_values() {
+        let db = database_with_account();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO transactions
+                 (id, holding_id, account_id, symbol, name, market, transaction_type,
+                  shares, price, total_amount, commission, currency, traded_at, notes, created_at)
+                 VALUES ('broken-transaction', NULL, 'account-1', 'BROKEN', 'Broken', 'US',
+                         'BUY', 1, 'not-a-number', 10, 0, 'USD', '2026-09-03', NULL,
+                         '2026-09-03')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let error = export_transactions_csv(&db, "", "", &no_filters()).unwrap_err();
+        assert!(error.contains("Invalid column type"), "{error}");
+    }
+
+    #[test]
+    fn nullable_export_fields_remain_blank_cells() {
+        let db = database_with_account();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost,
+                  currency, created_at, updated_at)
+                 VALUES ('holding-1', 'account-1', 'AAPL', 'Apple', 'US', NULL, 2, 10,
+                         'USD', '2026-09-03', '2026-09-03');
+                 INSERT INTO transactions
+                 (id, holding_id, account_id, symbol, name, market, transaction_type,
+                  shares, price, total_amount, commission, currency, traded_at, notes, created_at)
+                 VALUES ('transaction-1', 'holding-1', 'account-1', 'AAPL', 'Apple', 'US',
+                         'BUY', 2, 10, 20, 0, 'USD', '2026-09-03', NULL, '2026-09-03');",
+            )
+            .unwrap();
+        }
+
+        let holdings = export_holdings_csv(&db, &no_filters()).unwrap();
+        let holding_row = csv::Reader::from_reader(holdings.as_bytes())
+            .records()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&holding_row[4], "");
+
+        let transactions = export_transactions_csv(&db, "", "", &no_filters()).unwrap();
+        let transaction_row = csv::Reader::from_reader(transactions.as_bytes())
+            .records()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&transaction_row[11], "");
     }
 
     #[test]

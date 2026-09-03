@@ -97,3 +97,59 @@ test("a delayed delete does not clear contracts fetched for a newer account", as
     ["account-b"],
   );
 });
+
+test("starting an option refresh clears cached contracts before new data arrives", async () => {
+  const request = deferred();
+  globalThis.window = {
+    __TAURI_INTERNALS__: {
+      invoke(command: string, args: { accountId: string }) {
+        assert.equal(command, "get_option_contracts");
+        assert.equal(args.accountId, "account-a");
+        return request.promise;
+      },
+    },
+  };
+
+  const { useOptionStore } = await import("./optionStore.ts");
+  useOptionStore.setState({
+    contracts: [contract("stale", "account-a")],
+    loading: false,
+    error: null,
+  });
+
+  const refreshing = useOptionStore.getState().fetchContracts("account-a");
+
+  assert.deepEqual(useOptionStore.getState().contracts, []);
+  assert.equal(useOptionStore.getState().loading, true);
+
+  request.resolve([contract("fresh", "account-a")]);
+  await refreshing;
+});
+
+test("a failed option refresh exposes a contract-specific error instead of an empty success", async () => {
+  globalThis.window = {
+    __TAURI_INTERNALS__: {
+      invoke(command: string, args: { accountId: string }) {
+        assert.equal(command, "get_option_contracts");
+        assert.equal(args.accountId, "account-a");
+        return Promise.reject(new Error("database unavailable"));
+      },
+    },
+  };
+
+  const { useOptionStore } = await import("./optionStore.ts");
+  useOptionStore.setState({
+    contracts: [contract("stale", "account-a")],
+    loading: false,
+    error: null,
+    contractsError: null,
+  });
+
+  await useOptionStore.getState().fetchContracts("account-a");
+
+  assert.deepEqual(useOptionStore.getState().contracts, []);
+  assert.match(
+    useOptionStore.getState().contractsError,
+    /database unavailable/,
+  );
+});

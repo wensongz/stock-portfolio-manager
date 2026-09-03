@@ -14,6 +14,7 @@ interface OptionState {
   callSimulations: SellCallSimulation[];
   loading: boolean;
   error: string | null;
+  contractsError: string | null;
 
   fetchContracts: (accountId: string) => Promise<void>;
   importOptionsCsv: (accountId: string, csvContent: string) => Promise<ImportOptionsResult>;
@@ -31,10 +32,11 @@ export const useOptionStore = create<OptionState>((set) => ({
   callSimulations: [],
   loading: false,
   error: null,
+  contractsError: null,
 
   fetchContracts: async (accountId: string) => {
     const requestId = ++latestContractsRequest;
-    set({ loading: true, error: null });
+    set({ contracts: [], loading: true, error: null, contractsError: null });
     try {
       const contracts = await invoke<OptionContract[]>("get_option_contracts", {
         accountId,
@@ -44,7 +46,7 @@ export const useOptionStore = create<OptionState>((set) => ({
       }
     } catch (err) {
       if (requestId === latestContractsRequest) {
-        set({ error: String(err), loading: false });
+        set({ error: String(err), contractsError: String(err), loading: false });
       }
     }
   },
@@ -85,7 +87,12 @@ export const useOptionStore = create<OptionState>((set) => ({
     const requestId = ++latestContractsRequest;
     await invoke("delete_option_records", { accountId });
     if (requestId === latestContractsRequest) {
-      set({ contracts: [], putSimulations: [], callSimulations: [] });
+      set({
+        contracts: [],
+        putSimulations: [],
+        callSimulations: [],
+        contractsError: null,
+      });
     }
   },
 

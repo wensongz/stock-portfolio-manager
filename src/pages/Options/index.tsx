@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import dayjs from "dayjs";
 import {
   Card,
   Select,
@@ -46,6 +47,11 @@ import {
   selectAccountOptionContracts,
 } from "./expiredOptionsViewModel";
 import type { ExpiredUnderlyingSummary } from "./expiredOptionsViewModel";
+import {
+  buildActiveUnderlyingSummaries,
+  resolveActiveUnderlyingSelection,
+} from "./activeOptionsViewModel";
+import type { ActiveUnderlyingSummary } from "./activeOptionsViewModel";
 
 const { Title, Text } = Typography;
 
@@ -60,6 +66,8 @@ export default function OptionsPage() {
   const { accounts, fetchAccounts } = useAccountStore();
   const {
     contracts,
+    loading: optionContractsLoading,
+    contractsError: optionContractsError,
     putSimulations,
     callSimulations,
     fetchContracts,
@@ -83,9 +91,13 @@ export default function OptionsPage() {
     return localStorage.getItem("options_selected_account_id") || "";
   });
   const selectedAccountIdRef = useRef(selectedAccountId);
+  const activeUnderlyingSelectedByUserRef = useRef(false);
   const expiredUnderlyingSelectedByUserRef = useRef(false);
   const [stockPrices, setStockPrices] = useState<Record<string, number>>({});
   const [activeTab, setActiveTab] = useState<string>("active");
+  const [selectedActiveUnderlying, setSelectedActiveUnderlying] = useState<
+    string | null
+  >(null);
   const [selectedExpiredUnderlying, setSelectedExpiredUnderlying] = useState<
     string | null
   >(null);
@@ -135,6 +147,8 @@ export default function OptionsPage() {
     }
     clearSimulations();
     setStockPrices({});
+    activeUnderlyingSelectedByUserRef.current = false;
+    setSelectedActiveUnderlying(null);
     expiredUnderlyingSelectedByUserRef.current = false;
     setSelectedExpiredUnderlying(null);
   }, [
@@ -246,36 +260,69 @@ export default function OptionsPage() {
     });
   }, []);
 
-  const groupedActiveContracts = useMemo(
-    () => groupContracts(activeContracts),
-    [activeContracts, groupContracts]
-  );
-
-  const expiredReviewReady = isAllHistoryOptionReview(
+  const allHistoryReviewReady = isAllHistoryOptionReview(
     optionReviewReport,
     selectedAccountId,
   );
-  const expiredReviewRequestMatches = isAllHistoryOptionReviewRequest(
+  const allHistoryReviewRequestMatches = isAllHistoryOptionReviewRequest(
     optionReviewRequestedAccountId,
     optionReviewRequestedPeriodDays,
     selectedAccountId,
+  );
+  const activeSummaryDate = dayjs().format("YYYY-MM-DD");
+
+  const activeSummaryRows = useMemo(
+    () =>
+      buildActiveUnderlyingSummaries(
+        activeContracts,
+        allHistoryReviewReady && optionReviewReport
+          ? optionReviewReport.underlyings
+          : [],
+        activeSummaryDate,
+      ),
+    [
+      activeContracts,
+      activeSummaryDate,
+      allHistoryReviewReady,
+      optionReviewReport,
+    ],
+  );
+
+  useEffect(() => {
+    setSelectedActiveUnderlying((current) =>
+      resolveActiveUnderlyingSelection(
+        activeSummaryRows,
+        current,
+        activeUnderlyingSelectedByUserRef.current,
+      ),
+    );
+  }, [activeSummaryRows]);
+
+  const selectedActiveContracts = useMemo(
+    () =>
+      groupContracts(
+        activeContracts.filter(
+          (contract) => contract.underlying === selectedActiveUnderlying,
+        ),
+      ),
+    [activeContracts, groupContracts, selectedActiveUnderlying],
   );
 
   const expiredSummaryRows = useMemo(
     () =>
       buildExpiredUnderlyingSummaries(
         expiredContracts,
-        expiredReviewReady && optionReviewReport
+        allHistoryReviewReady && optionReviewReport
           ? optionReviewReport.underlyings
           : [],
       ),
-    [expiredContracts, expiredReviewReady, optionReviewReport],
+    [expiredContracts, allHistoryReviewReady, optionReviewReport],
   );
 
   useEffect(() => {
-    if (!expiredReviewRequestMatches) return;
+    if (!allHistoryReviewRequestMatches) return;
     if (optionReviewLoading) return;
-    if (!expiredReviewReady && !optionReviewError) return;
+    if (!allHistoryReviewReady && !optionReviewError) return;
     setSelectedExpiredUnderlying((current) =>
       resolveExpiredUnderlyingSelection(
         expiredSummaryRows,
@@ -287,8 +334,8 @@ export default function OptionsPage() {
     expiredSummaryRows,
     optionReviewError,
     optionReviewLoading,
-    expiredReviewRequestMatches,
-    expiredReviewReady,
+    allHistoryReviewRequestMatches,
+    allHistoryReviewReady,
   ]);
 
   const selectedExpiredContracts = useMemo(
@@ -362,17 +409,6 @@ export default function OptionsPage() {
     [expiredContracts],
   );
 
-  // Compute premium grouped by underlying stock for active contracts
-  const activePremiumByStock = useMemo(() => {
-    const map: Record<string, number> = {};
-    for (const c of activeContracts) {
-      map[c.underlying] = (map[c.underlying] || 0) + Math.abs(c.open_amount);
-    }
-    return Object.entries(map)
-      .map(([underlying, premium]) => ({ underlying, premium }))
-      .sort((a, b) => b.premium - a.premium);
-  }, [activeContracts]);
-
   // Handle CSV import
   const handleImport = useCallback(
     async (file: File) => {
@@ -398,6 +434,8 @@ export default function OptionsPage() {
           selectedAccountIdRef.current,
         );
         if (refreshAccountId) {
+          activeUnderlyingSelectedByUserRef.current = false;
+          setSelectedActiveUnderlying(null);
           expiredUnderlyingSelectedByUserRef.current = false;
           setSelectedExpiredUnderlying(null);
           fetchContracts(refreshAccountId);
@@ -461,6 +499,8 @@ export default function OptionsPage() {
         )
       ) {
         clearOptionReview();
+        activeUnderlyingSelectedByUserRef.current = false;
+        setSelectedActiveUnderlying(null);
         expiredUnderlyingSelectedByUserRef.current = false;
         setSelectedExpiredUnderlying(null);
       }
@@ -489,7 +529,7 @@ export default function OptionsPage() {
       title: "期权标识",
       dataIndex: "option_symbol",
       key: "option_symbol",
-      width: 255,
+      width: 230,
     },
     {
       title: "股票",
@@ -515,7 +555,7 @@ export default function OptionsPage() {
       title: "类型",
       dataIndex: "option_type",
       key: "option_type",
-      width: 70,
+      width: 60,
       render: (v: string) => (
         <Tag color={v === "P" ? "orange" : "green"}>
           {v === "P" ? "Put" : "Call"}
@@ -526,7 +566,7 @@ export default function OptionsPage() {
       title: "合约数",
       dataIndex: "contracts",
       key: "contracts",
-      width: 80,
+      width: 70,
     },
     {
       title: "开仓价",
@@ -548,7 +588,7 @@ export default function OptionsPage() {
       title: "佣金",
       dataIndex: "commission",
       key: "commission",
-      width: 80,
+      width: 75,
       render: (v: number) => (
         <Text type="secondary">${Math.abs(v).toLocaleString()}</Text>
       ),
@@ -557,7 +597,7 @@ export default function OptionsPage() {
       title: "交易时间",
       dataIndex: "traded_at",
       key: "traded_at",
-      width: 120,
+      width: 110,
       render: (v: string | null) => v ? v.substring(0, 10) : "-",
     },
   ];
@@ -579,16 +619,84 @@ export default function OptionsPage() {
     },
   ];
 
-  const expiredCurrency = expiredReviewReady
+  const optionReviewCurrency = allHistoryReviewReady
     ? optionReviewReport!.currency
     : selectedAccountCurrency || "USD";
-  const formatExpiredCurrency = (value: number) =>
+  const formatOptionReviewCurrency = (value: number) =>
     new Intl.NumberFormat("zh-CN", {
       style: "currency",
-      currency: expiredCurrency,
+      currency: optionReviewCurrency,
       minimumFractionDigits: 2,
       maximumFractionDigits: 2,
     }).format(value);
+
+  const activeSummaryColumns: ColumnsType<ActiveUnderlyingSummary> = [
+    {
+      title: "标的",
+      dataIndex: "underlying",
+      key: "underlying",
+      fixed: "left",
+      width: 80,
+      render: (value: string) => <Tag color="blue">{value}</Tag>,
+    },
+    {
+      title: "累计净权利金",
+      dataIndex: "netPremium",
+      key: "netPremium",
+      align: "right",
+      width: 130,
+      render: (value: number | null) =>
+        allHistoryReviewReady && value != null ? (
+          <Text type={value < 0 ? "danger" : "success"}>
+            {formatOptionReviewCurrency(value)}
+          </Text>
+        ) : (
+          "—"
+        ),
+    },
+    {
+      title: "总合约数（记录）",
+      dataIndex: "totalRecords",
+      key: "totalRecords",
+      align: "right",
+      width: 125,
+    },
+    {
+      title: "Put / Call（合约数）",
+      key: "optionMix",
+      align: "right",
+      width: 125,
+      render: (_: unknown, row) =>
+        `${row.putContracts} / ${row.callContracts}`,
+    },
+    {
+      title: "平均净权利金/记录",
+      dataIndex: "averageNetPremiumPerRecord",
+      key: "averageNetPremiumPerRecord",
+      align: "right",
+      width: 145,
+      render: (value: number | null) =>
+        allHistoryReviewReady && value != null
+          ? formatOptionReviewCurrency(value)
+          : "—",
+    },
+    {
+      title: "下一到期日",
+      dataIndex: "nextExpiryDate",
+      key: "nextExpiryDate",
+      width: 110,
+      render: (value: string | null) => value ?? "—",
+    },
+    {
+      title: "30天内到期记录",
+      dataIndex: "expiringWithin30Days",
+      key: "expiringWithin30Days",
+      align: "right",
+      width: 125,
+      render: (value: number) =>
+        value > 0 ? <Text type="warning">{value}</Text> : value,
+    },
+  ];
 
   const expiredSummaryColumns: ColumnsType<ExpiredUnderlyingSummary> = [
     {
@@ -606,9 +714,9 @@ export default function OptionsPage() {
       align: "right",
       width: 120,
       render: (value: number | null) =>
-        expiredReviewReady && value != null ? (
+        allHistoryReviewReady && value != null ? (
           <Text type={value < 0 ? "danger" : "success"}>
-            {formatExpiredCurrency(value)}
+            {formatOptionReviewCurrency(value)}
           </Text>
         ) : (
           "—"
@@ -657,7 +765,9 @@ export default function OptionsPage() {
       align: "right",
       width: 120,
       render: (value: number | null) =>
-        expiredReviewReady && value != null ? formatExpiredCurrency(value) : "—",
+        allHistoryReviewReady && value != null
+          ? formatOptionReviewCurrency(value)
+          : "—",
     },
     {
       title: "最近完成日",
@@ -671,6 +781,16 @@ export default function OptionsPage() {
   // Render active tab content with simulation
   const renderActiveTab = () => (
     <div>
+      <style>{`
+        .active-option-selected-row > td {
+          background: color-mix(in srgb, var(--color-info) 12%, transparent) !important;
+        }
+        .active-option-table th,
+        .active-option-table td {
+          white-space: nowrap;
+        }
+      `}</style>
+
       <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
         <Col xs={24} sm={12} lg={6}>
           <StatCard
@@ -706,46 +826,81 @@ export default function OptionsPage() {
         </Col>
       </Row>
 
-      <Table
-        dataSource={groupedActiveContracts}
-        columns={activeColumns}
-        rowKey={(record: any) => record.key || record.id}
-        size="small"
-        pagination={false}
-        style={{ marginBottom: 24 }}
-        expandable={{
-          childrenColumnName: "children",
-          expandIcon: ({ expanded, onExpand, record }) =>
-            record.children ? (
-              expanded ? (
-                <MinusOutlined onClick={(e) => onExpand(record, e)} style={{ cursor: "pointer", marginRight: 8 }} />
-              ) : (
-                <PlusOutlined onClick={(e) => onExpand(record, e)} style={{ cursor: "pointer", marginRight: 8 }} />
-              )
-            ) : (
-              <span style={{ marginRight: 8, width: 14, display: "inline-block" }} />
-            ),
-        }}
-      />
+      {allHistoryReviewRequestMatches && optionReviewError ? (
+        <Alert
+          type="warning"
+          showIcon
+          title="净权利金数据加载失败"
+          description={optionReviewError}
+          style={{ marginBottom: 16 }}
+        />
+      ) : null}
 
-      {activePremiumByStock.length > 0 && (
-        <Card title="按股票权利金统计" size="small" style={{ marginBottom: 24 }}>
-          <Row gutter={[12, 12]}>
-            {activePremiumByStock.map((item) => (
-              <Col key={item.underlying} flex="20%">
-                <Card size="small" styles={{ body: { padding: "10px 16px" } }}>
-                  <Space>
-                    <Text strong>{item.underlying}</Text>
-                    <Text strong style={{ color: "var(--color-success)" }}>
-                      ${item.premium.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
-                    </Text>
-                  </Space>
-                </Card>
-              </Col>
-            ))}
-          </Row>
+      <Card title="个股期权汇总" style={{ overflow: "hidden", marginBottom: 16 }}>
+        <Table<ActiveUnderlyingSummary>
+          className="active-option-table"
+          dataSource={activeSummaryRows}
+          columns={activeSummaryColumns}
+          rowKey="underlying"
+          size="small"
+          pagination={false}
+          loading={
+            optionContractsLoading ||
+            (allHistoryReviewRequestMatches && optionReviewLoading)
+          }
+          scroll={{ x: "max-content" }}
+          rowClassName={(row) =>
+            row.underlying === selectedActiveUnderlying
+              ? "active-option-selected-row"
+              : ""
+          }
+          onRow={(row) => ({
+            onClick: () => {
+              activeUnderlyingSelectedByUserRef.current = true;
+              setSelectedActiveUnderlying(row.underlying);
+            },
+            style: { cursor: "pointer" },
+          })}
+        />
+      </Card>
+
+      {selectedActiveUnderlying ? (
+        <Card
+          title={`${selectedActiveUnderlying} 进行中期权记录`}
+          style={{ marginBottom: 24 }}
+        >
+          <Table
+            className="active-option-table"
+            dataSource={selectedActiveContracts}
+            columns={activeColumns}
+            rowKey={getOptionContractRowKey}
+            size="small"
+            pagination={false}
+            scroll={{ x: "max-content" }}
+            expandable={{
+              childrenColumnName: "children",
+              expandIcon: ({ expanded, onExpand, record }) =>
+                record.children ? (
+                  expanded ? (
+                    <MinusOutlined
+                      onClick={(event) => onExpand(record, event)}
+                      style={{ cursor: "pointer", marginRight: 8 }}
+                    />
+                  ) : (
+                    <PlusOutlined
+                      onClick={(event) => onExpand(record, event)}
+                      style={{ cursor: "pointer", marginRight: 8 }}
+                    />
+                  )
+                ) : (
+                  <span
+                    style={{ marginRight: 8, width: 14, display: "inline-block" }}
+                  />
+                ),
+            }}
+          />
         </Card>
-      )}
+      ) : null}
 
       {activeUnderlyings.length > 0 && (
         <>
@@ -964,7 +1119,7 @@ export default function OptionsPage() {
         </Col>
       </Row>
 
-      {expiredReviewRequestMatches && optionReviewError ? (
+      {allHistoryReviewRequestMatches && optionReviewError ? (
         <Alert
           type="warning"
           showIcon
@@ -982,7 +1137,10 @@ export default function OptionsPage() {
           rowKey="underlying"
           size="small"
           pagination={false}
-          loading={expiredReviewRequestMatches && optionReviewLoading}
+          loading={
+            optionContractsLoading ||
+            (allHistoryReviewRequestMatches && optionReviewLoading)
+          }
           scroll={{ x: "max-content" }}
           rowClassName={(row) =>
             row.underlying === selectedExpiredUnderlying
@@ -1133,6 +1291,16 @@ export default function OptionsPage() {
           showIcon
         />
       )}
+
+      {selectedAccountId && optionContractsError ? (
+        <Alert
+          title="期权记录加载失败"
+          description={optionContractsError}
+          type="error"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
+      ) : null}
 
       {selectedAccountId && (
         <Tabs

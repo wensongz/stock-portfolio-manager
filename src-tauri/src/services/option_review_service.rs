@@ -3,8 +3,11 @@ use crate::models::{
     OptionCampaign, OptionReviewDataQuality, OptionReviewReport, OptionReviewSummary,
     OptionUnderlyingReview, OptionWorstCampaign,
 };
-use chrono::{NaiveDate, NaiveDateTime, Utc};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::services::option_matching::{
+    match_options_fifo, parse_trade_date, MatchRecord, SplitRecord,
+};
+use chrono::{NaiveDate, Utc};
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone)]
 struct RawOptionRecord {
@@ -23,78 +26,6 @@ struct RawOptionRecord {
     fee: f64,
     traded_at: Option<String>,
     trade_date: Option<NaiveDate>,
-    trade_timestamp: Option<NaiveDateTime>,
-}
-
-#[derive(Debug, Clone)]
-struct OpenLot {
-    record: RawOptionRecord,
-    original_quantity: i64,
-    remaining_quantity: ContractQuantity,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ContractQuantity {
-    numerator: i128,
-    denominator: i128,
-}
-
-impl ContractQuantity {
-    fn new(numerator: i128, denominator: i128) -> Option<Self> {
-        if numerator < 0 || denominator <= 0 {
-            return None;
-        }
-        if numerator == 0 {
-            return Some(Self {
-                numerator: 0,
-                denominator: 1,
-            });
-        }
-        let divisor = greatest_common_divisor(numerator, denominator);
-        Some(Self {
-            numerator: numerator / divisor,
-            denominator: denominator / divisor,
-        })
-    }
-
-    fn from_i64(value: i64) -> Self {
-        Self::new(i128::from(value), 1).expect("positive option record quantity")
-    }
-
-    fn is_positive(self) -> bool {
-        self.numerator > 0
-    }
-
-    fn checked_min(self, other: Self) -> Option<Self> {
-        let left = self.numerator.checked_mul(other.denominator)?;
-        let right = other.numerator.checked_mul(self.denominator)?;
-        Some(if left <= right { self } else { other })
-    }
-
-    fn checked_sub(self, other: Self) -> Option<Self> {
-        let divisor = greatest_common_divisor(self.denominator, other.denominator);
-        let self_scale = other.denominator / divisor;
-        let other_scale = self.denominator / divisor;
-        let numerator = self
-            .numerator
-            .checked_mul(self_scale)?
-            .checked_sub(other.numerator.checked_mul(other_scale)?)?;
-        let denominator = self.denominator.checked_mul(self_scale)?;
-        Self::new(numerator, denominator)
-    }
-
-    fn as_f64(self) -> f64 {
-        self.numerator as f64 / self.denominator as f64
-    }
-}
-
-fn greatest_common_divisor(mut left: i128, mut right: i128) -> i128 {
-    while right != 0 {
-        let remainder = left % right;
-        left = right;
-        right = remainder;
-    }
-    left
 }
 
 #[derive(Debug, Clone)]
@@ -113,14 +44,6 @@ struct OptionCycle {
     fees: f64,
     secured_notional: f64,
     capital_days: f64,
-}
-
-#[derive(Debug, Clone)]
-struct SplitInput {
-    stock_code: String,
-    split_date: NaiveDate,
-    ratio_from: i64,
-    ratio_to: i64,
 }
 
 pub fn get_option_review(
@@ -167,7 +90,7 @@ type LoadedInputs = (
     String,
     Vec<RawOptionRecord>,
     HashMap<String, i64>,
-    Vec<SplitInput>,
+    Vec<SplitRecord>,
 );
 
 fn load_inputs(db: &Database, account_id: &str) -> Result<LoadedInputs, String> {
@@ -195,7 +118,6 @@ fn load_inputs(db: &Database, account_id: &str) -> Result<LoadedInputs, String> 
     let records = statement
         .query_map([account_id], |row| {
             let traded_at = row.get::<_, Option<String>>(12)?;
-            let trade_timestamp = traded_at.as_deref().and_then(parse_trade_timestamp);
             Ok(RawOptionRecord {
                 id: row.get(0)?,
                 option_symbol: row.get(1)?,
@@ -211,7 +133,6 @@ fn load_inputs(db: &Database, account_id: &str) -> Result<LoadedInputs, String> 
                 commission: row.get(10)?,
                 fee: row.get(11)?,
                 trade_date: traded_at.as_deref().and_then(parse_trade_date),
-                trade_timestamp,
                 traded_at,
             })
         })
@@ -243,56 +164,19 @@ fn load_inputs(db: &Database, account_id: &str) -> Result<LoadedInputs, String> 
             ))
         })
         .map_err(|error| error.to_string())?
-        .filter_map(|result| match result {
-            Ok((stock_code, split_date, ratio_from, ratio_to)) => parse_trade_date(&split_date)
-                .map(|split_date| {
-                    Ok(SplitInput {
-                        stock_code,
-                        split_date,
-                        ratio_from,
-                        ratio_to,
-                    })
-                }),
-            Err(error) => Some(Err(error)),
+        .map(|result| match result {
+            Ok((stock_code, split_date, ratio_from, ratio_to)) => Ok(SplitRecord {
+                stock_code,
+                split_date,
+                ratio_from,
+                ratio_to,
+            }),
+            Err(error) => Err(error),
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
 
     Ok((market, records, share_lots, splits))
-}
-
-fn parse_trade_date(raw: &str) -> Option<NaiveDate> {
-    let date = raw.trim().split([',', ' ']).next()?;
-    ["%Y-%m-%d", "%Y/%m/%d", "%d%b%y"]
-        .iter()
-        .find_map(|format| NaiveDate::parse_from_str(date, format).ok())
-        .or_else(|| {
-            let serial = date.parse::<i64>().ok()?;
-            (serial > 0).then_some(())?;
-            NaiveDate::from_ymd_opt(1899, 12, 30)?
-                .checked_add_signed(chrono::Duration::days(serial))
-        })
-}
-
-fn parse_trade_timestamp(raw: &str) -> Option<NaiveDateTime> {
-    let raw = raw.trim();
-    [
-        "%Y-%m-%d, %H:%M:%S",
-        "%Y-%m-%d, %H:%M",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y/%m/%d, %H:%M:%S",
-        "%Y/%m/%d, %H:%M",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y/%m/%d %H:%M",
-        "%d%b%y, %H:%M:%S",
-        "%d%b%y, %H:%M",
-        "%d%b%y %H:%M:%S",
-        "%d%b%y %H:%M",
-    ]
-    .iter()
-    .find_map(|format| NaiveDateTime::parse_from_str(raw, format).ok())
-    .or_else(|| parse_trade_date(raw)?.and_hms_opt(0, 0, 0))
 }
 
 fn parse_expiry_date(raw: &str) -> Option<NaiveDate> {
@@ -319,89 +203,51 @@ fn close_status(code: &str) -> &'static str {
     }
 }
 
-fn has_split_match(open: &OpenLot, close: &RawOptionRecord, splits: &[SplitInput]) -> bool {
-    if open.record.underlying != close.underlying
-        || open.record.expiry_date != close.expiry_date
-        || open.record.option_type != close.option_type
-    {
-        return false;
-    }
-    let Some(expiry) = parse_expiry_date(&close.expiry_date) else {
-        return false;
-    };
-    let (Some(opened_at), Some(closed_at)) = (open.record.trade_date, close.trade_date) else {
-        return false;
-    };
-    splits.iter().any(|split| {
-        if split.stock_code != open.record.underlying
-            || split.split_date <= opened_at
-            || split.split_date > closed_at
-            || split.split_date > expiry
-            || split.ratio_from <= 0
-            || split.ratio_to <= 0
-        {
-            return false;
-        }
-        let ratio = split.ratio_to as f64 / split.ratio_from as f64;
-        let expected_strike = open.record.strike_price / ratio;
-        expected_strike > 0.0
-            && (close.strike_price - expected_strike).abs() / expected_strike <= 0.02
-    })
-}
-
-fn matched_quantities(
-    open_remaining: ContractQuantity,
-    close_remaining: ContractQuantity,
-) -> Option<(ContractQuantity, ContractQuantity)> {
-    let matched = open_remaining.checked_min(close_remaining)?;
-    Some((matched, matched))
-}
-
 fn cycle_from_match(
-    open: &OpenLot,
+    open: &RawOptionRecord,
     close: Option<&RawOptionRecord>,
-    matched_open: ContractQuantity,
-    matched_close: ContractQuantity,
+    matched_open: i64,
+    matched_close: i64,
     share_lots: &HashMap<String, i64>,
     today: NaiveDate,
 ) -> OptionCycle {
-    let matched_open = matched_open.as_f64();
-    let open_fraction = matched_open / open.original_quantity as f64;
+    let matched_open = matched_open as f64;
+    let open_fraction = matched_open / open.quantity as f64;
     let close_fraction = close
-        .map(|record| matched_close.as_f64() / record.quantity as f64)
+        .map(|record| matched_close as f64 / record.quantity as f64)
         .unwrap_or(0.0);
-    let opened_at = open.record.trade_date.expect("validated open trade date");
+    let opened_at = open.trade_date.expect("validated open trade date");
     let ended_at = close.and_then(|record| record.trade_date);
     let effective_end = ended_at.unwrap_or(today);
     let holding_days = (effective_end - opened_at).num_days().max(1) as f64;
     let shares_per_contract = share_lots
-        .get(&open.record.underlying)
+        .get(&open.underlying)
         .copied()
         .unwrap_or(100)
         .abs() as f64;
-    let secured_notional = matched_open * shares_per_contract * open.record.strike_price.abs();
+    let secured_notional = matched_open * shares_per_contract * open.strike_price.abs();
     let close_cost = close
         .map(|record| record.amount.abs() * close_fraction)
         .unwrap_or(0.0);
-    let fees = (open.record.commission.abs() + open.record.fee.abs()) * open_fraction
+    let fees = (open.commission.abs() + open.fee.abs()) * open_fraction
         + close
             .map(|record| (record.commission.abs() + record.fee.abs()) * close_fraction)
             .unwrap_or(0.0);
     OptionCycle {
-        open_record_id: open.record.id.clone(),
-        underlying: open.record.underlying.clone(),
-        option_symbol: open.record.option_symbol.clone(),
-        expiry_date: parse_expiry_date(&open.record.expiry_date)
+        open_record_id: open.id.clone(),
+        underlying: open.underlying.clone(),
+        option_symbol: open.option_symbol.clone(),
+        expiry_date: parse_expiry_date(&open.expiry_date)
             .map(|date| date.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| open.record.expiry_date.clone()),
-        contracts: open.record.raw_quantity,
-        option_type: open.record.option_type.clone(),
+            .unwrap_or_else(|| open.expiry_date.clone()),
+        contracts: open.raw_quantity,
+        option_type: open.option_type.clone(),
         opened_at,
         ended_at,
         status: close
             .map(|record| close_status(&record.code).to_string())
             .unwrap_or_else(|| "active".to_string()),
-        gross_premium: open.record.amount * open_fraction,
+        gross_premium: open.amount * open_fraction,
         close_cost,
         fees,
         secured_notional,
@@ -412,139 +258,66 @@ fn cycle_from_match(
 fn pair_cycles_fifo(
     records: Vec<RawOptionRecord>,
     share_lots: &HashMap<String, i64>,
-    splits: &[SplitInput],
+    splits: &[SplitRecord],
     today: NaiveDate,
 ) -> (Vec<OptionCycle>, OptionReviewDataQuality) {
     let missing_trade_dates = records
         .iter()
         .filter(|record| record.traded_at.is_none() || record.trade_date.is_none())
         .count();
-    let mut valid: Vec<_> = records
+    let valid: Vec<_> = records
         .into_iter()
         .filter(|record| record.trade_date.is_some() && record.quantity > 0)
         .filter(|record| is_open(record) || is_close(record))
         .collect();
-    valid.sort_by(|left, right| {
-        left.trade_timestamp
-            .cmp(&right.trade_timestamp)
-            .then_with(|| match (left.action.as_str(), right.action.as_str()) {
-                ("SELL", "BUY") => std::cmp::Ordering::Less,
-                ("BUY", "SELL") => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            })
-            .then_with(|| left.id.cmp(&right.id))
-    });
-
-    let mut opens: Vec<OpenLot> = Vec::new();
-    let mut cycles = Vec::new();
-    let mut unmatched_close_ids = HashSet::new();
-    'record_loop: for record in valid {
-        if is_open(&record) {
-            opens.push(OpenLot {
-                original_quantity: record.quantity,
-                remaining_quantity: ContractQuantity::from_i64(record.quantity),
-                record,
-            });
-            continue;
-        }
-
-        let mut remaining_quantity = ContractQuantity::from_i64(record.quantity);
-        let exact_indices: Vec<_> = opens
-            .iter()
-            .enumerate()
-            .filter(|(_, open)| {
-                open.remaining_quantity.is_positive()
-                    && open.record.option_symbol == record.option_symbol
-            })
-            .map(|(index, _)| index)
-            .collect();
-        for index in exact_indices {
-            if !remaining_quantity.is_positive() {
-                break;
-            }
-            let open = &mut opens[index];
-            let Some((matched_open, matched_close)) =
-                matched_quantities(open.remaining_quantity, remaining_quantity)
-            else {
-                unmatched_close_ids.insert(record.id.clone());
-                continue 'record_loop;
-            };
-            let (Some(next_open_remaining), Some(next_close_remaining)) = (
-                open.remaining_quantity.checked_sub(matched_open),
-                remaining_quantity.checked_sub(matched_close),
-            ) else {
-                unmatched_close_ids.insert(record.id.clone());
-                continue 'record_loop;
-            };
-            cycles.push(cycle_from_match(
-                open,
-                Some(&record),
-                matched_open,
-                matched_close,
-                share_lots,
-                today,
-            ));
-            open.remaining_quantity = next_open_remaining;
-            remaining_quantity = next_close_remaining;
-        }
-
-        if remaining_quantity.is_positive() {
-            let candidates: Vec<_> = opens
-                .iter()
-                .enumerate()
-                .filter(|(_, open)| {
-                    open.remaining_quantity.is_positive() && has_split_match(open, &record, splits)
-                })
-                .map(|(index, _)| index)
-                .collect();
-            for index in candidates {
-                if !remaining_quantity.is_positive() {
-                    break;
-                }
-                let open = &mut opens[index];
-                let Some((matched_open, matched_close)) =
-                    matched_quantities(open.remaining_quantity, remaining_quantity)
-                else {
-                    unmatched_close_ids.insert(record.id.clone());
-                    continue 'record_loop;
-                };
-                let (Some(next_open_remaining), Some(next_close_remaining)) = (
-                    open.remaining_quantity.checked_sub(matched_open),
-                    remaining_quantity.checked_sub(matched_close),
-                ) else {
-                    unmatched_close_ids.insert(record.id.clone());
-                    continue 'record_loop;
-                };
-                cycles.push(cycle_from_match(
-                    open,
-                    Some(&record),
-                    matched_open,
-                    matched_close,
-                    share_lots,
-                    today,
-                ));
-                open.remaining_quantity = next_open_remaining;
-                remaining_quantity = next_close_remaining;
-            }
-        }
-
-        if remaining_quantity.is_positive() {
-            unmatched_close_ids.insert(record.id);
-        }
-    }
-
-    for open in opens
+    let match_records: Vec<_> = valid
         .iter()
-        .filter(|open| open.remaining_quantity.is_positive())
-    {
+        .map(|record| MatchRecord {
+            id: record.id.clone(),
+            option_symbol: record.option_symbol.clone(),
+            underlying: record.underlying.clone(),
+            expiry_date: record.expiry_date.clone(),
+            strike_price: record.strike_price,
+            option_type: record.option_type.clone(),
+            action: record.action.clone(),
+            code: record.code.clone(),
+            quantity: record.quantity,
+            traded_at: record.traded_at.clone(),
+        })
+        .collect();
+    let match_result = match_options_fifo(&match_records, splits);
+    let records_by_id: HashMap<_, _> = valid
+        .iter()
+        .map(|record| (record.id.as_str(), record))
+        .collect();
+    let mut cycles = Vec::new();
+    for allocation in &match_result.allocations {
+        let (Some(open), Some(close)) = (
+            records_by_id.get(allocation.open_id.as_str()),
+            records_by_id.get(allocation.close_id.as_str()),
+        ) else {
+            continue;
+        };
         cycles.push(cycle_from_match(
             open,
-            None,
-            open.remaining_quantity,
-            ContractQuantity::from_i64(0),
+            Some(close),
+            allocation.quantity,
+            allocation.quantity,
             share_lots,
             today,
         ));
+    }
+    for open in valid.iter().filter(|record| is_open(record)) {
+        let remaining = match_result
+            .remaining_open
+            .get(&open.id)
+            .copied()
+            .unwrap_or(0);
+        if remaining > 0 {
+            cycles.push(cycle_from_match(
+                open, None, remaining, 0, share_lots, today,
+            ));
+        }
     }
     cycles.sort_by(|left, right| {
         left.underlying
@@ -556,7 +329,7 @@ fn pair_cycles_fifo(
         cycles,
         OptionReviewDataQuality {
             excluded_open_campaigns: 0,
-            unmatched_records: unmatched_close_ids.len(),
+            unmatched_records: match_result.unmatched_close_ids.len(),
             missing_trade_dates,
             notes: Vec::new(),
         },

@@ -345,9 +345,7 @@ pub(super) fn import_options_csv_inner(
     })
 }
 
-/// Recompute contract_status for all open records of an account.
-/// Pairs open (SELL+O) and close (BUY+C/C;Ep/A;C/C;P) records by option_symbol,
-/// and handles cross-symbol split-affected contract matching.
+/// Export all option records for an account as a CSV string.
 pub(super) fn export_options_csv_inner(db: &Database, account_id: &str) -> Result<String, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn

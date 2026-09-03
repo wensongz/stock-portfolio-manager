@@ -3,7 +3,7 @@
 mod tests {
     use crate::db::{
         migrations::{column_exists, run_migrations, CURRENT_SCHEMA_VERSION},
-        Database,
+        schema, Database,
     };
     use rusqlite::Connection;
 
@@ -1299,6 +1299,132 @@ mod tests {
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
         assert_eq!(required_indices, 3);
         assert!(invalid_transaction.is_err());
+    }
+
+    const PORTFOLIO_QUERY_INDEXES: [&str; 4] = [
+        "idx_transactions_account_symbol_traded_at",
+        "idx_transactions_account_traded_at",
+        "idx_transactions_holding_id",
+        "idx_option_records_account_symbol_traded_at",
+    ];
+
+    fn remove_v2_indexes(conn: &Connection) {
+        for index in PORTFOLIO_QUERY_INDEXES {
+            conn.execute_batch(&format!("DROP INDEX IF EXISTS {index}"))
+                .unwrap();
+        }
+    }
+
+    fn query_plan(conn: &Connection, query: &str) -> String {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+    }
+
+    #[test]
+    fn v1_database_migrates_to_v2_with_idempotent_index_definitions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("portfolio.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            schema::create_current_schema(&conn).unwrap();
+            remove_v2_indexes(&conn);
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+
+        let definitions = {
+            let mut conn = Connection::open(&path).unwrap();
+            run_migrations(&mut conn).unwrap();
+            let version: i64 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 2);
+
+            PORTFOLIO_QUERY_INDEXES
+                .iter()
+                .map(|name| {
+                    conn.query_row(
+                        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                        [name],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert!(definitions[0].contains("account_id, UPPER(symbol), traded_at"));
+        assert!(definitions[1].contains("account_id, traded_at DESC"));
+        assert!(definitions[2].contains("holding_id"));
+        assert!(definitions[3].contains("account_id, option_symbol, traded_at"));
+
+        let mut reopened = Connection::open(&path).unwrap();
+        run_migrations(&mut reopened).unwrap();
+        let reopened_definitions = PORTFOLIO_QUERY_INDEXES
+            .iter()
+            .map(|name| {
+                reopened
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                        [name],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reopened_definitions, definitions);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 2);
+    }
+
+    #[test]
+    fn portfolio_history_queries_use_v2_indexes() {
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+
+        let account_symbol = query_plan(
+            &conn,
+            "SELECT id FROM transactions
+             WHERE account_id = 'account' AND UPPER(symbol) = UPPER('aapl')
+             ORDER BY traded_at DESC",
+        );
+        assert!(
+            account_symbol.contains("idx_transactions_account_symbol_traded_at"),
+            "{account_symbol}"
+        );
+
+        let account_history = query_plan(
+            &conn,
+            "SELECT id FROM transactions
+             WHERE account_id = 'account' ORDER BY traded_at DESC",
+        );
+        assert!(
+            account_history.contains("idx_transactions_account_traded_at"),
+            "{account_history}"
+        );
+
+        let holding_history = query_plan(
+            &conn,
+            "SELECT id FROM transactions WHERE holding_id = 'holding'",
+        );
+        assert!(
+            holding_history.contains("idx_transactions_holding_id"),
+            "{holding_history}"
+        );
+
+        let option_history = query_plan(
+            &conn,
+            "SELECT id FROM option_records
+             WHERE account_id = 'account' AND option_symbol = 'AAPL 18SEP26 200 C'
+             ORDER BY traded_at",
+        );
+        assert!(
+            option_history.contains("idx_option_records_account_symbol_traded_at"),
+            "{option_history}"
+        );
     }
 
     #[test]

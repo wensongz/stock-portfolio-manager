@@ -287,6 +287,8 @@ pub(super) fn create_current_schema(conn: &Connection) -> Result<()> {
          );",
     )?;
 
+    create_portfolio_query_indexes(conn)?;
+
     let now = chrono::Utc::now().to_rfc3339();
     for (name, color, icon, sort_order) in SYSTEM_CATEGORIES {
         conn.execute(
@@ -306,4 +308,17 @@ pub(super) fn create_current_schema(conn: &Connection) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+pub(super) fn create_portfolio_query_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_transactions_account_symbol_traded_at
+           ON transactions(account_id, UPPER(symbol), traded_at);
+         CREATE INDEX IF NOT EXISTS idx_transactions_account_traded_at
+           ON transactions(account_id, traded_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_transactions_holding_id
+           ON transactions(holding_id);
+         CREATE INDEX IF NOT EXISTS idx_option_records_account_symbol_traded_at
+           ON option_records(account_id, option_symbol, traded_at);",
+    )
 }

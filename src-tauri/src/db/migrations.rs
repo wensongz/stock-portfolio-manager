@@ -1,7 +1,7 @@
 use super::schema;
 use rusqlite::{Connection, Error, OptionalExtension, Result};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 pub(crate) fn run_migrations(conn: &mut Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -20,8 +20,15 @@ pub(crate) fn run_migrations(conn: &mut Connection) -> Result<()> {
     if version < 1 {
         migrate_unversioned_database(&transaction)?;
     }
+    if version < 2 {
+        migrate_v2(&transaction)?;
+    }
     transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     transaction.commit()
+}
+
+fn migrate_v2(conn: &Connection) -> Result<()> {
+    schema::create_portfolio_query_indexes(conn)
 }
 
 pub(crate) fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {

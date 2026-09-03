@@ -150,13 +150,11 @@ export default function PerformancePage() {
   };
 
   const handleMarketChange = (value: string | undefined) => {
-    setMarket(value ?? null);
-    setTimeout(() => usePerformanceStore.getState().fetchAll(), 0);
+    void setMarket(value ?? null);
   };
 
   const handleAccountChange = (value: string | undefined) => {
-    setAccountId(value ?? null);
-    setTimeout(() => usePerformanceStore.getState().fetchAll(), 0);
+    void setAccountId(value ?? null);
   };
 
   return (

@@ -90,8 +90,8 @@ interface PerformanceState {
 
   setTimeRange: (range: TimeRange, start?: string, end?: string) => void;
   setBenchmarks: (symbols: string[]) => void;
-  setMarket: (market: string | null) => void;
-  setAccountId: (accountId: string | null) => void;
+  setMarket: (market: string | null) => Promise<void>;
+  setAccountId: (accountId: string | null) => Promise<void>;
   fetchAll: (forceRefresh?: boolean) => Promise<void>;
   fetchBenchmark: (symbol: string) => Promise<void>;
 }
@@ -150,12 +150,14 @@ export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
     set({ selectedBenchmarks: symbols });
   },
 
-  setMarket: (market) => {
+  setMarket: async (market) => {
     set({ selectedMarket: market, selectedAccountId: null });
+    await get().fetchAll();
   },
 
-  setAccountId: (accountId) => {
+  setAccountId: async (accountId) => {
     set({ selectedAccountId: accountId, selectedMarket: null });
+    await get().fetchAll();
   },
 
   fetchAll: async (forceRefresh?: boolean) => {

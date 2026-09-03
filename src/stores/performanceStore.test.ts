@@ -112,6 +112,25 @@ test("a failed refresh preserves the last successful report", async () => {
   assert.equal(store.getState().loading, false);
 });
 
+test("market and account selections refresh with the newly written filter", async () => {
+  const reportCalls = [];
+  const invoke = async (command, args) => {
+    if (command === "backfill_snapshots") return 0;
+    assert.equal(command, "get_performance_report");
+    reportCalls.push(args);
+    return report(`result-${reportCalls.length}`);
+  };
+  const store = createPerformanceStore(invoke);
+
+  await store.getState().setMarket("HK");
+  assert.equal(reportCalls[0].market, "HK");
+  assert.equal(reportCalls[0].accountId, undefined);
+
+  await store.getState().setAccountId("account-1");
+  assert.equal(reportCalls[1].accountId, "account-1");
+  assert.equal(reportCalls[1].market, undefined);
+});
+
 test("the latest request for one benchmark wins when responses arrive out of order", async () => {
   const oldResponse = deferred();
   const newResponse = deferred();

@@ -678,9 +678,9 @@ async fn tool_stock_quote(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         }
     };
     match quote {
-        Ok(q) => {
-            ctx.quote_cache.set(q.clone());
-            ToolResult::ok_json(json!(q))
+        Ok(result) => {
+            ctx.quote_cache.set(result.data.clone());
+            ToolResult::ok_json(json!(result.data))
         }
         Err(e) => ToolResult::err_json(format!("获取 {symbol} 行情失败：{e}")),
     }
@@ -730,19 +730,22 @@ async fn tool_stock_fundamentals(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult 
         _ => quote_service::fetch_us_quote_with_provider(ctx.quote_state, &symbol, &provider).await,
     };
     match quote {
-        Ok(q) => ToolResult::ok_json(json!({
-            "symbol": q.symbol,
-            "name": q.name,
-            "market": q.market,
-            "current_price": q.current_price,
-            "pe_ttm": q.pe_ttm,
-            "pb": q.pb,
-            "market_cap": q.market_cap,
-            "dividend_yield": q.dividend_yield,
-            "eps": q.eps,
-            "roe": q.roe,
-            "turnover_rate": q.turnover_rate,
-        })),
+        Ok(result) => {
+            let q = result.data;
+            ToolResult::ok_json(json!({
+                "symbol": q.symbol,
+                "name": q.name,
+                "market": q.market,
+                "current_price": q.current_price,
+                "pe_ttm": q.pe_ttm,
+                "pb": q.pb,
+                "market_cap": q.market_cap,
+                "dividend_yield": q.dividend_yield,
+                "eps": q.eps,
+                "roe": q.roe,
+                "turnover_rate": q.turnover_rate,
+            }))
+        }
         Err(e) => ToolResult::err_json(format!("获取 {symbol} 基本面失败：{e}")),
     }
 }

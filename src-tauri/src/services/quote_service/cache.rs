@@ -1,4 +1,4 @@
-use super::{fetch_quotes_batch_with_providers, QuoteServiceState};
+use super::{fetch_quotes_batch_with_providers, QuoteFetchResult, QuoteServiceState};
 use crate::models::StockQuote;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -113,7 +113,7 @@ pub async fn fetch_quotes_batch_cached_with_providers(
     hk_provider: &str,
     cn_provider: &str,
     force_refresh: bool,
-) -> Result<Vec<StockQuote>, String> {
+) -> Result<QuoteFetchResult<Vec<StockQuote>>, String> {
     // Deduplicate symbols so we only look up / fetch each symbol once.
     let unique_symbols = deduplicate_symbols(symbols);
 
@@ -127,12 +127,12 @@ pub async fn fetch_quotes_batch_cached_with_providers(
             cn_provider,
         )
         .await?;
-        cache.set_batch(&fresh);
+        cache.set_batch(&fresh.data);
 
         // Fall back to stale cache for any symbols that failed to fetch
         let fetched_symbols: std::collections::HashSet<String> =
-            fresh.iter().map(|q| q.symbol.clone()).collect();
-        let mut result = fresh;
+            fresh.data.iter().map(|q| q.symbol.clone()).collect();
+        let mut result = fresh.data;
         for (symbol, _) in &unique_symbols {
             if !fetched_symbols.contains(symbol) {
                 if let Some(stale) = cache.get_stale(symbol) {
@@ -140,13 +140,21 @@ pub async fn fetch_quotes_batch_cached_with_providers(
                 }
             }
         }
-        return Ok(result);
+        return Ok(QuoteFetchResult {
+            data: result,
+            warning: fresh.warning,
+            did_refresh: fresh.did_refresh,
+        });
     }
 
     let (mut result, missing) = cache.get_batch(&unique_symbols);
 
     if missing.is_empty() {
-        return Ok(result);
+        return Ok(QuoteFetchResult {
+            data: result,
+            warning: None,
+            did_refresh: false,
+        });
     }
 
     let fresh = fetch_quotes_batch_with_providers(
@@ -157,8 +165,8 @@ pub async fn fetch_quotes_batch_cached_with_providers(
         cn_provider,
     )
     .await?;
-    cache.set_batch(&fresh);
-    result.extend(fresh);
+    cache.set_batch(&fresh.data);
+    result.extend(fresh.data);
 
     // For any symbols that were missing from fresh results (fetch failed),
     // try to use stale cache as fallback
@@ -172,5 +180,9 @@ pub async fn fetch_quotes_batch_cached_with_providers(
         }
     }
 
-    Ok(result)
+    Ok(QuoteFetchResult {
+        data: result,
+        warning: fresh.warning,
+        did_refresh: fresh.did_refresh,
+    })
 }

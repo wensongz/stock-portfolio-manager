@@ -464,7 +464,7 @@ async fn resolve_current_prices(
             true,
         )
         .await?;
-        for quote in quotes {
+        for quote in quotes.data {
             if quote.current_price.is_finite() && quote.current_price > 0.0 {
                 for holding in holdings.iter().filter(|holding| {
                     holding.symbol.eq_ignore_ascii_case(&quote.symbol)

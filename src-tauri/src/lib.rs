@@ -172,22 +172,47 @@ pub fn run() {
                 )
                 .await
                 {
-                    Ok(quotes) => {
+                    Ok(fetch) => {
                         // Persist the freshly fetched quotes to the database.
-                        let _ = services::quote_service::save_quotes_to_db(&db, &quotes);
-                        let _ = services::quote_service::save_quote_refresh_time(&db);
-                        // Peek at any warning (without consuming it) so we can
-                        // include it in the quote-warning event.  The warning stays
-                        // in managed state so the frontend's take_quote_warning
-                        // command can still read it as a fallback if the event is
-                        // missed, e.g. due to listener registration timing.
-                        if let Some(warning) =
-                            services::quote_service::peek_quote_warning(&quote_state)
-                        {
-                            let _ = handle.emit("quote-warning", warning);
+                        if fetch.did_refresh {
+                            if let Err(error) =
+                                services::quote_service::save_quotes_to_db(&db, &fetch.data)
+                            {
+                                warn!("Background refresh: failed to persist quotes: {}", error);
+                            }
                         }
-                        // Notify the frontend so it can re-render with fresh prices.
-                        let _ = handle.emit("quotes-refreshed", ());
+                        let refreshed_at = if fetch.did_refresh {
+                            services::quote_service::save_quote_refresh_time(&db)
+                                .map(Some)
+                                .unwrap_or_else(|error| {
+                                    warn!(
+                                        "Background refresh: failed to persist refresh time: {}",
+                                        error
+                                    );
+                                    services::quote_service::get_quote_refresh_time(&db)
+                                        .unwrap_or(None)
+                                })
+                        } else {
+                            services::quote_service::get_quote_refresh_time(&db).unwrap_or(None)
+                        };
+                        match commands::quotes::get_holding_quotes_inner(
+                            &db,
+                            &cache,
+                            &quote_state,
+                            Some(Vec::new()),
+                        )
+                        .await
+                        {
+                            Ok(mut outcome) => {
+                                outcome.warning = fetch.warning;
+                                outcome.refreshed_at = refreshed_at;
+                                let _ = handle.emit("quotes-refreshed", outcome);
+                            }
+                            Err(error) => warn!(
+                                "Background refresh: failed to build holding quotes: {}",
+                                error
+                            ),
+                        }
                     }
                     Err(e) => warn!("Background quote refresh failed: {}", e),
                 }
@@ -218,8 +243,6 @@ pub fn run() {
             commands::quotes::get_us_quote,
             commands::quotes::get_hk_quote,
             commands::quotes::get_cn_quote,
-            commands::quotes::take_quote_warning,
-            commands::quotes::get_last_quote_refresh_time,
             commands::exchange_rates::get_exchange_rates,
             commands::snapshots::backfill_snapshots,
             commands::dashboard::get_dashboard_report,

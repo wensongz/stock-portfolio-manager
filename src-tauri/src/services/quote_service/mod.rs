@@ -33,10 +33,8 @@ use xueqiu::{
     to_xueqiu_us_symbol, xueqiu_history_request_count, XueqiuData, XueqiuKlineResponse,
     XueqiuQuote, XueqiuResponse, XUEQIU_API_FAILED_HINT,
 };
-#[allow(unused_imports)]
 pub use xueqiu::{
-    clear_quote_warning, fetch_candles_xueqiu, fetch_stock_history_xueqiu, peek_quote_warning,
-    reset_xueqiu_token, set_xueqiu_user_cookie, set_xueqiu_user_u, take_quote_warning,
+    fetch_candles_xueqiu, reset_xueqiu_token, set_xueqiu_user_cookie, set_xueqiu_user_u,
     xueqiu_fetch, QuoteServiceState,
 };
 #[allow(unused_imports)]
@@ -47,13 +45,31 @@ pub(crate) use xueqiu::{
 use xueqiu::{
     fetch_stock_history_xueqiu_outcome, fetch_xueqiu_cn_quote, fetch_xueqiu_hk_quote,
     fetch_xueqiu_us_quote, is_xueqiu_cookie_expired_error, is_xueqiu_request_error,
-    record_batch_warning, record_xueqiu_warning,
+    quote_warning_for_error,
 };
 pub use yahoo::{fetch_stock_history_yahoo, fetch_yahoo_quote, to_yahoo_symbol};
 
 /// Cash symbol prefix used to represent cash holdings.
 /// Cash symbols follow the pattern `$CASH-{CURRENCY}`, e.g. `$CASH-USD`, `$CASH-CNY`, `$CASH-HKD`.
 pub const CASH_SYMBOL_PREFIX: &str = "$CASH-";
+
+#[derive(Debug, Clone)]
+pub struct QuoteFetchResult<T> {
+    pub data: T,
+    pub warning: Option<String>,
+    pub did_refresh: bool,
+}
+
+pub(crate) fn merge_quote_warning(current: &mut Option<String>, candidate: Option<String>) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    if current.as_deref() != Some(xueqiu::XUEQIU_COOKIE_EXPIRED_HINT)
+        || candidate == xueqiu::XUEQIU_COOKIE_EXPIRED_HINT
+    {
+        *current = Some(candidate);
+    }
+}
 
 /// Returns `true` if the symbol represents a cash holding.
 pub fn is_cash_symbol(symbol: &str) -> bool {
@@ -117,7 +133,9 @@ pub fn make_cash_quote(symbol: &str, market: &str) -> StockQuote {
 /// Fetch a US stock quote using the configured provider.
 #[cfg(test)]
 pub async fn fetch_us_quote(state: &QuoteServiceState, symbol: &str) -> Result<StockQuote, String> {
-    fetch_us_quote_with_provider(state, symbol, "eastmoney").await
+    fetch_us_quote_with_provider(state, symbol, "eastmoney")
+        .await
+        .map(|result| result.data)
 }
 
 /// Fetch a US stock quote using the specified provider.
@@ -129,33 +147,60 @@ pub async fn fetch_us_quote_with_provider(
     state: &QuoteServiceState,
     symbol: &str,
     provider: &str,
-) -> Result<StockQuote, String> {
+) -> Result<QuoteFetchResult<StockQuote>, String> {
     match provider {
-        "eastmoney" => fetch_eastmoney_us_quote(symbol).await,
+        "eastmoney" => fetch_eastmoney_us_quote(symbol)
+            .await
+            .map(|data| QuoteFetchResult {
+                data,
+                warning: None,
+                did_refresh: true,
+            }),
         "xueqiu" => match fetch_xueqiu_us_quote(state, symbol).await {
-            Ok(q) => Ok(q),
+            Ok(data) => Ok(QuoteFetchResult {
+                data,
+                warning: None,
+                did_refresh: true,
+            }),
             Err(e) => {
-                record_xueqiu_warning(state, &e);
+                let warning = quote_warning_for_error(&e);
                 info!(
                     "fetch_us_quote: Xueqiu failed for {}: {}, falling back to eastmoney",
                     symbol, e
                 );
                 match fetch_eastmoney_us_quote(symbol).await {
-                    Ok(q) => Ok(q),
+                    Ok(data) => Ok(QuoteFetchResult {
+                        data,
+                        warning,
+                        did_refresh: true,
+                    }),
                     Err(e2) => {
                         warn!(
                             "fetch_us_quote: EastMoney also failed for {}: {}, falling back to yahoo",
                             symbol, e2
                         );
                         let yahoo_symbol = to_yahoo_symbol(symbol, "US");
-                        fetch_yahoo_quote(&yahoo_symbol, "US").await
+                        fetch_yahoo_quote(&yahoo_symbol, "US")
+                            .await
+                            .map(|data| QuoteFetchResult {
+                                data,
+                                warning,
+                                did_refresh: true,
+                            })
+                            .map_err(|fallback| format!("{e}; fallback failed: {fallback}"))
                     }
                 }
             }
         },
         _ => {
             let yahoo_symbol = to_yahoo_symbol(symbol, "US");
-            fetch_yahoo_quote(&yahoo_symbol, "US").await
+            fetch_yahoo_quote(&yahoo_symbol, "US")
+                .await
+                .map(|data| QuoteFetchResult {
+                    data,
+                    warning: None,
+                    did_refresh: true,
+                })
         }
     }
 }
@@ -169,19 +214,33 @@ pub async fn fetch_hk_quote_with_provider(
     state: &QuoteServiceState,
     symbol: &str,
     provider: &str,
-) -> Result<StockQuote, String> {
+) -> Result<QuoteFetchResult<StockQuote>, String> {
     match provider {
-        "eastmoney" => fetch_eastmoney_hk_quote(symbol).await,
+        "eastmoney" => fetch_eastmoney_hk_quote(symbol)
+            .await
+            .map(|data| QuoteFetchResult {
+                data,
+                warning: None,
+                did_refresh: true,
+            }),
         "xueqiu" => match fetch_xueqiu_hk_quote(state, symbol).await {
-            Ok(q) => Ok(q),
+            Ok(data) => Ok(QuoteFetchResult {
+                data,
+                warning: None,
+                did_refresh: true,
+            }),
             Err(e) => {
-                record_xueqiu_warning(state, &e);
+                let warning = quote_warning_for_error(&e);
                 info!(
                     "fetch_hk_quote: Xueqiu failed for {}: {}, falling back to eastmoney",
                     symbol, e
                 );
                 match fetch_eastmoney_hk_quote(symbol).await {
-                    Ok(q) => Ok(q),
+                    Ok(data) => Ok(QuoteFetchResult {
+                        data,
+                        warning,
+                        did_refresh: true,
+                    }),
                     Err(e2) => {
                         warn!(
                             "fetch_hk_quote: EastMoney also failed for {}: {}, falling back to yahoo",
@@ -192,7 +251,14 @@ pub async fn fetch_hk_quote_with_provider(
                         } else {
                             format!("{}.HK", symbol)
                         };
-                        fetch_yahoo_quote(&yahoo_symbol, "HK").await
+                        fetch_yahoo_quote(&yahoo_symbol, "HK")
+                            .await
+                            .map(|data| QuoteFetchResult {
+                                data,
+                                warning,
+                                did_refresh: true,
+                            })
+                            .map_err(|fallback| format!("{e}; fallback failed: {fallback}"))
                     }
                 }
             }
@@ -203,7 +269,13 @@ pub async fn fetch_hk_quote_with_provider(
             } else {
                 format!("{}.HK", symbol)
             };
-            fetch_yahoo_quote(&yahoo_symbol, "HK").await
+            fetch_yahoo_quote(&yahoo_symbol, "HK")
+                .await
+                .map(|data| QuoteFetchResult {
+                    data,
+                    warning: None,
+                    did_refresh: true,
+                })
         }
     }
 }
@@ -211,7 +283,9 @@ pub async fn fetch_hk_quote_with_provider(
 /// Fetch a CN A-share stock quote using East Money.
 #[cfg(test)]
 pub async fn fetch_cn_quote(state: &QuoteServiceState, symbol: &str) -> Result<StockQuote, String> {
-    fetch_cn_quote_with_provider(state, symbol, "eastmoney").await
+    fetch_cn_quote_with_provider(state, symbol, "eastmoney")
+        .await
+        .map(|result| result.data)
 }
 
 /// Fetch a CN A-share stock quote using the specified provider.
@@ -225,21 +299,38 @@ pub async fn fetch_cn_quote_with_provider(
     state: &QuoteServiceState,
     symbol: &str,
     provider: &str,
-) -> Result<StockQuote, String> {
+) -> Result<QuoteFetchResult<StockQuote>, String> {
     match provider {
         "xueqiu" => match fetch_xueqiu_cn_quote(state, symbol).await {
-            Ok(q) => Ok(q),
+            Ok(data) => Ok(QuoteFetchResult {
+                data,
+                warning: None,
+                did_refresh: true,
+            }),
             Err(e) => {
-                record_xueqiu_warning(state, &e);
+                let warning = quote_warning_for_error(&e);
                 info!(
                     "fetch_cn_quote: Xueqiu failed for {}: {}, falling back to eastmoney",
                     symbol, e
                 );
-                fetch_eastmoney_cn_quote(symbol).await
+                fetch_eastmoney_cn_quote(symbol)
+                    .await
+                    .map(|data| QuoteFetchResult {
+                        data,
+                        warning,
+                        did_refresh: true,
+                    })
+                    .map_err(|fallback| format!("{e}; fallback failed: {fallback}"))
             }
         },
         // Default to eastmoney for CN
-        _ => fetch_eastmoney_cn_quote(symbol).await,
+        _ => fetch_eastmoney_cn_quote(symbol)
+            .await
+            .map(|data| QuoteFetchResult {
+                data,
+                warning: None,
+                did_refresh: true,
+            }),
     }
 }
 
@@ -252,14 +343,14 @@ pub async fn fetch_quotes_batch_with_providers(
     us_provider: &str,
     hk_provider: &str,
     cn_provider: &str,
-) -> Result<Vec<StockQuote>, String> {
+) -> Result<QuoteFetchResult<Vec<StockQuote>>, String> {
     // Deduplicate symbols so we only fetch each symbol once,
     // even if it appears in multiple accounts.
     let unique_symbols = deduplicate_symbols(symbols);
 
     let mut quotes = Vec::new();
-    let mut has_xueqiu_cookie_warning = false;
-    let mut has_xueqiu_api_warning = false;
+    let mut warning = None;
+    let mut did_refresh = false;
     // Once we know Xueqiu is unreachable, skip remaining Xueqiu symbols so
     // we don't wait for N × 15-second timeouts (one per symbol).  Non-Xueqiu
     // symbols (e.g. US via Yahoo) are still fetched normally.
@@ -292,16 +383,19 @@ pub async fn fetch_quotes_batch_with_providers(
             _ => Err(format!("Unknown market: {}", market)),
         };
         match result {
-            Ok(quote) => quotes.push(quote),
+            Ok(result) => {
+                if result.warning.is_some() {
+                    xueqiu_failed = true;
+                }
+                merge_quote_warning(&mut warning, result.warning);
+                did_refresh |= result.did_refresh;
+                quotes.push(result.data);
+            }
             Err(e) => {
                 warn!("failed to fetch quote for {} ({}): {}", symbol, market, e);
                 let is_cookie_err = is_xueqiu_cookie_expired_error(&e);
                 let is_api_err = is_xueqiu_request_error(&e);
-                if is_cookie_err {
-                    has_xueqiu_cookie_warning = true;
-                } else if is_api_err {
-                    has_xueqiu_api_warning = true;
-                }
+                merge_quote_warning(&mut warning, quote_warning_for_error(&e));
                 // Mark Xueqiu as failed for either error kind so we can skip
                 // remaining Xueqiu symbols without waiting for more timeouts.
                 if is_cookie_err || is_api_err {
@@ -310,8 +404,11 @@ pub async fn fetch_quotes_batch_with_providers(
             }
         }
     }
-    record_batch_warning(state, has_xueqiu_cookie_warning, has_xueqiu_api_warning);
-    Ok(quotes)
+    Ok(QuoteFetchResult {
+        data: quotes,
+        warning,
+        did_refresh,
+    })
 }
 
 #[cfg(test)]

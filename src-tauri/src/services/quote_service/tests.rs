@@ -18,24 +18,23 @@ fn quote_refresh_time_distinguishes_missing_from_malformed_rows() {
 }
 
 #[test]
-fn quote_service_state_keeps_credentials_and_warnings_isolated() {
+fn quote_service_state_keeps_credentials_while_warnings_are_request_values() {
     let first = QuoteServiceState::new();
     let second = QuoteServiceState::new();
 
     set_xueqiu_user_cookie(&first, Some(" token-a ".to_string()));
     set_xueqiu_user_u(&first, Some(" user-a ".to_string()));
-    record_xueqiu_warning(&first, "Xueqiu request failed");
 
     assert_eq!(
         build_xueqiu_cookie_header(&first).as_deref(),
         Some("xq_a_token=token-a; u=user-a")
     );
+    assert_eq!(build_xueqiu_cookie_header(&second), None);
     assert_eq!(
-        take_quote_warning(&first).as_deref(),
+        quote_warning_for_error("Xueqiu request failed").as_deref(),
         Some(XUEQIU_API_FAILED_HINT)
     );
-    assert_eq!(build_xueqiu_cookie_header(&second), None);
-    assert_eq!(take_quote_warning(&second), None);
+    assert_eq!(quote_warning_for_error("unrelated provider failed"), None);
 }
 
 #[test]
@@ -574,8 +573,8 @@ fn test_fetch_quotes_batch_with_providers_deduplicates_symbols() {
         ))
         .unwrap();
     // Should only return 3 unique quotes, not 5
-    assert_eq!(quotes.len(), 3);
-    let syms: Vec<&str> = quotes.iter().map(|q| q.symbol.as_str()).collect();
+    assert_eq!(quotes.data.len(), 3);
+    let syms: Vec<&str> = quotes.data.iter().map(|q| q.symbol.as_str()).collect();
     assert!(syms.contains(&"$CASH-USD"));
     assert!(syms.contains(&"$CASH-CNY"));
     assert!(syms.contains(&"$CASH-HKD"));
@@ -605,7 +604,7 @@ fn test_fetch_quotes_batch_cached_deduplicates_symbols() {
         ))
         .unwrap();
     // Should only return 2 unique quotes, not 4
-    assert_eq!(quotes.len(), 2);
+    assert_eq!(quotes.data.len(), 2);
 }
 
 #[test]
@@ -661,9 +660,10 @@ fn test_fetch_quotes_batch_cached_force_refresh() {
             false,
         ))
         .unwrap();
-    assert_eq!(quotes.len(), 1);
+    assert_eq!(quotes.data.len(), 1);
     // Cached quote has price 100.0 (from sample_quote)
-    assert!((quotes[0].current_price - 100.0).abs() < 0.001);
+    assert!((quotes.data[0].current_price - 100.0).abs() < 0.001);
+    assert!(!quotes.did_refresh);
 
     // With force_refresh=true, should fetch fresh data (cash quote has price 1.0)
     let quotes = rt
@@ -677,8 +677,12 @@ fn test_fetch_quotes_batch_cached_force_refresh() {
             true,
         ))
         .unwrap();
-    assert_eq!(quotes.len(), 1);
-    assert!((quotes[0].current_price - 1.0).abs() < 0.001);
+    assert_eq!(quotes.data.len(), 1);
+    assert!((quotes.data[0].current_price - 1.0).abs() < 0.001);
+    assert!(
+        !quotes.did_refresh,
+        "synthetic cash quotes do not hit an upstream provider"
+    );
 }
 
 #[test]
@@ -755,8 +759,8 @@ async fn test_batch_fetch_cash_symbols_no_network() {
         fetch_quotes_batch_with_providers(&state, symbols, "yahoo", "yahoo", "eastmoney").await;
     assert!(result.is_ok());
     let quotes = result.unwrap();
-    assert_eq!(quotes.len(), 3);
-    for q in &quotes {
+    assert_eq!(quotes.data.len(), 3);
+    for q in &quotes.data {
         assert!(is_cash_symbol(&q.symbol));
         assert!((q.current_price - 1.0).abs() < f64::EPSILON);
     }
@@ -1168,17 +1172,10 @@ fn test_parse_xueqiu_quote_error_code() {
 }
 
 #[test]
-fn test_record_xueqiu_warning_preserves_fallback_failure_for_frontend() {
-    let state = QuoteServiceState::new();
-    clear_quote_warning(&state);
-
-    record_xueqiu_warning(
-        &state,
-        "Network error fetching AAPL from Xueqiu: operation timed out",
-    );
-
+fn test_quote_warning_value_preserves_fallback_failure_for_frontend() {
     assert_eq!(
-        take_quote_warning(&state).as_deref(),
+        quote_warning_for_error("Network error fetching AAPL from Xueqiu: operation timed out")
+            .as_deref(),
         Some(XUEQIU_API_FAILED_HINT)
     );
 }

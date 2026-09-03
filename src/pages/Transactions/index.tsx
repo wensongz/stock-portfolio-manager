@@ -23,13 +23,22 @@ import dayjs from "dayjs";
 import { invoke } from "@tauri-apps/api/core";
 import { useTransactionStore } from "../../stores/transactionStore";
 import { useAccountStore } from "../../stores/accountStore";
-import type { Transaction, Market, Currency, TransactionType, Holding, StockQuote } from "../../types";
+import type {
+  Transaction,
+  Market,
+  Currency,
+  TransactionType,
+  Holding,
+  StockQuote,
+  QuoteCommandResult,
+} from "../../types";
 import ImportFromImageModal from "./ImportFromImageModal";
 import ImportFromIbCsvModal from "./ImportFromIbCsvModal";
 import ImportFromMoomooCsvModal from "./ImportFromMoomooCsvModal";
 import ImportFromThsCsvModal from "./ImportFromThsCsvModal";
 import ImportFromFirstradeCsvModal from "./ImportFromFirstradeCsvModal";
 import { useTablePageSize } from "../../hooks/tablePageSize";
+import { useQuoteStore } from "../../stores/quoteStore";
 
 const { Title, Text } = Typography;
 
@@ -181,10 +190,12 @@ export default function TransactionsPage() {
     // Try to fetch quote from backend
     setSymbolSearching(true);
     try {
-      const quotes = await invoke<StockQuote[]>("get_real_time_quotes", {
+      const outcome = await invoke<QuoteCommandResult<StockQuote[]>>("get_real_time_quotes", {
         symbols: [[symbol, market]],
         forceRefresh: false,
       });
+      useQuoteStore.getState().applyQuoteMetadata(outcome);
+      const quotes = outcome.data;
       if (quotes.length > 0 && quotes[0].name) {
         form.setFieldsValue({ name: quotes[0].name });
       }

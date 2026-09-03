@@ -65,7 +65,7 @@ pub fn save_quotes_to_db(db: &Database, quotes: &[StockQuote]) -> Result<(), Str
 }
 
 /// Persist the last quote refresh timestamp to the database (single-row upsert, id=1).
-pub fn save_quote_refresh_time(db: &Database) -> Result<(), String> {
+pub fn save_quote_refresh_time(db: &Database) -> Result<String, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let now = Utc::now().to_rfc3339();
     conn.execute(
@@ -73,7 +73,7 @@ pub fn save_quote_refresh_time(db: &Database) -> Result<(), String> {
         rusqlite::params![now],
     )
     .map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(now)
 }
 
 /// Load the persisted last quote refresh timestamp from the database.

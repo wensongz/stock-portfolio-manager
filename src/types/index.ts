@@ -75,6 +75,12 @@ export interface StockQuote {
   turnover_rate?: number;
 }
 
+export interface QuoteCommandResult<T> {
+  data: T;
+  warning: string | null;
+  refreshedAt: string | null;
+}
+
 export interface HoldingWithQuote extends Holding {
   quote: StockQuote | null;
   market_value: number | null;

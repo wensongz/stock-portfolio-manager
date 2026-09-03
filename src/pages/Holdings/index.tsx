@@ -32,7 +32,16 @@ import { useQuoteStore } from "../../stores/quoteStore";
 import { toQuoteWarning } from "../../stores/quoteErrors";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
 import { usePnlColor } from "../../hooks/usePnlColor";
-import type { Holding, HoldingWithQuote, Market, Currency, StockQuote, Transaction, TransactionType } from "../../types";
+import type {
+  Holding,
+  HoldingWithQuote,
+  Market,
+  Currency,
+  StockQuote,
+  Transaction,
+  TransactionType,
+  QuoteCommandResult,
+} from "../../types";
 import dayjs from "dayjs";
 
 const { Title, Text } = Typography;
@@ -130,7 +139,14 @@ export default function HoldingsPage() {
     useHoldingStore();
   const { accounts, fetchAccounts } = useAccountStore();
   const { categories, fetchCategories } = useCategoryStore();
-  const { holdingQuotes, loading: quotesLoading, lastUpdatedAt, fetchHoldingQuotes, setQuoteWarning } = useQuoteStore();
+  const {
+    holdingQuotes,
+    loading: quotesLoading,
+    lastUpdatedAt,
+    fetchHoldingQuotes,
+    applyQuoteMetadata,
+    setQuoteWarning,
+  } = useQuoteStore();
   const { pnlColorDark: pnlColorDarkFn } = usePnlColor();
   const { convertWithCachedRates, fetchRates } = useExchangeRateStore();
 
@@ -221,22 +237,21 @@ export default function HoldingsPage() {
           CN: "get_cn_quote",
           HK: "get_hk_quote",
         };
-        const quote = await invoke<StockQuote>(commandMap[market], {
+        const outcome = await invoke<QuoteCommandResult<StockQuote>>(commandMap[market], {
           symbol: symbol.trim(),
         });
+        const quote = outcome.data;
         if (quote && quote.name) {
           form.setFieldsValue({ name: quote.name });
         }
-        const warning = await invoke<string | null>("take_quote_warning").catch(() => null);
-        if (warning) setQuoteWarning(warning);
+        applyQuoteMetadata(outcome);
       } catch (error) {
-        const warning = await invoke<string | null>("take_quote_warning").catch(() => null);
-        setQuoteWarning(warning ?? toQuoteWarning(error));
+        setQuoteWarning(toQuoteWarning(error));
       } finally {
         setFetchingName(false);
       }
     },
-    [form, setQuoteWarning],
+    [applyQuoteMetadata, form, setQuoteWarning],
   );
 
   const handleSymbolBlur = useCallback(

@@ -119,6 +119,7 @@ pub async fn take_daily_snapshot(
             true,
         )
         .await?
+        .data
     };
     let quote_map: std::collections::HashMap<String, f64> = quotes
         .iter()

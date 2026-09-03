@@ -4,10 +4,36 @@ use crate::services::quote_provider_service;
 use crate::services::quote_service::{
     fetch_cn_quote_with_provider, fetch_hk_quote_with_provider,
     fetch_quotes_batch_cached_with_providers, fetch_us_quote_with_provider, get_quote_refresh_time,
-    save_quote_refresh_time, save_quotes_to_db, QuoteCache, QuoteServiceState, CASH_SYMBOL_PREFIX,
+    merge_quote_warning, save_quote_refresh_time, save_quotes_to_db, QuoteCache, QuoteFetchResult,
+    QuoteServiceState, CASH_SYMBOL_PREFIX,
 };
+use serde::Serialize;
 use tauri::State;
 use tracing::warn;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteCommandResult<T> {
+    pub data: T,
+    pub warning: Option<String>,
+    pub refreshed_at: Option<String>,
+}
+
+fn finish_quote_command<T>(
+    db: &Database,
+    fetch: QuoteFetchResult<T>,
+) -> Result<QuoteCommandResult<T>, String> {
+    let refreshed_at = if fetch.did_refresh {
+        Some(save_quote_refresh_time(db)?)
+    } else {
+        get_quote_refresh_time(db)?
+    };
+    Ok(QuoteCommandResult {
+        data: fetch.data,
+        warning: fetch.warning,
+        refreshed_at,
+    })
+}
 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_real_time_quotes(
@@ -16,10 +42,9 @@ pub async fn get_real_time_quotes(
     quote_state: State<'_, QuoteServiceState>,
     symbols: Vec<(String, String)>,
     force_refresh: Option<bool>,
-) -> Result<Vec<StockQuote>, String> {
+) -> Result<QuoteCommandResult<Vec<StockQuote>>, String> {
     let config = quote_provider_service::get_quote_provider_config(&db)?;
-    crate::services::quote_service::clear_quote_warning(&quote_state);
-    let quotes = fetch_quotes_batch_cached_with_providers(
+    let fetch = fetch_quotes_batch_cached_with_providers(
         &quote_state,
         &quote_cache,
         symbols,
@@ -30,13 +55,12 @@ pub async fn get_real_time_quotes(
     )
     .await?;
     // Persist freshly fetched quotes to the database
-    if let Err(e) = save_quotes_to_db(&db, &quotes) {
-        warn!("Failed to persist quotes to DB: {}", e);
+    if fetch.did_refresh {
+        if let Err(e) = save_quotes_to_db(&db, &fetch.data) {
+            warn!("Failed to persist quotes to DB: {}", e);
+        }
     }
-    if let Err(e) = save_quote_refresh_time(&db) {
-        warn!("Failed to persist quote refresh time: {}", e);
-    }
-    Ok(quotes)
+    finish_quote_command(&db, fetch)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -45,15 +69,17 @@ pub async fn get_holding_quotes(
     quote_cache: State<'_, QuoteCache>,
     quote_state: State<'_, QuoteServiceState>,
     refresh_symbols: Option<Vec<(String, String)>>,
-) -> Result<Vec<HoldingWithQuote>, String> {
-    let config = quote_provider_service::get_quote_provider_config(&db)?;
-    let should_refresh_from_api = match refresh_symbols.as_ref() {
-        Some(symbols) => !symbols.is_empty(),
-        None => true,
-    };
-    if should_refresh_from_api {
-        crate::services::quote_service::clear_quote_warning(&quote_state);
-    }
+) -> Result<QuoteCommandResult<Vec<HoldingWithQuote>>, String> {
+    get_holding_quotes_inner(&db, &quote_cache, &quote_state, refresh_symbols).await
+}
+
+pub async fn get_holding_quotes_inner(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    quote_state: &QuoteServiceState,
+    refresh_symbols: Option<Vec<(String, String)>>,
+) -> Result<QuoteCommandResult<Vec<HoldingWithQuote>>, String> {
+    let config = quote_provider_service::get_quote_provider_config(db)?;
     // Load holdings from DB (synchronous) and pre-compute realized PnL for cleared positions.
     // realized_pnl_map: holding_id -> (realized_pnl, total_buy_cost)
     let (holdings, realized_pnl_map) = {
@@ -103,12 +129,12 @@ pub async fn get_holding_quotes(
         .map(|h| (h.symbol.clone(), h.market.clone()))
         .collect();
 
-    let quotes = match refresh_symbols {
+    let mut fetch = match refresh_symbols {
         Some(ref symbols) if !symbols.is_empty() => {
             // Targeted refresh: force-refresh only the specified symbols
-            fetch_quotes_batch_cached_with_providers(
-                &quote_state,
-                &quote_cache,
+            let targeted = fetch_quotes_batch_cached_with_providers(
+                quote_state,
+                quote_cache,
                 symbols.clone(),
                 &config.us_provider,
                 &config.hk_provider,
@@ -117,22 +143,25 @@ pub async fn get_holding_quotes(
             )
             .await?;
             // Then load all quotes from cache (the refreshed ones are now fresh)
-            fetch_quotes_batch_cached_with_providers(
-                &quote_state,
-                &quote_cache,
+            let mut all = fetch_quotes_batch_cached_with_providers(
+                quote_state,
+                quote_cache,
                 all_symbols,
                 &config.us_provider,
                 &config.hk_provider,
                 &config.cn_provider,
                 false,
             )
-            .await?
+            .await?;
+            merge_quote_warning(&mut all.warning, targeted.warning);
+            all.did_refresh |= targeted.did_refresh;
+            all
         }
         Some(_) => {
             // Empty list: no refresh needed, just use cache
             fetch_quotes_batch_cached_with_providers(
-                &quote_state,
-                &quote_cache,
+                quote_state,
+                quote_cache,
                 all_symbols,
                 &config.us_provider,
                 &config.hk_provider,
@@ -144,8 +173,8 @@ pub async fn get_holding_quotes(
         None => {
             // No list provided: full refresh of all symbols
             fetch_quotes_batch_cached_with_providers(
-                &quote_state,
-                &quote_cache,
+                quote_state,
+                quote_cache,
                 all_symbols,
                 &config.us_provider,
                 &config.hk_provider,
@@ -156,14 +185,16 @@ pub async fn get_holding_quotes(
         }
     };
     // Persist freshly fetched quotes to the database
-    if let Err(e) = save_quotes_to_db(&db, &quotes) {
-        warn!("Failed to persist quotes to DB: {}", e);
+    if fetch.did_refresh {
+        if let Err(e) = save_quotes_to_db(db, &fetch.data) {
+            warn!("Failed to persist quotes to DB: {}", e);
+        }
     }
-    if let Err(e) = save_quote_refresh_time(&db) {
-        warn!("Failed to persist quote refresh time: {}", e);
-    }
-    let quote_map: std::collections::HashMap<String, StockQuote> =
-        quotes.into_iter().map(|q| (q.symbol.clone(), q)).collect();
+    let quote_map: std::collections::HashMap<String, StockQuote> = fetch
+        .data
+        .drain(..)
+        .map(|q| (q.symbol.clone(), q))
+        .collect();
 
     let result = holdings
         .into_iter()
@@ -220,7 +251,14 @@ pub async fn get_holding_quotes(
         })
         .collect();
 
-    Ok(result)
+    finish_quote_command(
+        db,
+        QuoteFetchResult {
+            data: result,
+            warning: fetch.warning,
+            did_refresh: fetch.did_refresh,
+        },
+    )
 }
 
 /// Load realized PnL for every cleared non-cash position in one grouped query.
@@ -258,31 +296,30 @@ fn load_realized_pnl_by_holding(
     rows.collect()
 }
 
-#[tauri::command]
-pub fn take_quote_warning(quote_state: State<'_, QuoteServiceState>) -> Option<String> {
-    crate::services::quote_service::take_quote_warning(&quote_state)
-}
-
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_us_quote(
     db: State<'_, Database>,
     quote_cache: State<'_, QuoteCache>,
     quote_state: State<'_, QuoteServiceState>,
     symbol: String,
-) -> Result<StockQuote, String> {
+) -> Result<QuoteCommandResult<StockQuote>, String> {
     if let Some(cached) = quote_cache.get(&symbol) {
-        return Ok(cached);
+        return finish_quote_command(
+            &db,
+            QuoteFetchResult {
+                data: cached,
+                warning: None,
+                did_refresh: false,
+            },
+        );
     }
     let config = quote_provider_service::get_quote_provider_config(&db)?;
-    let quote = fetch_us_quote_with_provider(&quote_state, &symbol, &config.us_provider).await?;
-    quote_cache.set(quote.clone());
-    if let Err(e) = save_quotes_to_db(&db, std::slice::from_ref(&quote)) {
+    let fetch = fetch_us_quote_with_provider(&quote_state, &symbol, &config.us_provider).await?;
+    quote_cache.set(fetch.data.clone());
+    if let Err(e) = save_quotes_to_db(&db, std::slice::from_ref(&fetch.data)) {
         warn!("Failed to persist quote to DB: {}", e);
     }
-    if let Err(e) = save_quote_refresh_time(&db) {
-        warn!("Failed to persist quote refresh time: {}", e);
-    }
-    Ok(quote)
+    finish_quote_command(&db, fetch)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -291,20 +328,24 @@ pub async fn get_hk_quote(
     quote_cache: State<'_, QuoteCache>,
     quote_state: State<'_, QuoteServiceState>,
     symbol: String,
-) -> Result<StockQuote, String> {
+) -> Result<QuoteCommandResult<StockQuote>, String> {
     if let Some(cached) = quote_cache.get(&symbol) {
-        return Ok(cached);
+        return finish_quote_command(
+            &db,
+            QuoteFetchResult {
+                data: cached,
+                warning: None,
+                did_refresh: false,
+            },
+        );
     }
     let config = quote_provider_service::get_quote_provider_config(&db)?;
-    let quote = fetch_hk_quote_with_provider(&quote_state, &symbol, &config.hk_provider).await?;
-    quote_cache.set(quote.clone());
-    if let Err(e) = save_quotes_to_db(&db, std::slice::from_ref(&quote)) {
+    let fetch = fetch_hk_quote_with_provider(&quote_state, &symbol, &config.hk_provider).await?;
+    quote_cache.set(fetch.data.clone());
+    if let Err(e) = save_quotes_to_db(&db, std::slice::from_ref(&fetch.data)) {
         warn!("Failed to persist quote to DB: {}", e);
     }
-    if let Err(e) = save_quote_refresh_time(&db) {
-        warn!("Failed to persist quote refresh time: {}", e);
-    }
-    Ok(quote)
+    finish_quote_command(&db, fetch)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -313,25 +354,24 @@ pub async fn get_cn_quote(
     quote_cache: State<'_, QuoteCache>,
     quote_state: State<'_, QuoteServiceState>,
     symbol: String,
-) -> Result<StockQuote, String> {
+) -> Result<QuoteCommandResult<StockQuote>, String> {
     if let Some(cached) = quote_cache.get(&symbol) {
-        return Ok(cached);
+        return finish_quote_command(
+            &db,
+            QuoteFetchResult {
+                data: cached,
+                warning: None,
+                did_refresh: false,
+            },
+        );
     }
     let config = quote_provider_service::get_quote_provider_config(&db)?;
-    let quote = fetch_cn_quote_with_provider(&quote_state, &symbol, &config.cn_provider).await?;
-    quote_cache.set(quote.clone());
-    if let Err(e) = save_quotes_to_db(&db, std::slice::from_ref(&quote)) {
+    let fetch = fetch_cn_quote_with_provider(&quote_state, &symbol, &config.cn_provider).await?;
+    quote_cache.set(fetch.data.clone());
+    if let Err(e) = save_quotes_to_db(&db, std::slice::from_ref(&fetch.data)) {
         warn!("Failed to persist quote to DB: {}", e);
     }
-    if let Err(e) = save_quote_refresh_time(&db) {
-        warn!("Failed to persist quote refresh time: {}", e);
-    }
-    Ok(quote)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub fn get_last_quote_refresh_time(db: State<'_, Database>) -> Result<Option<String>, String> {
-    get_quote_refresh_time(&db)
+    finish_quote_command(&db, fetch)
 }
 
 #[cfg(test)]
@@ -341,6 +381,55 @@ mod tests {
 
     fn now() -> String {
         chrono::Utc::now().to_rfc3339()
+    }
+
+    #[test]
+    fn cache_only_quote_result_preserves_persisted_refresh_time() {
+        let db = Database::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO cached_quote_refresh_time (id, updated_at) VALUES (1, '2026-09-01T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let outcome = finish_quote_command(
+            &db,
+            QuoteFetchResult {
+                data: Vec::<StockQuote>::new(),
+                warning: None,
+                did_refresh: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.refreshed_at.as_deref(),
+            Some("2026-09-01T10:00:00Z")
+        );
+        assert_eq!(
+            get_quote_refresh_time(&db).unwrap().as_deref(),
+            Some("2026-09-01T10:00:00Z")
+        );
+    }
+
+    #[test]
+    fn refreshed_quote_result_returns_exact_persisted_time() {
+        let db = Database::new(":memory:").unwrap();
+        let outcome = finish_quote_command(
+            &db,
+            QuoteFetchResult {
+                data: Vec::<StockQuote>::new(),
+                warning: Some("fallback".to_string()),
+                did_refresh: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.warning.as_deref(), Some("fallback"));
+        assert_eq!(get_quote_refresh_time(&db).unwrap(), outcome.refreshed_at);
     }
 
     /// Build an in-memory DB with one account and a cleared 410.HK position:

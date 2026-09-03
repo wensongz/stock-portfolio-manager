@@ -12,7 +12,7 @@ use tracing::{info, warn};
 // Xueqiu (雪球) API
 // ---------------------------------------------------------------------------
 
-/// Runtime-owned Xueqiu credentials, session token and warning state.
+/// Runtime-owned Xueqiu credentials and session token.
 ///
 /// Tauri manages one instance for the application. Tests can create isolated
 /// instances, and quote requests no longer open a second SQLite connection or
@@ -22,7 +22,6 @@ pub struct QuoteServiceState {
     user_cookie: Mutex<Option<String>>,
     user_u: Mutex<Option<String>>,
     auto_cookie: Mutex<Option<String>>,
-    last_quote_warning: Mutex<Option<String>>,
 }
 
 impl QuoteServiceState {
@@ -32,7 +31,6 @@ impl QuoteServiceState {
             user_cookie: Mutex::new(None),
             user_u: Mutex::new(None),
             auto_cookie: Mutex::new(None),
-            last_quote_warning: Mutex::new(None),
         }
     }
 }
@@ -58,52 +56,14 @@ pub(super) fn is_xueqiu_request_error(err: &str) -> bool {
     err.contains("Xueqiu") || err.contains("xueqiu.com") || err.contains("stock.xueqiu.com")
 }
 
-pub(super) fn record_xueqiu_warning(state: &QuoteServiceState, err: &str) {
-    let warning = if is_xueqiu_cookie_expired_error(err) {
-        XUEQIU_COOKIE_EXPIRED_HINT
+pub(super) fn quote_warning_for_error(err: &str) -> Option<String> {
+    if is_xueqiu_cookie_expired_error(err) {
+        Some(XUEQIU_COOKIE_EXPIRED_HINT.to_string())
     } else if is_xueqiu_request_error(err) {
-        XUEQIU_API_FAILED_HINT
-    } else {
-        return;
-    };
-
-    let mut current = state.last_quote_warning.lock().unwrap();
-    if current.as_deref() != Some(XUEQIU_COOKIE_EXPIRED_HINT)
-        || warning == XUEQIU_COOKIE_EXPIRED_HINT
-    {
-        *current = Some(warning.to_string());
-    }
-}
-
-pub(super) fn record_batch_warning(
-    state: &QuoteServiceState,
-    has_cookie_warning: bool,
-    has_api_warning: bool,
-) {
-    let warning = if has_cookie_warning {
-        Some(XUEQIU_COOKIE_EXPIRED_HINT)
-    } else if has_api_warning {
-        Some(XUEQIU_API_FAILED_HINT)
+        Some(XUEQIU_API_FAILED_HINT.to_string())
     } else {
         None
-    };
-    if let Some(warning) = warning {
-        *state.last_quote_warning.lock().unwrap() = Some(warning.to_string());
     }
-}
-
-pub fn clear_quote_warning(state: &QuoteServiceState) {
-    *state.last_quote_warning.lock().unwrap() = None;
-}
-
-pub fn take_quote_warning(state: &QuoteServiceState) -> Option<String> {
-    state.last_quote_warning.lock().unwrap().take()
-}
-
-/// Return the current warning without consuming it, so the value remains
-/// available for the fallback `take_quote_warning` invocation from the frontend.
-pub fn peek_quote_warning(state: &QuoteServiceState) -> Option<String> {
-    state.last_quote_warning.lock().unwrap().clone()
 }
 
 /// Set (or clear) the user-provided Xueqiu cookie string.

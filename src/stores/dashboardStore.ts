@@ -4,7 +4,9 @@ import type {
   DashboardSummary,
   DashboardReport,
   HoldingDetail,
+  QuoteCommandResult,
 } from "../types";
+import { useQuoteStore } from "./quoteStore.ts";
 
 interface DashboardState {
   summary: DashboardSummary | null;
@@ -47,13 +49,22 @@ export const createDashboardStore = (invokeFn: DashboardInvoke = invoke) => {
 
       const request = (async () => {
         try {
-          const report = await invokeFn<DashboardReport>(
+          const response = await invokeFn<
+            QuoteCommandResult<DashboardReport> | DashboardReport
+          >(
             "get_dashboard_report",
             {
               baseCurrency: baseCurrency ?? null,
             },
           );
+          const outcome = "data" in response
+            ? response as QuoteCommandResult<DashboardReport>
+            : null;
+          const report = outcome?.data ?? response as DashboardReport;
           if (latestRequestToken === token) {
+            if (outcome) {
+              useQuoteStore.getState().applyQuoteMetadata(outcome);
+            }
             set({
               summary: report.summary,
               holdingDetails: report.holdings,

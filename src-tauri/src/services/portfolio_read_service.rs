@@ -15,6 +15,8 @@ pub enum QuoteReadMode {
 #[derive(Debug)]
 pub struct PortfolioReadModel {
     holdings: Vec<HoldingDetail>,
+    quote_warning: Option<String>,
+    quotes_refreshed: bool,
 }
 
 impl PortfolioReadModel {
@@ -77,17 +79,25 @@ impl PortfolioReadModel {
         };
 
         if rows.is_empty() {
-            return Ok(Self { holdings: vec![] });
+            return Ok(Self {
+                holdings: vec![],
+                quote_warning: None,
+                quotes_refreshed: false,
+            });
         }
 
         let symbols: Vec<(String, String)> = rows
             .iter()
             .map(|row| (row.symbol.clone(), row.market.clone()))
             .collect();
-        let quotes = match mode {
+        let quote_result = match mode {
             QuoteReadMode::CacheOnly => {
                 let (cached, _missing) = quote_cache.get_batch(&symbols);
-                cached
+                crate::services::quote_service::QuoteFetchResult {
+                    data: cached,
+                    warning: None,
+                    did_refresh: false,
+                }
             }
             QuoteReadMode::RefreshMissing => {
                 let config = quote_provider_service::get_quote_provider_config(db)?;
@@ -106,7 +116,8 @@ impl PortfolioReadModel {
                 .await?
             }
         };
-        let quote_map: std::collections::HashMap<String, (f64, f64)> = quotes
+        let quote_map: std::collections::HashMap<String, (f64, f64)> = quote_result
+            .data
             .into_iter()
             .map(|quote| (quote.symbol.clone(), (quote.current_price, quote.change)))
             .collect();
@@ -146,7 +157,11 @@ impl PortfolioReadModel {
             })
             .collect();
 
-        Ok(Self { holdings })
+        Ok(Self {
+            holdings,
+            quote_warning: quote_result.warning,
+            quotes_refreshed: quote_result.did_refresh,
+        })
     }
 
     pub fn holdings(&self) -> &[HoldingDetail] {
@@ -228,7 +243,19 @@ impl PortfolioReadModel {
 
     #[cfg(test)]
     pub(crate) fn from_holdings_for_test(holdings: Vec<HoldingDetail>) -> Self {
-        Self { holdings }
+        Self {
+            holdings,
+            quote_warning: None,
+            quotes_refreshed: false,
+        }
+    }
+
+    pub fn quote_warning(&self) -> Option<&str> {
+        self.quote_warning.as_deref()
+    }
+
+    pub fn quotes_refreshed(&self) -> bool {
+        self.quotes_refreshed
     }
 }
 

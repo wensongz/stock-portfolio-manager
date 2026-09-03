@@ -29,9 +29,10 @@ pub use persistence::{
 };
 #[cfg(test)]
 use xueqiu::{
-    build_xueqiu_cookie_header, parse_xueqiu_quote, to_xueqiu_cn_symbol, to_xueqiu_hk_symbol,
-    to_xueqiu_us_symbol, xueqiu_history_request_count, XueqiuData, XueqiuKlineResponse,
-    XueqiuQuote, XueqiuResponse, XUEQIU_API_FAILED_HINT,
+    build_xueqiu_cookie_header, build_xueqiu_realtime_url, parse_xueqiu_quote,
+    parse_xueqiu_realtime_body, to_xueqiu_cn_symbol, to_xueqiu_hk_symbol, to_xueqiu_us_symbol,
+    xueqiu_history_request_count, XueqiuData, XueqiuKlineResponse, XueqiuQuote, XueqiuResponse,
+    XUEQIU_API_FAILED_HINT, XUEQIU_COOKIE_EXPIRED_HINT,
 };
 pub use xueqiu::{
     fetch_candles_xueqiu, reset_xueqiu_token, set_xueqiu_user_cookie, set_xueqiu_user_u,
@@ -44,7 +45,7 @@ pub(crate) use xueqiu::{
 };
 use xueqiu::{
     fetch_stock_history_xueqiu_outcome, fetch_xueqiu_cn_quote, fetch_xueqiu_hk_quote,
-    fetch_xueqiu_us_quote, is_xueqiu_cookie_expired_error, is_xueqiu_request_error,
+    fetch_xueqiu_realtime_batch, fetch_xueqiu_us_quote, plan_xueqiu_realtime_batches,
     quote_warning_for_error,
 };
 pub use yahoo::{fetch_stock_history_yahoo, fetch_yahoo_quote, to_yahoo_symbol};
@@ -334,9 +335,58 @@ pub async fn fetch_cn_quote_with_provider(
     }
 }
 
+/// Fetch from the providers that follow Xueqiu in the existing fallback chain.
+/// This avoids retrying the same failed Xueqiu request once per symbol after a
+/// realtime batch has already failed.
+fn restore_original_symbol(quote: &mut StockQuote, original_symbol: &str) {
+    quote.symbol = original_symbol.to_string();
+}
+
+async fn fetch_quote_after_xueqiu_failure(
+    symbol: &str,
+    market: &str,
+) -> Result<StockQuote, String> {
+    let result = match market {
+        "US" => match fetch_eastmoney_us_quote(symbol).await {
+            Ok(quote) => Ok(quote),
+            Err(eastmoney_error) => {
+                let yahoo_symbol = to_yahoo_symbol(symbol, "US");
+                fetch_yahoo_quote(&yahoo_symbol, "US")
+                    .await
+                    .map_err(|yahoo_error| {
+                        format!(
+                            "EastMoney failed: {}; Yahoo fallback failed: {}",
+                            eastmoney_error, yahoo_error
+                        )
+                    })
+            }
+        },
+        "HK" => match fetch_eastmoney_hk_quote(symbol).await {
+            Ok(quote) => Ok(quote),
+            Err(eastmoney_error) => {
+                let yahoo_symbol = to_yahoo_symbol(symbol, "HK");
+                fetch_yahoo_quote(&yahoo_symbol, "HK")
+                    .await
+                    .map_err(|yahoo_error| {
+                        format!(
+                            "EastMoney failed: {}; Yahoo fallback failed: {}",
+                            eastmoney_error, yahoo_error
+                        )
+                    })
+            }
+        },
+        "CN" => fetch_eastmoney_cn_quote(symbol).await,
+        _ => Err(format!("Unknown market: {}", market)),
+    };
+    let mut quote = result?;
+    restore_original_symbol(&mut quote, symbol);
+    Ok(quote)
+}
+
 /// Batch fetch quotes using the specified providers for US, HK and CN markets.
-/// Cash symbols return synthetic quotes (price = 1.0).
-/// Duplicate symbols are automatically deduplicated so that each symbol is fetched only once.
+/// All symbols configured for Xueqiu are combined into multi-symbol realtime
+/// requests. Cash symbols return synthetic quotes (price = 1.0), and duplicate
+/// symbols are fetched only once.
 pub async fn fetch_quotes_batch_with_providers(
     state: &QuoteServiceState,
     symbols: Vec<(String, String)>,
@@ -344,38 +394,33 @@ pub async fn fetch_quotes_batch_with_providers(
     hk_provider: &str,
     cn_provider: &str,
 ) -> Result<QuoteFetchResult<Vec<StockQuote>>, String> {
-    // Deduplicate symbols so we only fetch each symbol once,
-    // even if it appears in multiple accounts.
     let unique_symbols = deduplicate_symbols(symbols);
-
     let mut quotes = Vec::new();
     let mut warning = None;
     let mut did_refresh = false;
-    // Once we know Xueqiu is unreachable, skip remaining Xueqiu symbols so
-    // we don't wait for N × 15-second timeouts (one per symbol).  Non-Xueqiu
-    // symbols (e.g. US via Yahoo) are still fetched normally.
-    let mut xueqiu_failed = false;
-    for (symbol, market) in unique_symbols {
-        // Cash symbols don't need an API call – return a synthetic quote.
-        if is_cash_symbol(&symbol) {
-            quotes.push(make_cash_quote(&symbol, &market));
+    let mut xueqiu_symbols = Vec::new();
+    let mut other_symbols = Vec::new();
+
+    for (symbol, market) in &unique_symbols {
+        if is_cash_symbol(symbol) {
+            quotes.push(make_cash_quote(symbol, market));
             continue;
         }
-        // Determine whether this symbol would use the Xueqiu API.
         let uses_xueqiu = match market.as_str() {
             "CN" => cn_provider == "xueqiu",
             "HK" => hk_provider == "xueqiu",
             "US" => us_provider == "xueqiu",
             _ => false,
         };
-        if xueqiu_failed && uses_xueqiu {
-            // Skip: Xueqiu is already known to be unreachable for this batch.
-            info!(
-                "Skipping {} ({}) – Xueqiu already failed for this batch",
-                symbol, market
-            );
-            continue;
+        if uses_xueqiu {
+            xueqiu_symbols.push((symbol.clone(), market.clone()));
+        } else {
+            other_symbols.push((symbol.clone(), market.clone()));
         }
+    }
+
+    // Fetch non-Xueqiu providers with their existing per-symbol behaviour.
+    for (symbol, market) in other_symbols {
         let result = match market.as_str() {
             "US" => fetch_us_quote_with_provider(state, &symbol, us_provider).await,
             "HK" => fetch_hk_quote_with_provider(state, &symbol, hk_provider).await,
@@ -383,27 +428,97 @@ pub async fn fetch_quotes_batch_with_providers(
             _ => Err(format!("Unknown market: {}", market)),
         };
         match result {
-            Ok(result) => {
-                if result.warning.is_some() {
-                    xueqiu_failed = true;
-                }
+            Ok(mut result) => {
+                restore_original_symbol(&mut result.data, &symbol);
                 merge_quote_warning(&mut warning, result.warning);
                 did_refresh |= result.did_refresh;
                 quotes.push(result.data);
             }
             Err(e) => {
                 warn!("failed to fetch quote for {} ({}): {}", symbol, market, e);
-                let is_cookie_err = is_xueqiu_cookie_expired_error(&e);
-                let is_api_err = is_xueqiu_request_error(&e);
                 merge_quote_warning(&mut warning, quote_warning_for_error(&e));
-                // Mark Xueqiu as failed for either error kind so we can skip
-                // remaining Xueqiu symbols without waiting for more timeouts.
-                if is_cookie_err || is_api_err {
-                    xueqiu_failed = true;
+            }
+        }
+    }
+
+    // A normal portfolio fits in one request; larger portfolios are split at
+    // the conservative URL-size boundary. Invalid or missing symbols use the
+    // same EastMoney/Yahoo fallback chain as the former single-quote path.
+    let (batches, mut fallback_symbols) = plan_xueqiu_realtime_batches(&xueqiu_symbols);
+    if !fallback_symbols.is_empty() {
+        merge_quote_warning(
+            &mut warning,
+            quote_warning_for_error("Xueqiu realtime symbol normalization failed"),
+        );
+    }
+    for batch in batches {
+        match fetch_xueqiu_realtime_batch(state, &batch).await {
+            Ok(batch_quotes) => {
+                let fetched: std::collections::HashSet<&str> = batch_quotes
+                    .iter()
+                    .map(|quote| quote.symbol.as_str())
+                    .collect();
+                let mut response_omitted_symbol = false;
+                for request_symbol in &batch {
+                    let original_symbols =
+                        std::iter::once((&request_symbol.original_symbol, &request_symbol.market))
+                            .chain(
+                                request_symbol
+                                    .aliases
+                                    .iter()
+                                    .map(|(symbol, market)| (symbol, market)),
+                            );
+                    for (symbol, market) in original_symbols {
+                        if !fetched.contains(symbol.as_str()) {
+                            response_omitted_symbol = true;
+                            fallback_symbols.push((symbol.clone(), market.clone()));
+                        }
+                    }
+                }
+                if response_omitted_symbol {
+                    merge_quote_warning(
+                        &mut warning,
+                        quote_warning_for_error("Xueqiu realtime response omitted a symbol"),
+                    );
+                }
+                did_refresh |= !batch_quotes.is_empty();
+                quotes.extend(batch_quotes);
+            }
+            Err(error) => {
+                warn!("Xueqiu realtime batch failed: {}", error);
+                merge_quote_warning(&mut warning, quote_warning_for_error(&error));
+                for request_symbol in batch {
+                    fallback_symbols.push((request_symbol.original_symbol, request_symbol.market));
+                    fallback_symbols.extend(request_symbol.aliases);
                 }
             }
         }
     }
+
+    for (symbol, market) in fallback_symbols {
+        match fetch_quote_after_xueqiu_failure(&symbol, &market).await {
+            Ok(quote) => {
+                did_refresh = true;
+                quotes.push(quote);
+            }
+            Err(error) => warn!(
+                "failed to fetch fallback quote for {} ({}): {}",
+                symbol, market, error
+            ),
+        }
+    }
+
+    // Preserve the caller's symbol order even though requests were grouped by
+    // provider and market internally.
+    let mut quotes_by_symbol: std::collections::HashMap<String, StockQuote> = quotes
+        .into_iter()
+        .map(|quote| (quote.symbol.clone(), quote))
+        .collect();
+    let quotes = unique_symbols
+        .iter()
+        .filter_map(|(symbol, _)| quotes_by_symbol.remove(symbol))
+        .collect();
+
     Ok(QuoteFetchResult {
         data: quotes,
         warning,

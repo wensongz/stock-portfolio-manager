@@ -3,6 +3,7 @@ use crate::models::{PriceCandle, StockQuote};
 use crate::services::http_client;
 use chrono::Utc;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -355,6 +356,47 @@ pub(super) struct XueqiuQuote {
     pub(super) turnover_rate: Option<f64>,
 }
 
+/// A lightweight quote returned by Xueqiu's multi-symbol realtime endpoint.
+#[derive(Debug, Deserialize, Default)]
+struct XueqiuRealtimeQuote {
+    symbol: Option<String>,
+    name: Option<String>,
+    current: Option<f64>,
+    last_close: Option<f64>,
+    chg: Option<f64>,
+    percent: Option<f64>,
+    high: Option<f64>,
+    low: Option<f64>,
+    volume: Option<f64>,
+    market_capital: Option<f64>,
+    turnover_rate: Option<f64>,
+    pe_ttm: Option<f64>,
+    pb: Option<f64>,
+    dividend_yield: Option<f64>,
+    eps: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XueqiuRealtimeResponse {
+    data: Option<Vec<XueqiuRealtimeQuote>>,
+    error_code: Option<i32>,
+    #[serde(alias = "description")]
+    error_description: Option<String>,
+}
+
+/// One original portfolio symbol and its normalized Xueqiu API symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct XueqiuRealtimeRequestSymbol {
+    pub(super) original_symbol: String,
+    pub(super) market: String,
+    pub(super) api_symbol: String,
+    pub(super) aliases: Vec<(String, String)>,
+}
+
+/// A conservative request cap. The endpoint has been verified with larger
+/// batches, while 200 keeps URLs comfortably below common proxy limits.
+const XUEQIU_REALTIME_BATCH_SIZE: usize = 200;
+
 /// Xueqiu kline (historical candlestick) API response wrapper.
 #[derive(Debug, Deserialize)]
 pub(super) struct XueqiuKlineResponse {
@@ -608,6 +650,204 @@ pub(super) fn to_xueqiu_hk_symbol(symbol: &str) -> Result<String, String> {
     } else {
         Err(format!("Invalid HK symbol for Xueqiu: {}", symbol))
     }
+}
+
+fn is_safe_xueqiu_realtime_symbol(symbol: &str) -> bool {
+    !symbol.is_empty()
+        && symbol
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '.')
+}
+
+fn to_xueqiu_realtime_symbol(symbol: &str, market: &str) -> Result<String, String> {
+    let api_symbol = match market {
+        "CN" => to_xueqiu_cn_symbol(symbol)?,
+        "HK" => to_xueqiu_hk_symbol(symbol)?,
+        "US" => to_xueqiu_us_symbol(symbol),
+        _ => return Err(format!("Unknown market: {}", market)),
+    };
+    if is_safe_xueqiu_realtime_symbol(&api_symbol) {
+        Ok(api_symbol)
+    } else {
+        Err(format!(
+            "Invalid symbol for Xueqiu realtime request: {}",
+            symbol
+        ))
+    }
+}
+
+/// Normalize symbols for the realtime endpoint and split them into URL-safe
+/// batches. Symbols which cannot be represented are returned for fallback.
+pub(super) fn plan_xueqiu_realtime_batches(
+    symbols: &[(String, String)],
+) -> (Vec<Vec<XueqiuRealtimeRequestSymbol>>, Vec<(String, String)>) {
+    let mut planned: Vec<XueqiuRealtimeRequestSymbol> = Vec::new();
+    let mut index_by_api_symbol: HashMap<String, usize> = HashMap::new();
+    let mut invalid = Vec::new();
+    for (symbol, market) in symbols {
+        match to_xueqiu_realtime_symbol(symbol, market) {
+            Ok(api_symbol) => {
+                let key = api_symbol.to_ascii_uppercase();
+                if let Some(existing_index) = index_by_api_symbol.get(&key).copied() {
+                    planned[existing_index]
+                        .aliases
+                        .push((symbol.clone(), market.clone()));
+                } else {
+                    index_by_api_symbol.insert(key, planned.len());
+                    planned.push(XueqiuRealtimeRequestSymbol {
+                        original_symbol: symbol.clone(),
+                        market: market.clone(),
+                        api_symbol,
+                        aliases: Vec::new(),
+                    });
+                }
+            }
+            Err(_) => invalid.push((symbol.clone(), market.clone())),
+        }
+    }
+    let batches = planned
+        .chunks(XUEQIU_REALTIME_BATCH_SIZE)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    (batches, invalid)
+}
+
+/// Build the realtime URL with literal commas. Xueqiu returns an empty body
+/// when the comma-separated symbol value is encoded as `%2C`.
+pub(super) fn build_xueqiu_realtime_url(api_symbols: &[String]) -> String {
+    format!(
+        "https://stock.xueqiu.com/v5/stock/realtime/quotec.json?symbol={}&_={}",
+        api_symbols.join(","),
+        Utc::now().timestamp_millis()
+    )
+}
+
+/// Parse one realtime batch and map Xueqiu's normalized symbols back to the
+/// exact symbols stored by the application.
+pub(super) fn parse_xueqiu_realtime_body(
+    body: &str,
+    request_symbols: &[XueqiuRealtimeRequestSymbol],
+) -> Result<Vec<StockQuote>, String> {
+    let response: XueqiuRealtimeResponse = serde_json::from_str(body).map_err(|e| {
+        let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
+        format!(
+            "Failed to parse Xueqiu realtime response: {}. Response preview: {}",
+            e, preview
+        )
+    })?;
+    if let Some(error_code) = response.error_code {
+        if error_code != 0 {
+            return Err(format!(
+                "Xueqiu API error for realtime quotes: code={}, message={}",
+                error_code,
+                response.error_description.unwrap_or_default()
+            ));
+        }
+    }
+
+    let data = response
+        .data
+        .ok_or_else(|| "No data from Xueqiu realtime quotes".to_string())?;
+    let request_by_api_symbol: HashMap<String, &XueqiuRealtimeRequestSymbol> = request_symbols
+        .iter()
+        .map(|symbol| (symbol.api_symbol.to_ascii_uppercase(), symbol))
+        .collect();
+    let mut seen = HashSet::new();
+    let mut quotes = Vec::new();
+    for item in data {
+        let Some(api_symbol) = item.symbol.as_deref() else {
+            continue;
+        };
+        let Some(request_symbol) = request_by_api_symbol.get(&api_symbol.to_ascii_uppercase())
+        else {
+            continue;
+        };
+        let Some(current_price) = item.current else {
+            continue;
+        };
+        let previous_close = item.last_close.unwrap_or(0.0);
+        let change = item.chg.unwrap_or(current_price - previous_close);
+        let change_percent = item.percent.unwrap_or_else(|| {
+            if previous_close == 0.0 {
+                0.0
+            } else {
+                change / previous_close * 100.0
+            }
+        });
+        let original_symbols =
+            std::iter::once((&request_symbol.original_symbol, &request_symbol.market)).chain(
+                request_symbol
+                    .aliases
+                    .iter()
+                    .map(|(symbol, market)| (symbol, market)),
+            );
+        for (original_symbol, market) in original_symbols {
+            if !seen.insert(original_symbol.clone()) {
+                continue;
+            }
+            quotes.push(StockQuote {
+                symbol: original_symbol.clone(),
+                name: item
+                    .name
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| original_symbol.clone()),
+                market: market.clone(),
+                current_price,
+                previous_close,
+                change,
+                change_percent,
+                high: item.high.unwrap_or(0.0),
+                low: item.low.unwrap_or(0.0),
+                volume: item.volume.unwrap_or(0.0) as i64,
+                updated_at: Utc::now().to_rfc3339(),
+                pe_ttm: item.pe_ttm,
+                pb: item.pb,
+                market_cap: item.market_capital,
+                dividend_yield: item.dividend_yield.map(|yield_value| yield_value * 100.0),
+                eps: item.eps,
+                roe: None,
+                turnover_rate: item.turnover_rate,
+            });
+        }
+    }
+    Ok(quotes)
+}
+
+/// Fetch one planned batch from Xueqiu's multi-symbol realtime endpoint.
+pub(super) async fn fetch_xueqiu_realtime_batch(
+    state: &QuoteServiceState,
+    request_symbols: &[XueqiuRealtimeRequestSymbol],
+) -> Result<Vec<StockQuote>, String> {
+    if request_symbols.is_empty() {
+        return Ok(Vec::new());
+    }
+    let api_symbols: Vec<String> = request_symbols
+        .iter()
+        .map(|symbol| symbol.api_symbol.clone())
+        .collect();
+    let url = build_xueqiu_realtime_url(&api_symbols);
+    let response = send_xueqiu_request(state, &url, "realtime batch").await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_preview = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
+            .collect::<String>();
+        return Err(format!(
+            "Xueqiu API error for realtime quotes: HTTP {}. Response: {}",
+            status, body_preview
+        ));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read Xueqiu realtime response body: {}", e))?;
+    parse_xueqiu_realtime_body(&body, request_symbols)
 }
 
 /// Fetch a CN A-share stock quote from Xueqiu (雪球).

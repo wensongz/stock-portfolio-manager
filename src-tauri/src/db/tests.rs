@@ -403,7 +403,13 @@ mod tests {
                 low: 173.0,
                 volume: 50000000,
                 updated_at: "2024-01-15T16:00:00Z".to_string(),
-                ..Default::default()
+                pe_ttm: Some(31.2),
+                pb: Some(48.5),
+                market_cap: Some(3_200_000_000_000.0),
+                dividend_yield: Some(0.41),
+                eps: Some(7.15),
+                roe: Some(152.0),
+                turnover_rate: Some(0.61),
             },
             crate::models::StockQuote {
                 symbol: "sh600519".to_string(),
@@ -431,6 +437,13 @@ mod tests {
         assert_eq!(aapl.name, "Apple Inc.");
         assert!((aapl.current_price - 175.50).abs() < 0.001);
         assert_eq!(aapl.volume, 50000000);
+        assert_eq!(aapl.pe_ttm, Some(31.2));
+        assert_eq!(aapl.pb, Some(48.5));
+        assert_eq!(aapl.market_cap, Some(3_200_000_000_000.0));
+        assert_eq!(aapl.dividend_yield, Some(0.41));
+        assert_eq!(aapl.eps, Some(7.15));
+        assert_eq!(aapl.roe, Some(152.0));
+        assert_eq!(aapl.turnover_rate, Some(0.61));
 
         let moutai = loaded.iter().find(|q| q.symbol == "sh600519").unwrap();
         assert_eq!(moutai.name, "贵州茅台");
@@ -1142,6 +1155,56 @@ mod tests {
     }
 
     #[test]
+    fn v2_database_migrates_cached_quote_metadata_to_v3() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cached_quotes (
+               symbol TEXT PRIMARY KEY NOT NULL,
+               name TEXT NOT NULL,
+               market TEXT NOT NULL,
+               current_price REAL NOT NULL DEFAULT 0,
+               previous_close REAL NOT NULL DEFAULT 0,
+               change REAL NOT NULL DEFAULT 0,
+               change_percent REAL NOT NULL DEFAULT 0,
+               high REAL NOT NULL DEFAULT 0,
+               low REAL NOT NULL DEFAULT 0,
+               volume INTEGER NOT NULL DEFAULT 0,
+               updated_at TEXT NOT NULL
+             );
+             INSERT INTO cached_quotes VALUES
+               ('AAPL', 'Apple Inc.', 'US', 175.5, 174.0, 1.5, 0.86, 176.0, 173.0, 50000000, 'old');
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+
+        run_migrations(&mut conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        for column in [
+            "pe_ttm",
+            "pb",
+            "market_cap",
+            "dividend_yield",
+            "eps",
+            "roe",
+            "turnover_rate",
+        ] {
+            assert!(column_exists(&conn, "cached_quotes", column).unwrap());
+        }
+        let existing_name: String = conn
+            .query_row(
+                "SELECT name FROM cached_quotes WHERE symbol = 'AAPL'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(existing_name, "Apple Inc.");
+    }
+
+    #[test]
     fn unversioned_legacy_database_adds_columns_repairs_open_rows_and_keeps_data() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1326,7 +1389,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_migrates_to_v2_with_idempotent_index_definitions() {
+    fn v1_database_migrates_through_current_with_idempotent_index_definitions() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("portfolio.sqlite");
         {
@@ -1342,7 +1405,7 @@ mod tests {
             let version: i64 = conn
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 2);
+            assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
             PORTFOLIO_QUERY_INDEXES
                 .iter()
@@ -1377,7 +1440,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(reopened_definitions, definitions);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 2);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 3);
     }
 
     #[test]

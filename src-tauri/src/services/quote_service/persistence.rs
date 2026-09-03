@@ -8,7 +8,8 @@ pub fn load_quotes_from_db(db: &Database) -> Result<Vec<StockQuote>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT symbol, name, market, current_price, previous_close,
-                    change, change_percent, high, low, volume, updated_at
+                    change, change_percent, high, low, volume, updated_at,
+                    pe_ttm, pb, market_cap, dividend_yield, eps, roe, turnover_rate
              FROM cached_quotes",
         )
         .map_err(|e| e.to_string())?;
@@ -26,7 +27,13 @@ pub fn load_quotes_from_db(db: &Database) -> Result<Vec<StockQuote>, String> {
                 low: row.get(8)?,
                 volume: row.get(9)?,
                 updated_at: row.get(10)?,
-                ..Default::default()
+                pe_ttm: row.get(11)?,
+                pb: row.get(12)?,
+                market_cap: row.get(13)?,
+                dividend_yield: row.get(14)?,
+                eps: row.get(15)?,
+                roe: row.get(16)?,
+                turnover_rate: row.get(17)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -41,8 +48,10 @@ pub fn save_quotes_to_db(db: &Database, quotes: &[StockQuote]) -> Result<(), Str
         .prepare(
             "INSERT OR REPLACE INTO cached_quotes
                 (symbol, name, market, current_price, previous_close,
-                 change, change_percent, high, low, volume, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 change, change_percent, high, low, volume, updated_at,
+                 pe_ttm, pb, market_cap, dividend_yield, eps, roe, turnover_rate)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         )
         .map_err(|e| e.to_string())?;
     for q in quotes {
@@ -58,6 +67,13 @@ pub fn save_quotes_to_db(db: &Database, quotes: &[StockQuote]) -> Result<(), Str
             q.low,
             q.volume,
             q.updated_at,
+            q.pe_ttm,
+            q.pb,
+            q.market_cap,
+            q.dividend_yield,
+            q.eps,
+            q.roe,
+            q.turnover_rate,
         ])
         .map_err(|e| e.to_string())?;
     }

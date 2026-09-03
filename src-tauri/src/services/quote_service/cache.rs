@@ -61,6 +61,35 @@ impl QuoteCache {
         }
     }
 
+    /// Merge lightweight realtime quotes with richer cached metadata, then
+    /// replace the cached prices. The realtime endpoint intentionally omits
+    /// fields such as company name, P/E and dividend yield.
+    pub fn merge_and_set_batch(&self, quotes: &mut [StockQuote]) {
+        let mut lock = self.inner.lock().unwrap();
+        let now = Instant::now();
+        for quote in quotes {
+            if let Some(cached) = lock.get(&quote.symbol).map(|entry| &entry.quote) {
+                if quote.name.trim().is_empty() || quote.name == quote.symbol {
+                    quote.name = cached.name.clone();
+                }
+                quote.pe_ttm = quote.pe_ttm.or(cached.pe_ttm);
+                quote.pb = quote.pb.or(cached.pb);
+                quote.market_cap = quote.market_cap.or(cached.market_cap);
+                quote.dividend_yield = quote.dividend_yield.or(cached.dividend_yield);
+                quote.eps = quote.eps.or(cached.eps);
+                quote.roe = quote.roe.or(cached.roe);
+                quote.turnover_rate = quote.turnover_rate.or(cached.turnover_rate);
+            }
+            lock.insert(
+                quote.symbol.clone(),
+                CachedQuote {
+                    quote: quote.clone(),
+                    _cached_at: now,
+                },
+            );
+        }
+    }
+
     /// Returns all cached quotes for the given symbols, plus the list of
     /// symbols that are missing from the cache.
     pub fn get_batch(
@@ -119,7 +148,7 @@ pub async fn fetch_quotes_batch_cached_with_providers(
 
     if force_refresh {
         // Force refresh: fetch all symbols from the upstream API.
-        let fresh = fetch_quotes_batch_with_providers(
+        let mut fresh = fetch_quotes_batch_with_providers(
             state,
             unique_symbols.clone(),
             us_provider,
@@ -127,7 +156,7 @@ pub async fn fetch_quotes_batch_cached_with_providers(
             cn_provider,
         )
         .await?;
-        cache.set_batch(&fresh.data);
+        cache.merge_and_set_batch(&mut fresh.data);
 
         // Fall back to stale cache for any symbols that failed to fetch
         let fetched_symbols: std::collections::HashSet<String> =
@@ -157,7 +186,7 @@ pub async fn fetch_quotes_batch_cached_with_providers(
         });
     }
 
-    let fresh = fetch_quotes_batch_with_providers(
+    let mut fresh = fetch_quotes_batch_with_providers(
         state,
         missing.clone(),
         us_provider,
@@ -165,7 +194,7 @@ pub async fn fetch_quotes_batch_cached_with_providers(
         cn_provider,
     )
     .await?;
-    cache.set_batch(&fresh.data);
+    cache.merge_and_set_batch(&mut fresh.data);
     result.extend(fresh.data);
 
     // For any symbols that were missing from fresh results (fetch failed),

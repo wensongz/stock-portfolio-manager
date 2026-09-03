@@ -38,6 +38,24 @@ fn quote_service_state_keeps_credentials_while_warnings_are_request_values() {
 }
 
 #[test]
+fn realtime_http_400_with_expired_cookie_code_uses_cookie_warning() {
+    let error = "Xueqiu API error for realtime quotes: HTTP 400. Response: {\"error_code\":400016}";
+    assert_eq!(
+        quote_warning_for_error(error).as_deref(),
+        Some(XUEQIU_COOKIE_EXPIRED_HINT)
+    );
+}
+
+#[test]
+fn unrelated_xueqiu_error_containing_400016_is_not_cookie_expiry() {
+    let error = "Network error fetching symbol 400016 from Xueqiu";
+    assert_eq!(
+        quote_warning_for_error(error).as_deref(),
+        Some(XUEQIU_API_FAILED_HINT)
+    );
+}
+
+#[test]
 fn resolve_index_secid_handles_common_forms() {
     // US indices — ^-prefixed, bare, and suffix-stripped.
     assert_eq!(resolve_index_secid("^GSPC").unwrap().0, "100.SPX");
@@ -533,6 +551,47 @@ fn test_quote_cache_set_batch() {
 }
 
 #[test]
+fn test_quote_cache_merge_and_set_batch_preserves_rich_metadata() {
+    let cache = QuoteCache::new();
+    let mut cached = sample_quote("AAPL", "US");
+    cached.name = "Apple Inc.".to_string();
+    cached.pe_ttm = Some(31.2);
+    cached.pb = Some(48.5);
+    cached.dividend_yield = Some(0.41);
+    cached.eps = Some(7.15);
+    cached.roe = Some(152.0);
+    cached.market_cap = Some(3_000_000_000_000.0);
+    cached.turnover_rate = Some(0.52);
+    cache.set(cached);
+
+    let mut realtime = sample_quote("AAPL", "US");
+    realtime.name = "AAPL".to_string();
+    realtime.current_price = 211.5;
+    realtime.pe_ttm = None;
+    realtime.pb = None;
+    realtime.dividend_yield = None;
+    realtime.eps = None;
+    realtime.roe = None;
+    realtime.market_cap = Some(3_200_000_000_000.0);
+    realtime.turnover_rate = Some(0.61);
+
+    cache.merge_and_set_batch(std::slice::from_mut(&mut realtime));
+
+    assert_eq!(realtime.name, "Apple Inc.");
+    assert_eq!(realtime.pe_ttm, Some(31.2));
+    assert_eq!(realtime.pb, Some(48.5));
+    assert_eq!(realtime.dividend_yield, Some(0.41));
+    assert_eq!(realtime.eps, Some(7.15));
+    assert_eq!(realtime.roe, Some(152.0));
+    assert_eq!(realtime.market_cap, Some(3_200_000_000_000.0));
+    assert_eq!(realtime.turnover_rate, Some(0.61));
+    assert_eq!(
+        cache.get("AAPL").unwrap().current_price,
+        realtime.current_price
+    );
+}
+
+#[test]
 fn test_quote_cache_get_batch() {
     let cache = QuoteCache::new();
     cache.set(sample_quote("AAPL", "US"));
@@ -578,6 +637,17 @@ fn test_fetch_quotes_batch_with_providers_deduplicates_symbols() {
     assert!(syms.contains(&"$CASH-USD"));
     assert!(syms.contains(&"$CASH-CNY"));
     assert!(syms.contains(&"$CASH-HKD"));
+}
+
+#[test]
+fn test_restore_original_symbol_after_provider_normalization() {
+    let mut yahoo_quote = sample_quote("BRK-B", "US");
+    restore_original_symbol(&mut yahoo_quote, "BRK.B");
+    assert_eq!(yahoo_quote.symbol, "BRK.B");
+
+    let mut yahoo_hk_quote = sample_quote("0700.HK", "HK");
+    restore_original_symbol(&mut yahoo_hk_quote, "00700");
+    assert_eq!(yahoo_hk_quote.symbol, "00700");
 }
 
 #[test]
@@ -770,6 +840,72 @@ async fn test_batch_fetch_cash_symbols_no_network() {
 // These tests verify that the API actually works end-to-end.
 // They are marked #[ignore] so they only run when explicitly requested
 // via `cargo test -- --ignored`.
+
+#[tokio::test]
+#[ignore]
+async fn test_integration_xueqiu_realtime_with_saved_cookie_and_public_symbols() {
+    let db_path = std::env::var("XUEQIU_TEST_DB_PATH")
+        .expect("set XUEQIU_TEST_DB_PATH to the application's portfolio.db");
+    let connection =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let (cookie, user_u): (Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT xueqiu_cookie, xueqiu_u FROM quote_provider_config WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(cookie.as_deref().is_some_and(|value| !value.is_empty()));
+
+    let state = QuoteServiceState::new();
+    set_xueqiu_user_cookie(&state, cookie);
+    set_xueqiu_user_u(&state, user_u);
+
+    let symbols = vec![
+        ("BABA".to_string(), "US".to_string()),
+        ("TCEHY".to_string(), "US".to_string()),
+        ("DIDIY".to_string(), "US".to_string()),
+        ("PDD".to_string(), "US".to_string()),
+        ("AAPL".to_string(), "US".to_string()),
+        ("GOOG".to_string(), "US".to_string()),
+        ("MSFT".to_string(), "US".to_string()),
+        ("AMZN".to_string(), "US".to_string()),
+        ("NVDA".to_string(), "US".to_string()),
+        ("IBKR".to_string(), "US".to_string()),
+        ("BRK.B".to_string(), "US".to_string()),
+        ("SNOW".to_string(), "US".to_string()),
+        ("DDOG".to_string(), "US".to_string()),
+        ("TWLO".to_string(), "US".to_string()),
+        ("OXY".to_string(), "US".to_string()),
+        ("INTC".to_string(), "US".to_string()),
+        ("ZTO".to_string(), "US".to_string()),
+        ("CHA".to_string(), "US".to_string()),
+        ("CROX".to_string(), "US".to_string()),
+        ("KHC".to_string(), "US".to_string()),
+        ("sh600519".to_string(), "CN".to_string()),
+        ("sz000858".to_string(), "CN".to_string()),
+        ("0700.HK".to_string(), "HK".to_string()),
+        ("9988.HK".to_string(), "HK".to_string()),
+    ];
+
+    let (batches, invalid) = plan_xueqiu_realtime_batches(&symbols);
+    assert!(invalid.is_empty(), "invalid public symbols: {:?}", invalid);
+    let started_at = std::time::Instant::now();
+    let mut quotes = Vec::new();
+    for batch in &batches {
+        quotes.extend(fetch_xueqiu_realtime_batch(&state, batch).await.unwrap());
+    }
+    let elapsed = started_at.elapsed();
+
+    assert_eq!(quotes.len(), symbols.len());
+    println!(
+        "Xueqiu realtime: {} symbols in {} request(s), {:?}",
+        quotes.len(),
+        batches.len(),
+        elapsed
+    );
+}
 
 #[tokio::test]
 #[ignore]
@@ -1014,6 +1150,139 @@ fn test_to_xueqiu_hk_symbol() {
 #[test]
 fn test_to_xueqiu_hk_symbol_invalid() {
     assert!(to_xueqiu_hk_symbol("INVALID").is_err());
+}
+
+#[test]
+fn test_plan_xueqiu_realtime_batches_maps_mixed_markets() {
+    let symbols = vec![
+        ("aapl".to_string(), "US".to_string()),
+        ("BRK-B".to_string(), "US".to_string()),
+        ("sh600519".to_string(), "CN".to_string()),
+        ("0700.HK".to_string(), "HK".to_string()),
+        ("bad symbol".to_string(), "US".to_string()),
+    ];
+
+    let (batches, invalid) = plan_xueqiu_realtime_batches(&symbols);
+
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.len(), 4);
+    assert_eq!(batch[0].api_symbol, "AAPL");
+    assert_eq!(batch[0].original_symbol, "aapl");
+    assert_eq!(batch[1].api_symbol, "BRK.B");
+    assert_eq!(batch[2].api_symbol, "SH600519");
+    assert_eq!(batch[3].api_symbol, "00700");
+    assert_eq!(invalid, vec![("bad symbol".to_string(), "US".to_string())]);
+}
+
+#[test]
+fn test_xueqiu_realtime_batches_cap_at_200_and_keep_literal_commas() {
+    let symbols: Vec<(String, String)> = (0..201)
+        .map(|index| (format!("T{:03}", index), "US".to_string()))
+        .collect();
+
+    let (batches, invalid) = plan_xueqiu_realtime_batches(&symbols);
+
+    assert!(invalid.is_empty());
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].len(), 200);
+    assert_eq!(batches[1].len(), 1);
+
+    let api_symbols: Vec<String> = batches[0]
+        .iter()
+        .map(|symbol| symbol.api_symbol.clone())
+        .collect();
+    let url = build_xueqiu_realtime_url(&api_symbols);
+    assert!(url.contains("symbol=T000,T001,T002"));
+    assert!(!url.contains("%2C"));
+}
+
+#[test]
+fn test_parse_xueqiu_realtime_body_maps_original_symbols_and_fields() {
+    let symbols = vec![
+        ("aapl".to_string(), "US".to_string()),
+        ("sh600519".to_string(), "CN".to_string()),
+        ("0700.HK".to_string(), "HK".to_string()),
+    ];
+    let (batches, invalid) = plan_xueqiu_realtime_batches(&symbols);
+    assert!(invalid.is_empty());
+
+    let body = r#"{
+        "data": [
+            {"symbol":"AAPL","current":211.50,"last_close":209.10,"chg":2.40,"percent":1.15,"high":213.00,"low":208.50,"volume":1234567,"market_capital":3200000000000,"turnover_rate":0.61},
+            {"symbol":"SH600519","current":1516.00,"last_close":1513.00,"chg":3.00,"percent":0.20,"high":1519.00,"low":1508.00,"volume":30279},
+            {"symbol":"00700","current":620.00,"last_close":615.00,"chg":5.00,"percent":0.81,"high":623.00,"low":610.00,"volume":998877}
+        ],
+        "error_code": 0,
+        "error_description": null
+    }"#;
+
+    let quotes = parse_xueqiu_realtime_body(body, &batches[0]).unwrap();
+
+    assert_eq!(quotes.len(), 3);
+    assert_eq!(quotes[0].symbol, "aapl");
+    assert_eq!(quotes[0].market, "US");
+    assert_eq!(quotes[0].name, "aapl");
+    assert_eq!(quotes[0].current_price, 211.50);
+    assert_eq!(quotes[0].market_cap, Some(3_200_000_000_000.0));
+    assert_eq!(quotes[0].turnover_rate, Some(0.61));
+    assert_eq!(quotes[1].symbol, "sh600519");
+    assert_eq!(quotes[1].market, "CN");
+    assert_eq!(quotes[2].symbol, "0700.HK");
+    assert_eq!(quotes[2].market, "HK");
+}
+
+#[test]
+fn test_parse_xueqiu_realtime_body_ignores_unusable_items() {
+    let symbols = vec![("AAPL".to_string(), "US".to_string())];
+    let (batches, _) = plan_xueqiu_realtime_batches(&symbols);
+    let body = r#"{
+        "data": [
+            {"symbol":"AAPL","current":null},
+            {"symbol":"UNKNOWN","current":10.0}
+        ],
+        "error_code": 0
+    }"#;
+
+    let quotes = parse_xueqiu_realtime_body(body, &batches[0]).unwrap();
+    assert!(quotes.is_empty());
+}
+
+#[test]
+fn test_xueqiu_realtime_aliases_share_one_api_symbol_and_fan_out() {
+    let symbols = vec![
+        ("BRK-B".to_string(), "US".to_string()),
+        ("BRK.B".to_string(), "US".to_string()),
+        ("aapl".to_string(), "US".to_string()),
+        ("AAPL".to_string(), "US".to_string()),
+        ("00700".to_string(), "HK".to_string()),
+        ("0700.HK".to_string(), "HK".to_string()),
+    ];
+    let (batches, invalid) = plan_xueqiu_realtime_batches(&symbols);
+    assert!(invalid.is_empty());
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].len(), 3);
+
+    let api_symbols: Vec<String> = batches[0]
+        .iter()
+        .map(|request| request.api_symbol.clone())
+        .collect();
+    assert_eq!(api_symbols, vec!["BRK.B", "AAPL", "00700"]);
+
+    let body = r#"{
+        "data": [
+            {"symbol":"BRK.B","current":500.0,"last_close":495.0},
+            {"symbol":"AAPL","current":211.5,"last_close":209.1},
+            {"symbol":"00700","current":620.0,"last_close":615.0}
+        ],
+        "error_code": 0
+    }"#;
+    let quotes = parse_xueqiu_realtime_body(body, &batches[0]).unwrap();
+    let returned_symbols: Vec<&str> = quotes.iter().map(|quote| quote.symbol.as_str()).collect();
+    assert_eq!(
+        returned_symbols,
+        vec!["BRK-B", "BRK.B", "aapl", "AAPL", "00700", "0700.HK"]
+    );
 }
 
 // ---- Xueqiu response parsing tests ----

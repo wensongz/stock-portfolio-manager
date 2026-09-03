@@ -61,6 +61,133 @@ struct CachedQuoteRow {
     low: f64,
     volume: i64,
     updated_at: String,
+    pe_ttm: Option<f64>,
+    pb: Option<f64>,
+    market_cap: Option<f64>,
+    dividend_yield: Option<f64>,
+    eps: Option<f64>,
+    roe: Option<f64>,
+    turnover_rate: Option<f64>,
+}
+
+const CACHED_QUOTE_METADATA_COLUMNS: &[&str] = &[
+    "pe_ttm",
+    "pb",
+    "market_cap",
+    "dividend_yield",
+    "eps",
+    "roe",
+    "turnover_rate",
+];
+
+/// Refuse to mutate a pre-v3 database. This check runs before the table loop so
+/// the utility cannot leave symbols normalized in only a subset of tables.
+fn ensure_cached_quotes_metadata_schema(conn: &Connection) -> Result<(), String> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cached_quotes'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !table_exists {
+        return Ok(());
+    }
+
+    for column in CACHED_QUOTE_METADATA_COLUMNS {
+        let column_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM pragma_table_info('cached_quotes') WHERE name = ?1
+                 )",
+                params![column],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !column_exists {
+            return Err(format!(
+                "cached_quotes 缺少字段 {column}；请先用当前版本应用打开数据库完成 v3 迁移"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn replace_cached_quote_symbol(
+    conn: &Connection,
+    old_symbol: &str,
+    new_symbol: &str,
+) -> rusqlite::Result<usize> {
+    let transaction = conn.unchecked_transaction()?;
+    let rows: Vec<CachedQuoteRow> = {
+        let mut stmt = transaction.prepare(
+            "SELECT name, market, current_price, previous_close,
+                    change, change_percent, high, low, volume, updated_at,
+                    pe_ttm, pb, market_cap, dividend_yield, eps, roe, turnover_rate
+             FROM cached_quotes WHERE symbol = ?1",
+        )?;
+        let mapped_rows = stmt.query_map(params![old_symbol], |row| {
+            Ok(CachedQuoteRow {
+                name: row.get(0)?,
+                market: row.get(1)?,
+                current_price: row.get(2)?,
+                previous_close: row.get(3)?,
+                change: row.get(4)?,
+                change_percent: row.get(5)?,
+                high: row.get(6)?,
+                low: row.get(7)?,
+                volume: row.get(8)?,
+                updated_at: row.get(9)?,
+                pe_ttm: row.get(10)?,
+                pb: row.get(11)?,
+                market_cap: row.get(12)?,
+                dividend_yield: row.get(13)?,
+                eps: row.get(14)?,
+                roe: row.get(15)?,
+                turnover_rate: row.get(16)?,
+            })
+        })?;
+        mapped_rows.collect::<rusqlite::Result<_>>()?
+    };
+
+    for row in &rows {
+        transaction.execute(
+            "INSERT OR REPLACE INTO cached_quotes
+             (symbol, name, market, current_price, previous_close,
+              change, change_percent, high, low, volume, updated_at,
+              pe_ttm, pb, market_cap, dividend_yield, eps, roe, turnover_rate)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            params![
+                new_symbol,
+                row.name,
+                row.market,
+                row.current_price,
+                row.previous_close,
+                row.change,
+                row.change_percent,
+                row.high,
+                row.low,
+                row.volume,
+                row.updated_at,
+                row.pe_ttm,
+                row.pb,
+                row.market_cap,
+                row.dividend_yield,
+                row.eps,
+                row.roe,
+                row.turnover_rate,
+            ],
+        )?;
+    }
+
+    let deleted = transaction.execute(
+        "DELETE FROM cached_quotes WHERE symbol = ?1",
+        params![old_symbol],
+    )?;
+    transaction.commit()?;
+    Ok(deleted)
 }
 
 const TABLES: &[TableSpec] = &[
@@ -151,6 +278,10 @@ fn main() {
         eprintln!("无法打开数据库 {}: {}", db_path, e);
         std::process::exit(1);
     });
+    if let Err(error) = ensure_cached_quotes_metadata_schema(&conn) {
+        eprintln!("数据库版本不兼容：{}", error);
+        std::process::exit(1);
+    }
 
     let mut total_updated = 0u64;
     let mut total_skipped = 0u64;
@@ -225,10 +356,7 @@ fn main() {
                         spec.table, old_sym, new_sym
                     );
                 } else {
-                    println!(
-                        "[预览] 表 {}: {} → {}",
-                        spec.table, old_sym, new_sym
-                    );
+                    println!("[预览] 表 {}: {} → {}", spec.table, old_sym, new_sym);
                 }
                 total_updated += 1;
                 continue;
@@ -238,70 +366,20 @@ fn main() {
                 // For PRIMARY KEY columns we cannot UPDATE directly.
                 // Strategy: copy the row(s) with the new symbol (INSERT OR REPLACE),
                 // then delete the old row(s).
-                //
-                // cached_quotes schema:
-                //   symbol TEXT PRIMARY KEY, name, market, current_price,
-                //   previous_close, change, change_percent, high, low, volume, updated_at
-                let rows: Vec<CachedQuoteRow> = {
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT name, market, current_price, previous_close, \
-                             change, change_percent, high, low, volume, updated_at \
-                             FROM cached_quotes WHERE symbol = ?1",
-                        )
-                        .unwrap_or_else(|e| {
-                            eprintln!("准备查询失败 [cached_quotes]: {}", e);
-                            std::process::exit(1);
-                        });
-                    stmt.query_map(params![old_sym], |row| {
-                        Ok(CachedQuoteRow {
-                            name: row.get(0)?,
-                            market: row.get(1)?,
-                            current_price: row.get(2)?,
-                            previous_close: row.get(3)?,
-                            change: row.get(4)?,
-                            change_percent: row.get(5)?,
-                            high: row.get(6)?,
-                            low: row.get(7)?,
-                            volume: row.get(8)?,
-                            updated_at: row.get(9)?,
-                        })
-                    })
-                    .unwrap_or_else(|e| {
-                        eprintln!("查询失败 [cached_quotes] {}: {}", old_sym, e);
-                        std::process::exit(1);
-                    })
-                    .filter_map(|r| r.ok())
-                    .collect()
-                };
-
-                for r in &rows {
-                    conn.execute(
-                        "INSERT OR REPLACE INTO cached_quotes \
-                         (symbol, name, market, current_price, previous_close, \
-                          change, change_percent, high, low, volume, updated_at) \
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-                        params![
-                            new_sym, r.name, r.market, r.current_price, r.previous_close,
-                            r.change, r.change_percent, r.high, r.low, r.volume, r.updated_at
-                        ],
-                    )
-                    .unwrap_or_else(|e| {
-                        eprintln!("插入失败 [{}] {} → {}: {}", spec.table, old_sym, new_sym, e);
-                        0
-                    });
+                match replace_cached_quote_symbol(&conn, old_sym, &new_sym) {
+                    Ok(_) => println!(
+                        "[更新] 表 {}: {} → {} （主键替换）",
+                        spec.table, old_sym, new_sym
+                    ),
+                    Err(error) => {
+                        eprintln!(
+                            "主键替换失败 [{}] {} → {}: {}",
+                            spec.table, old_sym, new_sym, error
+                        );
+                        total_skipped += 1;
+                        continue;
+                    }
                 }
-
-                conn.execute(
-                    &format!("DELETE FROM {} WHERE {} = ?1", spec.table, spec.symbol_col),
-                    params![old_sym],
-                )
-                .unwrap_or_else(|e| {
-                    eprintln!("删除失败 [{}] {}: {}", spec.table, old_sym, e);
-                    0
-                });
-
-                println!("[更新] 表 {}: {} → {} （主键替换）", spec.table, old_sym, new_sym);
             } else {
                 let update_sql = format!(
                     "UPDATE {t} SET {sc} = ?1 WHERE {sc} = ?2{market_filter}",
@@ -345,7 +423,20 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_hk_symbol;
+    use super::{
+        ensure_cached_quotes_metadata_schema, normalize_hk_symbol, replace_cached_quote_symbol,
+    };
+    use rusqlite::{params, Connection};
+
+    type OptionalMetadata = (
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    );
 
     #[test]
     fn test_normalize_hk_symbol() {
@@ -359,5 +450,117 @@ mod tests {
         // Non-HK symbols — should return None
         assert_eq!(normalize_hk_symbol("SH600036"), None);
         assert_eq!(normalize_hk_symbol("AAPL"), None);
+    }
+
+    #[test]
+    fn replacing_cached_quote_symbol_preserves_optional_metadata() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE cached_quotes (
+                   symbol TEXT PRIMARY KEY NOT NULL,
+                   name TEXT NOT NULL,
+                   market TEXT NOT NULL,
+                   current_price REAL NOT NULL,
+                   previous_close REAL NOT NULL,
+                   change REAL NOT NULL,
+                   change_percent REAL NOT NULL,
+                   high REAL NOT NULL,
+                   low REAL NOT NULL,
+                   volume INTEGER NOT NULL,
+                   updated_at TEXT NOT NULL,
+                   pe_ttm REAL,
+                   pb REAL,
+                   market_cap REAL,
+                   dividend_yield REAL,
+                   eps REAL,
+                   roe REAL,
+                   turnover_rate REAL
+                 );
+                 INSERT INTO cached_quotes VALUES
+                   ('00700.HK', '腾讯控股', 'HK', 620, 615, 5, 0.81, 623, 610,
+                    998877, '2026-09-03T00:00:00Z', 22.5, 4.2, 5800000000000,
+                    0.7, 28.1, 19.5, 0.61);",
+            )
+            .unwrap();
+
+        replace_cached_quote_symbol(&connection, "00700.HK", "700.HK").unwrap();
+
+        let metadata: OptionalMetadata = connection
+            .query_row(
+                "SELECT pe_ttm, pb, market_cap, dividend_yield, eps, roe, turnover_rate
+                 FROM cached_quotes WHERE symbol = ?1",
+                params!["700.HK"],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            metadata,
+            (
+                Some(22.5),
+                Some(4.2),
+                Some(5_800_000_000_000.0),
+                Some(0.7),
+                Some(28.1),
+                Some(19.5),
+                Some(0.61),
+            )
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM cached_quotes WHERE symbol = '00700.HK'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn metadata_schema_preflight_rejects_v2_without_writing() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE cached_quotes (
+                   symbol TEXT PRIMARY KEY NOT NULL,
+                   name TEXT NOT NULL,
+                   market TEXT NOT NULL,
+                   current_price REAL NOT NULL,
+                   previous_close REAL NOT NULL,
+                   change REAL NOT NULL,
+                   change_percent REAL NOT NULL,
+                   high REAL NOT NULL,
+                   low REAL NOT NULL,
+                   volume INTEGER NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO cached_quotes VALUES
+                   ('00700.HK', '腾讯控股', 'HK', 620, 615, 5, 0.81, 623, 610,
+                    998877, '2026-09-03T00:00:00Z');",
+            )
+            .unwrap();
+
+        let error = ensure_cached_quotes_metadata_schema(&connection).unwrap_err();
+        assert!(error.contains("v3"));
+        assert_eq!(
+            connection
+                .query_row("SELECT symbol FROM cached_quotes", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "00700.HK"
+        );
     }
 }

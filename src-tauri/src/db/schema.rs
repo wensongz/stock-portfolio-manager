@@ -217,7 +217,14 @@ pub(super) fn create_current_schema(conn: &Connection) -> Result<()> {
            high REAL NOT NULL DEFAULT 0,
            low REAL NOT NULL DEFAULT 0,
            volume INTEGER NOT NULL DEFAULT 0,
-           updated_at TEXT NOT NULL
+           updated_at TEXT NOT NULL,
+           pe_ttm REAL,
+           pb REAL,
+           market_cap REAL,
+           dividend_yield REAL,
+           eps REAL,
+           roe REAL,
+           turnover_rate REAL
          );
 
          CREATE TABLE IF NOT EXISTS cached_exchange_rates (

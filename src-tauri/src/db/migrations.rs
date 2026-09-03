@@ -1,7 +1,7 @@
 use super::schema;
 use rusqlite::{Connection, Error, OptionalExtension, Result};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 pub(crate) fn run_migrations(conn: &mut Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -23,12 +23,35 @@ pub(crate) fn run_migrations(conn: &mut Connection) -> Result<()> {
     if version < 2 {
         migrate_v2(&transaction)?;
     }
+    if version < 3 {
+        migrate_v3(&transaction)?;
+    }
     transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     transaction.commit()
 }
 
 fn migrate_v2(conn: &Connection) -> Result<()> {
     schema::create_portfolio_query_indexes(conn)
+}
+
+fn migrate_v3(conn: &Connection) -> Result<()> {
+    for (column, definition) in [
+        ("pe_ttm", "REAL"),
+        ("pb", "REAL"),
+        ("market_cap", "REAL"),
+        ("dividend_yield", "REAL"),
+        ("eps", "REAL"),
+        ("roe", "REAL"),
+        ("turnover_rate", "REAL"),
+    ] {
+        add_column_if_missing(
+            conn,
+            "cached_quotes",
+            column,
+            &format!("ALTER TABLE cached_quotes ADD COLUMN {column} {definition}"),
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {

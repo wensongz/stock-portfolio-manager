@@ -28,13 +28,14 @@ export default function SnapshotDetail() {
   const navigate = useNavigate();
   const {
     detail,
-    loading,
+    detailLoading,
+    mutationLoading,
     quarterlyTransactions,
     fetchDetail,
     refreshSnapshot,
     clearDetail,
-    fetchQuarterlyTransactions,
   } = useQuarterlyStore();
+  const loading = detailLoading || mutationLoading;
 
   const { pnlColorDark } = usePnlColor();
 
@@ -64,8 +65,7 @@ export default function SnapshotDetail() {
 
   useEffect(() => {
     if (snapshotId) {
-      fetchDetail(snapshotId);
-      fetchQuarterlyTransactions(snapshotId);
+      void fetchDetail(snapshotId);
     }
     fetchAccounts();
     return () => clearDetail();
@@ -102,7 +102,6 @@ export default function SnapshotDetail() {
           onClick={async () => {
             if (snapshotId) {
               await refreshSnapshot(snapshotId);
-              fetchQuarterlyTransactions(snapshotId);
             }
           }}
           loading={loading}

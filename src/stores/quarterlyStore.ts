@@ -9,16 +9,31 @@ import type {
   StockTransactionGroup,
 } from "../types";
 
-interface QuarterlyState {
+export type QuarterlyInvoke = <T>(
+  command: string,
+  args?: Record<string, unknown>,
+) => Promise<T>;
+
+export interface QuarterlyState {
   snapshots: QuarterlySnapshot[];
   detail: QuarterlySnapshotDetail | null;
+  detailSnapshotId: string | null;
   comparison: QuarterComparison | null;
   trends: QuarterlyTrends | null;
   notesSummaries: QuarterlyNotesSummary[];
   missingQuarters: string[];
   quarterlyTransactions: StockTransactionGroup[];
-  loading: boolean;
-  error: string | null;
+
+  listLoading: boolean;
+  listError: string | null;
+  detailLoading: boolean;
+  detailError: string | null;
+  comparisonLoading: boolean;
+  comparisonError: string | null;
+  trendsLoading: boolean;
+  trendsError: string | null;
+  mutationLoading: boolean;
+  mutationError: string | null;
 
   fetchSnapshots: () => Promise<void>;
   fetchDetail: (snapshotId: string) => Promise<void>;
@@ -32,178 +47,285 @@ interface QuarterlyState {
   fetchNotesSummaries: () => Promise<void>;
   updateHoldingNotes: (snapshotId: string, symbol: string, notes: string) => Promise<void>;
   updateQuarterlyNotes: (snapshotId: string, notes: string) => Promise<void>;
-  fetchQuarterlyTransactions: (snapshotId: string) => Promise<void>;
   clearDetail: () => void;
   clearComparison: () => void;
 }
 
-export const useQuarterlyStore = create<QuarterlyState>((set, get) => ({
-  snapshots: [],
-  detail: null,
-  comparison: null,
-  trends: null,
-  notesSummaries: [],
-  missingQuarters: [],
-  quarterlyTransactions: [],
-  loading: false,
-  error: null,
+export const createQuarterlyStore = (invokeFn: QuarterlyInvoke = invoke) => {
+  let listGeneration = 0;
+  let detailGeneration = 0;
+  let comparisonGeneration = 0;
+  let trendsGeneration = 0;
+  let missingGeneration = 0;
+  let notesGeneration = 0;
+  let mutationGeneration = 0;
+  let activeComparisonKey: string | null = null;
 
-  fetchSnapshots: async () => {
-    set({ loading: true, error: null });
-    try {
-      const snapshots = await invoke<QuarterlySnapshot[]>("get_quarterly_snapshots");
-      set({ snapshots, loading: false });
-    } catch (err) {
-      set({ error: String(err), loading: false });
-    }
-  },
-
-  fetchDetail: async (snapshotId: string) => {
-    set({ loading: true, error: null });
-    try {
-      const detail = await invoke<QuarterlySnapshotDetail>("get_quarterly_snapshot_detail", {
-        snapshotId,
+  return create<QuarterlyState>((set, get) => {
+    const loadDetailBundle = async (
+      snapshotId: string,
+      detailCommand: "get_quarterly_snapshot_detail" | "refresh_quarterly_snapshot",
+    ): Promise<boolean> => {
+      const generation = ++detailGeneration;
+      const changedSnapshot = get().detailSnapshotId !== snapshotId;
+      set({
+        detailSnapshotId: snapshotId,
+        detailLoading: true,
+        detailError: null,
+        ...(changedSnapshot ? { detail: null, quarterlyTransactions: [] } : {}),
       });
-      set({ detail, loading: false });
-    } catch (err) {
-      set({ error: String(err), loading: false });
-    }
-  },
 
-  refreshSnapshot: async (snapshotId: string) => {
-    set({ loading: true, error: null });
-    try {
-      const detail = await invoke<QuarterlySnapshotDetail>("refresh_quarterly_snapshot", {
-        snapshotId,
-      });
-      set({ detail, loading: false });
-      // Also refresh the snapshots list since totals may have changed
-      await get().fetchSnapshots();
-    } catch (err) {
-      set({ error: String(err), loading: false });
-    }
-  },
-
-  createSnapshot: async (quarter?: string) => {
-    set({ loading: true, error: null });
-    try {
-      const snapshot = await invoke<QuarterlySnapshot>("create_quarterly_snapshot", {
-        quarter: quarter ?? null,
-      });
-      // Refresh snapshots list
-      await get().fetchSnapshots();
-      set({ loading: false });
-      return snapshot;
-    } catch (err) {
-      set({ error: String(err), loading: false });
-      return null;
-    }
-  },
-
-  deleteSnapshot: async (snapshotId: string) => {
-    set({ loading: true, error: null });
-    try {
-      await invoke<boolean>("delete_quarterly_snapshot", { snapshotId });
-      await get().fetchSnapshots();
-      set({ loading: false });
-    } catch (err) {
-      set({ error: String(err), loading: false });
-    }
-  },
-
-  fetchMissingQuarters: async () => {
-    try {
-      const missingQuarters = await invoke<string[]>("check_missing_snapshots");
-      set({ missingQuarters });
-    } catch (err) {
-      console.error("fetchMissingQuarters error:", err);
-    }
-  },
-
-  ensureCurrentQuarterSnapshot: async () => {
-    try {
-      const snapshot = await invoke<QuarterlySnapshot | null>("ensure_current_quarter_snapshot");
-      return snapshot;
-    } catch (err) {
-      console.error("ensureCurrentQuarterSnapshot error:", err);
-      return null;
-    }
-  },
-
-  compareQuarters: async (quarter1: string, quarter2: string) => {
-    set({ loading: true, error: null });
-    try {
-      const comparison = await invoke<QuarterComparison>("compare_quarters", {
-        quarter1,
-        quarter2,
-      });
-      set({ comparison, loading: false });
-    } catch (err) {
-      set({ error: String(err), loading: false });
-    }
-  },
-
-  fetchTrends: async () => {
-    set({ loading: true, error: null });
-    try {
-      const trends = await invoke<QuarterlyTrends>("get_quarterly_trends");
-      set({ trends, loading: false });
-    } catch (err) {
-      set({ error: String(err), loading: false });
-    }
-  },
-
-  fetchNotesSummaries: async () => {
-    set({ loading: true, error: null });
-    try {
-      const notesSummaries = await invoke<QuarterlyNotesSummary[]>("get_quarterly_notes_history");
-      set({ notesSummaries, loading: false });
-    } catch (err) {
-      set({ error: String(err), loading: false });
-    }
-  },
-
-  updateHoldingNotes: async (snapshotId: string, symbol: string, notes: string) => {
-    try {
-      await invoke<boolean>("update_holding_notes", { snapshotId, symbol, notes });
-      // Refresh detail if currently viewing the same snapshot
-      const { detail } = get();
-      if (detail?.snapshot.id === snapshotId) {
-        await get().fetchDetail(snapshotId);
+      try {
+        const [detail, quarterlyTransactions] = await Promise.all([
+          invokeFn<QuarterlySnapshotDetail>(detailCommand, { snapshotId }),
+          invokeFn<StockTransactionGroup[]>("get_quarterly_transactions", { snapshotId }),
+        ]);
+        if (
+          generation === detailGeneration
+          && get().detailSnapshotId === snapshotId
+        ) {
+          set({
+            detail,
+            quarterlyTransactions,
+            detailLoading: false,
+          });
+          return true;
+        }
+      } catch (err) {
+        if (
+          generation === detailGeneration
+          && get().detailSnapshotId === snapshotId
+        ) {
+          set({ detailError: String(err), detailLoading: false });
+        }
       }
-    } catch (err) {
-      set({ error: String(err) });
-    }
-  },
+      return false;
+    };
 
-  updateQuarterlyNotes: async (snapshotId: string, notes: string) => {
-    try {
-      await invoke<boolean>("update_quarterly_notes", { snapshotId, notes });
-      // Refresh detail if currently viewing the same snapshot
-      const { detail } = get();
-      if (detail?.snapshot.id === snapshotId) {
-        await get().fetchDetail(snapshotId);
+    const startMutation = () => {
+      const generation = ++mutationGeneration;
+      set({ mutationLoading: true, mutationError: null });
+      return generation;
+    };
+
+    const finishMutation = (generation: number, error?: unknown) => {
+      if (generation === mutationGeneration) {
+        set({
+          mutationLoading: false,
+          ...(error === undefined ? {} : { mutationError: String(error) }),
+        });
       }
-      // Also refresh snapshots list for updated notes
-      await get().fetchSnapshots();
-    } catch (err) {
-      set({ error: String(err) });
-      throw err;
-    }
-  },
+    };
 
-  clearDetail: () => set({ detail: null }),
-  clearComparison: () => set({ comparison: null }),
+    return {
+      snapshots: [],
+      detail: null,
+      detailSnapshotId: null,
+      comparison: null,
+      trends: null,
+      notesSummaries: [],
+      missingQuarters: [],
+      quarterlyTransactions: [],
 
-  fetchQuarterlyTransactions: async (snapshotId: string) => {
-    try {
-      const quarterlyTransactions = await invoke<StockTransactionGroup[]>(
-        "get_quarterly_transactions",
-        { snapshotId }
-      );
-      set({ quarterlyTransactions });
-    } catch (err) {
-      set({ error: String(err) });
-    }
-  },
-}));
+      listLoading: false,
+      listError: null,
+      detailLoading: false,
+      detailError: null,
+      comparisonLoading: false,
+      comparisonError: null,
+      trendsLoading: false,
+      trendsError: null,
+      mutationLoading: false,
+      mutationError: null,
+
+      fetchSnapshots: async () => {
+        const generation = ++listGeneration;
+        set({ listLoading: true, listError: null });
+        try {
+          const snapshots = await invokeFn<QuarterlySnapshot[]>("get_quarterly_snapshots");
+          if (generation === listGeneration) {
+            set({ snapshots, listLoading: false });
+          }
+        } catch (err) {
+          if (generation === listGeneration) {
+            set({ listError: String(err), listLoading: false });
+          }
+        }
+      },
+
+      fetchDetail: async (snapshotId) => {
+        await loadDetailBundle(snapshotId, "get_quarterly_snapshot_detail");
+      },
+
+      refreshSnapshot: async (snapshotId) => {
+        const mutation = startMutation();
+        const refreshed = await loadDetailBundle(snapshotId, "refresh_quarterly_snapshot");
+        if (!refreshed) {
+          const error = get().detailSnapshotId === snapshotId
+            ? get().detailError ?? "季度快照刷新失败"
+            : undefined;
+          finishMutation(mutation, error);
+          return;
+        }
+        await get().fetchSnapshots();
+        finishMutation(mutation);
+      },
+
+      createSnapshot: async (quarter) => {
+        const generation = startMutation();
+        try {
+          const snapshot = await invokeFn<QuarterlySnapshot>("create_quarterly_snapshot", {
+            quarter: quarter ?? null,
+          });
+          await get().fetchSnapshots();
+          finishMutation(generation);
+          return snapshot;
+        } catch (err) {
+          finishMutation(generation, err);
+          return null;
+        }
+      },
+
+      deleteSnapshot: async (snapshotId) => {
+        const generation = startMutation();
+        try {
+          await invokeFn<boolean>("delete_quarterly_snapshot", { snapshotId });
+          await get().fetchSnapshots();
+          finishMutation(generation);
+        } catch (err) {
+          finishMutation(generation, err);
+        }
+      },
+
+      fetchMissingQuarters: async () => {
+        const generation = ++missingGeneration;
+        try {
+          const missingQuarters = await invokeFn<string[]>("check_missing_snapshots");
+          if (generation === missingGeneration) {
+            set({ missingQuarters });
+          }
+        } catch (err) {
+          console.error("fetchMissingQuarters error:", err);
+        }
+      },
+
+      ensureCurrentQuarterSnapshot: async () => {
+        try {
+          return await invokeFn<QuarterlySnapshot | null>(
+            "ensure_current_quarter_snapshot",
+          );
+        } catch (err) {
+          console.error("ensureCurrentQuarterSnapshot error:", err);
+          return null;
+        }
+      },
+
+      compareQuarters: async (quarter1, quarter2) => {
+        const pairKey = JSON.stringify([quarter1.trim(), quarter2.trim()]);
+        const generation = ++comparisonGeneration;
+        activeComparisonKey = pairKey;
+        set({
+          comparison: null,
+          comparisonLoading: true,
+          comparisonError: null,
+        });
+        try {
+          const comparison = await invokeFn<QuarterComparison>("compare_quarters", {
+            quarter1,
+            quarter2,
+          });
+          if (
+            generation === comparisonGeneration
+            && activeComparisonKey === pairKey
+          ) {
+            set({ comparison, comparisonLoading: false });
+          }
+        } catch (err) {
+          if (generation === comparisonGeneration) {
+            set({ comparisonError: String(err), comparisonLoading: false });
+          }
+        }
+      },
+
+      fetchTrends: async () => {
+        const generation = ++trendsGeneration;
+        set({ trendsLoading: true, trendsError: null });
+        try {
+          const trends = await invokeFn<QuarterlyTrends>("get_quarterly_trends");
+          if (generation === trendsGeneration) {
+            set({ trends, trendsLoading: false });
+          }
+        } catch (err) {
+          if (generation === trendsGeneration) {
+            set({ trendsError: String(err), trendsLoading: false });
+          }
+        }
+      },
+
+      fetchNotesSummaries: async () => {
+        const generation = ++notesGeneration;
+        try {
+          const notesSummaries = await invokeFn<QuarterlyNotesSummary[]>(
+            "get_quarterly_notes_history",
+          );
+          if (generation === notesGeneration) {
+            set({ notesSummaries });
+          }
+        } catch (err) {
+          console.error("fetchNotesSummaries error:", err);
+        }
+      },
+
+      updateHoldingNotes: async (snapshotId, symbol, notes) => {
+        const generation = startMutation();
+        try {
+          await invokeFn<boolean>("update_holding_notes", { snapshotId, symbol, notes });
+          if (get().detailSnapshotId === snapshotId) {
+            await get().fetchDetail(snapshotId);
+          }
+          finishMutation(generation);
+        } catch (err) {
+          finishMutation(generation, err);
+        }
+      },
+
+      updateQuarterlyNotes: async (snapshotId, notes) => {
+        const generation = startMutation();
+        try {
+          await invokeFn<boolean>("update_quarterly_notes", { snapshotId, notes });
+          if (get().detailSnapshotId === snapshotId) {
+            await get().fetchDetail(snapshotId);
+          }
+          await get().fetchSnapshots();
+          finishMutation(generation);
+        } catch (err) {
+          finishMutation(generation, err);
+          throw err;
+        }
+      },
+
+      clearDetail: () => {
+        detailGeneration += 1;
+        set({
+          detail: null,
+          detailSnapshotId: null,
+          quarterlyTransactions: [],
+          detailLoading: false,
+          detailError: null,
+        });
+      },
+
+      clearComparison: () => {
+        comparisonGeneration += 1;
+        activeComparisonKey = null;
+        set({
+          comparison: null,
+          comparisonLoading: false,
+          comparisonError: null,
+        });
+      },
+    };
+  });
+};
+
+export const useQuarterlyStore = createQuarterlyStore();

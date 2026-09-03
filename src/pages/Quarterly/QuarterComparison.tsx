@@ -29,8 +29,15 @@ function fmt(v: number) {
 export default function QuarterComparisonPage() {
   const navigate = useNavigate();
   const { pnlColorDark } = usePnlColor();
-  const { snapshots, comparison, loading, fetchSnapshots, compareQuarters, clearComparison } =
-    useQuarterlyStore();
+  const {
+    snapshots,
+    comparison,
+    listLoading,
+    comparisonLoading,
+    fetchSnapshots,
+    compareQuarters,
+    clearComparison,
+  } = useQuarterlyStore();
 
   const [q1, setQ1] = useState<string | undefined>();
   const [q2, setQ2] = useState<string | undefined>();
@@ -79,6 +86,7 @@ export default function QuarterComparisonPage() {
             options={quarterOptions}
             value={q1}
             onChange={setQ1}
+            loading={listLoading}
             placeholder="选择季度 1"
           />
           <SwapOutlined />
@@ -87,21 +95,22 @@ export default function QuarterComparisonPage() {
             options={quarterOptions}
             value={q2}
             onChange={setQ2}
+            loading={listLoading}
             placeholder="选择季度 2"
           />
-          <Button type="primary" onClick={handleCompare} loading={loading} disabled={!q1 || !q2}>
+          <Button type="primary" onClick={handleCompare} loading={comparisonLoading} disabled={!q1 || !q2}>
             开始对比
           </Button>
         </Space>
       </Card>
 
-      {loading && (
+      {comparisonLoading && (
         <div className="flex justify-center py-10">
           <Spin size="large" />
         </div>
       )}
 
-      {comparison && !loading && (
+      {comparison && !comparisonLoading && (
         <>
           {/* Overview */}
           <Row gutter={[16, 16]} className="mb-4">

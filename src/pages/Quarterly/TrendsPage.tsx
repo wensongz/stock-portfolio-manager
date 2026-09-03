@@ -10,7 +10,7 @@ const { Title, Text } = Typography;
 
 export default function TrendsPage() {
   const navigate = useNavigate();
-  const { trends, loading, fetchTrends } = useQuarterlyStore();
+  const { trends, trendsLoading, fetchTrends } = useQuarterlyStore();
   const { pnlColorDark } = usePnlColor();
 
   useEffect(() => {
@@ -32,18 +32,18 @@ export default function TrendsPage() {
             📈 多季度趋势
           </Title>
         </Space>
-        <Button icon={<ReloadOutlined />} onClick={fetchTrends} loading={loading} size="small">
+        <Button icon={<ReloadOutlined />} onClick={fetchTrends} loading={trendsLoading} size="small">
           刷新
         </Button>
       </div>
 
-      {loading && (
+      {trendsLoading && (
         <div className="flex justify-center py-10">
           <Spin size="large" />
         </div>
       )}
 
-      {trends && !loading && (
+      {trends && !trendsLoading && (
         <>
           {trends.quarters.length === 0 ? (
             <Text type="secondary">暂无季度快照数据，请先创建季度快照</Text>

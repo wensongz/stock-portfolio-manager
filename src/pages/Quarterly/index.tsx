@@ -38,13 +38,15 @@ export default function QuarterlyPage() {
   const {
     snapshots,
     missingQuarters,
-    loading,
+    listLoading,
+    mutationLoading,
     fetchSnapshots,
     fetchMissingQuarters,
     createSnapshot,
     deleteSnapshot,
     ensureCurrentQuarterSnapshot,
   } = useQuarterlyStore();
+  const loading = listLoading || mutationLoading;
 
   const [creating, setCreating] = useState(false);
 

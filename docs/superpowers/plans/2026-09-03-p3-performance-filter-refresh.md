@@ -119,7 +119,7 @@ git add src/stores/performanceStore.test.ts src/stores/performanceStore.ts src/p
 git commit -m "refactor: refresh performance filters without timers"
 ```
 
-### Task 2: Run the Complete P3 Gate
+## Final Verification (Controller)
 
 **Files:**
 - Verify: every file changed by the three P3 plans.

@@ -20,7 +20,9 @@
 
 ---
 
-### Task 1: Split Option Command Responsibilities
+### Task 1: Split Option and Performance Responsibilities
+
+#### Part A: Split Option Command Responsibilities
 
 **Files:**
 - Modify: `src-tauri/src/commands/options.rs`
@@ -133,7 +135,7 @@ CARGO_TARGET_DIR=/Users/wensongzhang/stock-portfolio-manager/src-tauri/target ca
 
 Expected: the same option tests pass and strict Clippy emits no diagnostics.
 
-### Task 2: Split Performance Service Responsibilities
+#### Part B: Split Performance Service Responsibilities
 
 **Files:**
 - Modify: `src-tauri/src/services/performance_service.rs`

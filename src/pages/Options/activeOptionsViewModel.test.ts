@@ -137,7 +137,7 @@ test("active summaries aggregate active-only net premium and expiry risk by unde
   ]);
 });
 
-test("active summaries sort by next expiry and place unknown expiries last", async () => {
+test("active summaries sort by net premium descending with missing values last", async () => {
   const { buildActiveUnderlyingSummaries } = await import(
     "./activeOptionsViewModel.ts"
   );
@@ -145,21 +145,55 @@ test("active summaries sort by next expiry and place unknown expiries last", asy
   const rows = buildActiveUnderlyingSummaries(
     [
       contract({ id: "unknown", underlying: "ZZZ", expiry_date: "unknown" }),
-      contract({ id: "later", underlying: "MSFT", expiry_date: "16OCT26" }),
-      contract({ id: "tie-b", underlying: "BABA", expiry_date: "18SEP26" }),
-      contract({ id: "tie-a", underlying: "AAPL", expiry_date: "2026-09-18" }),
+      contract({ id: "loss", underlying: "AAPL", expiry_date: "18SEP26" }),
+      contract({ id: "tie-m", underlying: "MSFT", expiry_date: "20NOV26" }),
+      contract({ id: "tie-b", underlying: "BABA", expiry_date: "16OCT26" }),
     ],
-    [],
+    [
+      review({
+        underlying: "AAPL",
+        active_campaigns: 1,
+        campaigns: [
+          campaign({
+            id: "option-review:account-id:AAPL:loss",
+            underlying: "AAPL",
+            net_premium_pnl: -50,
+          }),
+        ],
+      }),
+      review({
+        underlying: "MSFT",
+        active_campaigns: 1,
+        campaigns: [
+          campaign({
+            id: "option-review:account-id:MSFT:tie-m",
+            underlying: "MSFT",
+            net_premium_pnl: 500,
+          }),
+        ],
+      }),
+      review({
+        underlying: "BABA",
+        active_campaigns: 1,
+        campaigns: [
+          campaign({
+            id: "option-review:account-id:BABA:tie-b",
+            underlying: "BABA",
+            net_premium_pnl: 500,
+          }),
+        ],
+      }),
+    ],
     "2026-09-03",
   );
 
   assert.deepEqual(
     rows.map((row) => row.underlying),
-    ["AAPL", "BABA", "MSFT", "ZZZ"],
+    ["BABA", "MSFT", "AAPL", "ZZZ"],
   );
 });
 
-test("active selection preserves a valid symbol and otherwise uses the first expiry", async () => {
+test("active selection preserves a valid symbol and otherwise uses the first summary row", async () => {
   const { resolveActiveUnderlyingSelection } = await import(
     "./activeOptionsViewModel.ts"
   );
@@ -236,16 +270,23 @@ test("active expiry risk accepts supported formats, rejects impossible dates, an
   );
 
   assert.deepEqual(
-    rows.map(({ underlying, nextExpiryDate, expiringWithin30Days }) => ({
-      underlying,
-      nextExpiryDate,
-      expiringWithin30Days,
-    })),
+    rows
+      .map(({ underlying, nextExpiryDate, expiringWithin30Days }) => ({
+        underlying,
+        nextExpiryDate,
+        expiringWithin30Days,
+      }))
+      .sort((left, right) => left.underlying.localeCompare(right.underlying)),
     [
       {
         underlying: "AAPL",
         nextExpiryDate: "2026-09-03",
         expiringWithin30Days: 1,
+      },
+      {
+        underlying: "MIX",
+        nextExpiryDate: null,
+        expiringWithin30Days: 0,
       },
       {
         underlying: "MSFT",
@@ -255,11 +296,6 @@ test("active expiry risk accepts supported formats, rejects impossible dates, an
       {
         underlying: "NVDA",
         nextExpiryDate: "2026-10-04",
-        expiringWithin30Days: 0,
-      },
-      {
-        underlying: "MIX",
-        nextExpiryDate: null,
         expiringWithin30Days: 0,
       },
       {

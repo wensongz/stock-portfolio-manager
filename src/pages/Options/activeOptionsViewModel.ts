@@ -141,10 +141,10 @@ export function buildActiveUnderlyingSummaries(
       }).length,
     };
   }).sort((left, right) => {
-    if (left.nextExpiryDate == null && right.nextExpiryDate != null) return 1;
-    if (left.nextExpiryDate != null && right.nextExpiryDate == null) return -1;
+    if (left.netPremium == null && right.netPremium != null) return 1;
+    if (left.netPremium != null && right.netPremium == null) return -1;
     return (
-      (left.nextExpiryDate ?? "").localeCompare(right.nextExpiryDate ?? "") ||
+      (right.netPremium ?? 0) - (left.netPremium ?? 0) ||
       left.underlying.localeCompare(right.underlying)
     );
   });

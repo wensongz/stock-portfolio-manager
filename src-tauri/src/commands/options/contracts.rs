@@ -117,8 +117,17 @@ pub(super) fn recompute_option_statuses_in(
     Ok(())
 }
 
+pub(super) fn delete_option_records_inner(db: &Database, account_id: &str) -> Result<(), String> {
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM option_records WHERE account_id = ?1",
+        rusqlite::params![account_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Get all option contracts for an account, paired by option_symbol
-#[tauri::command(rename_all = "camelCase")]
 pub fn get_option_contracts_inner(
     db: &Database,
     account_id: &str,

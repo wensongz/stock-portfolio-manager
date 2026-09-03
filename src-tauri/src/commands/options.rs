@@ -50,13 +50,7 @@ pub fn simulate_sell_call(
 
 #[tauri::command(rename_all = "camelCase")]
 pub fn delete_option_records(db: State<Database>, account_id: String) -> Result<(), String> {
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "DELETE FROM option_records WHERE account_id = ?1",
-        rusqlite::params![account_id],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    contracts::delete_option_records_inner(&db, &account_id)
 }
 
 #[tauri::command(rename_all = "camelCase")]

@@ -39,7 +39,11 @@ pub fn create_alert(
 }
 
 pub fn get_alerts(db: &Database) -> Result<Vec<PriceAlert>, String> {
-    let conn = db.conn.lock().unwrap();
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    load_alerts(&conn)
+}
+
+fn load_alerts(conn: &rusqlite::Connection) -> Result<Vec<PriceAlert>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, holding_id, symbol, name, market, alert_type, threshold,
@@ -124,11 +128,11 @@ pub fn check_alerts(
     db: &Database,
     quotes: &std::collections::HashMap<String, (f64, f64, f64)>,
 ) -> Result<Vec<TriggeredAlert>, String> {
-    let alerts = get_alerts(db)?;
+    let mut conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let transaction = conn.transaction().map_err(|e| e.to_string())?;
+    let alerts = load_alerts(&transaction)?;
     let now = Utc::now().to_rfc3339();
     let mut triggered = Vec::new();
-
-    let conn = db.conn.lock().unwrap();
 
     for alert in alerts {
         if !alert.is_active || alert.is_triggered {
@@ -191,10 +195,12 @@ pub fn check_alerts(
         };
 
         if condition_met {
-            let _ = conn.execute(
-                "UPDATE price_alerts SET is_triggered = 1, triggered_at = ?1 WHERE id = ?2",
-                rusqlite::params![now, alert.id],
-            );
+            transaction
+                .execute(
+                    "UPDATE price_alerts SET is_triggered = 1, triggered_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now, alert.id],
+                )
+                .map_err(|e| e.to_string())?;
 
             triggered.push(TriggeredAlert {
                 alert: PriceAlert {
@@ -208,5 +214,58 @@ pub fn check_alerts(
         }
     }
 
+    transaction.commit().map_err(|e| e.to_string())?;
     Ok(triggered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn seeded_alert_db() -> Database {
+        let db = Database::new(":memory:").unwrap();
+        let conn = db.conn.lock().unwrap();
+        conn.execute_batch(
+            "INSERT INTO price_alerts
+                 (id, holding_id, symbol, name, market, alert_type, threshold,
+                  is_active, is_triggered, triggered_at, created_at)
+             VALUES
+                 ('first', NULL, 'FIRST', 'First', 'US', 'PRICE_ABOVE', 1,
+                  1, 0, NULL, '2026-09-03T02:00:00Z'),
+                 ('second', NULL, 'SECOND', 'Second', 'US', 'PRICE_ABOVE', 1,
+                  1, 0, NULL, '2026-09-03T01:00:00Z');
+             CREATE TRIGGER fail_second_alert_update
+             BEFORE UPDATE OF is_triggered ON price_alerts
+             WHEN OLD.id = 'second'
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced alert update failure');
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+        db
+    }
+
+    #[test]
+    fn alert_update_failure_rolls_back_every_triggered_status() {
+        let db = seeded_alert_db();
+        let quotes = HashMap::from([
+            ("FIRST".to_string(), (2.0, 0.0, 0.0)),
+            ("SECOND".to_string(), (2.0, 0.0, 0.0)),
+        ]);
+
+        let error = check_alerts(&db, &quotes).unwrap_err();
+        assert!(error.contains("forced alert update failure"), "{error}");
+
+        let conn = db.conn.lock().unwrap();
+        let statuses = conn
+            .prepare("SELECT is_triggered FROM price_alerts ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i32>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(statuses, vec![0, 0]);
+    }
 }

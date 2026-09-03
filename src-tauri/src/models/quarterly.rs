@@ -138,16 +138,6 @@ pub struct HoldingNoteHistory {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct QuarterlyNotesSummary {
-    pub snapshot_id: String,
-    pub quarter: String,
-    pub snapshot_date: String,
-    pub overall_notes: String,
-    pub total_value: f64,
-    pub total_pnl: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct QuarterlyTrends {
     pub quarters: Vec<String>,
     pub total_values: Vec<f64>,

@@ -518,15 +518,6 @@ export interface HoldingNoteHistory {
   notes: string;
 }
 
-export interface QuarterlyNotesSummary {
-  snapshot_id: string;
-  quarter: string;
-  snapshot_date: string;
-  overall_notes: string;
-  total_value: number;
-  total_pnl: number;
-}
-
 export interface QuarterlyTrends {
   quarters: string[];
   total_values: number[];
@@ -607,12 +598,6 @@ export interface PriceAlert {
   is_triggered: boolean;
   triggered_at: string | null;
   created_at: string;
-}
-
-export interface TriggeredAlert {
-  alert: PriceAlert;
-  current_value: number;
-  message: string;
 }
 
 export interface OptionReviewReport {

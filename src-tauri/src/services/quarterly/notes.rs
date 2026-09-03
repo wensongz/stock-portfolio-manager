@@ -69,32 +69,3 @@ pub fn update_quarterly_notes(
         .map_err(|e| e.to_string())?;
     Ok(rows > 0)
 }
-
-/// Get a list of all quarterly notes summaries.
-pub fn get_quarterly_notes_history(db: &Database) -> Result<Vec<QuarterlyNotesSummary>, String> {
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, quarter, snapshot_date, COALESCE(overall_notes, ''), total_value, total_pnl
-             FROM quarterly_snapshots
-             ORDER BY quarter DESC",
-        )
-        .map_err(|e| e.to_string())?;
-
-    let summaries = stmt
-        .query_map([], |row| {
-            Ok(QuarterlyNotesSummary {
-                snapshot_id: row.get(0)?,
-                quarter: row.get(1)?,
-                snapshot_date: row.get(2)?,
-                overall_notes: row.get(3)?,
-                total_value: row.get(4)?,
-                total_pnl: row.get(5)?,
-            })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-
-    Ok(summaries)
-}

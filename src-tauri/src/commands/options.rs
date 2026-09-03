@@ -1,7 +1,7 @@
 use crate::db::Database;
 use crate::models::option::{
-    CallContractSimulation, ExpiredOptionStats, OptionContract, OptionRecord,
-    PutContractSimulation, SellCallSimulation, SellPutSimulation,
+    CallContractSimulation, OptionContract, OptionRecord, PutContractSimulation,
+    SellCallSimulation, SellPutSimulation,
 };
 use crate::services::option_matching::{match_options_fifo, MatchRecord, SplitRecord};
 use tauri::State;
@@ -498,39 +498,6 @@ pub fn get_option_contracts(
     account_id: String,
 ) -> Result<Vec<OptionContract>, String> {
     get_option_contracts_inner(&db, &account_id)
-}
-
-/// Get statistics for expired options
-#[tauri::command(rename_all = "camelCase")]
-pub fn get_expired_option_stats(
-    db: State<Database>,
-    account_id: String,
-) -> Result<ExpiredOptionStats, String> {
-    let contracts = get_option_contracts_inner(&db, &account_id)?;
-
-    let expired: Vec<&OptionContract> = contracts.iter().filter(|c| c.status != "active").collect();
-    let total = expired.len() as i64;
-    let assigned = expired
-        .iter()
-        .filter(|c| c.close_code.as_deref() == Some("A;C"))
-        .count() as i64;
-    let expired_count = expired
-        .iter()
-        .filter(|c| c.close_code.as_deref() == Some("C;Ep"))
-        .count() as i64;
-
-    let ratio = if total > 0 {
-        assigned as f64 / total as f64
-    } else {
-        0.0
-    };
-
-    Ok(ExpiredOptionStats {
-        total_contracts: total,
-        assigned_contracts: assigned,
-        expired_contracts: expired_count,
-        assignment_ratio: ratio,
-    })
 }
 
 /// Simulate sell put assignments given stock prices

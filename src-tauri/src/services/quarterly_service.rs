@@ -1,8 +1,8 @@
 use crate::db::Database;
 use crate::models::quarterly::{
     CategoryComparison, ComparisonOverview, HoldingChangeItem, HoldingChanges, HoldingNoteHistory,
-    MarketComparison, QuarterComparison, QuarterlyHoldingSnapshot, QuarterlyNotesSummary,
-    QuarterlySnapshot, QuarterlySnapshotDetail, QuarterlyTrends, StockTransactionGroup,
+    MarketComparison, QuarterComparison, QuarterlyHoldingSnapshot, QuarterlySnapshot,
+    QuarterlySnapshotDetail, QuarterlyTrends, StockTransactionGroup,
 };
 use crate::models::transaction::Transaction;
 use crate::services::exchange_rate_service::ExchangeRateCache;
@@ -28,10 +28,7 @@ use comparison::load_holdings_for_quarter_from_snapshot;
 pub use dates::{
     date_to_quarter, parse_quarter, previous_quarter, quarter_end_date, quarter_start_date,
 };
-pub use notes::{
-    get_holding_notes_history, get_quarterly_notes_history, update_holding_notes,
-    update_quarterly_notes,
-};
+pub use notes::{get_holding_notes_history, update_holding_notes, update_quarterly_notes};
 pub use transactions::get_quarterly_transactions;
 pub use trends::get_quarterly_trends;
 

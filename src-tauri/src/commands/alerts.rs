@@ -1,7 +1,6 @@
 use crate::db::Database;
-use crate::models::alert::{PriceAlert, TriggeredAlert};
+use crate::models::alert::PriceAlert;
 use crate::services::alert_service;
-use std::collections::HashMap;
 use tauri::State;
 
 #[tauri::command(rename_all = "camelCase")]
@@ -34,26 +33,4 @@ pub async fn update_alert(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn delete_alert(db: State<'_, Database>, id: String) -> Result<bool, String> {
     alert_service::delete_alert(&db, &id)
-}
-
-/// quotes_json: JSON object { symbol: [price, change_percent, pnl_percent] }
-#[tauri::command(rename_all = "camelCase")]
-pub async fn check_alerts(
-    db: State<'_, Database>,
-    quotes_json: serde_json::Value,
-) -> Result<Vec<TriggeredAlert>, String> {
-    let mut quotes: HashMap<String, (f64, f64, f64)> = HashMap::new();
-
-    if let Some(obj) = quotes_json.as_object() {
-        for (symbol, arr) in obj {
-            if let Some(arr) = arr.as_array() {
-                let price = arr.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let change = arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let pnl = arr.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                quotes.insert(symbol.clone(), (price, change, pnl));
-            }
-        }
-    }
-
-    alert_service::check_alerts(&db, &quotes)
 }

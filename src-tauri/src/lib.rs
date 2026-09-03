@@ -265,7 +265,6 @@ pub fn run() {
             commands::quarterly::update_holding_notes,
             commands::quarterly::get_holding_notes_history,
             commands::quarterly::update_quarterly_notes,
-            commands::quarterly::get_quarterly_notes_history,
             commands::quarterly::get_quarterly_trends,
             commands::quarterly::get_quarterly_transactions,
             // Phase 6: Import/Export
@@ -279,7 +278,6 @@ pub fn run() {
             commands::alerts::get_alerts,
             commands::alerts::update_alert,
             commands::alerts::delete_alert,
-            commands::alerts::check_alerts,
             // Phase 6: Review
             commands::review::get_stock_operation_review,
             // Phase 6: AI Config
@@ -320,7 +318,6 @@ pub fn run() {
             // Options Management
             commands::options::import_options_csv,
             commands::options::get_option_contracts,
-            commands::options::get_expired_option_stats,
             commands::options::simulate_sell_put,
             commands::options::simulate_sell_call,
             commands::options::delete_option_records,

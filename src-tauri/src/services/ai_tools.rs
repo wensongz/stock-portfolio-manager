@@ -1235,7 +1235,10 @@ async fn tool_check_alerts(ctx: &ToolCtx<'_>) -> ToolResult {
             quote_map.insert(a.symbol.clone(), (q.current_price, q.change_percent, 0.0));
         }
     }
-    let triggered = alert_service::check_alerts(ctx.db, &quote_map).unwrap_or_default();
+    let triggered = match alert_service::check_alerts(ctx.db, &quote_map) {
+        Ok(triggered) => triggered,
+        Err(e) => return ToolResult::err_json(format!("检查价格提醒失败：{e}")),
+    };
     ToolResult::ok_json(json!({
         "total_alerts": alerts.len(),
         "alerts": alerts,
@@ -1432,6 +1435,43 @@ async fn tool_stock_review(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn alert_check_update_failure_is_an_explicit_tool_error() {
+        let db = Database::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO price_alerts
+                     (id, holding_id, symbol, name, market, alert_type, threshold,
+                      is_active, is_triggered, triggered_at, created_at)
+                 VALUES ('broken', NULL, 'AAPL', 'Apple', 'US', 'PRICE_ABOVE', 1,
+                         1, 0, NULL, '2026-09-03T01:00:00Z');
+                 CREATE TRIGGER fail_alert_tool_update
+                 BEFORE UPDATE OF is_triggered ON price_alerts
+                 WHEN OLD.id = 'broken'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced alert tool failure');
+                 END;",
+            )
+            .unwrap();
+        }
+        let cache = ExchangeRateCache::new();
+        let quote_cache = QuoteCache::new();
+        quote_cache.set(crate::models::StockQuote {
+            symbol: "AAPL".to_string(),
+            current_price: 2.0,
+            ..Default::default()
+        });
+        let quote_state = QuoteServiceState::new();
+        let ctx =
+            ToolCtx::for_untrusted_model_turn(&db, &cache, &quote_cache, &quote_state, "untrusted");
+
+        let result = execute_tool(&ctx, "check_price_alerts", "{}").await;
+
+        assert!(!result.ok, "{}", result.content);
+        assert!(result.content.contains("forced alert tool failure"));
+    }
 
     #[test]
     fn dashboard_tool_turns_unavailable_rates_into_explicit_error_data() {

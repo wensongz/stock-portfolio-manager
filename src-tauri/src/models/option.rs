@@ -42,15 +42,6 @@ pub struct OptionContract {
     pub account_id: String,
 }
 
-/// Statistics for expired options
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ExpiredOptionStats {
-    pub total_contracts: i64,
-    pub assigned_contracts: i64,
-    pub expired_contracts: i64,
-    pub assignment_ratio: f64,
-}
-
 /// Sell Put simulation result per stock
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SellPutSimulation {

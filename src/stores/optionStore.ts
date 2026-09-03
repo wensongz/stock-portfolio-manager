@@ -2,7 +2,6 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   OptionContract,
-  ExpiredOptionStats,
   SellPutSimulation,
   SellCallSimulation,
   ImportOptionsResult,
@@ -11,14 +10,12 @@ import type {
 
 interface OptionState {
   contracts: OptionContract[];
-  expiredStats: ExpiredOptionStats | null;
   putSimulations: SellPutSimulation[];
   callSimulations: SellCallSimulation[];
   loading: boolean;
   error: string | null;
 
   fetchContracts: (accountId: string) => Promise<void>;
-  fetchExpiredStats: (accountId: string) => Promise<void>;
   importOptionsCsv: (accountId: string, csvContent: string) => Promise<ImportOptionsResult>;
   simulateSellPut: (accountId: string, stockPrices: StockPriceInput[]) => Promise<void>;
   simulateSellCall: (accountId: string, stockPrices: StockPriceInput[]) => Promise<void>;
@@ -30,7 +27,6 @@ let latestContractsRequest = 0;
 
 export const useOptionStore = create<OptionState>((set) => ({
   contracts: [],
-  expiredStats: null,
   putSimulations: [],
   callSimulations: [],
   loading: false,
@@ -50,17 +46,6 @@ export const useOptionStore = create<OptionState>((set) => ({
       if (requestId === latestContractsRequest) {
         set({ error: String(err), loading: false });
       }
-    }
-  },
-
-  fetchExpiredStats: async (accountId: string) => {
-    try {
-      const stats = await invoke<ExpiredOptionStats>("get_expired_option_stats", {
-        accountId,
-      });
-      set({ expiredStats: stats });
-    } catch (err) {
-      set({ error: String(err) });
     }
   },
 
@@ -100,7 +85,7 @@ export const useOptionStore = create<OptionState>((set) => ({
     const requestId = ++latestContractsRequest;
     await invoke("delete_option_records", { accountId });
     if (requestId === latestContractsRequest) {
-      set({ contracts: [], expiredStats: null, putSimulations: [], callSimulations: [] });
+      set({ contracts: [], putSimulations: [], callSimulations: [] });
     }
   },
 

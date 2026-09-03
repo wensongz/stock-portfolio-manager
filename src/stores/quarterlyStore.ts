@@ -2,7 +2,6 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   QuarterComparison,
-  QuarterlyNotesSummary,
   QuarterlySnapshot,
   QuarterlySnapshotDetail,
   QuarterlyTrends,
@@ -20,7 +19,6 @@ export interface QuarterlyState {
   detailSnapshotId: string | null;
   comparison: QuarterComparison | null;
   trends: QuarterlyTrends | null;
-  notesSummaries: QuarterlyNotesSummary[];
   missingQuarters: string[];
   quarterlyTransactions: StockTransactionGroup[];
 
@@ -44,7 +42,6 @@ export interface QuarterlyState {
   ensureCurrentQuarterSnapshot: () => Promise<QuarterlySnapshot | null>;
   compareQuarters: (quarter1: string, quarter2: string) => Promise<void>;
   fetchTrends: () => Promise<void>;
-  fetchNotesSummaries: () => Promise<void>;
   updateHoldingNotes: (snapshotId: string, symbol: string, notes: string) => Promise<void>;
   updateQuarterlyNotes: (snapshotId: string, notes: string) => Promise<void>;
   clearDetail: () => void;
@@ -57,7 +54,6 @@ export const createQuarterlyStore = (invokeFn: QuarterlyInvoke = invoke) => {
   let comparisonGeneration = 0;
   let trendsGeneration = 0;
   let missingGeneration = 0;
-  let notesGeneration = 0;
   let mutationGeneration = 0;
   let activeComparisonKey: string | null = null;
 
@@ -123,7 +119,6 @@ export const createQuarterlyStore = (invokeFn: QuarterlyInvoke = invoke) => {
       detailSnapshotId: null,
       comparison: null,
       trends: null,
-      notesSummaries: [],
       missingQuarters: [],
       quarterlyTransactions: [],
 
@@ -259,20 +254,6 @@ export const createQuarterlyStore = (invokeFn: QuarterlyInvoke = invoke) => {
           if (generation === trendsGeneration) {
             set({ trendsError: String(err), trendsLoading: false });
           }
-        }
-      },
-
-      fetchNotesSummaries: async () => {
-        const generation = ++notesGeneration;
-        try {
-          const notesSummaries = await invokeFn<QuarterlyNotesSummary[]>(
-            "get_quarterly_notes_history",
-          );
-          if (generation === notesGeneration) {
-            set({ notesSummaries });
-          }
-        } catch (err) {
-          console.error("fetchNotesSummaries error:", err);
         }
       },
 

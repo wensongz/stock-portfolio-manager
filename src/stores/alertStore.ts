@@ -1,10 +1,9 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
-import type { PriceAlert, TriggeredAlert } from "../types";
+import type { PriceAlert } from "../types";
 
 interface AlertState {
   alerts: PriceAlert[];
-  triggeredAlerts: TriggeredAlert[];
   loading: boolean;
   error: string | null;
 
@@ -19,13 +18,10 @@ interface AlertState {
   ) => Promise<PriceAlert | null>;
   updateAlert: (id: string, isActive: boolean) => Promise<void>;
   deleteAlert: (id: string) => Promise<void>;
-  checkAlerts: (quotesJson: Record<string, [number, number, number]>) => Promise<TriggeredAlert[]>;
-  clearTriggered: () => void;
 }
 
 export const useAlertStore = create<AlertState>((set, get) => ({
   alerts: [],
-  triggeredAlerts: [],
   loading: false,
   error: null,
 
@@ -77,16 +73,4 @@ export const useAlertStore = create<AlertState>((set, get) => ({
     }
   },
 
-  checkAlerts: async (quotesJson) => {
-    try {
-      const triggered = await invoke<TriggeredAlert[]>("check_alerts", { quotesJson });
-      set({ triggeredAlerts: triggered });
-      return triggered;
-    } catch (err) {
-      console.error("checkAlerts error:", err);
-      return [];
-    }
-  },
-
-  clearTriggered: () => set({ triggeredAlerts: [] }),
 }));

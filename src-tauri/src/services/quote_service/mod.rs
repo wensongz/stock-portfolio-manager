@@ -12,15 +12,19 @@ mod yahoo;
 
 use cache::deduplicate_symbols;
 pub use cache::{fetch_quotes_batch_cached_with_providers, QuoteCache};
+#[cfg(test)]
+use eastmoney::{
+    build_eastmoney_batch_url, parse_eastmoney_batch_body, parse_eastmoney_body,
+    parse_eastmoney_quote, to_eastmoney_hk_secid, to_eastmoney_secid, to_eastmoney_us_secid,
+    EastMoneyData, EastMoneyResponse,
+};
 pub use eastmoney::{
     fetch_candles_eastmoney, fetch_index_quote_eastmoney, fetch_stock_history_eastmoney,
     resolve_index_secid,
 };
-use eastmoney::{fetch_eastmoney_cn_quote, fetch_eastmoney_hk_quote, fetch_eastmoney_us_quote};
-#[cfg(test)]
 use eastmoney::{
-    parse_eastmoney_body, parse_eastmoney_quote, to_eastmoney_hk_secid, to_eastmoney_secid,
-    to_eastmoney_us_secid, EastMoneyData, EastMoneyResponse,
+    fetch_eastmoney_cn_quote, fetch_eastmoney_hk_quote, fetch_eastmoney_quotes_batch,
+    fetch_eastmoney_us_quote, plan_eastmoney_quote_batches,
 };
 pub use financials::fetch_financial_statements;
 pub use history::{fetch_stock_candles, fetch_stock_history};
@@ -383,8 +387,45 @@ async fn fetch_quote_after_xueqiu_failure(
     Ok(quote)
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct QuoteProviderRequestPlan {
+    cash_symbols: Vec<(String, String)>,
+    xueqiu_symbols: Vec<(String, String)>,
+    eastmoney_symbols: Vec<(String, String)>,
+    other_symbols: Vec<(String, String)>,
+}
+
+fn plan_quote_provider_requests(
+    symbols: &[(String, String)],
+    us_provider: &str,
+    hk_provider: &str,
+    cn_provider: &str,
+) -> QuoteProviderRequestPlan {
+    let mut plan = QuoteProviderRequestPlan::default();
+    for (symbol, market) in symbols {
+        if is_cash_symbol(symbol) {
+            plan.cash_symbols.push((symbol.clone(), market.clone()));
+            continue;
+        }
+        let provider = match market.as_str() {
+            "US" => us_provider,
+            "HK" => hk_provider,
+            "CN" => cn_provider,
+            _ => "",
+        };
+        match provider {
+            "xueqiu" => plan.xueqiu_symbols.push((symbol.clone(), market.clone())),
+            "eastmoney" => plan
+                .eastmoney_symbols
+                .push((symbol.clone(), market.clone())),
+            _ => plan.other_symbols.push((symbol.clone(), market.clone())),
+        }
+    }
+    plan
+}
+
 /// Batch fetch quotes using the specified providers for US, HK and CN markets.
-/// All symbols configured for Xueqiu are combined into multi-symbol realtime
+/// Symbols configured for Xueqiu or EastMoney are combined into multi-symbol
 /// requests. Cash symbols return synthetic quotes (price = 1.0), and duplicate
 /// symbols are fetched only once.
 pub async fn fetch_quotes_batch_with_providers(
@@ -398,29 +439,16 @@ pub async fn fetch_quotes_batch_with_providers(
     let mut quotes = Vec::new();
     let mut warning = None;
     let mut did_refresh = false;
-    let mut xueqiu_symbols = Vec::new();
-    let mut other_symbols = Vec::new();
+    let provider_plan =
+        plan_quote_provider_requests(&unique_symbols, us_provider, hk_provider, cn_provider);
 
-    for (symbol, market) in &unique_symbols {
-        if is_cash_symbol(symbol) {
-            quotes.push(make_cash_quote(symbol, market));
-            continue;
-        }
-        let uses_xueqiu = match market.as_str() {
-            "CN" => cn_provider == "xueqiu",
-            "HK" => hk_provider == "xueqiu",
-            "US" => us_provider == "xueqiu",
-            _ => false,
-        };
-        if uses_xueqiu {
-            xueqiu_symbols.push((symbol.clone(), market.clone()));
-        } else {
-            other_symbols.push((symbol.clone(), market.clone()));
-        }
+    for (symbol, market) in &provider_plan.cash_symbols {
+        quotes.push(make_cash_quote(symbol, market));
     }
 
-    // Fetch non-Xueqiu providers with their existing per-symbol behaviour.
-    for (symbol, market) in other_symbols {
+    // Providers without a multi-symbol endpoint keep their existing
+    // per-symbol behaviour.
+    for (symbol, market) in provider_plan.other_symbols {
         let result = match market.as_str() {
             "US" => fetch_us_quote_with_provider(state, &symbol, us_provider).await,
             "HK" => fetch_hk_quote_with_provider(state, &symbol, hk_provider).await,
@@ -444,14 +472,15 @@ pub async fn fetch_quotes_batch_with_providers(
     // A normal portfolio fits in one request; larger portfolios are split at
     // the conservative URL-size boundary. Invalid or missing symbols use the
     // same EastMoney/Yahoo fallback chain as the former single-quote path.
-    let (batches, mut fallback_symbols) = plan_xueqiu_realtime_batches(&xueqiu_symbols);
-    if !fallback_symbols.is_empty() {
+    let (xueqiu_batches, mut xueqiu_fallback_symbols) =
+        plan_xueqiu_realtime_batches(&provider_plan.xueqiu_symbols);
+    if !xueqiu_fallback_symbols.is_empty() {
         merge_quote_warning(
             &mut warning,
             quote_warning_for_error("Xueqiu realtime symbol normalization failed"),
         );
     }
-    for batch in batches {
+    for batch in xueqiu_batches {
         match fetch_xueqiu_realtime_batch(state, &batch).await {
             Ok(batch_quotes) => {
                 let fetched: std::collections::HashSet<&str> = batch_quotes
@@ -471,7 +500,7 @@ pub async fn fetch_quotes_batch_with_providers(
                     for (symbol, market) in original_symbols {
                         if !fetched.contains(symbol.as_str()) {
                             response_omitted_symbol = true;
-                            fallback_symbols.push((symbol.clone(), market.clone()));
+                            xueqiu_fallback_symbols.push((symbol.clone(), market.clone()));
                         }
                     }
                 }
@@ -488,21 +517,94 @@ pub async fn fetch_quotes_batch_with_providers(
                 warn!("Xueqiu realtime batch failed: {}", error);
                 merge_quote_warning(&mut warning, quote_warning_for_error(&error));
                 for request_symbol in batch {
-                    fallback_symbols.push((request_symbol.original_symbol, request_symbol.market));
-                    fallback_symbols.extend(request_symbol.aliases);
+                    xueqiu_fallback_symbols
+                        .push((request_symbol.original_symbol, request_symbol.market));
+                    xueqiu_fallback_symbols.extend(request_symbol.aliases);
                 }
             }
         }
     }
 
-    for (symbol, market) in fallback_symbols {
-        match fetch_quote_after_xueqiu_failure(&symbol, &market).await {
-            Ok(quote) => {
-                did_refresh = true;
-                quotes.push(quote);
+    // EastMoney is both a selectable provider and Xueqiu's first fallback.
+    // Combining both queues ensures an unavailable Xueqiu batch does not turn
+    // into one EastMoney request per holding.
+    let after_xueqiu: std::collections::HashSet<(String, String)> =
+        xueqiu_fallback_symbols.iter().cloned().collect();
+    let mut eastmoney_symbols = provider_plan.eastmoney_symbols;
+    eastmoney_symbols.extend(xueqiu_fallback_symbols);
+    let eastmoney_symbols = deduplicate_symbols(eastmoney_symbols);
+    let (eastmoney_batches, mut per_symbol_fallback) =
+        plan_eastmoney_quote_batches(&eastmoney_symbols);
+
+    for batch in eastmoney_batches {
+        match fetch_eastmoney_quotes_batch(&batch).await {
+            Ok(batch_quotes) => {
+                let fetched: std::collections::HashSet<&str> = batch_quotes
+                    .iter()
+                    .map(|quote| quote.symbol.as_str())
+                    .collect();
+                for request_symbol in &batch {
+                    let original_symbols =
+                        std::iter::once((&request_symbol.original_symbol, &request_symbol.market))
+                            .chain(
+                                request_symbol
+                                    .aliases
+                                    .iter()
+                                    .map(|(symbol, market)| (symbol, market)),
+                            );
+                    for (symbol, market) in original_symbols {
+                        if !fetched.contains(symbol.as_str()) {
+                            per_symbol_fallback.push((symbol.clone(), market.clone()));
+                        }
+                    }
+                }
+                did_refresh |= !batch_quotes.is_empty();
+                quotes.extend(batch_quotes);
+            }
+            Err(error) => {
+                warn!("EastMoney realtime batch failed: {}", error);
+                for request_symbol in batch {
+                    per_symbol_fallback
+                        .push((request_symbol.original_symbol, request_symbol.market));
+                    per_symbol_fallback.extend(request_symbol.aliases);
+                }
+            }
+        }
+    }
+
+    // The batch endpoint can omit a symbol or return `f2 = null` for an
+    // otherwise valid instrument. Preserve the former per-symbol behaviour in
+    // those cases, including Yahoo after an earlier Xueqiu failure.
+    for (symbol, market) in deduplicate_symbols(per_symbol_fallback) {
+        if after_xueqiu.contains(&(symbol.clone(), market.clone())) {
+            match fetch_quote_after_xueqiu_failure(&symbol, &market).await {
+                Ok(quote) => {
+                    did_refresh = true;
+                    quotes.push(quote);
+                }
+                Err(error) => warn!(
+                    "failed to fetch fallback quote for {} ({}): {}",
+                    symbol, market, error
+                ),
+            }
+            continue;
+        }
+
+        let result = match market.as_str() {
+            "US" => fetch_us_quote_with_provider(state, &symbol, "eastmoney").await,
+            "HK" => fetch_hk_quote_with_provider(state, &symbol, "eastmoney").await,
+            "CN" => fetch_cn_quote_with_provider(state, &symbol, "eastmoney").await,
+            _ => Err(format!("Unknown market: {}", market)),
+        };
+        match result {
+            Ok(mut result) => {
+                restore_original_symbol(&mut result.data, &symbol);
+                merge_quote_warning(&mut warning, result.warning);
+                did_refresh |= result.did_refresh;
+                quotes.push(result.data);
             }
             Err(error) => warn!(
-                "failed to fetch fallback quote for {} ({}): {}",
+                "failed to fetch EastMoney fallback quote for {} ({}): {}",
                 symbol, market, error
             ),
         }

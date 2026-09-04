@@ -78,6 +78,181 @@ fn resolve_index_secid_handles_common_forms() {
 }
 
 #[test]
+fn eastmoney_batch_plan_maps_mixed_markets_and_probes_all_us_exchanges() {
+    let symbols = vec![
+        ("PDD".to_string(), "US".to_string()),
+        ("BRK-B".to_string(), "US".to_string()),
+        ("sh600036".to_string(), "CN".to_string()),
+        ("1211.HK".to_string(), "HK".to_string()),
+        ("bad symbol".to_string(), "US".to_string()),
+    ];
+
+    let (batches, invalid) = plan_eastmoney_quote_batches(&symbols);
+
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.len(), 4);
+    assert_eq!(
+        batch[0].api_secids,
+        vec!["105.PDD", "106.PDD", "107.PDD", "153.PDD"]
+    );
+    assert_eq!(
+        batch[1].api_secids,
+        vec!["105.BRK_B", "106.BRK_B", "107.BRK_B", "153.BRK_B"]
+    );
+    assert_eq!(batch[2].api_secids, vec!["1.600036"]);
+    assert_eq!(batch[3].api_secids, vec!["116.01211"]);
+    assert_eq!(invalid, vec![("bad symbol".to_string(), "US".to_string())]);
+}
+
+#[test]
+fn eastmoney_batch_plan_merges_normalized_aliases() {
+    let symbols = vec![
+        ("BRK-B".to_string(), "US".to_string()),
+        ("BRK.B".to_string(), "US".to_string()),
+        ("00700".to_string(), "HK".to_string()),
+        ("700.HK".to_string(), "HK".to_string()),
+    ];
+
+    let (batches, invalid) = plan_eastmoney_quote_batches(&symbols);
+
+    assert!(invalid.is_empty());
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].len(), 2);
+    assert_eq!(
+        batches[0][0].aliases,
+        vec![("BRK.B".to_string(), "US".to_string())]
+    );
+    assert_eq!(
+        batches[0][1].aliases,
+        vec![("700.HK".to_string(), "HK".to_string())]
+    );
+}
+
+#[test]
+fn eastmoney_batch_parser_maps_fields_and_skips_unusable_items() {
+    let symbols = vec![
+        ("PDD".to_string(), "US".to_string()),
+        ("BRK-B".to_string(), "US".to_string()),
+        ("sh600036".to_string(), "CN".to_string()),
+        ("1211.HK".to_string(), "HK".to_string()),
+    ];
+    let (batches, invalid) = plan_eastmoney_quote_batches(&symbols);
+    assert!(invalid.is_empty());
+
+    let body = r#"{
+        "rc": 0,
+        "data": {
+            "total": 5,
+            "diff": [
+                {"f2":81.63,"f3":-0.75,"f4":-0.62,"f5":6224107,"f8":0.44,"f12":"PDD","f13":105,"f14":"拼多多","f15":82.5,"f16":81.27,"f18":82.25,"f20":116191853193,"f23":1.77,"f115":8.67},
+                {"f2":508.13,"f3":0.57,"f4":2.89,"f5":3850190,"f8":0.27,"f12":"BRK_B","f13":106,"f14":"伯克希尔哈撒韦-B","f15":508.95,"f16":505.21,"f18":505.24,"f20":1087759054109,"f23":1.45,"f115":12.68},
+                {"f2":null,"f3":null,"f4":null,"f5":null,"f8":0.0,"f12":"600036","f13":1,"f14":"招商银行","f15":null,"f16":null,"f18":41.07,"f20":1035779058833,"f23":0.9,"f115":6.83},
+                {"f2":85.7,"f3":0.53,"f4":0.45,"f5":17224379,"f8":0.47,"f12":"01211","f13":116,"f14":"比亚迪股份","f15":86.3,"f16":85.0,"f18":85.25,"f20":781343831321,"f23":2.83,"f115":23.47},
+                {"f2":10.0,"f3":1.0,"f4":0.1,"f5":100,"f8":0.2,"f12":"UNKNOWN","f13":105,"f14":"Unknown","f15":10.1,"f16":9.9,"f18":9.9,"f20":1000,"f23":1.0,"f115":2.0}
+            ]
+        }
+    }"#;
+
+    let quotes = parse_eastmoney_batch_body(body, &batches[0]).unwrap();
+
+    assert_eq!(quotes.len(), 3);
+    assert_eq!(quotes[0].symbol, "PDD");
+    assert_eq!(quotes[0].market, "US");
+    assert_eq!(quotes[0].name, "拼多多");
+    assert_eq!(quotes[0].current_price, 81.63);
+    assert_eq!(quotes[0].previous_close, 82.25);
+    assert_eq!(quotes[0].change, -0.62);
+    assert_eq!(quotes[0].change_percent, -0.75);
+    assert_eq!(quotes[0].high, 82.5);
+    assert_eq!(quotes[0].low, 81.27);
+    assert_eq!(quotes[0].volume, 6_224_107);
+    assert_eq!(quotes[0].market_cap, Some(116_191_853_193.0));
+    assert_eq!(quotes[0].pb, Some(1.77));
+    assert_eq!(quotes[0].pe_ttm, Some(8.67));
+    assert_eq!(quotes[0].turnover_rate, Some(0.44));
+    assert_eq!(quotes[1].symbol, "BRK-B");
+    assert_eq!(quotes[2].symbol, "1211.HK");
+}
+
+#[test]
+fn eastmoney_batch_url_requests_decoded_realtime_and_fundamental_fields() {
+    let symbols = vec![
+        ("PDD".to_string(), "US".to_string()),
+        ("700.HK".to_string(), "HK".to_string()),
+    ];
+    let (batches, invalid) = plan_eastmoney_quote_batches(&symbols);
+    assert!(invalid.is_empty());
+
+    let url = build_eastmoney_batch_url(&batches[0]);
+
+    assert!(url.starts_with("https://push2delay.eastmoney.com/api/qt/ulist.np/get?"));
+    assert!(url.contains("secids=105.PDD,106.PDD,107.PDD,153.PDD,116.00700"));
+    assert!(url.contains("fields=f2,f3,f4,f5,f8,f12,f13,f14,f15,f16,f18,f20,f23,f115"));
+    assert!(url.contains("fltt=2"));
+    assert!(url.contains("invt=3"));
+}
+
+#[test]
+fn eastmoney_batch_plan_rejects_malformed_cn_and_hk_symbols() {
+    let symbols = vec![
+        ("shABCDEF".to_string(), "CN".to_string()),
+        ("not-hk.HK".to_string(), "HK".to_string()),
+        ("AAPL".to_string(), "UNKNOWN".to_string()),
+    ];
+
+    let (batches, invalid) = plan_eastmoney_quote_batches(&symbols);
+
+    assert!(batches.is_empty());
+    assert_eq!(invalid, symbols);
+}
+
+#[test]
+fn eastmoney_batch_plan_caps_expanded_secids_at_two_hundred() {
+    let symbols: Vec<(String, String)> = (0..51)
+        .map(|index| (format!("T{:03}", index), "US".to_string()))
+        .collect();
+
+    let (batches, invalid) = plan_eastmoney_quote_batches(&symbols);
+
+    assert!(invalid.is_empty());
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].len(), 50);
+    assert_eq!(
+        batches[0]
+            .iter()
+            .map(|symbol| symbol.api_secids.len())
+            .sum::<usize>(),
+        200
+    );
+    assert_eq!(batches[1].len(), 1);
+    assert_eq!(batches[1][0].api_secids.len(), 4);
+}
+
+#[test]
+fn eastmoney_batch_parser_fans_one_api_quote_out_to_aliases() {
+    let symbols = vec![
+        ("BRK-B".to_string(), "US".to_string()),
+        ("BRK.B".to_string(), "US".to_string()),
+    ];
+    let (batches, invalid) = plan_eastmoney_quote_batches(&symbols);
+    assert!(invalid.is_empty());
+    let body = r#"{
+        "rc": 0,
+        "data": {
+            "diff": [
+                {"f2":508.13,"f3":0.57,"f4":2.89,"f5":3850190,"f8":0.27,"f12":"BRK_B","f13":106,"f14":"伯克希尔哈撒韦-B","f15":508.95,"f16":505.21,"f18":505.24,"f20":1087759054109,"f23":1.45,"f115":12.68}
+            ]
+        }
+    }"#;
+
+    let quotes = parse_eastmoney_batch_body(body, &batches[0]).unwrap();
+    let returned: Vec<&str> = quotes.iter().map(|quote| quote.symbol.as_str()).collect();
+
+    assert_eq!(returned, vec!["BRK-B", "BRK.B"]);
+}
+
+#[test]
 fn xueqiu_history_count_is_inclusive_for_short_weekday_window() {
     let monday = chrono::NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
     let friday = chrono::NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
@@ -640,6 +815,35 @@ fn test_fetch_quotes_batch_with_providers_deduplicates_symbols() {
 }
 
 #[test]
+fn quote_provider_plan_routes_eastmoney_symbols_to_batch_queue() {
+    let symbols = vec![
+        ("AAPL".to_string(), "US".to_string()),
+        ("700.HK".to_string(), "HK".to_string()),
+        ("sh600036".to_string(), "CN".to_string()),
+        ("$CASH-USD".to_string(), "US".to_string()),
+    ];
+
+    let plan = plan_quote_provider_requests(&symbols, "eastmoney", "xueqiu", "yahoo");
+
+    assert_eq!(
+        plan.eastmoney_symbols,
+        vec![("AAPL".to_string(), "US".to_string())]
+    );
+    assert_eq!(
+        plan.xueqiu_symbols,
+        vec![("700.HK".to_string(), "HK".to_string())]
+    );
+    assert_eq!(
+        plan.other_symbols,
+        vec![("sh600036".to_string(), "CN".to_string())]
+    );
+    assert_eq!(
+        plan.cash_symbols,
+        vec![("$CASH-USD".to_string(), "US".to_string())]
+    );
+}
+
+#[test]
 fn test_restore_original_symbol_after_provider_normalization() {
     let mut yahoo_quote = sample_quote("BRK-B", "US");
     restore_original_symbol(&mut yahoo_quote, "BRK.B");
@@ -840,6 +1044,33 @@ async fn test_batch_fetch_cash_symbols_no_network() {
 // These tests verify that the API actually works end-to-end.
 // They are marked #[ignore] so they only run when explicitly requested
 // via `cargo test -- --ignored`.
+
+#[tokio::test]
+#[ignore]
+async fn test_integration_eastmoney_batch_public_symbols() {
+    let symbols = vec![
+        ("PDD".to_string(), "US".to_string()),
+        ("BABA".to_string(), "US".to_string()),
+        ("TCEHY".to_string(), "US".to_string()),
+        ("sh600036".to_string(), "CN".to_string()),
+        ("700.HK".to_string(), "HK".to_string()),
+    ];
+    let (batches, invalid) = plan_eastmoney_quote_batches(&symbols);
+    assert!(invalid.is_empty());
+    assert_eq!(batches.len(), 1);
+
+    let quotes = fetch_eastmoney_quotes_batch(&batches[0]).await.unwrap();
+    let returned: std::collections::HashSet<&str> =
+        quotes.iter().map(|quote| quote.symbol.as_str()).collect();
+
+    assert!(returned.contains("PDD"));
+    assert!(returned.contains("BABA"));
+    assert!(returned.contains("TCEHY"));
+    assert!(returned.contains("700.HK"));
+    for quote in quotes {
+        assert!(quote.current_price > 0.0);
+    }
+}
 
 #[tokio::test]
 #[ignore]

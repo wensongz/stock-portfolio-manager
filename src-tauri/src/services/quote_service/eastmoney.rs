@@ -58,6 +58,22 @@ pub(super) struct EastMoneyResponse {
     pub(super) data: Option<EastMoneyData>,
 }
 
+/// One portfolio symbol and the EastMoney `secid` candidates used by the
+/// batch quote endpoint. US symbols are probed across all supported US
+/// exchange namespaces because the application stores only `market = US`,
+/// not the individual listing exchange.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EastMoneyBatchRequestSymbol {
+    pub(super) original_symbol: String,
+    pub(super) market: String,
+    pub(super) api_secids: Vec<String>,
+    pub(super) aliases: Vec<(String, String)>,
+}
+
+/// Keep expanded `secid` lists below common proxy URL-size limits. A US
+/// symbol consumes four candidates, while CN and HK symbols consume one.
+const EASTMONEY_QUOTE_BATCH_MAX_SECIDS: usize = 200;
+
 /// Deserialize a numeric field that EastMoney sometimes returns as the
 /// string `"-"` (when the value doesn't exist for this instrument — e.g.
 /// market cap / P/E for a market index). Without this, serde fails the
@@ -73,6 +89,160 @@ where
         // `"-"`, `""`, or any other non-numeric string → treat as missing.
         _ => Ok(None),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct EastMoneyBatchResponse {
+    rc: Option<i32>,
+    data: Option<EastMoneyBatchData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EastMoneyBatchData {
+    diff: Option<EastMoneyBatchDiff>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EastMoneyBatchDiff {
+    List(Vec<EastMoneyBatchQuote>),
+    Map(std::collections::HashMap<String, EastMoneyBatchQuote>),
+}
+
+impl EastMoneyBatchDiff {
+    fn into_quotes(self) -> Vec<EastMoneyBatchQuote> {
+        match self {
+            Self::List(quotes) => quotes,
+            Self::Map(quotes) => quotes.into_values().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct EastMoneyBatchQuote {
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    f2: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    f3: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    f4: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    f5: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    f8: Option<f64>,
+    f12: Option<String>,
+    f13: Option<i32>,
+    f14: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    f15: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    f16: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    f18: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    f20: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    f23: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    f115: Option<f64>,
+}
+
+/// Parse a batch quote response and restore the exact symbols supplied by the
+/// caller. Items omitted by EastMoney, or present without a current price,
+/// are intentionally left out so the orchestration layer can fall back to the
+/// existing single-symbol request path.
+pub(super) fn parse_eastmoney_batch_body(
+    body: &str,
+    request_symbols: &[EastMoneyBatchRequestSymbol],
+) -> Result<Vec<StockQuote>, String> {
+    let response: EastMoneyBatchResponse = serde_json::from_str(body).map_err(|e| {
+        let preview: String = body.chars().take(EASTMONEY_RESPONSE_PREVIEW_LEN).collect();
+        format!(
+            "Failed to parse East Money batch response: {}. Response preview: {}",
+            e, preview
+        )
+    })?;
+    if response.rc.is_some_and(|rc| rc != 0) {
+        return Err(format!(
+            "East Money batch API returned rc={}",
+            response.rc.unwrap_or_default()
+        ));
+    }
+    let diff = response
+        .data
+        .and_then(|data| data.diff)
+        .ok_or_else(|| "No data from East Money batch quotes".to_string())?;
+
+    let request_by_secid: std::collections::HashMap<String, &EastMoneyBatchRequestSymbol> =
+        request_symbols
+            .iter()
+            .flat_map(|request| {
+                request
+                    .api_secids
+                    .iter()
+                    .map(move |secid| (secid.to_ascii_uppercase(), request))
+            })
+            .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut quotes = Vec::new();
+
+    for item in diff.into_quotes() {
+        let (Some(code), Some(market_id), Some(current_price)) =
+            (item.f12.as_deref(), item.f13, item.f2)
+        else {
+            continue;
+        };
+        let secid = format!("{}.{}", market_id, code).to_ascii_uppercase();
+        let Some(request) = request_by_secid.get(&secid) else {
+            continue;
+        };
+        let previous_close = item.f18.unwrap_or(0.0);
+        let change = item.f4.unwrap_or(current_price - previous_close);
+        let change_percent = item.f3.unwrap_or_else(|| {
+            if previous_close == 0.0 {
+                0.0
+            } else {
+                change / previous_close * 100.0
+            }
+        });
+        let original_symbols = std::iter::once((&request.original_symbol, &request.market)).chain(
+            request
+                .aliases
+                .iter()
+                .map(|(symbol, market)| (symbol, market)),
+        );
+        for (original_symbol, market) in original_symbols {
+            if !seen.insert(original_symbol.clone()) {
+                continue;
+            }
+            quotes.push(StockQuote {
+                symbol: original_symbol.clone(),
+                name: item
+                    .f14
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| original_symbol.clone()),
+                market: market.clone(),
+                current_price,
+                previous_close,
+                change,
+                change_percent,
+                high: item.f15.unwrap_or(0.0),
+                low: item.f16.unwrap_or(0.0),
+                volume: item.f5.unwrap_or(0.0) as i64,
+                updated_at: Utc::now().to_rfc3339(),
+                pe_ttm: item.f115,
+                pb: item.f23,
+                market_cap: item.f20,
+                dividend_yield: None,
+                eps: None,
+                roe: None,
+                turnover_rate: item.f8,
+            });
+        }
+    }
+    Ok(quotes)
 }
 
 /// Inner data of an East Money quote response.
@@ -343,6 +513,141 @@ pub(super) fn to_eastmoney_hk_secid(symbol: &str) -> Result<String, String> {
     } else {
         Err(format!("Invalid HK symbol: {}", symbol))
     }
+}
+
+fn is_safe_eastmoney_us_code(code: &str) -> bool {
+    !code.is_empty()
+        && code
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn to_eastmoney_batch_secids(symbol: &str, market: &str) -> Result<Vec<String>, String> {
+    match market {
+        "CN" => {
+            let normalized = symbol.trim().to_lowercase();
+            let code = normalized
+                .get(2..)
+                .ok_or_else(|| format!("Invalid CN symbol: {}", symbol))?;
+            if code.len() != 6 || !code.chars().all(|ch| ch.is_ascii_digit()) {
+                return Err(format!("Invalid CN symbol: {}", symbol));
+            }
+            Ok(vec![to_eastmoney_secid(&normalized)?])
+        }
+        "HK" => Ok(vec![to_eastmoney_hk_secid(symbol)?]),
+        "US" => {
+            let code = symbol.trim().to_uppercase().replace(['-', '.'], "_");
+            if !is_safe_eastmoney_us_code(&code) {
+                return Err(format!("Invalid US symbol: {}", symbol));
+            }
+            Ok([105, 106, 107, 153]
+                .into_iter()
+                .map(|market_id| format!("{}.{}", market_id, code))
+                .collect())
+        }
+        _ => Err(format!("Unknown market: {}", market)),
+    }
+}
+
+/// Normalize symbols for EastMoney's multi-symbol quote endpoint and split
+/// them by expanded `secid` count. Symbols which cannot be represented are
+/// returned for the existing per-symbol fallback path.
+pub(super) fn plan_eastmoney_quote_batches(
+    symbols: &[(String, String)],
+) -> (Vec<Vec<EastMoneyBatchRequestSymbol>>, Vec<(String, String)>) {
+    let mut planned: Vec<EastMoneyBatchRequestSymbol> = Vec::new();
+    let mut index_by_secids: std::collections::HashMap<Vec<String>, usize> =
+        std::collections::HashMap::new();
+    let mut invalid = Vec::new();
+
+    for (symbol, market) in symbols {
+        let api_secids = match to_eastmoney_batch_secids(symbol, market) {
+            Ok(secids) => secids,
+            Err(_) => {
+                invalid.push((symbol.clone(), market.clone()));
+                continue;
+            }
+        };
+        if let Some(existing_index) = index_by_secids.get(&api_secids).copied() {
+            planned[existing_index]
+                .aliases
+                .push((symbol.clone(), market.clone()));
+            continue;
+        }
+        index_by_secids.insert(api_secids.clone(), planned.len());
+        planned.push(EastMoneyBatchRequestSymbol {
+            original_symbol: symbol.clone(),
+            market: market.clone(),
+            api_secids,
+            aliases: Vec::new(),
+        });
+    }
+
+    let mut batches = Vec::new();
+    let mut current_batch = Vec::new();
+    let mut current_secid_count = 0;
+    for request_symbol in planned {
+        if !current_batch.is_empty()
+            && current_secid_count + request_symbol.api_secids.len()
+                > EASTMONEY_QUOTE_BATCH_MAX_SECIDS
+        {
+            batches.push(std::mem::take(&mut current_batch));
+            current_secid_count = 0;
+        }
+        current_secid_count += request_symbol.api_secids.len();
+        current_batch.push(request_symbol);
+    }
+    if !current_batch.is_empty() {
+        batches.push(current_batch);
+    }
+    (batches, invalid)
+}
+
+/// Build a one-shot JSON batch quote URL. `fltt=2` asks EastMoney to return
+/// decoded decimal values, so prices and percentages require no field-specific
+/// scaling in the parser.
+pub(super) fn build_eastmoney_batch_url(request_symbols: &[EastMoneyBatchRequestSymbol]) -> String {
+    let secids = request_symbols
+        .iter()
+        .flat_map(|symbol| symbol.api_secids.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "https://push2delay.eastmoney.com/api/qt/ulist.np/get?\
+         secids={secids}&\
+         fields=f2,f3,f4,f5,f8,f12,f13,f14,f15,f16,f18,f20,f23,f115&\
+         fltt=2&invt=3&ut=fa5fd1943c7b386f172d6893dbfba10b"
+    )
+}
+
+/// Fetch one planned batch from EastMoney's one-shot multi-symbol endpoint.
+pub(super) async fn fetch_eastmoney_quotes_batch(
+    request_symbols: &[EastMoneyBatchRequestSymbol],
+) -> Result<Vec<StockQuote>, String> {
+    if request_symbols.is_empty() {
+        return Ok(Vec::new());
+    }
+    let url = build_eastmoney_batch_url(request_symbols);
+    let response = send_eastmoney_request(&url, "realtime batch").await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_preview = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(EASTMONEY_RESPONSE_PREVIEW_LEN)
+            .collect::<String>();
+        return Err(format!(
+            "East Money batch API error: HTTP {}. Response: {}",
+            status, body_preview
+        ));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read East Money batch response body: {}", e))?;
+    parse_eastmoney_batch_body(&body, request_symbols)
 }
 
 /// Parse the East Money JSON response into a `StockQuote`.

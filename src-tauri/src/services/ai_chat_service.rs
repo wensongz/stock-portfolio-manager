@@ -43,6 +43,61 @@ use anthropic::chat_stream_anthropic;
 pub use context::build_portfolio_context;
 pub use title::generate_title;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PortfolioScope {
+    pub market: Option<String>,
+    pub account_id: Option<String>,
+}
+
+impl PortfolioScope {
+    pub(crate) fn matches_holding(
+        &self,
+        holding: &crate::models::dashboard::HoldingDetail,
+    ) -> bool {
+        self.market
+            .as_deref()
+            .is_none_or(|market| holding.market == market)
+            && self
+                .account_id
+                .as_deref()
+                .is_none_or(|account_id| holding.account_id == account_id)
+    }
+
+    pub(crate) fn performance_filter(&self) -> PerformanceFilter {
+        PerformanceFilter {
+            market: self.market.clone(),
+            account_id: self.account_id.clone(),
+        }
+    }
+
+    pub(crate) fn is_restricted(&self) -> bool {
+        self.market.is_some() || self.account_id.is_some()
+    }
+
+    pub(crate) fn allows_tool(&self, name: &str) -> bool {
+        if !self.is_restricted() {
+            return true;
+        }
+        matches!(
+            name,
+            "get_stock_quote"
+                | "get_price_history"
+                | "get_portfolio_overview"
+                | "get_holdings_detail"
+                | "get_performance_metrics"
+                | "search_stock"
+                | "get_return_attribution"
+                | "get_monthly_returns"
+                | "get_drawdown_analysis"
+                | "get_risk_metrics"
+                | "get_holding_ranking"
+                | "get_stock_fundamentals"
+                | "get_technical_indicators"
+                | "get_financial_statements"
+        )
+    }
+}
+
 /// Parameters for a chat turn.
 #[derive(Debug, Clone)]
 pub struct ChatParams {
@@ -60,6 +115,8 @@ pub struct ChatParams {
     pub active_skills: Vec<String>,
     /// Trusted one-turn read-tool context supplied by the host UI.
     pub tool_context: Option<PrefilledToolContext>,
+    /// Server-validated portfolio boundary derived from `tool_context`.
+    pub(crate) portfolio_scope: Option<PortfolioScope>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,34 +126,47 @@ pub struct PrefilledToolContext {
 }
 
 fn validated_prefilled_tool(context: &PrefilledToolContext) -> Result<String, String> {
-    if context.name != "get_stock_review" {
-        return Err("只允许预填只读股票复盘工具".to_string());
-    }
     let args = context
         .arguments
         .as_object()
-        .ok_or_else(|| "股票复盘工具参数必须是对象".to_string())?;
-    const ALLOWED: &[&str] = &[
-        "start_date",
-        "end_date",
-        "base_currency",
-        "account_id",
-        "market",
-        "symbol",
-    ];
-    if args.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
-        return Err("股票复盘工具参数包含未支持字段".to_string());
-    }
-    for required in ["start_date", "end_date", "base_currency"] {
-        if args
-            .get(required)
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .trim()
-            .is_empty()
-        {
-            return Err(format!("股票复盘工具缺少必填参数：{required}"));
+        .ok_or_else(|| "预填只读工具参数必须是对象".to_string())?;
+    match context.name.as_str() {
+        "get_stock_review" => {
+            const ALLOWED: &[&str] = &[
+                "start_date",
+                "end_date",
+                "base_currency",
+                "account_id",
+                "market",
+                "symbol",
+            ];
+            if args.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+                return Err("股票复盘工具参数包含未支持字段".to_string());
+            }
+            for required in ["start_date", "end_date", "base_currency"] {
+                if args
+                    .get(required)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                {
+                    return Err(format!("股票复盘工具缺少必填参数：{required}"));
+                }
+            }
         }
+        "get_portfolio_overview" => {
+            const ALLOWED: &[&str] = &["account_id", "market"];
+            if args.len() > 1 || args.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+                return Err("组合复盘范围只能指定一个市场或账户".to_string());
+            }
+            if let Some(market) = args.get("market").and_then(|value| value.as_str()) {
+                if !matches!(market, "US" | "CN" | "HK") {
+                    return Err("组合复盘市场只支持 US、CN 或 HK".to_string());
+                }
+            }
+        }
+        _ => return Err("只允许预填受信任的只读复盘工具".to_string()),
     }
     if args
         .values()
@@ -107,9 +177,34 @@ fn validated_prefilled_tool(context: &PrefilledToolContext) -> Result<String, St
     serde_json::to_string(&context.arguments).map_err(|error| error.to_string())
 }
 
+pub(crate) fn validated_portfolio_scope(
+    context: Option<&PrefilledToolContext>,
+) -> Result<Option<PortfolioScope>, String> {
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    validated_prefilled_tool(context)?;
+    if context.name != "get_portfolio_overview" {
+        return Ok(None);
+    }
+    let args = context.arguments.as_object().expect("validated object");
+    Ok(Some(PortfolioScope {
+        market: args
+            .get("market")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        account_id: args
+            .get("account_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    }))
+}
+
 #[cfg(test)]
 mod prefilled_tool_tests {
-    use super::{validated_prefilled_tool, PrefilledToolContext};
+    use super::{
+        validated_portfolio_scope, validated_prefilled_tool, PortfolioScope, PrefilledToolContext,
+    };
     use serde_json::json;
 
     #[test]
@@ -130,7 +225,7 @@ mod prefilled_tool_tests {
         assert_eq!(parsed, review.arguments);
 
         let mut wrong_tool = review.clone();
-        wrong_tool.name = "get_portfolio_overview".to_string();
+        wrong_tool.name = "get_transactions".to_string();
         assert!(validated_prefilled_tool(&wrong_tool).is_err());
 
         let mut legacy_benchmark = review.clone();
@@ -144,6 +239,63 @@ mod prefilled_tool_tests {
         let mut extra = review;
         extra.arguments["unexpected"] = json!(true);
         assert!(validated_prefilled_tool(&extra).is_err());
+    }
+
+    #[test]
+    fn accepts_only_exact_portfolio_review_scopes() {
+        let overview = PrefilledToolContext {
+            name: "get_portfolio_overview".to_string(),
+            arguments: json!({}),
+        };
+        assert_eq!(
+            validated_portfolio_scope(Some(&overview)).unwrap(),
+            Some(PortfolioScope::default())
+        );
+
+        let market = PrefilledToolContext {
+            arguments: json!({ "market": "CN" }),
+            ..overview.clone()
+        };
+        assert_eq!(
+            validated_portfolio_scope(Some(&market)).unwrap(),
+            Some(PortfolioScope {
+                market: Some("CN".to_string()),
+                account_id: None,
+            })
+        );
+        let market_scope = validated_portfolio_scope(Some(&market))
+            .unwrap()
+            .expect("market scope");
+        assert!(market_scope.allows_tool("get_holdings_detail"));
+        assert!(market_scope.allows_tool("get_stock_fundamentals"));
+        assert!(!market_scope.allows_tool("get_transactions"));
+        assert!(!market_scope.allows_tool("get_option_positions"));
+
+        let account = PrefilledToolContext {
+            arguments: json!({ "account_id": "account-a" }),
+            ..overview.clone()
+        };
+        assert_eq!(
+            validated_portfolio_scope(Some(&account)).unwrap(),
+            Some(PortfolioScope {
+                market: None,
+                account_id: Some("account-a".to_string()),
+            })
+        );
+
+        for arguments in [
+            json!({ "market": "EU" }),
+            json!({ "account_id": " " }),
+            json!({ "market": "CN", "account_id": "account-a" }),
+            json!({ "unexpected": "value" }),
+        ] {
+            let invalid = PrefilledToolContext {
+                arguments,
+                ..overview.clone()
+            };
+            assert!(validated_prefilled_tool(&invalid).is_err());
+            assert!(validated_portfolio_scope(Some(&invalid)).is_err());
+        }
     }
 }
 
@@ -875,8 +1027,8 @@ pub async fn chat_stream(
     if !skill_block.is_empty() {
         messages.push(json!({ "role": "system", "content": skill_block }));
     }
-    if params.include_context {
-        match build_portfolio_context(db, cache, quote_cache).await {
+    if params.include_context && params.portfolio_scope.is_none() {
+        match build_portfolio_context(db, cache, quote_cache, None).await {
             Ok(ctx) => {
                 messages.push(json!({
                     "role": "system",
@@ -900,7 +1052,7 @@ pub async fn chat_stream(
     // (DeepSeek-v4-flash, local Ollama) don't support function calling and
     // return empty replies when `tools` is present.
     let tools = if cfg.tools_enabled {
-        crate::services::ai_tools::tool_definitions()
+        crate::services::ai_tools::tool_definitions_for_scope(params.portfolio_scope.as_ref())
     } else {
         Vec::new()
     };
@@ -915,6 +1067,7 @@ pub async fn chat_stream(
         quote_cache,
         quote_state,
         latest_user_message(&params),
+        params.portfolio_scope.clone(),
     );
     if let Some(context) = &params.tool_context {
         let (arguments, content, _) = execute_prefilled_tool(&app, &tool_ctx, context)

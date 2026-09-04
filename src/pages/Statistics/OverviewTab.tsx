@@ -9,6 +9,7 @@ import { usePnlColor } from "../../hooks/usePnlColor";
 import { useTablePageSize } from "../../hooks/tablePageSize";
 import { statisticsViewKey, useStatisticsStore } from "../../stores/statisticsStore";
 import AccountStockTransactionsModal from "./AccountStockTransactionsModal";
+import StatisticsAiReviewButton from "./StatisticsAiReviewButton";
 
 const { Text } = Typography;
 
@@ -558,7 +559,14 @@ export default function OverviewTab({ baseCurrency }: Props) {
       {aggregatedStocks.length > 0 && (
         <Row gutter={[16, 16]} className="mt-4">
           <Col xs={24}>
-            <Card title="持仓明细">
+            <Card
+              title="持仓明细"
+              extra={(
+                <StatisticsAiReviewButton
+                  scope={{ kind: "overview", baseCurrency }}
+                />
+              )}
+            >
               <Table
                 columns={stockColumns}
                 dataSource={aggregatedStocks}

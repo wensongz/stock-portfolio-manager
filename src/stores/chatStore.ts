@@ -473,7 +473,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
                     ...(toolContext
                       ? {
                           explicitToolContext: toolContext,
-                          explicitSkillIds: ["stock-review"],
+                          explicitSkillIds: [
+                            toolContext.name === "get_stock_review"
+                              ? "stock-review"
+                              : "munger-perspective",
+                          ],
                         }
                       : {}),
                   };

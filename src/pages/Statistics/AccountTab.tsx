@@ -6,6 +6,7 @@ import { statisticsViewKey, useStatisticsStore } from "../../stores/statisticsSt
 import { useAccountStore } from "../../stores/accountStore";
 import type { AccountStatistics } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import StatisticsAiReviewButton from "./StatisticsAiReviewButton";
 
 interface Props {
   selectedAccountId: string;
@@ -29,6 +30,7 @@ export default function AccountTab({ selectedAccountId, onAccountChange }: Props
   const error = viewKey ? (errorByView[viewKey] ?? null) : null;
 
   const stats: AccountStatistics | undefined = accountStats[selectedAccountId];
+  const selectedAccount = accounts.find((account) => account.id === selectedAccountId);
   const currencyCode = stats ? (marketCurrency[stats.market]?.code ?? "USD") : "USD";
   const currencySymbol = stats ? (marketCurrency[stats.market]?.symbol ?? "$") : "$";
 
@@ -97,7 +99,18 @@ export default function AccountTab({ selectedAccountId, onAccountChange }: Props
             )}
           </Row>
 
-          <Card title="持仓明细">
+          <Card
+            title="持仓明细"
+            extra={(
+              <StatisticsAiReviewButton
+                scope={{
+                  kind: "account",
+                  accountId: selectedAccountId,
+                  accountName: selectedAccount?.name ?? selectedAccountId,
+                }}
+              />
+            )}
+          >
             <HoldingsTable holdings={stats.holdings} loading={loading} hideAccountMarket />
           </Card>
         </>

@@ -4,10 +4,11 @@ import type { ColumnsType } from "antd/es/table";
 import PieChart from "../../components/charts/PieChart";
 import StatCard from "../../components/charts/StatCard";
 import { statisticsViewKey, useStatisticsStore } from "../../stores/statisticsStore";
-import type { MarketStatistics } from "../../types";
+import type { Market, MarketStatistics } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
 import { useTablePageSize } from "../../hooks/tablePageSize";
 import AccountStockTransactionsModal from "./AccountStockTransactionsModal";
+import StatisticsAiReviewButton from "./StatisticsAiReviewButton";
 
 const { Text } = Typography;
 
@@ -486,7 +487,15 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
             )}
           </Row>
 
-          <Card title="持仓明细" className="mt-4">
+          <Card
+            title="持仓明细"
+            className="mt-4"
+            extra={(
+              <StatisticsAiReviewButton
+                scope={{ kind: "market", market: selectedMarket as Market }}
+              />
+            )}
+          >
             <Table
               columns={stockColumns}
               dataSource={aggregatedStocks}

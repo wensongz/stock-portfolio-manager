@@ -4,9 +4,22 @@ use crate::services::http_client;
 /// Strip a CN symbol's market prefix to get the bare 6-digit code.
 /// `"sh600519"` → `"600519"`; `"600519"` → `"600519"`.
 fn cn_bare_code(symbol: &str) -> String {
-    let s = symbol.to_lowercase();
-    let s = s.trim_start_matches("sh").trim_start_matches("sz");
-    s.trim_start_matches("bj").to_string()
+    let s = symbol.trim().to_ascii_lowercase();
+    let is_six_digit_code =
+        |value: &str| value.len() == 6 && value.chars().all(|character| character.is_ascii_digit());
+    if let Some(code) = ["sh", "sz", "bj"].iter().find_map(|prefix| {
+        s.strip_prefix(prefix)
+            .filter(|value| is_six_digit_code(value))
+    }) {
+        return code.to_string();
+    }
+    if let Some(code) = [".ss", ".sz"].iter().find_map(|suffix| {
+        s.strip_suffix(suffix)
+            .filter(|value| is_six_digit_code(value))
+    }) {
+        return code.to_string();
+    }
+    s
 }
 
 /// Fetch recent financial-statement periods (最近 N 期财报) from East Money's
@@ -110,4 +123,18 @@ reportName=RPT_F10_FINANCE_MAINFINADATA&columns={}&filter=(SECURITY_CODE=\"{}\")
         })
         .collect();
     Ok(reports)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cn_bare_code;
+
+    #[test]
+    fn cn_bare_code_accepts_exchange_prefixes_and_yahoo_suffixes() {
+        assert_eq!(cn_bare_code("sh600519"), "600519");
+        assert_eq!(cn_bare_code("SZ000001"), "000001");
+        assert_eq!(cn_bare_code("bj920001"), "920001");
+        assert_eq!(cn_bare_code("600519.SS"), "600519");
+        assert_eq!(cn_bare_code("000001.sz"), "000001");
+    }
 }

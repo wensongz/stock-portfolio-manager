@@ -52,6 +52,50 @@ test("reads a stock-review skill activation only from a valid prefill", () => {
   );
 });
 
+test("reads an explicitly staged Munger portfolio review skill", () => {
+  assert.equal(
+    readAiPrefillActiveSkill({
+      prefillPrompt: "请从芒格视角复盘整个投资组合",
+      prefillActiveSkill: "munger-perspective",
+      prefillAutoSend: false,
+    }),
+    "munger-perspective",
+  );
+});
+
+test("Munger portfolio review prefill accepts only one trusted holdings scope", () => {
+  const base = {
+    prefillPrompt: "请从芒格视角复盘组合",
+    prefillActiveSkill: "munger-perspective",
+    prefillAutoSend: false,
+    prefillToolName: "get_portfolio_overview",
+  };
+
+  assert.deepEqual(
+    readAiPrefillToolContext({ ...base, prefillToolArguments: {} }),
+    { name: "get_portfolio_overview", arguments: {} },
+  );
+  assert.deepEqual(
+    readAiPrefillToolContext({ ...base, prefillToolArguments: { market: "CN" } }),
+    { name: "get_portfolio_overview", arguments: { market: "CN" } },
+  );
+  assert.deepEqual(
+    readAiPrefillToolContext({ ...base, prefillToolArguments: { account_id: "account-a" } }),
+    { name: "get_portfolio_overview", arguments: { account_id: "account-a" } },
+  );
+  assert.equal(
+    readAiPrefillToolContext({
+      ...base,
+      prefillToolArguments: { market: "CN", account_id: "account-a" },
+    }),
+    null,
+  );
+  assert.equal(
+    readAiPrefillToolContext({ ...base, prefillToolArguments: { market: "EU" } }),
+    null,
+  );
+});
+
 test("stock-review prefill requests only get_stock_review without changing the visible prompt", () => {
   const portfolio = {
     prefillPrompt: "approved portfolio prompt",
@@ -152,6 +196,17 @@ test("persisted context reconstruction accepts one completed host-prefill record
   assert.deepEqual(readPersistedAiToolContext([genuineHostCall]), {
     name: "get_stock_review",
     arguments: JSON.parse(persistedArgumentsJson),
+  });
+});
+
+test("persisted context reconstruction restores a scoped Munger portfolio review", () => {
+  assert.deepEqual(readPersistedAiToolContext([{
+    ...genuineHostCall,
+    name: "get_portfolio_overview",
+    arguments: JSON.stringify({ market: "HK" }),
+  }]), {
+    name: "get_portfolio_overview",
+    arguments: { market: "HK" },
   });
 });
 

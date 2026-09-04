@@ -921,7 +921,7 @@ export interface ChatMessageWithMeta {
 }
 
 export interface AiToolContext {
-  name: "get_stock_review";
+  name: "get_stock_review" | "get_portfolio_overview";
   arguments: Record<string, string>;
 }
 

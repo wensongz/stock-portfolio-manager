@@ -18,11 +18,12 @@ export function readAiPrefillActiveSkill(state: unknown): string | null {
   if (
     readAiPrefill(state) == null ||
     candidate.prefillAutoSend !== false ||
-    candidate.prefillActiveSkill !== "stock-review"
+    (candidate.prefillActiveSkill !== "stock-review" &&
+      candidate.prefillActiveSkill !== "munger-perspective")
   ) {
     return null;
   }
-  return "stock-review";
+  return candidate.prefillActiveSkill;
 }
 
 export type AiPrefillToolContext = AiToolContext;
@@ -38,31 +39,48 @@ const STOCK_REVIEW_TOOL_ARGUMENT_KEYS = new Set([
   "symbol",
 ]);
 
+const PORTFOLIO_OVERVIEW_ARGUMENT_KEYS = new Set(["account_id", "market"]);
+
 export function readAiPrefillToolContext(state: unknown): AiPrefillToolContext | null {
   if (!state || typeof state !== "object") return null;
   const candidate = state as Record<string, unknown>;
   if (
-    readAiPrefillActiveSkill(state) !== "stock-review" ||
-    candidate.prefillToolName !== "get_stock_review" ||
     !candidate.prefillToolArguments ||
     typeof candidate.prefillToolArguments !== "object" ||
     Array.isArray(candidate.prefillToolArguments)
   ) {
     return null;
   }
+  const activeSkill = readAiPrefillActiveSkill(state);
   const args = candidate.prefillToolArguments as Record<string, unknown>;
   const keys = Object.keys(args);
+  if (activeSkill === "stock-review" && candidate.prefillToolName === "get_stock_review") {
+    if (
+      keys.some((key) => !STOCK_REVIEW_TOOL_ARGUMENT_KEYS.has(key)) ||
+      keys.some((key) => typeof args[key] !== "string" || !(args[key] as string).trim()) ||
+      typeof args.start_date !== "string" ||
+      typeof args.end_date !== "string" ||
+      !["USD", "CNY", "HKD"].includes(String(args.base_currency))
+    ) {
+      return null;
+    }
+    return {
+      name: "get_stock_review",
+      arguments: Object.fromEntries(keys.map((key) => [key, String(args[key])] )),
+    };
+  }
   if (
-    keys.some((key) => !STOCK_REVIEW_TOOL_ARGUMENT_KEYS.has(key)) ||
+    activeSkill !== "munger-perspective" ||
+    candidate.prefillToolName !== "get_portfolio_overview" ||
+    keys.length > 1 ||
+    keys.some((key) => !PORTFOLIO_OVERVIEW_ARGUMENT_KEYS.has(key)) ||
     keys.some((key) => typeof args[key] !== "string" || !(args[key] as string).trim()) ||
-    typeof args.start_date !== "string" ||
-    typeof args.end_date !== "string" ||
-    !["USD", "CNY", "HKD"].includes(String(args.base_currency))
+    ("market" in args && !["US", "CN", "HK"].includes(String(args.market)))
   ) {
     return null;
   }
   return {
-    name: "get_stock_review",
+    name: "get_portfolio_overview",
     arguments: Object.fromEntries(keys.map((key) => [key, String(args[key])] )),
   };
 }
@@ -84,7 +102,8 @@ export function readPersistedAiToolContext(
   const [persisted] = reserved;
   if (
     persisted.origin !== "host_prefill" ||
-    persisted.name !== "get_stock_review" ||
+    (persisted.name !== "get_stock_review" &&
+      persisted.name !== "get_portfolio_overview") ||
     (persisted.status !== "success" && persisted.status !== "error") ||
     typeof persisted.arguments !== "string"
   ) {
@@ -96,11 +115,12 @@ export function readPersistedAiToolContext(
   } catch {
     return null;
   }
+  const isStockReview = persisted.name === "get_stock_review";
   return readAiPrefillToolContext({
-    prefillPrompt: "persisted stock review context",
-    prefillActiveSkill: "stock-review",
+    prefillPrompt: "persisted trusted review context",
+    prefillActiveSkill: isStockReview ? "stock-review" : "munger-perspective",
     prefillAutoSend: false,
-    prefillToolName: "get_stock_review",
+    prefillToolName: persisted.name,
     prefillToolArguments: args,
   });
 }

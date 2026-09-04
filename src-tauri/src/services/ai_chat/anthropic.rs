@@ -52,8 +52,8 @@ pub(super) async fn chat_stream_anthropic(
     if !skill_block.is_empty() {
         system_parts.push(skill_block);
     }
-    if params.include_context {
-        match build_portfolio_context(db, cache, quote_cache).await {
+    if params.include_context && params.portfolio_scope.is_none() {
+        match build_portfolio_context(db, cache, quote_cache, None).await {
             Ok(ctx) => system_parts.push(format!(
                 "以下是用户的实时投资组合数据，请在回答时参考（金额单位均为 USD，数据可能略有延迟）：\n\n{ctx}"
             )),
@@ -72,7 +72,9 @@ pub(super) async fn chat_stream_anthropic(
     }
 
     let tools = if cfg.tools_enabled {
-        anthropic_tool_definitions(&crate::services::ai_tools::tool_definitions())
+        anthropic_tool_definitions(&crate::services::ai_tools::tool_definitions_for_scope(
+            params.portfolio_scope.as_ref(),
+        ))
     } else {
         Vec::new()
     };
@@ -83,6 +85,7 @@ pub(super) async fn chat_stream_anthropic(
         quote_cache,
         quote_state,
         latest_user_message(&params),
+        params.portfolio_scope.clone(),
     );
     if let Some(context) = &params.tool_context {
         let parsed_arguments = context.arguments.clone();

@@ -130,16 +130,24 @@ pub async fn build_portfolio_context(
     db: &Database,
     cache: &ExchangeRateCache,
     quote_cache: &QuoteCache,
+    scope: Option<&PortfolioScope>,
 ) -> Result<String, String> {
     let model = PortfolioReadModel::load(db, quote_cache, None, QuoteReadMode::CacheOnly).await?;
-    let details = model.holdings();
+    let details: Vec<_> = model
+        .holdings()
+        .iter()
+        .filter(|holding| scope.is_none_or(|scope| scope.matches_holding(holding)))
+        .cloned()
+        .collect();
     let rates = get_cached_rates(cache, db).await;
-    let mut out =
-        render_holdings_context(details, rates.as_ref().map_err(std::string::String::as_str));
+    let mut out = render_holdings_context(
+        &details,
+        rates.as_ref().map_err(std::string::String::as_str),
+    );
 
     // ── Recent transactions ────────────────────────────────────────────────
     out.push_str("## 近期交易（最近 20 条）\n");
-    match fetch_recent_transactions(db, 20) {
+    match fetch_recent_transactions(db, 20, scope) {
         Ok(txns) if !txns.is_empty() => {
             out.push_str("| 日期 | 代码 | 名称 | 类型 | 持仓 | 价格 | 金额 |\n");
             out.push_str("|------|------|------|------|------|------|------|\n");
@@ -164,10 +172,9 @@ pub async fn build_portfolio_context(
     out.push_str("## 绩效指标（近 1 年）\n");
     let end = Utc::now().date_naive();
     let start = end - Duration::days(365);
-    let filter = PerformanceFilter {
-        market: None,
-        account_id: None,
-    };
+    let filter = scope
+        .map(PortfolioScope::performance_filter)
+        .unwrap_or_default();
     match performance_service::get_performance_summary(db, start, end, &filter) {
         Ok(p) if p.end_value > 0.0 || !p.return_series.is_empty() => {
             let sharpe = p
@@ -202,18 +209,26 @@ struct TxnRow {
     total_amount: f64,
 }
 
-fn fetch_recent_transactions(db: &Database, limit: usize) -> Result<Vec<TxnRow>, String> {
+fn fetch_recent_transactions(
+    db: &Database,
+    limit: usize,
+    scope: Option<&PortfolioScope>,
+) -> Result<Vec<TxnRow>, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
             "SELECT traded_at, symbol, name, transaction_type, shares, price, total_amount
              FROM transactions
+             WHERE (?1 IS NULL OR account_id = ?1)
+               AND (?2 IS NULL OR market = ?2)
              ORDER BY traded_at DESC
-             LIMIT ?1",
+             LIMIT ?3",
         )
         .map_err(|e| e.to_string())?;
+    let account_id = scope.and_then(|scope| scope.account_id.as_deref());
+    let market = scope.and_then(|scope| scope.market.as_deref());
     let rows = stmt
-        .query_map(rusqlite::params![limit as i64], |row| {
+        .query_map(rusqlite::params![account_id, market, limit as i64], |row| {
             Ok(TxnRow {
                 traded_at: row.get(0)?,
                 symbol: row.get(1)?,
@@ -264,5 +279,51 @@ mod tests {
         assert!(rendered.contains("1000.00 CNY"));
         assert!(!rendered.contains("总市值："));
         assert!(!rendered.contains("市值(USD)"));
+    }
+
+    #[test]
+    fn portfolio_scope_matches_only_the_selected_market_or_account() {
+        let holding = HoldingDetail {
+            id: "holding".to_string(),
+            account_id: "account-a".to_string(),
+            account_name: "长期账户".to_string(),
+            symbol: "600000".to_string(),
+            name: "浦发银行".to_string(),
+            market: "CN".to_string(),
+            category_name: "分红股".to_string(),
+            category_color: "#fff".to_string(),
+            shares: 100.0,
+            avg_cost: 9.0,
+            current_price: 10.0,
+            market_value: 1000.0,
+            cost_value: 900.0,
+            pnl: 100.0,
+            pnl_percent: Some(11.11),
+            daily_pnl: 20.0,
+            currency: "CNY".to_string(),
+            market_value_usd: 0.0,
+        };
+
+        assert!(PortfolioScope::default().matches_holding(&holding));
+        assert!(PortfolioScope {
+            market: Some("CN".to_string()),
+            account_id: None,
+        }
+        .matches_holding(&holding));
+        assert!(!PortfolioScope {
+            market: Some("US".to_string()),
+            account_id: None,
+        }
+        .matches_holding(&holding));
+        assert!(PortfolioScope {
+            market: None,
+            account_id: Some("account-a".to_string()),
+        }
+        .matches_holding(&holding));
+        assert!(!PortfolioScope {
+            market: None,
+            account_id: Some("account-b".to_string()),
+        }
+        .matches_holding(&holding));
     }
 }

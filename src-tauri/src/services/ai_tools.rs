@@ -20,7 +20,7 @@ use crate::models::dashboard::DashboardSummary;
 use crate::models::option_review::OptionReviewReport;
 use crate::models::quote::ExchangeRates;
 use crate::models::stock_operation_review::StockOperationReviewQuery;
-use crate::services::ai_chat_service::build_portfolio_context;
+use crate::services::ai_chat_service::{build_portfolio_context, PortfolioScope};
 use crate::services::alert_service;
 use crate::services::exchange_rate_service::{
     convert_currency, get_cached_rates, ExchangeRateCache,
@@ -460,6 +460,11 @@ pub fn tool_definitions() -> Vec<Value> {
                             "type": "string",
                             "description": "A股股票代码，例如 \"SH600519\"、\"sz000001\""
                         },
+                        "market": {
+                            "type": "string",
+                            "enum": ["US", "HK", "CN"],
+                            "description": "市场：US 美股 / HK 港股 / CN A股。来自组合持仓时传持仓中的市场；不填则按代码格式推断。"
+                        },
                         "periods": {
                             "type": "integer",
                             "description": "要获取的财报期数，默认 4，最大 8。"
@@ -470,6 +475,16 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
     ]
+}
+
+pub(crate) fn tool_definitions_for_scope(scope: Option<&PortfolioScope>) -> Vec<Value> {
+    tool_definitions()
+        .into_iter()
+        .filter(|definition| {
+            let name = definition["function"]["name"].as_str().unwrap_or_default();
+            scope.is_none_or(|scope| scope.allows_tool(name))
+        })
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -483,6 +498,7 @@ pub struct ToolCtx<'a> {
     pub cache: &'a ExchangeRateCache,
     pub quote_cache: &'a QuoteCache,
     pub quote_state: &'a QuoteServiceState,
+    portfolio_scope: Option<PortfolioScope>,
 }
 
 impl<'a> ToolCtx<'a> {
@@ -493,13 +509,22 @@ impl<'a> ToolCtx<'a> {
         quote_cache: &'a QuoteCache,
         quote_state: &'a QuoteServiceState,
         _user_turn: &str,
+        portfolio_scope: Option<PortfolioScope>,
     ) -> Self {
         Self {
             db,
             cache,
             quote_cache,
             quote_state,
+            portfolio_scope,
         }
+    }
+
+    fn performance_filter(&self) -> PerformanceFilter {
+        self.portfolio_scope
+            .as_ref()
+            .map(PortfolioScope::performance_filter)
+            .unwrap_or_default()
     }
 }
 
@@ -537,6 +562,13 @@ impl ToolResult {
 /// produced (may be empty for no-arg tools). Unknown tool names return an
 /// error JSON so the model can apologise rather than the chat hanging.
 pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, arguments: &str) -> ToolResult {
+    if ctx
+        .portfolio_scope
+        .as_ref()
+        .is_some_and(|scope| !scope.allows_tool(name))
+    {
+        return ToolResult::err_json("该工具超出当前组合复盘的数据范围");
+    }
     let args: Value = if arguments.trim().is_empty() {
         json!({})
     } else {
@@ -587,10 +619,18 @@ async fn tool_market_overview(ctx: &ToolCtx<'_>) -> ToolResult {
 /// conventions used across the app (HK = `NNNN.HK`, CN A-share = `SH/`SZ` prefix
 /// or 6-digit code). Falls back to US.
 fn infer_market(symbol: &str) -> &'static str {
-    let s = symbol.trim();
-    if s.ends_with(".HK") || s.ends_with(".SS") {
+    let s = symbol.trim().to_ascii_uppercase();
+    let is_six_digit_code =
+        |value: &str| value.len() == 6 && value.chars().all(|character| character.is_ascii_digit());
+    let has_cn_prefix = ["SH", "SZ", "BJ"]
+        .iter()
+        .any(|prefix| s.strip_prefix(prefix).is_some_and(&is_six_digit_code));
+    let has_cn_suffix = [".SS", ".SZ"]
+        .iter()
+        .any(|suffix| s.strip_suffix(suffix).is_some_and(&is_six_digit_code));
+    if s.ends_with(".HK") {
         "HK"
-    } else if s.starts_with("SH") || s.starts_with("SZ") || s.starts_with("BJ") {
+    } else if has_cn_prefix || has_cn_suffix {
         "CN"
     } else if s.len() == 5 && s.chars().all(|c| c.is_ascii_digit()) {
         // Bare 5-digit codes are HK (e.g. "00700").
@@ -816,7 +856,50 @@ async fn tool_technical_indicators(ctx: &ToolCtx<'_>, args: &Value) -> ToolResul
     }))
 }
 
-async fn tool_financial_statements(_ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+fn holding_market_for_symbol(
+    ctx: &ToolCtx<'_>,
+    symbol: &str,
+) -> Result<Option<String>, ToolResult> {
+    let conn = ctx
+        .db
+        .conn
+        .lock()
+        .map_err(|error| ToolResult::err_json(format!("读取持仓市场失败：{error}")))?;
+    let mut statement = conn
+        .prepare(
+            "SELECT account_id, market
+             FROM holdings
+             WHERE shares > 0 AND symbol = ?1 COLLATE NOCASE
+             ORDER BY updated_at DESC",
+        )
+        .map_err(|error| ToolResult::err_json(format!("读取持仓市场失败：{error}")))?;
+    let rows = statement
+        .query_map([symbol], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| ToolResult::err_json(format!("读取持仓市场失败：{error}")))?;
+
+    for row in rows {
+        let (account_id, market) =
+            row.map_err(|error| ToolResult::err_json(format!("读取持仓市场失败：{error}")))?;
+        let matches_scope = ctx.portfolio_scope.as_ref().is_none_or(|scope| {
+            scope
+                .account_id
+                .as_deref()
+                .is_none_or(|expected| account_id == expected)
+                && scope
+                    .market
+                    .as_deref()
+                    .is_none_or(|expected| market == expected)
+        });
+        if matches_scope {
+            return Ok(Some(market));
+        }
+    }
+    Ok(None)
+}
+
+async fn tool_financial_statements(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let symbol = match args.get("symbol").and_then(|v| v.as_str()) {
         Some(s) => s.trim().to_string(),
         None => return ToolResult::err_json("缺少参数 symbol"),
@@ -829,7 +912,15 @@ async fn tool_financial_statements(_ctx: &ToolCtx<'_>, args: &Value) -> ToolResu
         .and_then(|v| v.as_i64())
         .unwrap_or(4)
         .clamp(1, 8) as usize;
-    let market = infer_market(&symbol).to_string();
+    let market = match holding_market_for_symbol(ctx, &symbol) {
+        Ok(Some(market)) => market,
+        Ok(None) => args
+            .get("market")
+            .and_then(|value| value.as_str())
+            .map(|market| market.trim().to_ascii_uppercase())
+            .unwrap_or_else(|| infer_market(&symbol).to_string()),
+        Err(error) => return error,
+    };
     match quote_service::fetch_financial_statements(&symbol, &market, periods).await {
         Ok(reports) if !reports.is_empty() => {
             ToolResult::ok_json(json!({ "symbol": symbol, "market": market, "periods": reports }))
@@ -904,7 +995,14 @@ async fn tool_price_history(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 }
 
 async fn tool_portfolio_overview(ctx: &ToolCtx<'_>) -> ToolResult {
-    match build_portfolio_context(ctx.db, ctx.cache, ctx.quote_cache).await {
+    match build_portfolio_context(
+        ctx.db,
+        ctx.cache,
+        ctx.quote_cache,
+        ctx.portfolio_scope.as_ref(),
+    )
+    .await
+    {
         Ok(markdown) => ToolResult::ok_json(json!({ "portfolio": markdown })),
         Err(e) => ToolResult::err_json(format!("获取组合总览失败：{e}")),
     }
@@ -914,7 +1012,18 @@ async fn tool_holdings_detail(ctx: &ToolCtx<'_>) -> ToolResult {
     // cache_only = true: tools should not trigger cascading network fetches.
     // The model can call get_stock_quote explicitly for fresh prices.
     match PortfolioReadModel::load(ctx.db, ctx.quote_cache, None, QuoteReadMode::CacheOnly).await {
-        Ok(model) => ToolResult::ok_json(json!({ "holdings": model.holdings() })),
+        Ok(model) => {
+            let holdings: Vec<_> = model
+                .holdings()
+                .iter()
+                .filter(|holding| {
+                    ctx.portfolio_scope
+                        .as_ref()
+                        .is_none_or(|scope| scope.matches_holding(holding))
+                })
+                .collect();
+            ToolResult::ok_json(json!({ "holdings": holdings }))
+        }
         Err(e) => ToolResult::err_json(format!("获取持仓明细失败：{e}")),
     }
 }
@@ -927,7 +1036,7 @@ async fn tool_performance_metrics(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult
         .clamp(1, 3650);
     let end = Utc::now().date_naive();
     let start = end - Duration::days(days);
-    let filter = PerformanceFilter::default();
+    let filter = ctx.performance_filter();
     match performance_service::get_performance_summary(ctx.db, start, end, &filter) {
         Ok(summary) => {
             // The return_series can be large; keep only a compact view so we
@@ -1028,7 +1137,7 @@ fn period_window(args: &Value) -> (chrono::NaiveDate, chrono::NaiveDate) {
 
 async fn tool_return_attribution(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let (start, end) = period_window(args);
-    let filter = PerformanceFilter::default();
+    let filter = ctx.performance_filter();
     match performance_service::get_return_attribution(ctx.db, start, end, &filter) {
         Ok(attr) => {
             // by_holding can be long; cap at top 15 by absolute contribution.
@@ -1053,7 +1162,7 @@ async fn tool_return_attribution(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult 
 
 async fn tool_monthly_returns(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let (start, end) = period_window(args);
-    let filter = PerformanceFilter::default();
+    let filter = ctx.performance_filter();
     match performance_service::get_monthly_returns(ctx.db, start, end, &filter) {
         Ok(returns) => ToolResult::ok_json(json!({ "monthly_returns": returns })),
         Err(e) => ToolResult::err_json(format!("月度收益查询失败：{e}")),
@@ -1062,7 +1171,7 @@ async fn tool_monthly_returns(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 
 async fn tool_drawdown_analysis(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let (start, end) = period_window(args);
-    let filter = PerformanceFilter::default();
+    let filter = ctx.performance_filter();
     match performance_service::get_drawdown_analysis(ctx.db, start, end, &filter) {
         Ok(dd) => ToolResult::ok_json(json!({
             "max_drawdown": dd.max_drawdown,
@@ -1078,7 +1187,7 @@ async fn tool_drawdown_analysis(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 
 async fn tool_risk_metrics(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let (start, end) = period_window(args);
-    let filter = PerformanceFilter::default();
+    let filter = ctx.performance_filter();
     match performance_service::get_risk_metrics(ctx.db, start, end, &filter) {
         Ok(m) => ToolResult::ok_json(json!({
             "daily_volatility": m.daily_volatility,
@@ -1100,7 +1209,7 @@ async fn tool_holding_ranking(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         .and_then(|v| v.as_i64())
         .unwrap_or(10)
         .clamp(1, 50) as usize;
-    let filter = PerformanceFilter::default();
+    let filter = ctx.performance_filter();
     match performance_service::get_holding_performance_ranking(
         ctx.db, start, end, sort_by, limit, &filter,
     ) {
@@ -1437,6 +1546,81 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn scoped_portfolio_turn_filters_holdings_and_blocks_unscoped_private_tools() {
+        let db = Database::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO accounts (id, name, market, description, created_at, updated_at)
+                 VALUES ('account-a', 'A', 'CN', NULL, '2026-01-01', '2026-01-01'),
+                        ('account-b', 'B', 'US', NULL, '2026-01-01', '2026-01-01');
+                 INSERT INTO holdings
+                    (id, account_id, symbol, name, market, category_id, shares,
+                     avg_cost, currency, created_at, updated_at)
+                 VALUES ('holding-a', 'account-a', '600000', '浦发银行', 'CN', NULL,
+                         100, 9, 'CNY', '2026-01-01', '2026-01-01'),
+                        ('holding-b', 'account-b', 'AAPL', 'Apple', 'US', NULL,
+                         10, 100, 'USD', '2026-01-01', '2026-01-01');
+                 INSERT INTO transactions
+                    (id, holding_id, account_id, symbol, name, market, transaction_type,
+                     shares, price, total_amount, commission, currency, traded_at, notes, created_at)
+                 VALUES ('txn-a', 'holding-a', 'account-a', 'CN-ONLY', '范围内交易', 'CN',
+                         'BUY', 1, 1, 1, 0, 'CNY', '2026-01-02', NULL, '2026-01-02'),
+                        ('txn-b', 'holding-b', 'account-b', 'US-ONLY', '范围外交易', 'US',
+                         'BUY', 1, 1, 1, 0, 'USD', '2026-01-02', NULL, '2026-01-02');",
+            )
+            .unwrap();
+        }
+        let cache = ExchangeRateCache::new();
+        let quote_cache = QuoteCache::new();
+        let quote_state = QuoteServiceState::new();
+        let scope = PortfolioScope {
+            market: None,
+            account_id: Some("account-a".to_string()),
+        };
+        let ctx = ToolCtx::for_untrusted_model_turn(
+            &db,
+            &cache,
+            &quote_cache,
+            &quote_state,
+            "untrusted",
+            Some(scope.clone()),
+        );
+
+        let holdings = execute_tool(&ctx, "get_holdings_detail", "{}").await;
+        let payload: Value = serde_json::from_str(&holdings.content).unwrap();
+        assert_eq!(payload["holdings"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["holdings"][0]["account_id"], "account-a");
+
+        let overview = execute_tool(&ctx, "get_portfolio_overview", "{}").await;
+        let payload: Value = serde_json::from_str(&overview.content).unwrap();
+        let portfolio = payload["portfolio"].as_str().unwrap();
+        assert!(portfolio.contains("600000"));
+        assert!(portfolio.contains("CN-ONLY"));
+        assert!(!portfolio.contains("AAPL"));
+        assert!(!portfolio.contains("US-ONLY"));
+
+        let blocked = execute_tool(&ctx, "get_transactions", "{}").await;
+        assert!(!blocked.ok);
+        assert!(blocked.content.contains("超出当前组合复盘的数据范围"));
+        let blocked_market_overview = execute_tool(&ctx, "get_market_overview", "{}").await;
+        assert!(!blocked_market_overview.ok);
+        assert!(blocked_market_overview
+            .content
+            .contains("超出当前组合复盘的数据范围"));
+
+        let advertised: Vec<_> = tool_definitions_for_scope(Some(&scope))
+            .into_iter()
+            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(advertised.contains(&"get_holdings_detail".to_string()));
+        assert!(advertised.contains(&"get_stock_fundamentals".to_string()));
+        assert!(!advertised.contains(&"get_market_overview".to_string()));
+        assert!(!advertised.contains(&"get_transactions".to_string()));
+        assert!(!advertised.contains(&"get_option_positions".to_string()));
+    }
+
+    #[tokio::test]
     async fn alert_check_update_failure_is_an_explicit_tool_error() {
         let db = Database::new(":memory:").unwrap();
         {
@@ -1464,8 +1648,14 @@ mod tests {
             ..Default::default()
         });
         let quote_state = QuoteServiceState::new();
-        let ctx =
-            ToolCtx::for_untrusted_model_turn(&db, &cache, &quote_cache, &quote_state, "untrusted");
+        let ctx = ToolCtx::for_untrusted_model_turn(
+            &db,
+            &cache,
+            &quote_cache,
+            &quote_state,
+            "untrusted",
+            None,
+        );
 
         let result = execute_tool(&ctx, "check_price_alerts", "{}").await;
 
@@ -1639,8 +1829,14 @@ mod tests {
         let cache = ExchangeRateCache::new();
         let quote_cache = QuoteCache::new();
         let quote_state = QuoteServiceState::new();
-        let ctx =
-            ToolCtx::for_untrusted_model_turn(&db, &cache, &quote_cache, &quote_state, "untrusted");
+        let ctx = ToolCtx::for_untrusted_model_turn(
+            &db,
+            &cache,
+            &quote_cache,
+            &quote_state,
+            "untrusted",
+            None,
+        );
         let result = execute_tool(
             &ctx,
             "get_stock_review",
@@ -1664,8 +1860,14 @@ mod tests {
         let cache = ExchangeRateCache::new();
         let quote_cache = QuoteCache::new();
         let quote_state = QuoteServiceState::new();
-        let ctx =
-            ToolCtx::for_untrusted_model_turn(&db, &cache, &quote_cache, &quote_state, "untrusted");
+        let ctx = ToolCtx::for_untrusted_model_turn(
+            &db,
+            &cache,
+            &quote_cache,
+            &quote_state,
+            "untrusted",
+            None,
+        );
 
         for (arguments, field) in [
             (
@@ -1777,11 +1979,145 @@ mod tests {
     fn infer_market_handles_common_formats() {
         assert_eq!(infer_market("AAPL"), "US");
         assert_eq!(infer_market("0700.HK"), "HK");
+        assert_eq!(infer_market("0700.hk"), "HK");
         assert_eq!(infer_market("9988.HK"), "HK");
         assert_eq!(infer_market("SH600519"), "CN");
+        assert_eq!(infer_market("sh600519"), "CN");
         assert_eq!(infer_market("SZ000001"), "CN");
+        assert_eq!(infer_market("sz000001"), "CN");
+        assert_eq!(infer_market("bj920001"), "CN");
+        assert_eq!(infer_market("600519.SS"), "CN");
+        assert_eq!(infer_market("000001.sz"), "CN");
         assert_eq!(infer_market("600519"), "CN");
         assert_eq!(infer_market("00700"), "HK");
+        assert_eq!(infer_market("shop"), "US");
+    }
+
+    #[test]
+    fn financial_statement_definition_accepts_an_explicit_market() {
+        let definition = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "get_financial_statements")
+            .expect("financial statement tool definition");
+
+        assert_eq!(
+            definition["function"]["parameters"]["properties"]["market"]["enum"],
+            json!(["US", "HK", "CN"])
+        );
+    }
+
+    #[tokio::test]
+    async fn financial_statement_tool_honors_an_explicit_market_for_an_unheld_symbol() {
+        let db = Database::new(":memory:").unwrap();
+        let cache = ExchangeRateCache::new();
+        let quote_cache = QuoteCache::new();
+        let quote_state = QuoteServiceState::new();
+        let ctx = ToolCtx::for_untrusted_model_turn(
+            &db,
+            &cache,
+            &quote_cache,
+            &quote_state,
+            "untrusted",
+            None,
+        );
+
+        let result = execute_tool(
+            &ctx,
+            "get_financial_statements",
+            r#"{"symbol":"NOT-A-CODE","market":"CN"}"#,
+        )
+        .await;
+
+        assert!(!result.ok);
+        assert!(result.content.contains("无效的 A 股代码"));
+        assert!(!result.content.contains("市场为 US"));
+    }
+
+    #[tokio::test]
+    async fn financial_statement_tool_prefers_the_in_scope_holding_market() {
+        let db = Database::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO accounts (id, name, market, description, created_at, updated_at)
+                 VALUES ('account-a', 'A', 'CN', NULL, '2026-01-01', '2026-01-01');
+                 INSERT INTO holdings
+                    (id, account_id, symbol, name, market, category_id, shares,
+                     avg_cost, currency, created_at, updated_at)
+                 VALUES ('holding-a', 'account-a', 'CN-HELD', '测试持仓', 'CN', NULL,
+                         100, 9, 'CNY', '2026-01-01', '2026-01-01');",
+            )
+            .unwrap();
+        }
+        let cache = ExchangeRateCache::new();
+        let quote_cache = QuoteCache::new();
+        let quote_state = QuoteServiceState::new();
+        let ctx = ToolCtx::for_untrusted_model_turn(
+            &db,
+            &cache,
+            &quote_cache,
+            &quote_state,
+            "untrusted",
+            Some(PortfolioScope {
+                market: None,
+                account_id: Some("account-a".to_string()),
+            }),
+        );
+
+        let result = execute_tool(
+            &ctx,
+            "get_financial_statements",
+            r#"{"symbol":"CN-HELD","market":"US"}"#,
+        )
+        .await;
+
+        assert!(!result.ok);
+        assert!(result.content.contains("无效的 A 股代码"));
+        assert!(!result.content.contains("市场为 US"));
+    }
+
+    #[tokio::test]
+    async fn financial_statement_tool_ignores_holdings_outside_the_active_scope() {
+        let db = Database::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO accounts (id, name, market, description, created_at, updated_at)
+                 VALUES ('account-a', 'A', 'CN', NULL, '2026-01-01', '2026-01-01'),
+                        ('account-b', 'B', 'US', NULL, '2026-01-01', '2026-01-01');
+                 INSERT INTO holdings
+                    (id, account_id, symbol, name, market, category_id, shares,
+                     avg_cost, currency, created_at, updated_at)
+                 VALUES ('holding-a', 'account-a', 'CN-HELD', '范围外持仓', 'CN', NULL,
+                         100, 9, 'CNY', '2026-01-01', '2026-01-01');",
+            )
+            .unwrap();
+        }
+        let cache = ExchangeRateCache::new();
+        let quote_cache = QuoteCache::new();
+        let quote_state = QuoteServiceState::new();
+        let ctx = ToolCtx::for_untrusted_model_turn(
+            &db,
+            &cache,
+            &quote_cache,
+            &quote_state,
+            "untrusted",
+            Some(PortfolioScope {
+                market: None,
+                account_id: Some("account-b".to_string()),
+            }),
+        );
+
+        let result = execute_tool(
+            &ctx,
+            "get_financial_statements",
+            r#"{"symbol":"CN-HELD","market":"US"}"#,
+        )
+        .await;
+
+        assert!(!result.ok);
+        assert!(result.content.contains("市场为 US"));
+        assert!(!result.content.contains("无效的 A 股代码"));
     }
 
     // execute_tool is async and needs a live AppHandle/Database, so we cover the

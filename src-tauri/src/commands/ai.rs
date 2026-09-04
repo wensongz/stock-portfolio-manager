@@ -1,6 +1,8 @@
 use crate::db::Database;
 use crate::models::ai_config::{AiConfig, AiModelInfo, ChatMessage, DEFAULT_SYSTEM_PROMPT};
-use crate::services::ai_chat_service::{self, ChatParams, PrefilledToolContext};
+use crate::services::ai_chat_service::{
+    self, validated_portfolio_scope, ChatParams, PrefilledToolContext,
+};
 use crate::services::ai_config_service;
 use crate::services::ai_models_service::{self, FetchModelsParams};
 use crate::services::exchange_rate_service::ExchangeRateCache;
@@ -82,6 +84,7 @@ pub async fn chat_with_ai(
     quote_state: State<'_, QuoteServiceState>,
     req: ChatRequest,
 ) -> Result<(), String> {
+    let portfolio_scope = validated_portfolio_scope(req.tool_context.as_ref())?;
     ai_chat_service::chat_stream(
         app,
         &db,
@@ -93,6 +96,7 @@ pub async fn chat_with_ai(
             include_context: req.include_context,
             active_skills: req.active_skills,
             tool_context: req.tool_context,
+            portfolio_scope,
         },
     )
     .await

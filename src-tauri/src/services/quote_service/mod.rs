@@ -52,7 +52,10 @@ use xueqiu::{
     fetch_xueqiu_realtime_batch, fetch_xueqiu_us_quote, plan_xueqiu_realtime_batches,
     quote_warning_for_error,
 };
+#[cfg(test)]
+use yahoo::{build_yahoo_spark_url, parse_yahoo_spark_body};
 pub use yahoo::{fetch_stock_history_yahoo, fetch_yahoo_quote, to_yahoo_symbol};
+use yahoo::{fetch_yahoo_quotes_batch, plan_yahoo_quote_batches};
 
 /// Cash symbol prefix used to represent cash holdings.
 /// Cash symbols follow the pattern `$CASH-{CURRENCY}`, e.g. `$CASH-USD`, `$CASH-CNY`, `$CASH-HKD`.
@@ -184,8 +187,7 @@ pub async fn fetch_us_quote_with_provider(
                             "fetch_us_quote: EastMoney also failed for {}: {}, falling back to yahoo",
                             symbol, e2
                         );
-                        let yahoo_symbol = to_yahoo_symbol(symbol, "US");
-                        fetch_yahoo_quote(&yahoo_symbol, "US")
+                        fetch_yahoo_quote_for_stored_symbol(symbol, "US")
                             .await
                             .map(|data| QuoteFetchResult {
                                 data,
@@ -197,16 +199,13 @@ pub async fn fetch_us_quote_with_provider(
                 }
             }
         },
-        _ => {
-            let yahoo_symbol = to_yahoo_symbol(symbol, "US");
-            fetch_yahoo_quote(&yahoo_symbol, "US")
-                .await
-                .map(|data| QuoteFetchResult {
-                    data,
-                    warning: None,
-                    did_refresh: true,
-                })
-        }
+        _ => fetch_yahoo_quote_for_stored_symbol(symbol, "US")
+            .await
+            .map(|data| QuoteFetchResult {
+                data,
+                warning: None,
+                did_refresh: true,
+            }),
     }
 }
 
@@ -251,12 +250,7 @@ pub async fn fetch_hk_quote_with_provider(
                             "fetch_hk_quote: EastMoney also failed for {}: {}, falling back to yahoo",
                             symbol, e2
                         );
-                        let yahoo_symbol = if symbol.ends_with(".HK") || symbol.ends_with(".hk") {
-                            symbol.to_string()
-                        } else {
-                            format!("{}.HK", symbol)
-                        };
-                        fetch_yahoo_quote(&yahoo_symbol, "HK")
+                        fetch_yahoo_quote_for_stored_symbol(symbol, "HK")
                             .await
                             .map(|data| QuoteFetchResult {
                                 data,
@@ -268,20 +262,13 @@ pub async fn fetch_hk_quote_with_provider(
                 }
             }
         },
-        _ => {
-            let yahoo_symbol = if symbol.ends_with(".HK") || symbol.ends_with(".hk") {
-                symbol.to_string()
-            } else {
-                format!("{}.HK", symbol)
-            };
-            fetch_yahoo_quote(&yahoo_symbol, "HK")
-                .await
-                .map(|data| QuoteFetchResult {
-                    data,
-                    warning: None,
-                    did_refresh: true,
-                })
-        }
+        _ => fetch_yahoo_quote_for_stored_symbol(symbol, "HK")
+            .await
+            .map(|data| QuoteFetchResult {
+                data,
+                warning: None,
+                did_refresh: true,
+            }),
     }
 }
 
@@ -346,6 +333,16 @@ fn restore_original_symbol(quote: &mut StockQuote, original_symbol: &str) {
     quote.symbol = original_symbol.to_string();
 }
 
+async fn fetch_yahoo_quote_for_stored_symbol(
+    symbol: &str,
+    market: &str,
+) -> Result<StockQuote, String> {
+    let yahoo_symbol = to_yahoo_symbol(symbol, market);
+    let mut quote = fetch_yahoo_quote(&yahoo_symbol, market).await?;
+    restore_original_symbol(&mut quote, symbol);
+    Ok(quote)
+}
+
 async fn fetch_quote_after_xueqiu_failure(
     symbol: &str,
     market: &str,
@@ -353,31 +350,25 @@ async fn fetch_quote_after_xueqiu_failure(
     let result = match market {
         "US" => match fetch_eastmoney_us_quote(symbol).await {
             Ok(quote) => Ok(quote),
-            Err(eastmoney_error) => {
-                let yahoo_symbol = to_yahoo_symbol(symbol, "US");
-                fetch_yahoo_quote(&yahoo_symbol, "US")
-                    .await
-                    .map_err(|yahoo_error| {
-                        format!(
-                            "EastMoney failed: {}; Yahoo fallback failed: {}",
-                            eastmoney_error, yahoo_error
-                        )
-                    })
-            }
+            Err(eastmoney_error) => fetch_yahoo_quote_for_stored_symbol(symbol, "US")
+                .await
+                .map_err(|yahoo_error| {
+                    format!(
+                        "EastMoney failed: {}; Yahoo fallback failed: {}",
+                        eastmoney_error, yahoo_error
+                    )
+                }),
         },
         "HK" => match fetch_eastmoney_hk_quote(symbol).await {
             Ok(quote) => Ok(quote),
-            Err(eastmoney_error) => {
-                let yahoo_symbol = to_yahoo_symbol(symbol, "HK");
-                fetch_yahoo_quote(&yahoo_symbol, "HK")
-                    .await
-                    .map_err(|yahoo_error| {
-                        format!(
-                            "EastMoney failed: {}; Yahoo fallback failed: {}",
-                            eastmoney_error, yahoo_error
-                        )
-                    })
-            }
+            Err(eastmoney_error) => fetch_yahoo_quote_for_stored_symbol(symbol, "HK")
+                .await
+                .map_err(|yahoo_error| {
+                    format!(
+                        "EastMoney failed: {}; Yahoo fallback failed: {}",
+                        eastmoney_error, yahoo_error
+                    )
+                }),
         },
         "CN" => fetch_eastmoney_cn_quote(symbol).await,
         _ => Err(format!("Unknown market: {}", market)),
@@ -392,6 +383,7 @@ struct QuoteProviderRequestPlan {
     cash_symbols: Vec<(String, String)>,
     xueqiu_symbols: Vec<(String, String)>,
     eastmoney_symbols: Vec<(String, String)>,
+    yahoo_symbols: Vec<(String, String)>,
     other_symbols: Vec<(String, String)>,
 }
 
@@ -418,6 +410,9 @@ fn plan_quote_provider_requests(
             "eastmoney" => plan
                 .eastmoney_symbols
                 .push((symbol.clone(), market.clone())),
+            "yahoo" if matches!(market.as_str(), "US" | "HK") => {
+                plan.yahoo_symbols.push((symbol.clone(), market.clone()))
+            }
             _ => plan.other_symbols.push((symbol.clone(), market.clone())),
         }
     }
@@ -425,9 +420,9 @@ fn plan_quote_provider_requests(
 }
 
 /// Batch fetch quotes using the specified providers for US, HK and CN markets.
-/// Symbols configured for Xueqiu or EastMoney are combined into multi-symbol
-/// requests. Cash symbols return synthetic quotes (price = 1.0), and duplicate
-/// symbols are fetched only once.
+/// Symbols configured for Xueqiu, EastMoney, or Yahoo are combined into
+/// provider-specific multi-symbol requests. Cash symbols return synthetic
+/// quotes (price = 1.0), and duplicate symbols are fetched only once.
 pub async fn fetch_quotes_batch_with_providers(
     state: &QuoteServiceState,
     symbols: Vec<(String, String)>,
@@ -466,6 +461,59 @@ pub async fn fetch_quotes_batch_with_providers(
                 warn!("failed to fetch quote for {} ({}): {}", symbol, market, e);
                 merge_quote_warning(&mut warning, quote_warning_for_error(&e));
             }
+        }
+    }
+
+    // Yahoo's spark endpoint accepts at most 20 symbols. Missing symbols and
+    // failed batches retain the existing single-symbol chart fallback.
+    let (yahoo_batches, mut yahoo_fallback_symbols) =
+        plan_yahoo_quote_batches(&provider_plan.yahoo_symbols);
+    for batch in yahoo_batches {
+        match fetch_yahoo_quotes_batch(&batch).await {
+            Ok(batch_quotes) => {
+                let fetched: std::collections::HashSet<&str> = batch_quotes
+                    .iter()
+                    .map(|quote| quote.symbol.as_str())
+                    .collect();
+                for request_symbol in &batch {
+                    let original_symbols =
+                        std::iter::once((&request_symbol.original_symbol, &request_symbol.market))
+                            .chain(
+                                request_symbol
+                                    .aliases
+                                    .iter()
+                                    .map(|(symbol, market)| (symbol, market)),
+                            );
+                    for (symbol, market) in original_symbols {
+                        if !fetched.contains(symbol.as_str()) {
+                            yahoo_fallback_symbols.push((symbol.clone(), market.clone()));
+                        }
+                    }
+                }
+                did_refresh |= !batch_quotes.is_empty();
+                quotes.extend(batch_quotes);
+            }
+            Err(error) => {
+                warn!("Yahoo spark batch failed: {}", error);
+                for request_symbol in batch {
+                    yahoo_fallback_symbols
+                        .push((request_symbol.original_symbol, request_symbol.market));
+                    yahoo_fallback_symbols.extend(request_symbol.aliases);
+                }
+            }
+        }
+    }
+
+    for (symbol, market) in deduplicate_symbols(yahoo_fallback_symbols) {
+        match fetch_yahoo_quote_for_stored_symbol(&symbol, &market).await {
+            Ok(quote) => {
+                did_refresh = true;
+                quotes.push(quote);
+            }
+            Err(error) => warn!(
+                "failed to fetch Yahoo fallback quote for {} ({}): {}",
+                symbol, market, error
+            ),
         }
     }
 

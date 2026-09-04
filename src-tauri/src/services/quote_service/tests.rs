@@ -844,6 +844,30 @@ fn quote_provider_plan_routes_eastmoney_symbols_to_batch_queue() {
 }
 
 #[test]
+fn quote_provider_plan_routes_yahoo_us_and_hk_symbols_to_batch_queue() {
+    let symbols = vec![
+        ("AAPL".to_string(), "US".to_string()),
+        ("700.HK".to_string(), "HK".to_string()),
+        ("sh600036".to_string(), "CN".to_string()),
+    ];
+
+    let plan = plan_quote_provider_requests(&symbols, "yahoo", "yahoo", "eastmoney");
+
+    assert_eq!(
+        plan.yahoo_symbols,
+        vec![
+            ("AAPL".to_string(), "US".to_string()),
+            ("700.HK".to_string(), "HK".to_string())
+        ]
+    );
+    assert_eq!(
+        plan.eastmoney_symbols,
+        vec![("sh600036".to_string(), "CN".to_string())]
+    );
+    assert!(plan.other_symbols.is_empty());
+}
+
+#[test]
 fn test_restore_original_symbol_after_provider_normalization() {
     let mut yahoo_quote = sample_quote("BRK-B", "US");
     restore_original_symbol(&mut yahoo_quote, "BRK.B");
@@ -974,7 +998,169 @@ fn test_to_yahoo_symbol_us() {
 #[test]
 fn test_to_yahoo_symbol_hk() {
     assert_eq!(to_yahoo_symbol("0700.HK", "HK"), "0700.HK");
-    assert_eq!(to_yahoo_symbol("00700", "HK"), "00700.HK");
+    assert_eq!(to_yahoo_symbol("700.HK", "HK"), "0700.HK");
+    assert_eq!(to_yahoo_symbol("133.HK", "HK"), "0133.HK");
+    assert_eq!(to_yahoo_symbol("00700", "HK"), "0700.HK");
+}
+
+#[test]
+fn yahoo_batch_plan_normalizes_aliases_and_caps_batches_at_twenty() {
+    let mut symbols: Vec<(String, String)> = (0..19)
+        .map(|index| (format!("T{:02}", index), "US".to_string()))
+        .collect();
+    symbols.extend([
+        ("700.HK".to_string(), "HK".to_string()),
+        ("0700.HK".to_string(), "HK".to_string()),
+        ("EXTRA".to_string(), "US".to_string()),
+        ("bad symbol".to_string(), "US".to_string()),
+    ]);
+
+    let (batches, invalid) = plan_yahoo_quote_batches(&symbols);
+
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].len(), 20);
+    assert_eq!(batches[1].len(), 1);
+    assert_eq!(batches[0][19].api_symbol, "0700.HK");
+    assert_eq!(
+        batches[0][19].aliases,
+        vec![("0700.HK".to_string(), "HK".to_string())]
+    );
+    assert_eq!(batches[1][0].api_symbol, "EXTRA");
+    assert_eq!(invalid, vec![("bad symbol".to_string(), "US".to_string())]);
+}
+
+#[test]
+fn yahoo_batch_plan_rejects_malformed_or_unsupported_symbols() {
+    let symbols = vec![
+        ("not-hk.HK".to_string(), "HK".to_string()),
+        ("123456.HK".to_string(), "HK".to_string()),
+        ("sh600036".to_string(), "CN".to_string()),
+        ("".to_string(), "US".to_string()),
+        ("-".to_string(), "US".to_string()),
+        ("===".to_string(), "US".to_string()),
+        ("A^^==".to_string(), "US".to_string()),
+        ("A--B".to_string(), "US".to_string()),
+        (format!("A{}", "B".repeat(32)), "US".to_string()),
+    ];
+
+    let (batches, invalid) = plan_yahoo_quote_batches(&symbols);
+
+    assert!(batches.is_empty());
+    assert_eq!(invalid, symbols);
+}
+
+#[test]
+fn yahoo_spark_url_contains_decodable_batch_parameters() {
+    let symbols = vec![
+        ("AAPL".to_string(), "US".to_string()),
+        ("700.HK".to_string(), "HK".to_string()),
+    ];
+    let (batches, invalid) = plan_yahoo_quote_batches(&symbols);
+    assert!(invalid.is_empty());
+
+    let url = url::Url::parse(&build_yahoo_spark_url(&batches[0])).unwrap();
+    let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+
+    assert_eq!(
+        params.get("symbols").map(String::as_str),
+        Some("AAPL,0700.HK")
+    );
+    assert_eq!(params.get("range").map(String::as_str), Some("1d"));
+    assert_eq!(params.get("interval").map(String::as_str), Some("1d"));
+}
+
+#[test]
+fn yahoo_spark_parser_maps_fields_and_omits_missing_or_unusable_symbols() {
+    let symbols = vec![
+        ("aapl".to_string(), "US".to_string()),
+        ("700.HK".to_string(), "HK".to_string()),
+        ("MISSING".to_string(), "US".to_string()),
+    ];
+    let (batches, invalid) = plan_yahoo_quote_batches(&symbols);
+    assert!(invalid.is_empty());
+    let body = r#"{
+        "spark": {
+            "result": [
+                {
+                    "symbol": "AAPL",
+                    "response": [{
+                        "meta": {
+                            "symbol": "AAPL",
+                            "shortName": "Apple Inc.",
+                            "regularMarketPrice": 211.50,
+                            "chartPreviousClose": 209.10,
+                            "regularMarketChangePercent": 1.1478,
+                            "regularMarketDayHigh": 213.00,
+                            "regularMarketDayLow": 208.50,
+                            "regularMarketVolume": 1234567
+                        }
+                    }]
+                },
+                {
+                    "symbol": "0700.HK",
+                    "response": [{
+                        "meta": {
+                            "symbol": "0700.HK",
+                            "longName": "Tencent Holdings Limited",
+                            "regularMarketPrice": 620.00,
+                            "previousClose": 615.00,
+                            "regularMarketDayHigh": 623.00,
+                            "regularMarketDayLow": 610.00,
+                            "regularMarketVolume": 998877
+                        }
+                    }]
+                },
+                {
+                    "symbol": "MISSING",
+                    "response": [{
+                        "meta": {"symbol": "MISSING"}
+                    }]
+                },
+                {
+                    "symbol": "UNREQUESTED",
+                    "response": [{
+                        "meta": {"symbol": "UNREQUESTED", "regularMarketPrice": 10.0}
+                    }]
+                }
+            ],
+            "error": null
+        }
+    }"#;
+
+    let quotes = parse_yahoo_spark_body(body, &batches[0]).unwrap();
+
+    assert_eq!(quotes.len(), 2);
+    assert_eq!(quotes[0].symbol, "aapl");
+    assert_eq!(quotes[0].market, "US");
+    assert_eq!(quotes[0].name, "Apple Inc.");
+    assert_eq!(quotes[0].current_price, 211.50);
+    assert_eq!(quotes[0].previous_close, 209.10);
+    assert!((quotes[0].change - 2.40).abs() < 0.001);
+    assert!((quotes[0].change_percent - 1.1478).abs() < 0.001);
+    assert_eq!(quotes[0].high, 213.00);
+    assert_eq!(quotes[0].low, 208.50);
+    assert_eq!(quotes[0].volume, 1_234_567);
+    assert_eq!(quotes[1].symbol, "700.HK");
+    assert_eq!(quotes[1].market, "HK");
+    assert_eq!(quotes[1].name, "Tencent Holdings Limited");
+    assert!((quotes[1].change_percent - (5.0 / 615.0 * 100.0)).abs() < 0.001);
+}
+
+#[test]
+fn yahoo_spark_parser_surfaces_api_errors() {
+    let body = r#"{
+        "spark": {
+            "result": null,
+            "error": {
+                "code": "Bad Request",
+                "description": "Number of symbols needs to be less than or equal to 20"
+            }
+        }
+    }"#;
+
+    let error = parse_yahoo_spark_body(body, &[]).unwrap_err();
+
+    assert!(error.contains("less than or equal to 20"));
 }
 
 #[test]
@@ -1070,6 +1256,72 @@ async fn test_integration_eastmoney_batch_public_symbols() {
     for quote in quotes {
         assert!(quote.current_price > 0.0);
     }
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_integration_yahoo_spark_batch_public_symbols() {
+    let symbols = vec![
+        ("AAPL".to_string(), "US".to_string()),
+        ("700.HK".to_string(), "HK".to_string()),
+        ("BRK.B".to_string(), "US".to_string()),
+    ];
+    let (batches, invalid) = plan_yahoo_quote_batches(&symbols);
+    assert!(invalid.is_empty());
+    assert_eq!(batches.len(), 1);
+
+    let quotes = fetch_yahoo_quotes_batch(&batches[0]).await.unwrap();
+    let returned: std::collections::HashSet<&str> =
+        quotes.iter().map(|quote| quote.symbol.as_str()).collect();
+
+    assert_eq!(quotes.len(), symbols.len());
+    assert!(returned.contains("AAPL"));
+    assert!(returned.contains("700.HK"));
+    assert!(returned.contains("BRK.B"));
+    assert!(quotes.iter().all(|quote| quote.current_price > 0.0));
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_integration_quote_orchestrator_uses_yahoo_batch_queue() {
+    let state = QuoteServiceState::new();
+    let symbols = vec![
+        ("AAPL".to_string(), "US".to_string()),
+        ("700.HK".to_string(), "HK".to_string()),
+        ("BRK.B".to_string(), "US".to_string()),
+    ];
+
+    let result = fetch_quotes_batch_with_providers(&state, symbols, "yahoo", "yahoo", "eastmoney")
+        .await
+        .unwrap();
+    let returned: std::collections::HashSet<&str> = result
+        .data
+        .iter()
+        .map(|quote| quote.symbol.as_str())
+        .collect();
+
+    assert_eq!(result.data.len(), 3);
+    assert!(returned.contains("AAPL"));
+    assert!(returned.contains("700.HK"));
+    assert!(returned.contains("BRK.B"));
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_integration_direct_yahoo_preserves_stored_symbols() {
+    let state = QuoteServiceState::new();
+
+    let us = fetch_us_quote_with_provider(&state, "BRK.B", "yahoo")
+        .await
+        .unwrap();
+    let hk = fetch_hk_quote_with_provider(&state, "700.HK", "yahoo")
+        .await
+        .unwrap();
+
+    assert_eq!(us.data.symbol, "BRK.B");
+    assert!(us.data.current_price > 0.0);
+    assert_eq!(hk.data.symbol, "700.HK");
+    assert!(hk.data.current_price > 0.0);
 }
 
 #[tokio::test]

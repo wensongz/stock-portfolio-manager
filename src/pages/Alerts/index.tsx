@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Card,
   Table,
@@ -22,6 +22,7 @@ import {
 import { useAlertStore } from "../../stores/alertStore";
 import { useHoldingStore } from "../../stores/holdingStore";
 import type { AlertType, PriceAlert } from "../../types";
+import { buildAlertHoldingOptions } from "./holdingOptions";
 
 const { Title, Text } = Typography;
 
@@ -49,6 +50,10 @@ export default function AlertsPage() {
   const { holdings, fetchHoldings } = useHoldingStore();
   const [modalVisible, setModalVisible] = useState(false);
   const [form] = Form.useForm();
+  const holdingOptions = useMemo(
+    () => buildAlertHoldingOptions(holdings),
+    [holdings],
+  );
 
   useEffect(() => {
     fetchAlerts();
@@ -179,10 +184,7 @@ export default function AlertsPage() {
               showSearch
               placeholder="搜索股票"
               optionFilterProp="label"
-              options={holdings.map((h) => ({
-                value: h.id,
-                label: `${h.symbol} ${h.name} (${h.market})`,
-              }))}
+              options={holdingOptions}
             />
           </Form.Item>
           <Form.Item name="alert_type" label="提醒类型" rules={[{ required: true }]}>

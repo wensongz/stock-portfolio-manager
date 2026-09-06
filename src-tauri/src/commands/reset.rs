@@ -220,6 +220,10 @@ mod tests {
                    VALUES ('transaction-1', 'holding-1', 'account-1', 'AAPL', 'Apple', 'US', 'OPEN', 1, 100, 100, 0, 'USD', '2026-09-01', '2026-09-01');
                  INSERT INTO cached_quote_refresh_time (id, updated_at)
                    VALUES (1, 'stale-refresh-time');
+                 INSERT INTO cached_quotes (symbol, name, market, current_price, updated_at)
+                   VALUES
+                     ('BABA', 'Alibaba US', 'US', 120, 'stale-quote'),
+                     ('BABA', 'Alibaba HK', 'HK', 90, 'stale-quote');
                  INSERT INTO ai_config
                    (id, provider, api_key, model, base_url, system_prompt, tools_enabled, updated_at)
                    VALUES (1, 'custom', 'secret', 'custom-model', 'https://example.test', 'custom prompt', 0, 'old');
@@ -241,6 +245,7 @@ mod tests {
             "accounts",
             "holdings",
             "transactions",
+            "cached_quotes",
             "cached_quote_refresh_time",
         ] {
             let count: i64 = conn

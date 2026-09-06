@@ -15,7 +15,7 @@ pub struct QuoteCache {
     inner: Mutex<HashMap<(String, String), CachedQuote>>,
 }
 
-fn quote_key(market: &str, symbol: &str) -> (String, String) {
+pub(crate) fn quote_key(market: &str, symbol: &str) -> (String, String) {
     (
         market.trim().to_ascii_uppercase(),
         symbol.trim().to_ascii_uppercase(),

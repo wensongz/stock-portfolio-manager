@@ -6,8 +6,8 @@ use crate::services::quote_provider_service;
 use crate::services::quote_service::{
     fetch_cn_quote_with_provider, fetch_hk_quote_with_provider,
     fetch_quotes_batch_cached_with_providers, fetch_us_quote_with_provider, get_quote_refresh_time,
-    merge_quote_warning, save_quote_refresh_time, save_quotes_to_db, QuoteCache, QuoteFetchResult,
-    QuoteServiceState, CASH_SYMBOL_PREFIX,
+    merge_quote_warning, quote_key, save_quote_refresh_time, save_quotes_to_db, QuoteCache,
+    QuoteFetchResult, QuoteServiceState, CASH_SYMBOL_PREFIX,
 };
 use serde::Serialize;
 use std::future::Future;
@@ -233,16 +233,16 @@ async fn get_holding_quotes_inner_with_refresh_status(
     };
     // Persist freshly fetched quotes to the database
     let persistence_succeeded = persist_holding_quote_refresh(db, &fetch);
-    let quote_map: std::collections::HashMap<String, StockQuote> = fetch
+    let quote_map: std::collections::HashMap<(String, String), StockQuote> = fetch
         .data
         .drain(..)
-        .map(|q| (q.symbol.clone(), q))
+        .map(|q| (quote_key(&q.market, &q.symbol), q))
         .collect();
 
     let result = holdings
         .into_iter()
         .map(|h| {
-            let quote = quote_map.get(&h.symbol).cloned();
+            let quote = quote_map.get(&quote_key(&h.market, &h.symbol)).cloned();
             let cleared = h.shares == 0.0 && !h.symbol.starts_with(CASH_SYMBOL_PREFIX);
             let (market_value, total_cost, unrealized_pnl, unrealized_pnl_percent) = if cleared {
                 // Cleared position: report realized PnL from transaction history.
@@ -526,6 +526,70 @@ mod tests {
 
         assert_eq!(outcome.warning.as_deref(), Some("fallback"));
         assert_eq!(get_quote_refresh_time(&db).unwrap(), outcome.refreshed_at);
+    }
+
+    #[tokio::test]
+    async fn holding_refresh_keeps_same_literal_symbol_separate_by_market_for_alerts() {
+        // $CASH-* is a real synchronous quote source, so this reaches the
+        // batch refresh, holding attachment, persistence and alert gate
+        // without a network mock. The exact same literal must remain two
+        // market-qualified quotes throughout.
+        let db = Database::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO accounts (id, name, market, created_at, updated_at) VALUES
+                   ('acct-cn', 'CN account', 'CN', '2026-09-06', '2026-09-06'),
+                   ('acct-us', 'US account', 'US', '2026-09-06', '2026-09-06');
+                 INSERT INTO holdings
+                   (id, account_id, symbol, name, market, shares, avg_cost, currency, created_at, updated_at)
+                 VALUES
+                   ('holding-cn', 'acct-cn', '$CASH-USD', 'CN cash', 'CN', 10, 1, 'CNY', '2026-09-06', '2026-09-06'),
+                   ('holding-us', 'acct-us', '$CASH-USD', 'US cash', 'US', 10, 1, 'USD', '2026-09-06', '2026-09-06');",
+            )
+            .unwrap();
+        }
+        let cache = QuoteCache::new();
+        let state = QuoteServiceState::new();
+
+        let (outcome, refresh, persisted) =
+            get_holding_quotes_inner_with_refresh_status(&db, &cache, &state, None)
+                .await
+                .unwrap();
+
+        assert!(!refresh.did_refresh);
+        assert!(!persisted);
+        assert_eq!(outcome.data.len(), 2);
+        for holding in outcome.data {
+            assert_eq!(holding.quote.unwrap().market, holding.market);
+        }
+
+        let requested = vec![
+            ("$CASH-USD".to_string(), "CN".to_string()),
+            ("$CASH-USD".to_string(), "US".to_string()),
+        ];
+        let fresh_quotes = vec![
+            cache.get("CN", "$CASH-USD").unwrap(),
+            cache.get("US", "$CASH-USD").unwrap(),
+        ];
+        let complete_refresh = QuoteFetchResult {
+            data: (),
+            warning: None,
+            did_refresh: true,
+            refresh_complete: crate::services::quote_service::classify_refresh_complete(
+                &requested,
+                &fresh_quotes,
+            ),
+        };
+        assert!(complete_refresh.refresh_complete);
+
+        let evaluated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = evaluated.clone();
+        run_alert_evaluation_after_holding_refresh(None, &complete_refresh, true, || async move {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+        assert!(evaluated.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// Build an in-memory DB with one account and a cleared 410.HK position:

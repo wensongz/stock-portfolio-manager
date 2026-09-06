@@ -303,6 +303,71 @@ test("reopening a rebalance turn restores its exact tool scope and skill", async
   });
 });
 
+test("rebalance session follow-ups reconstruct the persisted host capability and skill", async () => {
+  const user = persistedMessage("rebalance-user", "session-rebalance", "rebalance now");
+  const assistant = {
+    ...persistedMessage("rebalance-assistant", "session-rebalance", "plan"),
+    role: "assistant",
+    tool_calls: JSON.stringify([{
+      id: "prefilled-stock-review",
+      name: "get_rebalance_context",
+      arguments: JSON.stringify({ config_id: "config-us" }),
+      status: "success",
+      origin: "host_prefill",
+    }]),
+  };
+  const requests = [];
+  invokeImpl = async (command, args) => {
+    if (command === "get_chat_messages") return [user, assistant];
+    if (command === "chat_with_ai") {
+      requests.push(args.req);
+      return;
+    }
+    if (command === "save_chat_messages" || command === "touch_chat_session") return;
+    throw new Error(`unexpected command ${command}`);
+  };
+
+  await useChatStore.getState().loadSessionMessages("session-rebalance");
+  const result = await useChatStore.getState().sendMessage("how should I sequence it?", "session-rebalance");
+
+  assert.deepEqual(result, { ok: true });
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].activeSkills, ["portfolio-rebalance"]);
+  assert.deepEqual(requests[0].toolContext, {
+    name: "get_rebalance_context",
+    arguments: { config_id: "config-us" },
+  });
+});
+
+test("rebalance follow-up fails closed when reserved host provenance is malformed", async () => {
+  const user = persistedMessage("rebalance-user", "session-rebalance-invalid", "rebalance now");
+  const assistant = {
+    ...persistedMessage("rebalance-assistant", "session-rebalance-invalid", "plan"),
+    role: "assistant",
+    tool_calls: JSON.stringify([{
+      id: "prefilled-stock-review",
+      name: "get_rebalance_context",
+      arguments: JSON.stringify({ config_id: "config-us", market: "US" }),
+      status: "success",
+      origin: "host_prefill",
+    }]),
+  };
+  let chatCalls = 0;
+  invokeImpl = async (command) => {
+    if (command === "get_chat_messages") return [user, assistant];
+    if (command === "chat_with_ai") chatCalls += 1;
+    throw new Error(`unexpected command ${command}`);
+  };
+
+  await useChatStore.getState().loadSessionMessages("session-rebalance-invalid");
+  const result = await useChatStore.getState().sendMessage("continue", "session-rebalance-invalid");
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /可信.*再平衡/);
+  assert.equal(chatCalls, 0);
+  assert.equal(useChatStore.getState().messages.length, 2);
+});
+
 test("switching away lets a background reply finish without overwriting the new session", async () => {
   const savedSnapshots = [];
   const otherRecord = persistedMessage("other-user", "session-other", "other session");

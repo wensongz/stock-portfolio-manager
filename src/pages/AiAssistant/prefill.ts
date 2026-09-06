@@ -12,6 +12,11 @@ export interface PersistedAiPrefillContext {
   toolContext: AiToolContext;
 }
 
+export type PersistedRebalanceSessionBinding =
+  | { kind: "none" }
+  | { kind: "invalid" }
+  | { kind: "bound"; activeSkill: "portfolio-rebalance"; toolContext: AiToolContext };
+
 export function readAiPrefill(state: unknown): string | null {
   if (!state || typeof state !== "object" || !("prefillPrompt" in state)) return null;
   const value = (state as { prefillPrompt?: unknown }).prefillPrompt;
@@ -194,6 +199,52 @@ export function readPersistedAiPrefillContext(
   return request?.activeSkill && request.toolContext
     ? { activeSkill: request.activeSkill, toolContext: request.toolContext }
     : null;
+}
+
+/**
+ * Recover the single trusted rebalance capability that belongs to a persisted
+ * chat session. We only accept the host-reserved prefill card, require a
+ * successful invocation, and reject conflicting or malformed records instead
+ * of silently widening the next turn back to the full portfolio.
+ */
+export function readPersistedRebalanceSessionBinding(
+  toolCallsByTurn: ToolCallInfo[][],
+): PersistedRebalanceSessionBinding {
+  const rebalanceCalls = toolCallsByTurn
+    .flat()
+    .filter(
+      (call) =>
+        call.id === HOST_PREFILLED_TOOL_CALL_ID &&
+        call.name === "get_rebalance_context",
+    );
+  if (rebalanceCalls.length === 0) return { kind: "none" };
+
+  let configId: string | null = null;
+  for (const call of rebalanceCalls) {
+    if (call.origin !== "host_prefill" || call.status !== "success") {
+      return { kind: "invalid" };
+    }
+    const persisted = readPersistedAiPrefillContext([call]);
+    const currentConfigId = persisted?.toolContext.arguments.config_id;
+    if (
+      persisted?.activeSkill !== "portfolio-rebalance" ||
+      typeof currentConfigId !== "string" ||
+      !currentConfigId.trim() ||
+      (configId !== null && configId !== currentConfigId)
+    ) {
+      return { kind: "invalid" };
+    }
+    configId = currentConfigId;
+  }
+
+  return {
+    kind: "bound",
+    activeSkill: "portfolio-rebalance",
+    toolContext: {
+      name: "get_rebalance_context",
+      arguments: { config_id: configId! },
+    },
+  };
 }
 
 export function consumeCapturedAiPrefillRequest(

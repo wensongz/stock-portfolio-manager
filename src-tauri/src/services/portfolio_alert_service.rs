@@ -11,8 +11,8 @@ use crate::{
     services::{
         exchange_rate_service::convert_currency,
         portfolio_alert_calculator::{
-            calculate_portfolio_alert_snapshot, PortfolioAlertCalculation,
-            PortfolioAlertCategoryInput, PortfolioAlertPositionInput,
+            calculate_portfolio_alert_snapshot, target_total_is_within_tolerance,
+            PortfolioAlertCalculation, PortfolioAlertCategoryInput, PortfolioAlertPositionInput,
         },
         portfolio_read_service::{PortfolioReadModel, QuoteReadMode},
         quote_service::{is_cash_symbol, QuoteCache},
@@ -24,8 +24,6 @@ use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::warn;
 use uuid::Uuid;
-
-const TOTAL_TOLERANCE: f64 = 0.01;
 
 fn next_mutation_timestamp(
     connection: &Connection,
@@ -1483,15 +1481,6 @@ fn validate_input_basics(input: &SavePortfolioAlertConfigInput) -> Result<(), St
     Ok(())
 }
 
-fn target_total_is_within_tolerance(total: f64) -> bool {
-    if !total.is_finite() {
-        return false;
-    }
-    let lower_bound = (100.0 - TOTAL_TOLERANCE).next_down();
-    let upper_bound = (100.0 + TOTAL_TOLERANCE).next_up();
-    total >= lower_bound && total <= upper_bound
-}
-
 fn validate_scope_currency(
     connection: &Connection,
     input: &SavePortfolioAlertConfigInput,
@@ -2277,6 +2266,56 @@ mod tests {
             rates: rates(),
             config_id: config.id,
         }
+    }
+
+    #[tokio::test]
+    async fn saving_targets_at_the_lower_one_basis_point_boundary_evaluates_successfully() {
+        let db = configured_db();
+        seed_categories(&db, ["growth", "bonds"]);
+        seed_account(&db, "acct-us", "US");
+        seed_holding!(
+            &db,
+            "holding-aapl",
+            "acct-us",
+            "AAPL",
+            "US",
+            Some("growth"),
+            10.0,
+            "USD",
+        );
+        seed_holding!(
+            &db,
+            "holding-msft",
+            "acct-us",
+            "MSFT",
+            "US",
+            Some("bonds"),
+            10.0,
+            "USD",
+        );
+        let cache = crate::services::quote_service::QuoteCache::new();
+        cache.set(quote("US", "AAPL", 100.0));
+        cache.set(quote("US", "MSFT", 100.0));
+
+        let view = save_and_evaluate_portfolio_alert_config(
+            &db,
+            &cache,
+            None,
+            input(
+                overall_scope(),
+                20.0,
+                60.0,
+                [("growth", 33.33), ("bonds", 66.66)],
+            ),
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            view.evaluation.unwrap().status,
+            PortfolioAlertDataStatus::Ready
+        );
     }
 
     fn breach_count(db: &Database) -> i64 {

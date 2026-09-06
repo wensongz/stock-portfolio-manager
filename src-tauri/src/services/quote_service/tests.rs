@@ -846,6 +846,42 @@ fn test_fetch_quotes_batch_with_providers_deduplicates_symbols() {
 }
 
 #[test]
+fn batch_refresh_keeps_identical_symbols_from_different_markets_and_classifies_complete() {
+    // This catches any final result map keyed only by symbol: the synthetic
+    // cash route avoids a network mock while exercising real batch ordering.
+    let requested = vec![
+        ("$CASH-USD".to_string(), "CN".to_string()),
+        ("$CASH-USD".to_string(), "US".to_string()),
+    ];
+    let state = QuoteServiceState::new();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(fetch_quotes_batch_with_providers(
+            &state,
+            requested.clone(),
+            "eastmoney",
+            "eastmoney",
+            "eastmoney",
+        ))
+        .unwrap();
+
+    assert_eq!(result.data.len(), 2);
+    assert_eq!(
+        result
+            .data
+            .iter()
+            .map(|quote| (quote.market.as_str(), quote.symbol.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("CN", "$CASH-USD"), ("US", "$CASH-USD")]
+    );
+    // Cash quotes are deterministic local values, so the batch correctly
+    // reports no network refresh. Its final result must nevertheless be
+    // complete for the two market-qualified request keys.
+    assert!(!result.refresh_complete);
+    assert!(classify_refresh_complete(&requested, &result.data));
+}
+
+#[test]
 fn quote_provider_plan_routes_eastmoney_symbols_to_batch_queue() {
     let symbols = vec![
         ("AAPL".to_string(), "US".to_string()),

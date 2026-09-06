@@ -43,7 +43,16 @@ fn is_valid_number(value: f64) -> bool {
     value.is_finite() && value >= 0.0
 }
 
-const TARGET_PERCENT_SUM_TOLERANCE: f64 = 0.01;
+pub const TARGET_PERCENT_SUM_TOLERANCE: f64 = 0.01;
+
+pub fn target_total_is_within_tolerance(total: f64) -> bool {
+    if !total.is_finite() {
+        return false;
+    }
+    let lower_bound = (100.0 - TARGET_PERCENT_SUM_TOLERANCE).next_down();
+    let upper_bound = (100.0 + TARGET_PERCENT_SUM_TOLERANCE).next_up();
+    total >= lower_bound && total <= upper_bound
+}
 
 fn validate_inputs(
     config: &PortfolioAlertConfig,
@@ -69,7 +78,7 @@ fn validate_inputs(
         .iter()
         .map(|target| target.target_percent)
         .sum();
-    if (target_percent_sum - 100.0).abs() > TARGET_PERCENT_SUM_TOLERANCE {
+    if !target_total_is_within_tolerance(target_percent_sum) {
         return Err(format!(
             "target_percent values must sum to 100.0 within {:.2} tolerance",
             TARGET_PERCENT_SUM_TOLERANCE
@@ -809,6 +818,23 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn target_percentages_at_the_lower_one_basis_point_boundary_are_accepted() {
+        let config = config_with_targets(20.0, [("growth", 33.33), ("cash", 66.66)]);
+        let categories = default_categories();
+        let positions = positions([("growth", 60.0, false), ("cash", 40.0, true)]);
+
+        let result = calculate_portfolio_alert_snapshot(
+            &config,
+            &categories,
+            &positions,
+            "USD",
+            "2026-09-06T00:00:00Z",
+        );
+
+        assert!(result.is_ok());
     }
 
     #[test]

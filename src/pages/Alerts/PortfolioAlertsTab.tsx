@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { useNavigate } from "react-router-dom";
 import {
   Alert,
@@ -19,7 +18,6 @@ import {
   Tooltip,
   Typography,
   message,
-  notification,
 } from "antd";
 import {
   EditOutlined,
@@ -31,7 +29,6 @@ import type {
   Account,
   Category,
   PortfolioAlertConfig,
-  PortfolioAlertNotification,
   PortfolioAlertScope,
   SavePortfolioAlertConfigInput,
 } from "../../types";
@@ -49,7 +46,6 @@ import { useChatSessionStore } from "../../stores/chatSessionStore";
 import { navigateToPortfolioRebalance } from "../AiAssistant/portfolioRebalancePrefill";
 import {
   buildPortfolioAlertDisplayModel,
-  buildPortfolioAlertNotificationPresentation,
   buildPortfolioAlertScopeOptions,
   decideDeletedPortfolioAlertScopeTransition,
   mergePortfolioAlertDraftCategories,
@@ -138,19 +134,11 @@ export default function PortfolioAlertsTab() {
   const error = usePortfolioAlertStore(
     (state) => state.errorsByScope[state.selectedScopeKey],
   );
-  const pendingNotifications = usePortfolioAlertStore(
-    (state) => state.pendingNotifications,
-  );
   const selectScope = usePortfolioAlertStore((state) => state.selectScope);
   const loadScope = usePortfolioAlertStore((state) => state.loadScope);
   const saveConfig = usePortfolioAlertStore((state) => state.saveConfig);
   const setActive = usePortfolioAlertStore((state) => state.setActive);
   const evaluate = usePortfolioAlertStore((state) => state.evaluate);
-  const ingestNotification = usePortfolioAlertStore((state) => state.ingestNotification);
-  const takePendingNotifications = usePortfolioAlertStore(
-    (state) => state.takePendingNotifications,
-  );
-  const [notificationApi, notificationHolder] = notification.useNotification();
   const [dataReady, setDataReady] = useState(false);
   const [editing, setEditing] = useState(true);
   const [declinedDeletedScopeKey, setDeclinedDeletedScopeKey] = useState<string | null>(null);
@@ -336,37 +324,6 @@ export default function PortfolioAlertsTab() {
   }, [categories, categorySignature]);
 
   useEffect(() => {
-    if (pendingNotifications.length === 0) return;
-    for (const breach of takePendingNotifications()) {
-      const presentation = buildPortfolioAlertNotificationPresentation(breach);
-      notificationApi.warning({
-        message: presentation.title,
-        description: presentation.description,
-        placement: "topRight",
-      });
-    }
-  }, [notificationApi, pendingNotifications, takePendingNotifications]);
-
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-    void listen<PortfolioAlertNotification>("portfolio-alert-triggered", (event) => {
-      const incoming = event.payload;
-      ingestNotification(incoming);
-      if (portfolioAlertScopeKey(incoming.scope) === selectedScopeKeyRef.current) {
-        void loadScope(incoming.scope);
-      }
-    }).then((cleanup) => {
-      if (disposed) cleanup();
-      else unlisten = cleanup;
-    });
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [ingestNotification, loadScope]);
-
-  useEffect(() => {
     const previous = observedQuoteAtRef.current;
     observedQuoteAtRef.current = lastUpdatedAt;
     if (!lastUpdatedAt || lastUpdatedAt === previous) return;
@@ -531,7 +488,6 @@ export default function PortfolioAlertsTab() {
 
   return (
     <div className="space-y-4">
-      {notificationHolder}
       <Card>
         <div className="flex flex-wrap items-center justify-between gap-4">
           <Space wrap size="middle">

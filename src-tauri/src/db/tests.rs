@@ -109,7 +109,7 @@ mod tests {
 
         run_migrations(&mut conn).unwrap();
 
-        assert_eq!(schema_version(&conn), 4);
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
         for table in [
             "portfolio_alert_configs",
             "portfolio_alert_targets",
@@ -614,6 +614,46 @@ mod tests {
         assert_eq!(loaded.len(), 1); // Should be 1 row, not 2
         assert!((loaded[0].current_price - 180.0).abs() < 0.001);
         assert_eq!(loaded[0].volume, 60000000);
+    }
+
+    #[test]
+    fn cached_quotes_keep_same_symbol_in_different_markets_after_reload() {
+        // A symbol is only meaningful within its market. Reopening the cache
+        // must not discard either quote when two exchanges use the same text.
+        let db = create_test_db();
+        let quotes = vec![
+            crate::models::StockQuote {
+                symbol: "BABA".to_string(),
+                name: "Alibaba US".to_string(),
+                market: "US".to_string(),
+                current_price: 120.0,
+                updated_at: "2026-09-06T00:00:00Z".to_string(),
+                ..Default::default()
+            },
+            crate::models::StockQuote {
+                symbol: "BABA".to_string(),
+                name: "Alibaba HK".to_string(),
+                market: "HK".to_string(),
+                current_price: 90.0,
+                updated_at: "2026-09-06T00:00:00Z".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        crate::services::quote_service::save_quotes_to_db(&db, &quotes).unwrap();
+        let reloaded = crate::services::quote_service::load_quotes_from_db(&db).unwrap();
+        let restarted_cache = crate::services::quote_service::QuoteCache::new();
+        restarted_cache.set_batch(&reloaded);
+
+        assert_eq!(reloaded.len(), 2);
+        assert_eq!(
+            restarted_cache.get("US", "BABA").unwrap().current_price,
+            120.0
+        );
+        assert_eq!(
+            restarted_cache.get("HK", "BABA").unwrap().current_price,
+            90.0
+        );
     }
 
     #[test]
@@ -1329,6 +1369,74 @@ mod tests {
     }
 
     #[test]
+    fn v4_database_migrates_cached_quote_key_to_market_and_symbol() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cached_quotes (
+               symbol TEXT PRIMARY KEY NOT NULL,
+               name TEXT NOT NULL,
+               market TEXT NOT NULL,
+               current_price REAL NOT NULL DEFAULT 0,
+               previous_close REAL NOT NULL DEFAULT 0,
+               change REAL NOT NULL DEFAULT 0,
+               change_percent REAL NOT NULL DEFAULT 0,
+               high REAL NOT NULL DEFAULT 0,
+               low REAL NOT NULL DEFAULT 0,
+               volume INTEGER NOT NULL DEFAULT 0,
+               updated_at TEXT NOT NULL,
+               pe_ttm REAL,
+               pb REAL,
+               market_cap REAL,
+               dividend_yield REAL,
+               eps REAL,
+               roe REAL,
+               turnover_rate REAL
+             );
+             INSERT INTO cached_quotes (symbol, name, market, current_price, updated_at)
+             VALUES ('BABA', 'Alibaba US', 'US', 120.0, 'old');
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+
+        run_migrations(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO cached_quotes (symbol, name, market, current_price, updated_at)
+             VALUES ('BABA', 'Alibaba HK', 'HK', 90.0, 'new')",
+            [],
+        )
+        .unwrap();
+
+        let rows: Vec<(String, String, f64)> = conn
+            .prepare(
+                "SELECT market, name, current_price FROM cached_quotes
+                 WHERE symbol = 'BABA' ORDER BY market",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("HK".to_string(), "Alibaba HK".to_string(), 90.0),
+                ("US".to_string(), "Alibaba US".to_string(), 120.0),
+            ]
+        );
+        let primary_key_columns: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM pragma_table_info('cached_quotes')
+                 WHERE pk > 0 ORDER BY pk",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(primary_key_columns, vec!["market", "symbol"]);
+    }
+
+    #[test]
     fn unversioned_legacy_database_adds_columns_repairs_open_rows_and_keeps_data() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1564,7 +1672,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(reopened_definitions, definitions);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 4);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 5);
     }
 
     #[test]

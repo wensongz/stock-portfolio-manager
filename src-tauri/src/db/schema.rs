@@ -207,7 +207,7 @@ pub(super) fn create_current_schema(conn: &Connection) -> Result<()> {
            ON chat_messages(session_id, created_at);
 
          CREATE TABLE IF NOT EXISTS cached_quotes (
-           symbol TEXT PRIMARY KEY NOT NULL,
+           symbol TEXT NOT NULL,
            name TEXT NOT NULL,
            market TEXT NOT NULL,
            current_price REAL NOT NULL DEFAULT 0,
@@ -224,7 +224,8 @@ pub(super) fn create_current_schema(conn: &Connection) -> Result<()> {
            dividend_yield REAL,
            eps REAL,
            roe REAL,
-           turnover_rate REAL
+           turnover_rate REAL,
+           PRIMARY KEY (market, symbol)
          );
 
          CREATE TABLE IF NOT EXISTS cached_exchange_rates (

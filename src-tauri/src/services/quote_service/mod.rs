@@ -11,6 +11,7 @@ mod xueqiu;
 mod yahoo;
 
 use cache::deduplicate_symbols;
+pub(crate) use cache::quote_key;
 pub use cache::{fetch_quotes_batch_cached_with_providers, QuoteCache};
 #[cfg(test)]
 use eastmoney::{
@@ -692,13 +693,13 @@ pub async fn fetch_quotes_batch_with_providers(
 
     // Preserve the caller's symbol order even though requests were grouped by
     // provider and market internally.
-    let mut quotes_by_symbol: std::collections::HashMap<String, StockQuote> = quotes
+    let mut quotes_by_symbol: std::collections::HashMap<(String, String), StockQuote> = quotes
         .into_iter()
-        .map(|quote| (quote.symbol.clone(), quote))
+        .map(|quote| (quote_key(&quote.market, &quote.symbol), quote))
         .collect();
     let quotes = unique_symbols
         .iter()
-        .filter_map(|(symbol, _)| quotes_by_symbol.remove(symbol))
+        .filter_map(|(symbol, market)| quotes_by_symbol.remove(&quote_key(market, symbol)))
         .collect::<Vec<_>>();
 
     let refresh_complete = did_refresh && classify_refresh_complete(&unique_symbols, &quotes);

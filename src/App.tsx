@@ -28,6 +28,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
 }
 import { useQuoteStore } from "./stores/quoteStore";
 import MainLayout from "./components/Layout/MainLayout";
+import PortfolioAlertNotificationCenter from "./pages/Alerts/PortfolioAlertNotificationCenter";
 
 const DashboardPage = lazy(() => import("./pages/Dashboard"));
 const AccountsPage = lazy(() => import("./pages/Accounts"));
@@ -64,6 +65,7 @@ function App() {
 
   return (
     <>
+      <PortfolioAlertNotificationCenter />
       {/* Request and background outcomes share this single warning surface. */}
       {quoteWarning && (
         <div style={{

@@ -1,7 +1,7 @@
 use super::schema;
 use rusqlite::{Connection, Error, OptionalExtension, Result};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 pub(crate) fn run_migrations(conn: &mut Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -28,6 +28,9 @@ pub(crate) fn run_migrations(conn: &mut Connection) -> Result<()> {
     }
     if version < 4 {
         migrate_v4(&transaction)?;
+    }
+    if version < 5 {
+        migrate_v5(&transaction)?;
     }
     transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     transaction.commit()
@@ -59,6 +62,55 @@ fn migrate_v3(conn: &Connection) -> Result<()> {
 
 fn migrate_v4(conn: &Connection) -> Result<()> {
     schema::create_portfolio_alert_schema(conn)
+}
+
+fn migrate_v5(conn: &Connection) -> Result<()> {
+    let primary_key_columns: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM pragma_table_info('cached_quotes')
+             WHERE pk > 0 ORDER BY pk",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_>>()?;
+    if primary_key_columns == ["market", "symbol"] {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE cached_quotes_v5 (
+           symbol TEXT NOT NULL,
+           name TEXT NOT NULL,
+           market TEXT NOT NULL,
+           current_price REAL NOT NULL DEFAULT 0,
+           previous_close REAL NOT NULL DEFAULT 0,
+           change REAL NOT NULL DEFAULT 0,
+           change_percent REAL NOT NULL DEFAULT 0,
+           high REAL NOT NULL DEFAULT 0,
+           low REAL NOT NULL DEFAULT 0,
+           volume INTEGER NOT NULL DEFAULT 0,
+           updated_at TEXT NOT NULL,
+           pe_ttm REAL,
+           pb REAL,
+           market_cap REAL,
+           dividend_yield REAL,
+           eps REAL,
+           roe REAL,
+           turnover_rate REAL,
+           PRIMARY KEY (market, symbol)
+         );
+         INSERT INTO cached_quotes_v5 (
+           symbol, name, market, current_price, previous_close, change,
+           change_percent, high, low, volume, updated_at, pe_ttm, pb,
+           market_cap, dividend_yield, eps, roe, turnover_rate
+         )
+         SELECT
+           symbol, name, market, current_price, previous_close, change,
+           change_percent, high, low, volume, updated_at, pe_ttm, pb,
+           market_cap, dividend_yield, eps, roe, turnover_rate
+         FROM cached_quotes;
+         DROP TABLE cached_quotes;
+         ALTER TABLE cached_quotes_v5 RENAME TO cached_quotes;",
+    )
 }
 
 pub(crate) fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {

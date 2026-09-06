@@ -12,6 +12,7 @@ import type {
 import {
   consumeAiPrefillToolContext,
   readPersistedAiPrefillContext,
+  readPersistedRebalanceSessionBinding,
 } from "../pages/AiAssistant/prefill.ts";
 import {
   buildHistory,
@@ -181,6 +182,24 @@ function sameToolContext(
       left.name === right.name &&
       JSON.stringify(left.arguments) === JSON.stringify(right.arguments),
   );
+}
+
+function sessionTurnBinding(messages: ChatMessageWithMeta[]):
+  | { activeSkills: string[]; toolContext: AiToolContext | null }
+  | { error: string } {
+  const binding = readPersistedRebalanceSessionBinding(
+    messages.flatMap((message) => (message.toolCalls ? [message.toolCalls] : [])),
+  );
+  if (binding.kind === "invalid") {
+    return { error: "可信再平衡会话的预填来源无效，已拒绝发送以避免扩大数据范围" };
+  }
+  if (binding.kind === "bound") {
+    return {
+      activeSkills: [binding.activeSkill],
+      toolContext: binding.toolContext,
+    };
+  }
+  return { activeSkills: [], toolContext: null };
 }
 
 // Explicitly activated skill ids for the *next* outbound turn. Kept in the
@@ -580,6 +599,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (!trimmed) return { ok: false, error: "消息内容不能为空" };
     if (get().sending) return { ok: false, error: "AI 正在回复中" };
 
+    const priorMessages = get().messages;
+    const sessionBinding = sessionTurnBinding(priorMessages);
+    if ("error" in sessionBinding) {
+      return { ok: false, error: sessionBinding.error };
+    }
+
     const now = Date.now();
     const userMsg: ChatMessageWithMeta = {
       id: newId(),
@@ -590,9 +615,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Consume the one-shot explicit skill selection for this turn (set via
     // `/`, `@`, or a quick chip) BEFORE building the placeholder, so it can
     // be stamped onto the assistant row and later re-applied by retryLastTurn.
-    const activeSkills = get().pendingActiveSkills;
+    const stagedActiveSkills = get().pendingActiveSkills;
     const consumedToolContext = consumeAiPrefillToolContext(get().pendingToolContext);
-    const toolContext = consumedToolContext.current;
+    const activeSkills = sessionBinding.activeSkills.length > 0
+      ? sessionBinding.activeSkills
+      : stagedActiveSkills;
+    const toolContext = sessionBinding.toolContext ?? consumedToolContext.current;
     set({
       pendingActiveSkills: [],
       pendingToolContext: consumedToolContext.next,
@@ -615,7 +643,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // below sees the same snapshot. Reading get().messages after the set()
     // would already include userMsg/assistantMsg and lead to duplicated ids
     // when building the persistence payload (UNIQUE constraint violation).
-    const priorMessages = get().messages;
     const updatedMessages = [...priorMessages, userMsg, assistantMsg];
     // Build the outgoing request history through buildHistory so empty/error
     // rows and non-alternating roles are scrubbed — otherwise the provider can
@@ -669,13 +696,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (targetIdx === -1) return;
     const target = messages[targetIdx];
     if (target.role !== "user") return;
+    const sessionBinding = sessionTurnBinding(messages);
+    if ("error" in sessionBinding) {
+      set({ error: sessionBinding.error });
+      return;
+    }
 
     const editedUser: ChatMessageWithMeta = { ...target, content: trimmed };
     // Consume any staged explicit selection here too (a `/`-pick made just
     // before editing should still apply to the edited turn).
-    const activeSkills = get().pendingActiveSkills;
+    const stagedActiveSkills = get().pendingActiveSkills;
     const consumedToolContext = consumeAiPrefillToolContext(get().pendingToolContext);
-    const toolContext = consumedToolContext.current;
+    const activeSkills = sessionBinding.activeSkills.length > 0
+      ? sessionBinding.activeSkills
+      : stagedActiveSkills;
+    const toolContext = sessionBinding.toolContext ?? consumedToolContext.current;
     set({
       pendingActiveSkills: [],
       pendingToolContext: consumedToolContext.next,
@@ -734,6 +769,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     );
     if (failedIdx === -1) return;
     const failedMsg = messages[failedIdx];
+    const sessionBinding = sessionTurnBinding(messages);
+    if ("error" in sessionBinding) {
+      set({ error: sessionBinding.error });
+      return;
+    }
 
     // History = everything before the failed placeholder (the user turn that
     // triggered it is the last element). Normalise via buildHistory so any
@@ -746,8 +786,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // a retry would silently drop a `/`-picked skill and fall back to auto
     // matching. When none was set, an empty array preserves the original
     // behaviour (auto-match from the latest user message).
-    const activeSkills = failedMsg.explicitSkillIds ?? [];
-    const toolContext = failedMsg.explicitToolContext ?? null;
+    const activeSkills = sessionBinding.activeSkills.length > 0
+      ? sessionBinding.activeSkills
+      : failedMsg.explicitSkillIds ?? [];
+    const toolContext = sessionBinding.toolContext ?? failedMsg.explicitToolContext ?? null;
 
     // Reset the placeholder: clear error, wipe any partial content, and mark
     // it as the active streaming target so delta/usage/done listeners fill it.
@@ -785,6 +827,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (idx === -1) return;
     const target = messages[idx];
     if (target.role !== "assistant") return;
+    const sessionBinding = sessionTurnBinding(messages);
+    if ("error" in sessionBinding) {
+      set({ error: sessionBinding.error });
+      return;
+    }
 
     // Keep everything before this assistant turn (the last element is the user
     // turn that prompted it). Drop the target assistant message and anything
@@ -794,8 +841,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     // Re-apply the explicit skill selection captured on the original turn so
     // regenerate preserves a `/`-picked skill. Fall back to auto-match otherwise.
-    const activeSkills = target.explicitSkillIds ?? [];
-    const toolContext = target.explicitToolContext ?? null;
+    const activeSkills = sessionBinding.activeSkills.length > 0
+      ? sessionBinding.activeSkills
+      : target.explicitSkillIds ?? [];
+    const toolContext = sessionBinding.toolContext ?? target.explicitToolContext ?? null;
 
     // New placeholder so React sees a distinct key (the old row is dropped).
     const assistantMsg: ChatMessageWithMeta = {

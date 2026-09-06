@@ -1,5 +1,17 @@
 import type { AiToolContext, ToolCallInfo } from "../../types";
 
+export interface AiPrefillRequest {
+  prompt: string;
+  activeSkill: string | null;
+  autoSend: boolean;
+  toolContext: AiToolContext | null;
+}
+
+export interface PersistedAiPrefillContext {
+  activeSkill: string;
+  toolContext: AiToolContext;
+}
+
 export function readAiPrefill(state: unknown): string | null {
   if (!state || typeof state !== "object" || !("prefillPrompt" in state)) return null;
   const value = (state as { prefillPrompt?: unknown }).prefillPrompt;
@@ -24,6 +36,51 @@ export function readAiPrefillActiveSkill(state: unknown): string | null {
     return null;
   }
   return candidate.prefillActiveSkill;
+}
+
+export function readAiPrefillRequest(state: unknown): AiPrefillRequest | null {
+  const prompt = readAiPrefill(state);
+  if (!prompt || !state || typeof state !== "object") return null;
+  const candidate = state as Record<string, unknown>;
+
+  if (candidate.prefillAutoSend === true) {
+    const args = candidate.prefillToolArguments;
+    if (
+      candidate.prefillActiveSkill !== "portfolio-rebalance" ||
+      candidate.prefillToolName !== "get_rebalance_context" ||
+      !args ||
+      typeof args !== "object" ||
+      Array.isArray(args)
+    ) {
+      return null;
+    }
+    const argumentRecord = args as Record<string, unknown>;
+    const keys = Object.keys(argumentRecord);
+    if (
+      keys.length !== 1 ||
+      keys[0] !== "config_id" ||
+      typeof argumentRecord.config_id !== "string" ||
+      !argumentRecord.config_id.trim()
+    ) {
+      return null;
+    }
+    return {
+      prompt,
+      activeSkill: "portfolio-rebalance",
+      autoSend: true,
+      toolContext: {
+        name: "get_rebalance_context",
+        arguments: { config_id: argumentRecord.config_id },
+      },
+    };
+  }
+
+  return {
+    prompt,
+    activeSkill: readAiPrefillActiveSkill(state),
+    autoSend: false,
+    toolContext: readAiPrefillToolContext(state),
+  };
 }
 
 export type AiPrefillToolContext = AiToolContext;
@@ -95,6 +152,12 @@ export function consumeAiPrefillToolContext(
 export function readPersistedAiToolContext(
   toolCalls: ToolCallInfo[],
 ): AiToolContext | null {
+  return readPersistedAiPrefillContext(toolCalls)?.toolContext ?? null;
+}
+
+export function readPersistedAiPrefillContext(
+  toolCalls: ToolCallInfo[],
+): PersistedAiPrefillContext | null {
   const reserved = toolCalls.filter(
     (call) => call.id === HOST_PREFILLED_TOOL_CALL_ID,
   );
@@ -103,7 +166,8 @@ export function readPersistedAiToolContext(
   if (
     persisted.origin !== "host_prefill" ||
     (persisted.name !== "get_stock_review" &&
-      persisted.name !== "get_portfolio_overview") ||
+      persisted.name !== "get_portfolio_overview" &&
+      persisted.name !== "get_rebalance_context") ||
     (persisted.status !== "success" && persisted.status !== "error") ||
     typeof persisted.arguments !== "string"
   ) {
@@ -115,14 +179,34 @@ export function readPersistedAiToolContext(
   } catch {
     return null;
   }
-  const isStockReview = persisted.name === "get_stock_review";
-  return readAiPrefillToolContext({
+  const activeSkill = persisted.name === "get_stock_review"
+    ? "stock-review"
+    : persisted.name === "get_portfolio_overview"
+      ? "munger-perspective"
+      : "portfolio-rebalance";
+  const request = readAiPrefillRequest({
     prefillPrompt: "persisted trusted review context",
-    prefillActiveSkill: isStockReview ? "stock-review" : "munger-perspective",
-    prefillAutoSend: false,
+    prefillActiveSkill: activeSkill,
+    prefillAutoSend: persisted.name === "get_rebalance_context",
     prefillToolName: persisted.name,
     prefillToolArguments: args,
   });
+  return request?.activeSkill && request.toolContext
+    ? { activeSkill: request.activeSkill, toolContext: request.toolContext }
+    : null;
+}
+
+export function consumeCapturedAiPrefillRequest(
+  input: { request: AiPrefillRequest | null; consumed: boolean },
+  dependencies: {
+    setCurrentSession: (sessionId: string | null) => void;
+    clearRouteState: () => void;
+  },
+): boolean {
+  if (!input.request || input.consumed) return input.consumed;
+  dependencies.setCurrentSession(null);
+  dependencies.clearRouteState();
+  return true;
 }
 
 export function resolveAiPrefillSessionId(

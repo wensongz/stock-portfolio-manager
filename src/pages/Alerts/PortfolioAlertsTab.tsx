@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { useNavigate } from "react-router-dom";
 import {
   Alert,
   Badge,
@@ -44,6 +45,8 @@ import {
   usePortfolioAlertStore,
 } from "../../stores/portfolioAlertStore";
 import { useQuoteStore } from "../../stores/quoteStore";
+import { useChatSessionStore } from "../../stores/chatSessionStore";
+import { navigateToPortfolioRebalance } from "../AiAssistant/portfolioRebalancePrefill";
 import {
   buildPortfolioAlertDisplayModel,
   buildPortfolioAlertNotificationPresentation,
@@ -116,6 +119,8 @@ function formatEvaluatedAt(value: string | null): string {
 }
 
 export default function PortfolioAlertsTab() {
+  const navigate = useNavigate();
+  const setCurrentSession = useChatSessionStore((state) => state.setCurrentSession);
   const accounts = useAccountStore((state) => state.accounts);
   const fetchAccounts = useAccountStore((state) => state.fetchAccounts);
   const categories = useCategoryStore((state) => state.categories);
@@ -447,6 +452,15 @@ export default function PortfolioAlertsTab() {
     if (evaluationError) message.error(`评估失败：${evaluationError}`);
   };
 
+  const handleAskAi = () => {
+    const configId = displayModel.configId;
+    if (!displayModel.canAskAi || !configId) return;
+    navigateToPortfolioRebalance(configId, {
+      setCurrentSession,
+      navigate: (path, options) => navigate(path, options),
+    });
+  };
+
   const columns = [
     {
       title: "投资类别",
@@ -741,7 +755,7 @@ export default function PortfolioAlertsTab() {
                 icon={<RobotOutlined />}
                 disabled={!displayModel.canAskAi}
                 data-config-id={displayModel.configId ?? undefined}
-                onClick={() => message.info(`AI 调仓入口已就绪：${displayModel.configId ?? ""}`)}
+                onClick={handleAskAi}
               >
                 AI 调仓建议
               </Button>

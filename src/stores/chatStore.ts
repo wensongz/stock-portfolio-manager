@@ -11,7 +11,7 @@ import type {
 } from "../types";
 import {
   consumeAiPrefillToolContext,
-  readPersistedAiToolContext,
+  readPersistedAiPrefillContext,
 } from "../pages/AiAssistant/prefill.ts";
 import {
   buildHistory,
@@ -467,17 +467,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 try {
                   const parsed = JSON.parse(r.tool_calls);
                   if (!Array.isArray(parsed) || parsed.length === 0) return {};
-                  const toolContext = readPersistedAiToolContext(parsed);
+                  const persistedContext = readPersistedAiPrefillContext(parsed);
                   return {
                     toolCalls: parsed,
-                    ...(toolContext
+                    ...(persistedContext
                       ? {
-                          explicitToolContext: toolContext,
-                          explicitSkillIds: [
-                            toolContext.name === "get_stock_review"
-                              ? "stock-review"
-                              : "munger-perspective",
-                          ],
+                          explicitToolContext: persistedContext.toolContext,
+                          explicitSkillIds: [persistedContext.activeSkill],
                         }
                       : {}),
                   };

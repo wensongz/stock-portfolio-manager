@@ -170,6 +170,34 @@ function persistedMessage(id, sessionId, content) {
   };
 }
 
+test("reopening a rebalance turn restores its exact tool scope and skill", async () => {
+  const user = persistedMessage("rebalance-user", "session-rebalance", "rebalance now");
+  const assistant = {
+    ...persistedMessage("rebalance-assistant", "session-rebalance", "plan"),
+    role: "assistant",
+    tool_calls: JSON.stringify([{
+      id: "prefilled-stock-review",
+      name: "get_rebalance_context",
+      arguments: JSON.stringify({ config_id: "config-us" }),
+      status: "success",
+      origin: "host_prefill",
+    }]),
+  };
+  invokeImpl = async (command) => {
+    if (command === "get_chat_messages") return [user, assistant];
+    throw new Error(`unexpected command ${command}`);
+  };
+
+  await useChatStore.getState().loadSessionMessages("session-rebalance");
+
+  const restored = useChatStore.getState().messages[1];
+  assert.deepEqual(restored.explicitSkillIds, ["portfolio-rebalance"]);
+  assert.deepEqual(restored.explicitToolContext, {
+    name: "get_rebalance_context",
+    arguments: { config_id: "config-us" },
+  });
+});
+
 test("switching away lets a background reply finish without overwriting the new session", async () => {
   const savedSnapshots = [];
   const otherRecord = persistedMessage("other-user", "session-other", "other session");

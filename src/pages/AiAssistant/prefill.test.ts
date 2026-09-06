@@ -3,10 +3,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  consumeCapturedAiPrefillRequest,
   consumeAiPrefillToolContext,
   readAiPrefill,
   readAiPrefillActiveSkill,
+  readAiPrefillRequest,
   readAiPrefillToolContext,
+  readPersistedAiPrefillContext,
   readPersistedAiToolContext,
   resolveAiPrefillSessionId,
 } from "./prefill.ts";
@@ -19,6 +22,118 @@ test("rejects missing, blank, and non-string prompts", () => {
   assert.equal(readAiPrefill(null), null);
   assert.equal(readAiPrefill({ prefillPrompt: "  " }), null);
   assert.equal(readAiPrefill({ prefillPrompt: 42 }), null);
+});
+
+test("portfolio rebalance prefill requires the trusted tool, skill, and auto-send", () => {
+  const request = readAiPrefillRequest({
+    prefillPrompt: "请根据当前违规生成再平衡建议。",
+    prefillActiveSkill: "portfolio-rebalance",
+    prefillAutoSend: true,
+    prefillToolName: "get_rebalance_context",
+    prefillToolArguments: { config_id: "config-us" },
+  });
+
+  assert.deepEqual(request, {
+    prompt: "请根据当前违规生成再平衡建议。",
+    activeSkill: "portfolio-rebalance",
+    autoSend: true,
+    toolContext: {
+      name: "get_rebalance_context",
+      arguments: { config_id: "config-us" },
+    },
+  });
+});
+
+test("auto-send rejects arbitrary skills and every malformed rebalance scope", () => {
+  const valid = {
+    prefillPrompt: "send me",
+    prefillActiveSkill: "portfolio-rebalance",
+    prefillAutoSend: true,
+    prefillToolName: "get_rebalance_context",
+    prefillToolArguments: { config_id: "config-us" },
+  };
+  const invalidStates = [
+    { ...valid, prefillActiveSkill: "stock-review" },
+    { ...valid, prefillToolName: "get_portfolio_overview" },
+    { ...valid, prefillToolArguments: {} },
+    { ...valid, prefillToolArguments: { market: "US" } },
+    { ...valid, prefillToolArguments: { config_id: "config-us", market: "US" } },
+    { ...valid, prefillToolArguments: { config_id: 42 } },
+    { ...valid, prefillToolArguments: { config_id: " " } },
+    { ...valid, prefillPrompt: " " },
+  ];
+
+  for (const state of invalidStates) {
+    assert.equal(readAiPrefillRequest(state), null);
+  }
+});
+
+test("atomic prefill parsing preserves legacy composer-only requests", () => {
+  assert.deepEqual(readAiPrefillRequest({ prefillPrompt: "  复盘期权策略  " }), {
+    prompt: "复盘期权策略",
+    activeSkill: null,
+    autoSend: false,
+    toolContext: null,
+  });
+});
+
+test("atomic prefill parsing preserves stock-review and portfolio-overview staging", () => {
+  assert.deepEqual(readAiPrefillRequest({
+    prefillPrompt: "复盘 AAPL",
+    prefillActiveSkill: "stock-review",
+    prefillAutoSend: false,
+    prefillToolName: "get_stock_review",
+    prefillToolArguments: {
+      start_date: "2026-01-01",
+      end_date: "2026-08-28",
+      base_currency: "USD",
+      symbol: "AAPL",
+    },
+  }), {
+    prompt: "复盘 AAPL",
+    activeSkill: "stock-review",
+    autoSend: false,
+    toolContext: {
+      name: "get_stock_review",
+      arguments: {
+        start_date: "2026-01-01",
+        end_date: "2026-08-28",
+        base_currency: "USD",
+        symbol: "AAPL",
+      },
+    },
+  });
+  assert.deepEqual(readAiPrefillRequest({
+    prefillPrompt: "芒格组合复盘",
+    prefillActiveSkill: "munger-perspective",
+    prefillAutoSend: false,
+    prefillToolName: "get_portfolio_overview",
+    prefillToolArguments: { market: "HK" },
+  }), {
+    prompt: "芒格组合复盘",
+    activeSkill: "munger-perspective",
+    autoSend: false,
+    toolContext: {
+      name: "get_portfolio_overview",
+      arguments: { market: "HK" },
+    },
+  });
+});
+
+test("captured route state clears the current session and browser state once", () => {
+  const calls: string[] = [];
+  const request = readAiPrefillRequest({ prefillPrompt: "复盘期权策略" });
+  let consumed = false;
+  const dependencies = {
+    setCurrentSession: (sessionId: string | null) => calls.push(`session:${sessionId}`),
+    clearRouteState: () => calls.push("route:replace-null"),
+  };
+
+  consumed = consumeCapturedAiPrefillRequest({ request, consumed }, dependencies);
+  consumed = consumeCapturedAiPrefillRequest({ request, consumed }, dependencies);
+
+  assert.equal(consumed, true);
+  assert.deepEqual(calls, ["session:null", "route:replace-null"]);
 });
 
 test("valid prefill targets a new chat instead of the active session", () => {
@@ -207,6 +322,26 @@ test("persisted context reconstruction restores a scoped Munger portfolio review
   }]), {
     name: "get_portfolio_overview",
     arguments: { market: "HK" },
+  });
+});
+
+test("persisted context reconstruction restores exact portfolio rebalancing staging", () => {
+  const calls = [{
+    ...genuineHostCall,
+    name: "get_rebalance_context",
+    arguments: JSON.stringify({ config_id: "config-us" }),
+  }];
+
+  assert.deepEqual(readPersistedAiToolContext(calls), {
+    name: "get_rebalance_context",
+    arguments: { config_id: "config-us" },
+  });
+  assert.deepEqual(readPersistedAiPrefillContext(calls), {
+    activeSkill: "portfolio-rebalance",
+    toolContext: {
+      name: "get_rebalance_context",
+      arguments: { config_id: "config-us" },
+    },
   });
 });
 

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Typography } from "antd";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useChatStore } from "../../stores/chatStore";
@@ -6,10 +6,8 @@ import { useChatSessionStore } from "../../stores/chatSessionStore";
 import { useAiStore } from "../../stores/aiStore";
 import { useSkillStore } from "../../stores/skillStore";
 import {
-  readAiPrefill,
-  readAiPrefillActiveSkill,
-  readAiPrefillToolContext,
-  resolveAiPrefillSessionId,
+  consumeCapturedAiPrefillRequest,
+  readAiPrefillRequest,
 } from "./prefill";
 import { ChatPanel } from "./ChatPanel";
 import { SessionSidebar } from "./SessionSidebar";
@@ -27,23 +25,9 @@ export default function AiAssistantPage() {
     renameSession,
     setCurrentSession,
   } = useChatSessionStore();
-  const [initialPrompt] = useState(() => readAiPrefill(location.state));
-  const [initialActiveSkill] = useState(() =>
-    readAiPrefillActiveSkill(location.state),
-  );
-  const [initialToolContext] = useState(() =>
-    readAiPrefillToolContext(location.state),
-  );
-  const [initialSessionId] = useState(() =>
-    resolveAiPrefillSessionId(initialPrompt, currentSessionId),
-  );
+  const [initialRequest] = useState(() => readAiPrefillRequest(location.state));
+  const capturedRouteConsumedRef = useRef(false);
   const { init } = useChatStore();
-  const setActiveSkillsForNextTurn = useChatStore(
-    (state) => state.setActiveSkillsForNextTurn,
-  );
-  const setToolContextForNextTurn = useChatStore(
-    (state) => state.setToolContextForNextTurn,
-  );
   const streamingSessionId = useChatStore(
     (state) => state.streamingSessionIdState,
   );
@@ -52,24 +36,22 @@ export default function AiAssistantPage() {
   const [bootstrapped, setBootstrapped] = useState(false);
 
   useEffect(() => {
-    if (!initialPrompt) return;
-    setCurrentSession(initialSessionId);
-    if (initialActiveSkill) {
-      setActiveSkillsForNextTurn([initialActiveSkill]);
-    }
-    if (initialToolContext) {
-      setToolContextForNextTurn(initialToolContext);
-    }
-    navigate(location.pathname, { replace: true, state: null });
+    capturedRouteConsumedRef.current = consumeCapturedAiPrefillRequest(
+      {
+        request: initialRequest,
+        consumed: capturedRouteConsumedRef.current,
+      },
+      {
+        setCurrentSession,
+        clearRouteState: () => {
+          navigate(location.pathname, { replace: true, state: null });
+        },
+      },
+    );
   }, [
-    initialPrompt,
-    initialActiveSkill,
-    initialSessionId,
-    initialToolContext,
+    initialRequest,
     location.pathname,
     navigate,
-    setActiveSkillsForNextTurn,
-    setToolContextForNextTurn,
     setCurrentSession,
   ]);
 
@@ -99,7 +81,7 @@ export default function AiAssistantPage() {
           <ChatPanel
             sessionId={currentSessionId}
             navigate={navigate}
-            initialPrompt={initialPrompt}
+            initialRequest={initialRequest}
           />
         ) : (
           <div

@@ -26,6 +26,13 @@ import { useSkillStore } from "../../stores/skillStore";
 import type { Skill } from "../../types";
 import { Composer } from "./Composer";
 import { MessageRow } from "./MessageRow";
+import type { AiPrefillRequest } from "./prefill";
+import {
+  decideAiSessionTransition,
+  runAiPrefillAutoSend,
+  shouldAutoSendPrefill,
+  stageNonAutoAiPrefill,
+} from "./aiPrefillAutoSend";
 
 const { Title, Text } = Typography;
 
@@ -98,13 +105,13 @@ function pickRandom<T>(pool: readonly T[], n: number, seed: number): T[] {
 export function ChatPanel({
   sessionId,
   navigate,
-  initialPrompt,
+  initialRequest,
 }: {
   // null means "no active session" (welcome screen). A session is created
   // lazily on the first send.
   sessionId: string | null;
   navigate: NavigateFunction;
-  initialPrompt: string | null;
+  initialRequest: AiPrefillRequest | null;
 }) {
   const {
     messages,
@@ -124,12 +131,13 @@ export function ChatPanel({
     loadSessionMessages,
     resetForSessionSwitch,
     setActiveSkillsForNextTurn,
+    setToolContextForNextTurn,
   } = useChatStore();
   // Read the staged explicit selection so the Composer can render "待激活"
   // chips. Subscribing via the store keeps the chips reactive as the user
   // adds/removes skills via `/` or the × button.
   const pendingActiveSkillIds = useChatStore((s) => s.pendingActiveSkills);
-  const { config } = useAiStore();
+  const { config, loading: configLoading } = useAiStore();
   const { skills } = useSkillStore();
   // Quick chips and `/` autocomplete only show enabled skills.
   const enabledSkills = useMemo(() => skills.filter((s) => s.enabled), [skills]);
@@ -149,12 +157,7 @@ export function ChatPanel({
   const setCurrentSession = useChatSessionStore((s) => s.setCurrentSession);
 
   const [input, setInput] = useState("");
-  const seededPromptRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (!initialPrompt || seededPromptRef.current === initialPrompt) return;
-    seededPromptRef.current = initialPrompt;
-    setInput((current) => current.trim().length > 0 ? current : initialPrompt);
-  }, [initialPrompt]);
+  const initialPrefillConsumedRef = useRef(false);
   // Seed for the random suggestion picker. Bumping it reshuffles which 6 of
   // SUGGESTION_POOL are shown in the empty state ("换一批" button).
   const [suggestionSeed, setSuggestionSeed] = useState(0);
@@ -188,6 +191,24 @@ export function ChatPanel({
   // change after being set, so it can't suppress a later genuine switch.
   const expectingSessionCreation = useRef(false);
 
+  useEffect(() => {
+    if (
+      !initialRequest ||
+      initialRequest.autoSend ||
+      initialPrefillConsumedRef.current
+    ) {
+      return;
+    }
+    initialPrefillConsumedRef.current = true;
+    const prompt = stageNonAutoAiPrefill(initialRequest, {
+      stageSkill: (skill) => setActiveSkillsForNextTurn([skill]),
+      stageTool: setToolContextForNextTurn,
+    });
+    setInput((current) =>
+      current.trim().length > 0 ? current : (prompt ?? current),
+    );
+  }, [initialRequest, setActiveSkillsForNextTurn, setToolContextForNextTurn]);
+
   // Load messages whenever the active session changes.
   //
   // Three cases to be careful about:
@@ -206,7 +227,12 @@ export function ChatPanel({
   // every token streamed would retrigger this effect and reload over the
   // in-progress reply.
   useEffect(() => {
-    if (sessionId === null) {
+    const transition = decideAiSessionTransition({
+      nextSessionId: sessionId,
+      loadedSessionId: loadedSessionRef.current,
+      expectingSessionCreation: expectingSessionCreation.current,
+    });
+    if (transition === "CLEAR") {
       // Switching to "new chat" welcome screen: clear the loaded session
       // marker and wipe the in-memory messages so the welcome hero shows
       // instead of the previous conversation. Abort any in-flight stream.
@@ -215,10 +241,11 @@ export function ChatPanel({
       void resetForSessionSwitch();
       return;
     }
-    if (loadedSessionRef.current === sessionId) return;
+    if (transition === "UNCHANGED") return;
+    if (!sessionId) return;
     loadedSessionRef.current = sessionId;
     // Sending from welcome screen: skip reload, keep in-flight messages.
-    if (expectingSessionCreation.current) {
+    if (transition === "KEEP_IN_FLIGHT") {
       expectingSessionCreation.current = false;
       return;
     }
@@ -240,8 +267,47 @@ export function ChatPanel({
   );
 
   const providerIsOllama = config?.provider === "ollama";
-  const notConfigured =
-    config && (!config.model || (!providerIsOllama && !config.api_key));
+  const configuredForAutoSend = Boolean(
+    !configLoading &&
+    config?.model &&
+    (providerIsOllama || config.api_key),
+  );
+  const notConfigured = !configLoading && !configuredForAutoSend;
+
+  useEffect(() => {
+    if (!shouldAutoSendPrefill({
+      request: initialRequest,
+      consumed: initialPrefillConsumedRef.current,
+      configured: configuredForAutoSend,
+      sending,
+    })) {
+      return;
+    }
+
+    initialPrefillConsumedRef.current = true;
+    expectingSessionCreation.current = true;
+    void runAiPrefillAutoSend(initialRequest!, {
+      stageSkill: (skill) => setActiveSkillsForNextTurn([skill]),
+      stageTool: setToolContextForNextTurn,
+      createSession: async () => (await createSession()).id,
+      sendMessage,
+      touchSession,
+      renameSession: autoRenameIfDefault,
+    }).catch((error) => {
+      expectingSessionCreation.current = false;
+      message.error("自动发送再平衡请求失败：" + String(error));
+    });
+  }, [
+    autoRenameIfDefault,
+    configuredForAutoSend,
+    createSession,
+    initialRequest,
+    sendMessage,
+    sending,
+    setActiveSkillsForNextTurn,
+    setToolContextForNextTurn,
+    touchSession,
+  ]);
 
   // Resolve the effective session id, creating one on the fly if the user is
   // composing in the no-session welcome state. Returns null if creation

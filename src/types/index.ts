@@ -923,7 +923,7 @@ export interface ChatMessageWithMeta {
 }
 
 export interface AiToolContext {
-  name: "get_stock_review" | "get_portfolio_overview";
+  name: "get_stock_review" | "get_portfolio_overview" | "get_rebalance_context";
   arguments: Record<string, string>;
 }
 

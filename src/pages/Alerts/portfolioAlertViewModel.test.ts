@@ -12,6 +12,7 @@ import {
   overallScope,
   resolvePortfolioAlertCurrency,
   resolvePortfolioAlertScope,
+  selectPortfolioAlertWorkspaceRows,
   validatePortfolioAlertDraft,
 } from "./portfolioAlertViewModel.ts";
 
@@ -309,6 +310,38 @@ test("EMPTY never revives a config's cleared last snapshot", () => {
   assert.deepEqual(model.pieData, []);
   assert.deepEqual(model.rows, []);
   assert.deepEqual(model.concentrationRows, []);
+});
+
+test("edit mode keeps EMPTY evaluation rows empty while exposing dedicated target rows", () => {
+  const categories = [
+    category("growth", "成长", 10, "#00aa00", "🚀"),
+    category("cash", "现金", 20, "#ffaa00", "💵"),
+    category("new", "新类别", 30, "#333333", "🆕"),
+  ];
+  const emptyModel = buildPortfolioAlertDisplayModel(view({
+    status: "EMPTY",
+    snapshot: null,
+    stale: false,
+  }, {
+    lastSnapshot: snapshot(),
+  }), categories);
+  const rows = selectPortfolioAlertWorkspaceRows(
+    emptyModel.rows,
+    draft([], {
+      targets: [
+        { categoryId: "growth", targetPercent: 60 },
+        { categoryId: "cash", targetPercent: 40 },
+      ],
+    }),
+    categories,
+    true,
+  );
+
+  assert.deepEqual(rows.evaluatedRows, []);
+  assert.deepEqual(
+    rows.targetEditorRows.map((row) => [row.name, row.targetPercent]),
+    [["成长", 60], ["现金", 40], ["新类别", 0]],
+  );
 });
 
 test("an unconfigured scope is explicit and defaults to no AI action", () => {

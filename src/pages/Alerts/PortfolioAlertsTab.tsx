@@ -52,9 +52,11 @@ import {
   mergePortfolioAlertDraftCategories,
   overallScope,
   resolvePortfolioAlertCurrency,
+  selectPortfolioAlertWorkspaceRows,
   validatePortfolioAlertDraft,
   type PortfolioAlertDisplayRow,
   type PortfolioAlertDraft,
+  type PortfolioAlertTargetEditorRow,
 } from "./portfolioAlertViewModel";
 
 const { Text, Title } = Typography;
@@ -182,13 +184,15 @@ export default function PortfolioAlertsTab() {
     () => buildPortfolioAlertDisplayModel(currentView, categories),
     [categories, currentView],
   );
-  const tableRows = useMemo(() => {
-    if (!editing || displayModel.rows.length > 0) return displayModel.rows;
-    return buildPortfolioAlertDisplayModel(
-      currentView ? { config: currentView.config, evaluation: null } : undefined,
+  const workspaceRows = useMemo(
+    () => selectPortfolioAlertWorkspaceRows(
+      displayModel.rows,
+      draft,
       categories,
-    ).rows;
-  }, [categories, currentView, displayModel.rows, editing]);
+      editing,
+    ),
+    [categories, displayModel.rows, draft, editing],
+  );
   const validation = useMemo(() => validatePortfolioAlertDraft(draft), [draft]);
   const dirty = useMemo(
     () => draftFingerprint(draft) !== draftFingerprint(baseline),
@@ -459,28 +463,9 @@ export default function PortfolioAlertsTab() {
     },
     {
       title: "目标占比",
+      dataIndex: "targetPercentLabel",
       key: "targetPercent",
-      width: 155,
-      render: (_: unknown, row: PortfolioAlertDisplayRow) => {
-        const target = draft.targets.find((item) => item.categoryId === row.categoryId);
-        if (!editing || !row.editable || !target) return row.targetPercentLabel;
-        const fieldError = validation.targetErrors[target.categoryId];
-        return (
-          <div>
-            <InputNumber
-              min={0}
-              max={100}
-              precision={2}
-              value={Number.isFinite(target.targetPercent) ? target.targetPercent : null}
-              status={fieldError ? "error" : undefined}
-              addonAfter="%"
-              onChange={(value) => updateTarget(target.categoryId, value)}
-              style={{ width: 130 }}
-            />
-            {fieldError && <div><Text type="danger">{fieldError}</Text></div>}
-          </div>
-        );
-      },
+      width: 110,
     },
     {
       title: "当前占比",
@@ -642,6 +627,43 @@ export default function PortfolioAlertsTab() {
           <Text type="secondary">金额计算币种：{resolvePortfolioAlertCurrency(selectedScope, accounts, baseCurrency)}</Text>
           {validation.totalError && <Text type="danger">{validation.totalError}</Text>}
         </div>
+        {editing && (
+          <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-700">
+            <Title level={5}>目标配置</Title>
+            {workspaceRows.targetEditorRows.length === 0 ? (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="请先在设置中创建投资类别" />
+            ) : (
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+                {workspaceRows.targetEditorRows.map((row: PortfolioAlertTargetEditorRow) => {
+                  const fieldError = validation.targetErrors[row.categoryId];
+                  return (
+                    <div
+                      key={row.key}
+                      className="rounded-lg border border-slate-200 p-3 dark:border-slate-700"
+                    >
+                      <div className="mb-2 flex items-center gap-2">
+                        <span style={{ fontSize: 20 }}>{row.icon}</span>
+                        <Badge color={row.color} />
+                        <Text>{row.name}</Text>
+                      </div>
+                      <InputNumber
+                        min={0}
+                        max={100}
+                        precision={2}
+                        value={Number.isFinite(row.targetPercent) ? row.targetPercent : null}
+                        status={fieldError ? "error" : undefined}
+                        addonAfter="%"
+                        onChange={(value) => updateTarget(row.categoryId, value)}
+                        style={{ width: "100%" }}
+                      />
+                      {fieldError && <div><Text type="danger">{fieldError}</Text></div>}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
       </Card>
 
       {error && <Alert type="error" showIcon title="组合提醒加载失败" description={error} />}
@@ -697,12 +719,12 @@ export default function PortfolioAlertsTab() {
             extra={<Text type="secondary">当前合计 {displayModel.totalCurrentLabel}</Text>}
           >
             <Table<PortfolioAlertDisplayRow>
-              dataSource={tableRows}
+              dataSource={workspaceRows.evaluatedRows}
               columns={columns}
               rowKey="key"
               pagination={false}
               scroll={{ x: 1210 }}
-              locale={{ emptyText: "请先在设置中创建投资类别" }}
+              locale={{ emptyText: "暂无可展示的评估结果" }}
               size="middle"
             />
           </Card>

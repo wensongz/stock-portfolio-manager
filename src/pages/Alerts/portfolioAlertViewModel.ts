@@ -64,6 +64,20 @@ export interface PortfolioAlertPieRow {
   color: string;
 }
 
+export interface PortfolioAlertTargetEditorRow {
+  key: string;
+  categoryId: string;
+  name: string;
+  icon: string;
+  color: string;
+  targetPercent: number;
+}
+
+export interface PortfolioAlertWorkspaceRows {
+  evaluatedRows: PortfolioAlertDisplayRow[];
+  targetEditorRows: PortfolioAlertTargetEditorRow[];
+}
+
 export interface PortfolioAlertConcentrationRow {
   key: string;
   market: string;
@@ -206,6 +220,31 @@ export function mergePortfolioAlertDraftCategories(
       categoryId: category.id,
       targetPercent: targetByCategory.get(category.id) ?? 0,
     })),
+  };
+}
+
+export function selectPortfolioAlertWorkspaceRows(
+  evaluatedRows: PortfolioAlertDisplayRow[],
+  draft: PortfolioAlertDraft,
+  categories: Category[],
+  editing: boolean,
+): PortfolioAlertWorkspaceRows {
+  const mergedDraft = mergePortfolioAlertDraftCategories(draft, categories);
+  const targetByCategory = new Map(
+    mergedDraft.targets.map((target) => [target.categoryId, target.targetPercent]),
+  );
+  return {
+    evaluatedRows,
+    targetEditorRows: editing
+      ? orderedCategories(categories).map((category) => ({
+          key: category.id,
+          categoryId: category.id,
+          name: category.name,
+          icon: category.icon,
+          color: category.color,
+          targetPercent: targetByCategory.get(category.id) ?? 0,
+        }))
+      : [],
   };
 }
 
@@ -398,7 +437,7 @@ export function buildPortfolioAlertDisplayModel(
     config?.targets.map((target) => [target.categoryId, target.targetPercent]) ?? [],
   );
   const uncategorized = sourceRows.find((row) => row.categoryId === null);
-  const mergedRows = evaluation?.status === "EMPTY"
+  const mergedRows = evaluation?.status === "EMPTY" || snapshot === null
     ? []
     : categories
       ? [

@@ -29,6 +29,27 @@ pub(crate) async fn evaluate_and_emit_portfolio_alerts(
     quote_cache: &QuoteCache,
     exchange_rate_cache: &ExchangeRateCache,
 ) {
+    evaluate_portfolio_alerts_with_sink(
+        db,
+        quote_cache,
+        exchange_rate_cache,
+        |notification| {
+            if let Err(error) = app_handle.emit("portfolio-alert-triggered", notification) {
+                warn!("Failed to emit portfolio-alert-triggered event: {error}");
+            }
+        },
+    )
+    .await;
+}
+
+pub(crate) async fn evaluate_portfolio_alerts_with_sink<F>(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    exchange_rate_cache: &ExchangeRateCache,
+    emit: F,
+) where
+    F: FnMut(crate::models::portfolio_alert::PortfolioAlertNotification),
+{
     let rates = exchange_rate_cache.get_stale().or_else(|| {
         load_exchange_rates_from_db(db).unwrap_or_else(|error| {
             warn!("Unable to load persisted exchange rates for portfolio alerts: {error}");
@@ -43,13 +64,7 @@ pub(crate) async fn evaluate_and_emit_portfolio_alerts(
     )
     .await
     {
-        Ok(notifications) => {
-            emit_portfolio_alert_notifications(notifications, |notification| {
-                if let Err(error) = app_handle.emit("portfolio-alert-triggered", notification) {
-                    warn!("Failed to emit portfolio-alert-triggered event: {error}");
-                }
-            });
-        }
+        Ok(notifications) => emit_portfolio_alert_notifications(notifications, emit),
         Err(error) => warn!("Portfolio alert evaluation after quote refresh failed: {error}"),
     }
 }
@@ -68,47 +83,200 @@ pub(crate) fn emit_portfolio_alert_notifications<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::portfolio_alert::{
-        PortfolioAlertBreach, PortfolioAlertBreachDirection, PortfolioAlertBreachKind,
-        PortfolioAlertNotification, PortfolioAlertScopeKind,
+    use crate::commands::quotes::{
+        persist_holding_quote_refresh, run_alert_evaluation_after_holding_refresh,
     };
+    use crate::db::Database;
+    use crate::models::portfolio_alert::{
+        PortfolioAlertScopeKind, PortfolioAlertTarget, SavePortfolioAlertConfigInput,
+    };
+    use crate::models::StockQuote;
+    use crate::services::portfolio_alert_service;
+    use crate::services::quote_service::{classify_refresh_complete, QuoteCache, QuoteFetchResult};
 
-    fn notification(key: &str) -> PortfolioAlertNotification {
-        PortfolioAlertNotification {
-            config_id: "config-us".to_string(),
-            scope: PortfolioAlertScope {
-                kind: PortfolioAlertScopeKind::Market,
-                market: Some("US".to_string()),
-                account_id: None,
-            },
-            breach: PortfolioAlertBreach {
-                config_id: "config-us".to_string(),
-                breach_key: key.to_string(),
-                breach_kind: PortfolioAlertBreachKind::Concentration,
-                direction: PortfolioAlertBreachDirection::AboveLimit,
-                first_triggered_at: "2026-09-06T10:00:00Z".to_string(),
-                last_seen_at: "2026-09-06T10:00:00Z".to_string(),
-            },
-            message: "持仓集中度预警".to_string(),
-            triggered_at: "2026-09-06T10:00:00Z".to_string(),
+    fn fixture() -> (Database, QuoteCache, String, Vec<StockQuote>) {
+        let db = Database::new(":memory:").unwrap();
+        let config_id = "config-us".to_string();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, name, market, created_at, updated_at)
+                 VALUES ('acct-us', 'US', 'US', '2026-09-06', '2026-09-06')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO categories (id, name, color, icon, created_at)
+                 VALUES ('growth', 'Growth', '#00AA00', 'growth', '2026-09-06')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
+                 VALUES ('holding-aapl', 'acct-us', 'AAPL', 'Apple', 'US', 'growth', 10, 1, 'USD', '2026-09-06', '2026-09-06')",
+                [],
+            )
+            .unwrap();
         }
+        portfolio_alert_service::save_portfolio_alert_config(
+            &db,
+            SavePortfolioAlertConfigInput {
+                id: Some(config_id.clone()),
+                scope: PortfolioAlertScope {
+                    kind: PortfolioAlertScopeKind::Market,
+                    market: Some("US".to_string()),
+                    account_id: None,
+                },
+                base_currency: "USD".to_string(),
+                deviation_threshold: 20.0,
+                concentration_threshold: 60.0,
+                is_active: true,
+                targets: vec![PortfolioAlertTarget {
+                    category_id: "growth".to_string(),
+                    target_percent: 100.0,
+                }],
+            },
+        )
+        .unwrap();
+        let quotes = vec![StockQuote {
+            market: "US".to_string(),
+            symbol: "AAPL".to_string(),
+            current_price: 100.0,
+            ..StockQuote::default()
+        }];
+        let quote_cache = QuoteCache::new();
+        quote_cache.set_batch(&quotes);
+        (db, quote_cache, config_id, quotes)
     }
 
-    #[test]
-    fn emitted_event_count_matches_new_breach_payload_count() {
-        // This catches an event loop that drops or coalesces newly inserted
-        // breach payloads after batch evaluation.
-        let mut emitted_keys = Vec::new();
+    #[tokio::test]
+    async fn persisted_complete_refresh_evaluates_real_breaches_and_emits_exact_payloads() {
+        // This catches disconnected orchestration tests: all notifications here
+        // must come from real persisted breach transitions, not fixture values.
+        let (db, quote_cache, config_id, quotes) = fixture();
+        let requested = vec![("AAPL".to_string(), "US".to_string())];
+        let refresh_complete = classify_refresh_complete(&requested, &quotes);
+        let complete = QuoteFetchResult {
+            data: quotes,
+            warning: None,
+            did_refresh: true,
+            refresh_complete,
+        };
+        let persisted = persist_holding_quote_refresh(&db, &complete);
+        assert!(persisted);
+        let rate_cache = ExchangeRateCache::new();
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = emitted.clone();
 
-        emit_portfolio_alert_notifications(
-            vec![
-                notification("security:US:AAPL"),
-                notification("security:US:MSFT"),
-            ],
-            |notification| emitted_keys.push(notification.breach.breach_key),
-        );
+        run_alert_evaluation_after_holding_refresh(None, &complete, persisted, || async {
+            assert_eq!(
+                crate::services::quote_service::load_quotes_from_db(&db)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            evaluate_portfolio_alerts_with_sink(&db, &quote_cache, &rate_cache, |notification| {
+                captured.lock().unwrap().push(notification);
+            })
+            .await;
+        })
+        .await;
 
-        assert_eq!(emitted_keys, vec!["security:US:AAPL", "security:US:MSFT"]);
+        let emitted = emitted.lock().unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].config_id, config_id);
+        assert_eq!(emitted[0].breach.breach_key, "security:US:AAPL");
+    }
+
+    #[tokio::test]
+    async fn incomplete_cache_only_and_unpersisted_refreshes_skip_real_evaluation_and_emission() {
+        let requested = vec![("AAPL".to_string(), "US".to_string())];
+        let rate_cache = ExchangeRateCache::new();
+
+        // A stale/unresolved final result is classified from the final fresh
+        // quote set and must never create a persisted breach.
+        let (db, quote_cache, _, quotes) = fixture();
+        let partial = QuoteFetchResult {
+            data: Vec::<StockQuote>::new(),
+            warning: Some("stale fallback".to_string()),
+            did_refresh: true,
+            refresh_complete: classify_refresh_complete(&requested, &[]),
+        };
+        assert!(!partial.refresh_complete);
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = emitted.clone();
+        run_alert_evaluation_after_holding_refresh(None, &partial, true, || async {
+            evaluate_portfolio_alerts_with_sink(&db, &quote_cache, &rate_cache, |notification| {
+                captured.lock().unwrap().push(notification);
+            })
+            .await;
+        })
+        .await;
+        assert!(emitted.lock().unwrap().is_empty());
+        assert_eq!(breach_count(&db), 0);
+
+        // The public `Some(vec![])` cache-only path is never a real refresh,
+        // even if its caller happens to carry a complete prior result.
+        let (db, quote_cache, _, _) = fixture();
+        let complete = QuoteFetchResult {
+            data: quotes.clone(),
+            warning: None,
+            did_refresh: true,
+            refresh_complete: classify_refresh_complete(&requested, &quotes),
+        };
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = emitted.clone();
+        run_alert_evaluation_after_holding_refresh(Some(&[]), &complete, true, || async {
+            evaluate_portfolio_alerts_with_sink(&db, &quote_cache, &rate_cache, |notification| {
+                captured.lock().unwrap().push(notification);
+            })
+            .await;
+        })
+        .await;
+        assert!(emitted.lock().unwrap().is_empty());
+        assert_eq!(breach_count(&db), 0);
+
+        // Failure to save the fresh quotes is also a hard gate: the real
+        // evaluator/sink remains untouched despite a complete result.
+        let (db, quote_cache, _, quotes) = fixture();
+        let complete = QuoteFetchResult {
+            data: quotes,
+            warning: None,
+            did_refresh: true,
+            refresh_complete: classify_refresh_complete(&requested, &complete_quotes(&quote_cache)),
+        };
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE cached_quotes", [])
+            .unwrap();
+        assert!(!persist_holding_quote_refresh(&db, &complete));
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = emitted.clone();
+        run_alert_evaluation_after_holding_refresh(None, &complete, false, || async {
+            evaluate_portfolio_alerts_with_sink(&db, &quote_cache, &rate_cache, |notification| {
+                captured.lock().unwrap().push(notification);
+            })
+            .await;
+        })
+        .await;
+        assert!(emitted.lock().unwrap().is_empty());
+        assert_eq!(breach_count(&db), 0);
+    }
+
+    fn complete_quotes(quote_cache: &QuoteCache) -> Vec<StockQuote> {
+        quote_cache.get("US", "AAPL").into_iter().collect()
+    }
+
+    fn breach_count(db: &Database) -> i64 {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM portfolio_alert_breaches", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
     }
 }
 

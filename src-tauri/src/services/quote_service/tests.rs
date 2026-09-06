@@ -2,6 +2,35 @@ use super::*;
 use crate::services::http_client;
 
 #[test]
+fn final_fresh_fallback_result_is_complete_only_when_every_requested_key_resolves() {
+    // Simulate an initial provider omission followed by a successful network
+    // fallback. Completeness is derived from the final fresh set, not a sticky
+    // record of the intermediate provider failure.
+    let requested = vec![
+        ("AAPL".to_string(), "US".to_string()),
+        ("0700".to_string(), "HK".to_string()),
+    ];
+    let final_fresh = vec![
+        StockQuote {
+            market: "US".to_string(),
+            symbol: "AAPL".to_string(),
+            current_price: 100.0,
+            ..StockQuote::default()
+        },
+        StockQuote {
+            market: "HK".to_string(),
+            symbol: "0700".to_string(),
+            current_price: 400.0,
+            ..StockQuote::default()
+        },
+    ];
+
+    assert!(classify_refresh_complete(&requested, &final_fresh));
+    assert!(!classify_refresh_complete(&requested, &final_fresh[..1]));
+    assert!(!classify_refresh_complete(&[], &final_fresh));
+}
+
+#[test]
 fn quote_refresh_time_distinguishes_missing_from_malformed_rows() {
     let db = crate::db::Database::new(":memory:").unwrap();
     assert!(get_quote_refresh_time(&db).unwrap().is_none());

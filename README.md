@@ -46,11 +46,15 @@
 - 期权操作复盘：按 Campaign 匹配开平仓，分析权利金、留存率、担保名义资本口径年化收益率、最差 Campaign 和数据质量
 - 可将确定性的期权复盘结果一键交给 AI 助手继续分析
 
-### 导入、提醒与数据安全
+### 导入、提醒、组合再平衡与数据安全
 
 - 通用 CSV 导入/导出，以及 Interactive Brokers、Moomoo、Firstrade、同花顺等格式的持仓/交易导入
 - A 股交易截图 OCR 导入，导入前可预览与校验
-- 价格、涨跌幅和持仓盈亏阈值提醒规则及触发状态管理
+- **投资提醒**工作区（`/alerts`）包含“组合提醒”和“价格提醒”两个标签页；原有价格、涨跌幅和持仓盈亏阈值提醒的创建、编辑、启停和删除行为保持不变
+- 组合提醒可为整体组合、A 股（CN）、美股（US）、港股（HK）及每个证券账户分别保存独立的目标配置，互不继承或覆盖
+- 目标配置复用**设置 → 投资类别**中的类别、颜色和排序；相对偏离阈值与单票集中度阈值均默认 20%，用于识别类别偏离和过度集中的单个证券
+- 组合评估只使用缓存行情和所需缓存汇率。缺失行情或汇率时会标记数据不完整、保留最近一次有效快照，且不会错误地产生或恢复违规状态
+- 触发组合违规后可打开全页“AI 调仓建议”。建议以当前组合总资产为限、不默认追加新资金；AI 推荐的新证券会标记为待核实的候选标的。该功能只提供分析建议，不会自动交易或下单
 - SQLite 手动备份；可在应用启动时按数据库变更和时间间隔自动备份
 - 设置页提供恢复出厂设置，可清空数据库与本地界面偏好
 
@@ -95,9 +99,9 @@ stock-portfolio-manager/
 │   │   ├── Options/                  # 期权管理与统计
 │   │   ├── Review/                   # 股票与期权操作复盘
 │   │   ├── Import/                   # 通用导入导出
-│   │   ├── Alerts/                   # 价格提醒
+│   │   ├── Alerts/                   # 投资提醒：组合提醒与价格提醒
 │   │   ├── AiAssistant/              # AI 对话助手
-│   │   └── Settings/                 # 通用、类别、备份、期权与 AI 设置
+│   │   └── Settings/                 # 通用、投资类别、备份、期权与 AI 设置
 │   ├── components/                   # 图表、布局和 AI 展示组件
 │   ├── hooks/                        # 主题、盈亏配色、分页等 Hooks
 │   ├── stores/                       # Zustand stores
@@ -210,6 +214,7 @@ git push origin vX.Y.Z
 | `quarterly_snapshots`、`quarterly_holding_snapshots` | 季度快照、笔记与决策质量 |
 | `benchmark_daily_prices` | 绩效基准历史行情缓存 |
 | `price_alerts` | 价格/涨跌幅/盈亏提醒规则 |
+| `portfolio_alert_configs`、`portfolio_alert_targets`、`portfolio_alert_breaches` | 组合提醒的范围配置、类别目标与当前活动违规 |
 | `quote_provider_config` | 各市场行情源、雪球 Cookie 与成本调整设置 |
 | `ai_config`、`chat_sessions`、`chat_messages` | AI 配置、会话、消息、推理和工具调用记录 |
 | `cached_quotes`、`cached_exchange_rates`、`cached_quote_refresh_time` | 行情、汇率及刷新时间缓存 |

@@ -62,6 +62,10 @@ static BUILTIN_SKILLS: &[(&str, &str)] = &[
         "munger-perspective",
         include_str!("../skills/munger-perspective.md"),
     ),
+    (
+        "portfolio-rebalance",
+        include_str!("../skills/portfolio-rebalance.md"),
+    ),
 ];
 
 /// Name of the hidden marker directory that tracks which skill files were
@@ -87,7 +91,7 @@ pub fn skills_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// whose on-disk version is older than this — but ONLY if the user hasn't
 /// edited it (the `.builtin/{stem}` marker still exists). User-edited skills
 /// (marker removed by `save_skill`) are never auto-overwritten.
-const BUILTIN_SKILLS_VERSION: u32 = 10;
+const BUILTIN_SKILLS_VERSION: u32 = 11;
 
 /// Materialise built-in skills into the user directory on first launch, and
 /// auto-update them when [`BUILTIN_SKILLS_VERSION`] bumps.
@@ -764,6 +768,28 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_rebalance_builtin_parses_and_activates_only_for_rebalancing_requests() {
+        let skills = parsed_builtins();
+        let skill = skills
+            .iter()
+            .find(|skill| skill.id == "portfolio-rebalance")
+            .expect("portfolio-rebalance builtin must be registered");
+        assert_eq!(skill.name, "组合再平衡");
+        assert!(skill.enabled);
+        assert!(skill.content.contains("get_rebalance_context"));
+        assert!(skill.content.contains("不得建议自动下单"));
+        assert!(activated_ids("请给我 AI 调仓建议")
+            .iter()
+            .any(|id| id == "portfolio-rebalance"));
+        assert!(activated_ids("组合再平衡方案")
+            .iter()
+            .any(|id| id == "portfolio-rebalance"));
+        assert!(!activated_ids("做一次组合分析")
+            .iter()
+            .any(|id| id == "portfolio-rebalance"));
+    }
+
+    #[test]
     fn options_review_routes_historical_and_current_risk_tools() {
         let (_, body) = BUILTIN_SKILLS
             .iter()
@@ -905,7 +931,7 @@ mod tests {
         assert!(skills_dir.join("stock-review.md").exists());
         assert_eq!(
             fs::read_to_string(marker_dir.join("stock-review")).unwrap(),
-            "10"
+            "11"
         );
         assert!(skills_dir.join("my-private-process.md").exists());
         assert!(!marker_dir.join("my-private-process").exists());
@@ -942,7 +968,7 @@ mod tests {
                 fs::read_to_string(skills_dir.join(format!("{stem}.md"))).unwrap(),
                 embedded
             );
-            assert_eq!(fs::read_to_string(marker_dir.join(stem)).unwrap(), "10");
+            assert_eq!(fs::read_to_string(marker_dir.join(stem)).unwrap(), "11");
         }
         assert_eq!(
             fs::read_to_string(skills_dir.join("my-private-process.md")).unwrap(),
@@ -1000,7 +1026,7 @@ mod tests {
         assert!(!installed.contains("save_stock_review_annotation"));
         assert_eq!(
             fs::read_to_string(marker_dir.join("stock-review")).unwrap(),
-            "10"
+            "11"
         );
         assert_eq!(
             fs::read_to_string(skills_dir.join("my-private-process.md")).unwrap(),

@@ -641,6 +641,31 @@ pub async fn evaluate_portfolio_alert(
         config_id,
         evaluated_at,
         &read_model,
+        true,
+        || {},
+    )
+    .await
+}
+
+/// Recalculate an alert from the current in-memory quote snapshot without
+/// changing the saved snapshot, evaluation timestamp, breach rows, or config.
+pub async fn preview_portfolio_alert(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    exchange_rates: Option<&ExchangeRates>,
+    config_id: &str,
+    evaluated_at: &str,
+) -> Result<PortfolioAlertEvaluation, String> {
+    let quote_snapshot = quote_cache.snapshot();
+    let read_model =
+        PortfolioReadModel::load(db, &quote_snapshot, None, QuoteReadMode::CacheOnly).await?;
+    evaluate_portfolio_alert_inner(
+        db,
+        exchange_rates,
+        config_id,
+        evaluated_at,
+        &read_model,
+        false,
         || {},
     )
     .await
@@ -711,6 +736,7 @@ where
             &config_id,
             evaluated_at,
             &read_model,
+            true,
             || {},
         )
         .await
@@ -773,6 +799,7 @@ async fn evaluate_portfolio_alert_inner<F>(
     config_id: &str,
     evaluated_at: &str,
     read_model: &PortfolioReadModel,
+    persist: bool,
     before_persist: F,
 ) -> Result<PortfolioAlertEvaluation, String>
 where
@@ -798,8 +825,10 @@ where
         .collect::<Vec<_>>();
 
     if scoped_holdings.is_empty() {
-        before_persist();
-        persist_empty_transition(db, config_id, evaluated_at, &guard)?;
+        if persist {
+            before_persist();
+            persist_empty_transition(db, config_id, evaluated_at, &guard)?;
+        }
         return Ok(PortfolioAlertEvaluation {
             status: PortfolioAlertDataStatus::Empty,
             snapshot: None,
@@ -918,8 +947,10 @@ where
         .map(|position| position.market_value)
         .sum::<f64>();
     if total_market_value <= 0.0 {
-        before_persist();
-        persist_empty_transition(db, config_id, evaluated_at, &guard)?;
+        if persist {
+            before_persist();
+            persist_empty_transition(db, config_id, evaluated_at, &guard)?;
+        }
         return Ok(PortfolioAlertEvaluation {
             status: PortfolioAlertDataStatus::Empty,
             snapshot: None,
@@ -956,8 +987,10 @@ where
         evaluated_at,
     )? {
         PortfolioAlertCalculation::Empty => {
-            before_persist();
-            persist_empty_transition(db, config_id, evaluated_at, &guard)?;
+            if persist {
+                before_persist();
+                persist_empty_transition(db, config_id, evaluated_at, &guard)?;
+            }
             Ok(PortfolioAlertEvaluation {
                 status: PortfolioAlertDataStatus::Empty,
                 snapshot: None,
@@ -969,15 +1002,18 @@ where
         }
         PortfolioAlertCalculation::Ready(snapshot) => {
             let proposed = proposed_breaches(config_id, &snapshot, evaluated_at);
-            before_persist();
-            let (active_breaches, newly_triggered) = persist_ready_transition(
-                db,
-                config_id,
-                &snapshot,
-                &proposed,
-                evaluated_at,
-                &guard,
-            )?;
+            let (active_breaches, newly_triggered) = if persist {
+                before_persist();
+                persist_ready_transition(db, config_id, &snapshot, &proposed, evaluated_at, &guard)?
+            } else {
+                (
+                    existing_breaches
+                        .into_iter()
+                        .filter(|breach| proposed.contains_key(&breach.breach_key))
+                        .collect(),
+                    vec![],
+                )
+            };
             Ok(PortfolioAlertEvaluation {
                 status: PortfolioAlertDataStatus::Ready,
                 snapshot: Some(snapshot),
@@ -1010,6 +1046,7 @@ where
         config_id,
         evaluated_at,
         &read_model,
+        true,
         before_persist,
     )
     .await

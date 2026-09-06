@@ -22,6 +22,7 @@ use crate::services::ai_models_service::resolve_base_url;
 use crate::services::exchange_rate_service::{get_cached_rates, ExchangeRateCache};
 use crate::services::http_client;
 use crate::services::performance_service::{self, PerformanceFilter};
+use crate::services::portfolio_alert_service;
 use crate::services::portfolio_read_service::{PortfolioReadModel, QuoteReadMode};
 use crate::services::quote_service::{QuoteCache, QuoteServiceState};
 use crate::services::skill_service::{self, build_skill_system_message};
@@ -94,6 +95,7 @@ impl PortfolioScope {
                 | "get_stock_fundamentals"
                 | "get_technical_indicators"
                 | "get_financial_statements"
+                | "get_rebalance_context"
         )
     }
 }
@@ -166,6 +168,18 @@ fn validated_prefilled_tool(context: &PrefilledToolContext) -> Result<String, St
                 }
             }
         }
+        "get_rebalance_context" => {
+            if args.len() != 1 || !args.contains_key("config_id") {
+                return Err("再平衡上下文只接受配置 ID".to_string());
+            }
+            if args
+                .get("config_id")
+                .and_then(|value| value.as_str())
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err("再平衡配置 ID 必须是非空字符串".to_string());
+            }
+        }
         _ => return Err("只允许预填受信任的只读复盘工具".to_string()),
     }
     if args
@@ -178,26 +192,69 @@ fn validated_prefilled_tool(context: &PrefilledToolContext) -> Result<String, St
 }
 
 pub(crate) fn validated_portfolio_scope(
+    db: &Database,
     context: Option<&PrefilledToolContext>,
 ) -> Result<Option<PortfolioScope>, String> {
     let Some(context) = context else {
         return Ok(None);
     };
     validated_prefilled_tool(context)?;
+    if context.name == "get_rebalance_context" {
+        let config_id = context.arguments["config_id"]
+            .as_str()
+            .expect("validated config id");
+        let config = portfolio_alert_service::get_portfolio_alert_config_by_id(db, config_id)?;
+        let (market, account_id) = match config.scope.kind {
+            crate::models::portfolio_alert::PortfolioAlertScopeKind::Overall => (None, None),
+            crate::models::portfolio_alert::PortfolioAlertScopeKind::Market => {
+                (config.scope.market, None)
+            }
+            crate::models::portfolio_alert::PortfolioAlertScopeKind::Account => {
+                let account_id = config
+                    .scope
+                    .account_id
+                    .ok_or_else(|| "账户范围配置缺少账户 ID".to_string())?;
+                let market = db
+                    .conn
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .query_row(
+                        "SELECT market FROM accounts WHERE id = ?1",
+                        [&account_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|_| format!("account {account_id} not found"))?;
+                (Some(market), Some(account_id))
+            }
+        };
+        return Ok(Some(PortfolioScope { market, account_id }));
+    }
     if context.name != "get_portfolio_overview" {
         return Ok(None);
     }
     let args = context.arguments.as_object().expect("validated object");
-    Ok(Some(PortfolioScope {
-        market: args
+    let account_id = args
+        .get("account_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let market = match account_id.as_deref() {
+        Some(account_id) => Some(
+            db.conn
+                .lock()
+                .map_err(|error| error.to_string())?
+                .query_row(
+                    "SELECT market FROM accounts WHERE id = ?1",
+                    [account_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|_| format!("account {account_id} not found"))?,
+        ),
+        None => args
             .get("market")
             .and_then(|value| value.as_str())
             .map(str::to_string),
-        account_id: args
-            .get("account_id")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-    }))
+    };
+    Ok(Some(PortfolioScope { market, account_id }))
 }
 
 #[cfg(test)]
@@ -205,7 +262,64 @@ mod prefilled_tool_tests {
     use super::{
         validated_portfolio_scope, validated_prefilled_tool, PortfolioScope, PrefilledToolContext,
     };
+    use crate::db::Database;
     use serde_json::json;
+
+    fn rebalance_prefill(config_id: &str) -> PrefilledToolContext {
+        PrefilledToolContext {
+            name: "get_rebalance_context".to_string(),
+            arguments: json!({ "config_id": config_id }),
+        }
+    }
+
+    #[test]
+    fn rebalance_prefill_accepts_only_an_exact_config_id_payload() {
+        assert!(validated_prefilled_tool(&rebalance_prefill("config-us")).is_ok());
+
+        for invalid in [
+            json!({ "name": "get_rebalance_context", "arguments": {} }),
+            json!({ "name": "get_rebalance_context", "arguments": { "config_id": "config-us", "market": "CN" } }),
+            json!({ "name": "get_rebalance_context", "arguments": { "config_id": 1 } }),
+            json!({ "name": "get_rebalance_context", "arguments": { "config_id": " " } }),
+        ] {
+            let context: PrefilledToolContext = serde_json::from_value(invalid).unwrap();
+            assert!(validated_prefilled_tool(&context).is_err());
+        }
+    }
+
+    #[test]
+    fn rebalance_scope_is_derived_from_saved_config_and_rejects_missing_ids() {
+        let db = Database::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO accounts (id, name, market, created_at, updated_at)
+                 VALUES ('acct-us', 'US account', 'US', '2026-09-06', '2026-09-06');
+                 INSERT INTO portfolio_alert_configs
+                    (id, scope_key, scope_kind, market, account_id, base_currency,
+                     deviation_threshold, concentration_threshold, is_active, created_at, updated_at)
+                 VALUES ('config-market-us', 'market:US', 'MARKET', 'US', NULL, 'USD',
+                         20, 20, 1, '2026-09-06', '2026-09-06'),
+                        ('config-acct-us', 'account:acct-us', 'ACCOUNT', NULL, 'acct-us', 'USD',
+                         20, 20, 1, '2026-09-06', '2026-09-06');",
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            validated_portfolio_scope(&db, Some(&rebalance_prefill("config-market-us"))).unwrap(),
+            Some(PortfolioScope {
+                market: Some("US".to_string()),
+                account_id: None,
+            })
+        );
+        let account = validated_portfolio_scope(&db, Some(&rebalance_prefill("config-acct-us")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.account_id.as_deref(), Some("acct-us"));
+        assert_eq!(account.market.as_deref(), Some("US"));
+        assert!(validated_portfolio_scope(&db, Some(&rebalance_prefill("missing"))).is_err());
+    }
 
     #[test]
     fn accepts_exact_stock_review_scope_and_rejects_other_tools_or_extra_fields() {
@@ -243,12 +357,22 @@ mod prefilled_tool_tests {
 
     #[test]
     fn accepts_only_exact_portfolio_review_scopes() {
+        let db = Database::new(":memory:").unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, name, market, created_at, updated_at)
+                 VALUES ('account-a', 'Account A', 'US', '2026-09-06', '2026-09-06')",
+                [],
+            )
+            .unwrap();
         let overview = PrefilledToolContext {
             name: "get_portfolio_overview".to_string(),
             arguments: json!({}),
         };
         assert_eq!(
-            validated_portfolio_scope(Some(&overview)).unwrap(),
+            validated_portfolio_scope(&db, Some(&overview)).unwrap(),
             Some(PortfolioScope::default())
         );
 
@@ -257,13 +381,13 @@ mod prefilled_tool_tests {
             ..overview.clone()
         };
         assert_eq!(
-            validated_portfolio_scope(Some(&market)).unwrap(),
+            validated_portfolio_scope(&db, Some(&market)).unwrap(),
             Some(PortfolioScope {
                 market: Some("CN".to_string()),
                 account_id: None,
             })
         );
-        let market_scope = validated_portfolio_scope(Some(&market))
+        let market_scope = validated_portfolio_scope(&db, Some(&market))
             .unwrap()
             .expect("market scope");
         assert!(market_scope.allows_tool("get_holdings_detail"));
@@ -276,9 +400,9 @@ mod prefilled_tool_tests {
             ..overview.clone()
         };
         assert_eq!(
-            validated_portfolio_scope(Some(&account)).unwrap(),
+            validated_portfolio_scope(&db, Some(&account)).unwrap(),
             Some(PortfolioScope {
-                market: None,
+                market: Some("US".to_string()),
                 account_id: Some("account-a".to_string()),
             })
         );
@@ -294,7 +418,7 @@ mod prefilled_tool_tests {
                 ..overview.clone()
             };
             assert!(validated_prefilled_tool(&invalid).is_err());
-            assert!(validated_portfolio_scope(Some(&invalid)).is_err());
+            assert!(validated_portfolio_scope(&db, Some(&invalid)).is_err());
         }
     }
 }

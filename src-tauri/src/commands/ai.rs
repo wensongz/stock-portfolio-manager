@@ -84,7 +84,7 @@ pub async fn chat_with_ai(
     quote_state: State<'_, QuoteServiceState>,
     req: ChatRequest,
 ) -> Result<(), String> {
-    let portfolio_scope = validated_portfolio_scope(req.tool_context.as_ref())?;
+    let portfolio_scope = validated_portfolio_scope(&db, req.tool_context.as_ref())?;
     ai_chat_service::chat_stream(
         app,
         &db,

@@ -23,15 +23,18 @@ use crate::models::stock_operation_review::StockOperationReviewQuery;
 use crate::services::ai_chat_service::{build_portfolio_context, PortfolioScope};
 use crate::services::alert_service;
 use crate::services::exchange_rate_service::{
-    convert_currency, get_cached_rates, ExchangeRateCache,
+    convert_currency, get_cached_rates, load_exchange_rates_from_db, ExchangeRateCache,
 };
 use crate::services::indicators;
 use crate::services::market_overview_service;
 use crate::services::option_review_service;
 use crate::services::performance_service::{self, PerformanceFilter};
+use crate::services::portfolio_alert_service;
 use crate::services::portfolio_read_service::{PortfolioReadModel, QuoteReadMode};
 use crate::services::quote_provider_service;
-use crate::services::quote_service::{self, resolve_index_secid, QuoteCache, QuoteServiceState};
+use crate::services::quote_service::{
+    self, is_cash_symbol, resolve_index_secid, QuoteCache, QuoteServiceState,
+};
 use crate::services::stock_operation_builder::normalize_stock_symbol;
 use crate::services::stock_operation_review_service;
 use chrono::{Duration, NaiveDate, Utc};
@@ -474,6 +477,21 @@ pub fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "get_rebalance_context",
+                "description": "读取由应用按保存的组合提醒配置和当前缓存行情重新计算的可信再平衡上下文。只接受应用预填的 config_id，不接受市场、账户、金额或目标占比。只读，不下单。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "config_id": { "type": "string", "description": "组合提醒配置 ID" }
+                    },
+                    "required": ["config_id"],
+                    "additionalProperties": false
+                }
+            }
+        }),
     ]
 }
 
@@ -482,6 +500,9 @@ pub(crate) fn tool_definitions_for_scope(scope: Option<&PortfolioScope>) -> Vec<
         .into_iter()
         .filter(|definition| {
             let name = definition["function"]["name"].as_str().unwrap_or_default();
+            if name == "get_rebalance_context" {
+                return scope.is_some();
+            }
             scope.is_none_or(|scope| scope.allows_tool(name))
         })
         .collect()
@@ -562,6 +583,9 @@ impl ToolResult {
 /// produced (may be empty for no-arg tools). Unknown tool names return an
 /// error JSON so the model can apologise rather than the chat hanging.
 pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, arguments: &str) -> ToolResult {
+    if name == "get_rebalance_context" && ctx.portfolio_scope.is_none() {
+        return ToolResult::err_json("再平衡上下文只能由受信任的组合提醒入口读取");
+    }
     if ctx
         .portfolio_scope
         .as_ref()
@@ -600,6 +624,7 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, arguments: &str) -> Too
         "get_stock_fundamentals" => tool_stock_fundamentals(ctx, &args).await,
         "get_technical_indicators" => tool_technical_indicators(ctx, &args).await,
         "get_financial_statements" => tool_financial_statements(ctx, &args).await,
+        "get_rebalance_context" => tool_rebalance_context(ctx, &args).await,
         other => ToolResult::err_json(format!("未知工具：{other}")),
     }
 }
@@ -613,6 +638,175 @@ async fn tool_market_overview(ctx: &ToolCtx<'_>) -> ToolResult {
         Ok(overview) => ToolResult::ok_json(serde_json::to_value(&overview).unwrap_or(json!({}))),
         Err(e) => ToolResult::err_json(format!("获取大盘总览失败：{e}")),
     }
+}
+
+fn scope_for_rebalance_config(
+    db: &Database,
+    config: &crate::models::portfolio_alert::PortfolioAlertConfig,
+) -> Result<PortfolioScope, String> {
+    use crate::models::portfolio_alert::PortfolioAlertScopeKind;
+
+    match config.scope.kind {
+        PortfolioAlertScopeKind::Overall => Ok(PortfolioScope::default()),
+        PortfolioAlertScopeKind::Market => Ok(PortfolioScope {
+            market: config.scope.market.clone(),
+            account_id: None,
+        }),
+        PortfolioAlertScopeKind::Account => {
+            let account_id = config
+                .scope
+                .account_id
+                .clone()
+                .ok_or_else(|| "账户范围配置缺少账户 ID".to_string())?;
+            let market = db
+                .conn
+                .lock()
+                .map_err(|error| error.to_string())?
+                .query_row(
+                    "SELECT market FROM accounts WHERE id = ?1",
+                    [&account_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|_| format!("account {account_id} not found"))?;
+            Ok(PortfolioScope {
+                market: Some(market),
+                account_id: Some(account_id),
+            })
+        }
+    }
+}
+
+async fn tool_rebalance_context(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+    let Some(object) = args.as_object() else {
+        return ToolResult::err_json("再平衡上下文参数必须是对象");
+    };
+    if object.len() != 1 || !object.contains_key("config_id") {
+        return ToolResult::err_json("再平衡上下文只接受 config_id");
+    }
+    let Some(config_id) = object
+        .get("config_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return ToolResult::err_json("config_id 必须是非空字符串");
+    };
+    let config = match portfolio_alert_service::get_portfolio_alert_config_by_id(ctx.db, config_id)
+    {
+        Ok(config) => config,
+        Err(error) => return ToolResult::err_json(error),
+    };
+    if !config.is_active {
+        return ToolResult::err_json("组合提醒配置未启用");
+    }
+    let config_scope = match scope_for_rebalance_config(ctx.db, &config) {
+        Ok(scope) => scope,
+        Err(error) => return ToolResult::err_json(error),
+    };
+    if ctx.portfolio_scope.as_ref() != Some(&config_scope) {
+        return ToolResult::err_json("配置范围与受信任的组合范围不一致");
+    }
+
+    // Deliberately stale/cache-only: this trusted prefill must never start a
+    // quote or exchange-rate network refresh.
+    let rates = match ctx.cache.get_stale() {
+        Some(rates) => Some(rates),
+        None => match load_exchange_rates_from_db(ctx.db) {
+            Ok(rates) => rates,
+            Err(error) => return ToolResult::err_json(format!("读取缓存汇率失败：{error}")),
+        },
+    };
+    let evaluated_at = Utc::now().to_rfc3339();
+    let evaluation = match portfolio_alert_service::preview_portfolio_alert(
+        ctx.db,
+        ctx.quote_cache,
+        rates.as_ref(),
+        config_id,
+        &evaluated_at,
+    )
+    .await
+    {
+        Ok(evaluation) => evaluation,
+        Err(error) => return ToolResult::err_json(format!("生成再平衡预览失败：{error}")),
+    };
+    if evaluation.status != crate::models::portfolio_alert::PortfolioAlertDataStatus::Ready
+        || evaluation.stale
+    {
+        return ToolResult::err_json(format!(
+            "再平衡预览不可用：状态 {:?}，stale={}",
+            evaluation.status, evaluation.stale
+        ));
+    }
+    if evaluation.active_breaches.is_empty() {
+        return ToolResult::err_json("当前没有仍然有效的活动违规，不能生成金额级再平衡建议");
+    }
+    let Some(snapshot) = evaluation.snapshot else {
+        return ToolResult::err_json("READY 再平衡预览缺少快照");
+    };
+    let read_model =
+        match PortfolioReadModel::load(ctx.db, ctx.quote_cache, None, QuoteReadMode::CacheOnly)
+            .await
+        {
+            Ok(model) => model,
+            Err(error) => return ToolResult::err_json(format!("读取当前持仓失败：{error}")),
+        };
+    let positions = read_model
+        .holdings()
+        .iter()
+        .filter(|holding| config_scope.matches_holding(holding))
+        .map(|holding| {
+            let quote_updated_at = ctx
+                .quote_cache
+                .get_stale(&holding.market, &holding.symbol)
+                .map(|quote| quote.updated_at);
+            json!({
+                "accountId": holding.account_id,
+                "market": holding.market,
+                "symbol": holding.symbol,
+                "name": holding.name,
+                "categoryId": read_model.category_id_for_holding(&holding.id),
+                "categoryName": holding.category_name,
+                "shares": holding.shares,
+                "currentPrice": holding.current_price,
+                "quoteUpdatedAt": quote_updated_at,
+                "marketValue": holding.market_value,
+                "currency": holding.currency,
+                "isCash": is_cash_symbol(&holding.symbol),
+            })
+        })
+        .collect::<Vec<_>>();
+    let actions = snapshot
+        .categories
+        .iter()
+        .filter(|category| category.rebalance_amount != 0.0)
+        .map(|category| {
+            json!({
+                "categoryId": category.category_id,
+                "categoryName": category.category_name,
+                "side": if category.rebalance_amount >= 0.0 { "BUY" } else { "SELL" },
+                "amount": category.rebalance_amount,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    ToolResult::ok_json(json!({
+        "configId": config.id,
+        "scope": config.scope,
+        "baseCurrency": snapshot.base_currency,
+        "totalMarketValue": snapshot.total_market_value,
+        "thresholds": {
+            "relativeDeviationPercent": config.deviation_threshold,
+            "concentrationPercent": config.concentration_threshold,
+        },
+        "allocations": snapshot.categories,
+        "positions": positions,
+        "activeBreaches": evaluation.active_breaches,
+        "deterministicActions": actions,
+        "assumptions": {
+            "additionalCapital": 0,
+            "automaticTrading": false,
+        },
+    }))
 }
 
 /// Infer a market from a symbol's format when the model omits it. Mirrors the
@@ -642,14 +836,59 @@ fn infer_market(symbol: &str) -> &'static str {
     }
 }
 
-async fn tool_stock_quote(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
-    let symbol = match args.get("symbol").and_then(|v| v.as_str()) {
-        Some(s) => s.trim().to_string(),
-        None => return ToolResult::err_json("缺少参数 symbol"),
-    };
-    if symbol.is_empty() {
-        return ToolResult::err_json("symbol 不能为空");
+fn inferred_market_for_guard(symbol: &str) -> String {
+    if let Some((secid, _)) = resolve_index_secid(symbol) {
+        if secid.starts_with("1.") || secid.starts_with("0.") {
+            return "CN".to_string();
+        }
+        if secid == "100.HSI" {
+            return "HK".to_string();
+        }
+        return "US".to_string();
     }
+    infer_market(symbol).to_string()
+}
+
+/// Resolve a model-supplied symbol and market once, and enforce the trusted
+/// portfolio market before any cache lookup or provider/network operation.
+fn guarded_symbol_market(ctx: &ToolCtx<'_>, args: &Value) -> Result<(String, String), ToolResult> {
+    let symbol = args
+        .get("symbol")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|symbol| !symbol.is_empty())
+        .ok_or_else(|| ToolResult::err_json("缺少参数 symbol 或 symbol 为空"))?
+        .to_string();
+    let inferred = inferred_market_for_guard(&symbol);
+    let requested = args
+        .get("market")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|market| !market.is_empty())
+        .map(str::to_ascii_uppercase)
+        .unwrap_or_else(|| inferred.clone());
+    if !matches!(requested.as_str(), "US" | "CN" | "HK") {
+        return Err(ToolResult::err_json("market 只支持 US、CN 或 HK"));
+    }
+    if let Some(allowed) = ctx
+        .portfolio_scope
+        .as_ref()
+        .and_then(|scope| scope.market.as_deref())
+    {
+        if requested != allowed || inferred != allowed {
+            return Err(ToolResult::err_json(format!(
+                "标的 {symbol} 的请求市场 {requested} / 可推断市场 {inferred} 超出当前组合允许的 {allowed} 市场"
+            )));
+        }
+    }
+    Ok((symbol, requested))
+}
+
+async fn tool_stock_quote(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+    let (symbol, market) = match guarded_symbol_market(ctx, args) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
 
     // Index symbols (^GSPC, HSI, 000300.SS, …) are NOT recognised by the stock
     // fetchers (Yahoo 403s them, xueqiu/eastmoney stock endpoints return
@@ -657,17 +896,10 @@ async fn tool_stock_quote(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     // no auth and covers every major index. This is the fix for the
     // "获取 ^GSPC 行情失败：HTTP 403" class of errors.
     if let Some((secid, name)) = resolve_index_secid(&symbol) {
-        let market = if secid.starts_with("1.") || secid.starts_with("0.") {
-            "CN"
-        } else if secid == "100.HSI" {
-            "HK"
-        } else {
-            "US"
-        };
-        if let Some(cached) = ctx.quote_cache.get(market, &symbol) {
+        if let Some(cached) = ctx.quote_cache.get(&market, &symbol) {
             return ToolResult::ok_json(json!(cached));
         }
-        return match quote_service::fetch_index_quote_eastmoney(secid, &symbol, market).await {
+        return match quote_service::fetch_index_quote_eastmoney(secid, &symbol, &market).await {
             Ok(q) => {
                 ctx.quote_cache.set(q.clone());
                 ToolResult::ok_json(json!({ "quote": q, "index_name": name }))
@@ -675,12 +907,6 @@ async fn tool_stock_quote(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
             Err(e) => ToolResult::err_json(format!("获取指数 {symbol}（{name}）行情失败：{e}")),
         };
     }
-
-    let market = args
-        .get("market")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_uppercase())
-        .unwrap_or_else(|| infer_market(&symbol).to_string());
 
     // Serve from cache first (fast, offline-friendly); only hit the network on
     // a miss, exactly like the holding-quote command does.
@@ -731,18 +957,7 @@ fn resolve_symbol_market(
     ctx: &ToolCtx<'_>,
     args: &Value,
 ) -> Result<(String, String, String), ToolResult> {
-    let symbol = match args.get("symbol").and_then(|v| v.as_str()) {
-        Some(s) => s.trim().to_string(),
-        None => return Err(ToolResult::err_json("缺少参数 symbol")),
-    };
-    if symbol.is_empty() {
-        return Err(ToolResult::err_json("symbol 不能为空"));
-    }
-    let market = args
-        .get("market")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_uppercase())
-        .unwrap_or_else(|| infer_market(&symbol).to_string());
+    let (symbol, market) = guarded_symbol_market(ctx, args)?;
     let config = match quote_provider_service::get_quote_provider_config(ctx.db) {
         Ok(c) => c,
         Err(e) => return Err(ToolResult::err_json(format!("读取行情源配置失败：{e}"))),
@@ -900,13 +1115,10 @@ fn holding_market_for_symbol(
 }
 
 async fn tool_financial_statements(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
-    let symbol = match args.get("symbol").and_then(|v| v.as_str()) {
-        Some(s) => s.trim().to_string(),
-        None => return ToolResult::err_json("缺少参数 symbol"),
+    let (symbol, requested_market) = match guarded_symbol_market(ctx, args) {
+        Ok(value) => value,
+        Err(error) => return error,
     };
-    if symbol.is_empty() {
-        return ToolResult::err_json("symbol 不能为空");
-    }
     let periods = args
         .get("periods")
         .and_then(|v| v.as_i64())
@@ -914,11 +1126,7 @@ async fn tool_financial_statements(ctx: &ToolCtx<'_>, args: &Value) -> ToolResul
         .clamp(1, 8) as usize;
     let market = match holding_market_for_symbol(ctx, &symbol) {
         Ok(Some(market)) => market,
-        Ok(None) => args
-            .get("market")
-            .and_then(|value| value.as_str())
-            .map(|market| market.trim().to_ascii_uppercase())
-            .unwrap_or_else(|| infer_market(&symbol).to_string()),
+        Ok(None) => requested_market,
         Err(error) => return error,
     };
     match quote_service::fetch_financial_statements(&symbol, &market, periods).await {
@@ -933,18 +1141,10 @@ async fn tool_financial_statements(ctx: &ToolCtx<'_>, args: &Value) -> ToolResul
 }
 
 async fn tool_price_history(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
-    let symbol = match args.get("symbol").and_then(|v| v.as_str()) {
-        Some(s) => s.trim().to_string(),
-        None => return ToolResult::err_json("缺少参数 symbol"),
+    let (symbol, market) = match guarded_symbol_market(ctx, args) {
+        Ok(value) => value,
+        Err(error) => return error,
     };
-    if symbol.is_empty() {
-        return ToolResult::err_json("symbol 不能为空");
-    }
-    let market = args
-        .get("market")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_uppercase())
-        .unwrap_or_else(|| infer_market(&symbol).to_string());
 
     let days = args
         .get("days")
@@ -1065,6 +1265,26 @@ async fn tool_performance_metrics(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult
 // New tools (batch 2)
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn filter_search_result_for_scope(scope: Option<&PortfolioScope>, result: Value) -> Option<Value> {
+    let Some(allowed_market) = scope.and_then(|scope| scope.market.as_deref()) else {
+        return Some(result);
+    };
+    let market = result
+        .get("market")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_uppercase)
+        .or_else(|| {
+            result
+                .get("symbol")
+                .and_then(Value::as_str)
+                .map(inferred_market_for_guard)
+        });
+    market
+        .as_deref()
+        .is_some_and(|market| market == allowed_market)
+        .then_some(result)
+}
+
 async fn tool_search_stock(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let query = match args.get("query").and_then(|v| v.as_str()) {
         Some(s) => s.trim().to_string(),
@@ -1082,7 +1302,21 @@ async fn tool_search_stock(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
             let result =
                 lookup_stock_name_by_symbol_with_state(ctx.quote_state, query.clone()).await;
             match result {
-                Ok(Some(name)) => ToolResult::ok_json(json!({ "symbol": query, "name": name })),
+                Ok(Some(name)) => {
+                    let payload = json!({
+                        "symbol": query,
+                        "name": name,
+                        "market": inferred_market_for_guard(&query),
+                    });
+                    match filter_search_result_for_scope(ctx.portfolio_scope.as_ref(), payload) {
+                        Some(payload) => ToolResult::ok_json(payload),
+                        None => ToolResult::ok_json(json!({
+                            "symbol": null,
+                            "name": null,
+                            "note": "搜索结果不属于当前组合允许的市场"
+                        })),
+                    }
+                }
                 Ok(None) => ToolResult::ok_json(
                     json!({ "symbol": query, "name": null, "note": "未找到对应名称" }),
                 ),
@@ -1096,9 +1330,15 @@ async fn tool_search_stock(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
                     // lookup returns lowercased code (e.g. "sh600519"); normalise to the
                     // uppercase form the rest of the app expects (SH600519).
                     let normalized = code.to_uppercase();
-                    ToolResult::ok_json(
-                        json!({ "name": query, "symbol": normalized, "market": "CN" }),
-                    )
+                    let payload = json!({ "name": query, "symbol": normalized, "market": "CN" });
+                    match filter_search_result_for_scope(ctx.portfolio_scope.as_ref(), payload) {
+                        Some(payload) => ToolResult::ok_json(payload),
+                        None => ToolResult::ok_json(json!({
+                            "name": query,
+                            "symbol": null,
+                            "note": "搜索结果不属于当前组合允许的市场"
+                        })),
+                    }
                 }
                 Ok(None) => ToolResult::ok_json(
                     json!({ "name": query, "symbol": null, "note": "未找到对应 A 股代码；该名称可能为港股或美股，请尝试直接使用代码" }),
@@ -1549,6 +1789,357 @@ async fn tool_stock_review(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::portfolio_alert::{
+        PortfolioAlertScope, PortfolioAlertScopeKind, PortfolioAlertTarget,
+        SavePortfolioAlertConfigInput,
+    };
+    use crate::services::portfolio_alert_service::{
+        evaluate_portfolio_alert, save_portfolio_alert_config,
+    };
+
+    fn restricted_context<'a>(
+        db: &'a Database,
+        cache: &'a ExchangeRateCache,
+        quote_cache: &'a QuoteCache,
+        quote_state: &'a QuoteServiceState,
+        market: Option<&str>,
+        account_id: Option<&str>,
+    ) -> ToolCtx<'a> {
+        ToolCtx::for_untrusted_model_turn(
+            db,
+            cache,
+            quote_cache,
+            quote_state,
+            "untrusted",
+            Some(PortfolioScope {
+                market: market.map(str::to_string),
+                account_id: account_id.map(str::to_string),
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn restricted_rebalance_rejects_cross_market_symbols_for_every_market_bound_tool() {
+        let db = Database::new(":memory:").unwrap();
+        let cache = ExchangeRateCache::new();
+        let quote_cache = QuoteCache::new();
+        let quote_state = QuoteServiceState::new();
+        let ctx = restricted_context(
+            &db,
+            &cache,
+            &quote_cache,
+            &quote_state,
+            Some("US"),
+            Some("acct-us"),
+        );
+
+        for (tool, arguments) in [
+            (
+                "get_stock_quote",
+                json!({ "symbol": "600519", "market": "CN" }),
+            ),
+            ("get_stock_quote", json!({ "symbol": "600519" })),
+            (
+                "get_price_history",
+                json!({ "symbol": "600519", "market": "CN" }),
+            ),
+            (
+                "get_stock_fundamentals",
+                json!({ "symbol": "600519", "market": "CN" }),
+            ),
+            (
+                "get_technical_indicators",
+                json!({ "symbol": "600519", "market": "CN" }),
+            ),
+            (
+                "get_financial_statements",
+                json!({ "symbol": "600519", "market": "CN" }),
+            ),
+        ] {
+            let result = execute_tool(&ctx, tool, &arguments.to_string()).await;
+            assert!(
+                !result.ok,
+                "{tool} accepted cross-market input: {}",
+                result.content
+            );
+            assert!(result.content.contains("US"), "{tool}: {}", result.content);
+        }
+    }
+
+    #[test]
+    fn restricted_rebalance_search_filters_results_outside_the_allowed_market() {
+        let scope = PortfolioScope {
+            market: Some("US".to_string()),
+            account_id: Some("acct-us".to_string()),
+        };
+        assert_eq!(
+            filter_search_result_for_scope(
+                Some(&scope),
+                json!({ "name": "贵州茅台", "symbol": "SH600519", "market": "CN" }),
+            ),
+            None
+        );
+        assert_eq!(
+            filter_search_result_for_scope(
+                Some(&scope),
+                json!({ "name": "Apple", "symbol": "AAPL", "market": "US" }),
+            )
+            .unwrap()["symbol"],
+            "AAPL"
+        );
+        assert!(filter_search_result_for_scope(
+            Some(&PortfolioScope::default()),
+            json!({ "name": "贵州茅台", "symbol": "SH600519", "market": "CN" }),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn overall_rebalance_scope_keeps_cross_market_symbol_tools_unrestricted() {
+        let db = Database::new(":memory:").unwrap();
+        let cache = ExchangeRateCache::new();
+        let quote_cache = QuoteCache::new();
+        let quote_state = QuoteServiceState::new();
+        let ctx = restricted_context(&db, &cache, &quote_cache, &quote_state, None, None);
+
+        assert_eq!(
+            guarded_symbol_market(&ctx, &json!({ "symbol": "600519", "market": "CN" })).unwrap(),
+            ("600519".to_string(), "CN".to_string())
+        );
+        assert_eq!(
+            guarded_symbol_market(&ctx, &json!({ "symbol": "AAPL", "market": "US" })).unwrap(),
+            ("AAPL".to_string(), "US".to_string())
+        );
+    }
+
+    struct RebalanceFixture {
+        db: Database,
+        cache: ExchangeRateCache,
+        quote_cache: QuoteCache,
+        quote_state: QuoteServiceState,
+        config_id: String,
+    }
+
+    async fn ready_breached_rebalance_fixture() -> RebalanceFixture {
+        let db = Database::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO accounts (id, name, market, created_at, updated_at)
+                 VALUES ('acct-us', 'US account', 'US', '2026-09-06', '2026-09-06');
+                 INSERT INTO categories (id, name, color, icon, sort_order, created_at)
+                 VALUES ('growth', 'Growth', '#f00', 'G', 1, '2026-09-06'),
+                        ('bonds', 'Bonds', '#00f', 'B', 2, '2026-09-06');
+                 INSERT INTO holdings
+                    (id, account_id, symbol, name, market, category_id, shares,
+                     avg_cost, currency, created_at, updated_at)
+                 VALUES ('h-aapl', 'acct-us', 'AAPL', 'Apple', 'US', 'growth', 9,
+                         50, 'USD', '2026-09-06', '2026-09-06'),
+                        ('h-bnd', 'acct-us', 'BND', 'Bond ETF', 'US', 'bonds', 1,
+                         50, 'USD', '2026-09-06', '2026-09-06');",
+            )
+            .unwrap();
+        }
+        let config = save_portfolio_alert_config(
+            &db,
+            SavePortfolioAlertConfigInput {
+                id: Some("config-us".to_string()),
+                scope: PortfolioAlertScope {
+                    kind: PortfolioAlertScopeKind::Market,
+                    market: Some("US".to_string()),
+                    account_id: None,
+                },
+                base_currency: "USD".to_string(),
+                deviation_threshold: 20.0,
+                concentration_threshold: 95.0,
+                is_active: true,
+                targets: vec![
+                    PortfolioAlertTarget {
+                        category_id: "growth".to_string(),
+                        target_percent: 50.0,
+                    },
+                    PortfolioAlertTarget {
+                        category_id: "bonds".to_string(),
+                        target_percent: 50.0,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let quote_cache = QuoteCache::new();
+        for (symbol, price) in [("AAPL", 100.0), ("BND", 100.0)] {
+            quote_cache.set(crate::models::StockQuote {
+                symbol: symbol.to_string(),
+                name: symbol.to_string(),
+                market: "US".to_string(),
+                current_price: price,
+                previous_close: price,
+                updated_at: "2026-09-06T09:00:00Z".to_string(),
+                ..Default::default()
+            });
+        }
+        let evaluation =
+            evaluate_portfolio_alert(&db, &quote_cache, None, &config.id, "2026-09-06T09:00:00Z")
+                .await
+                .unwrap();
+        assert!(!evaluation.active_breaches.is_empty());
+        RebalanceFixture {
+            db,
+            cache: ExchangeRateCache::new(),
+            quote_cache,
+            quote_state: QuoteServiceState::new(),
+            config_id: config.id,
+        }
+    }
+
+    impl RebalanceFixture {
+        async fn execute(&self) -> ToolResult {
+            let ctx = restricted_context(
+                &self.db,
+                &self.cache,
+                &self.quote_cache,
+                &self.quote_state,
+                Some("US"),
+                None,
+            );
+            execute_tool(
+                &ctx,
+                "get_rebalance_context",
+                &json!({ "config_id": self.config_id }).to_string(),
+            )
+            .await
+        }
+
+        fn persisted_state(
+            &self,
+        ) -> (
+            Option<String>,
+            Option<String>,
+            Vec<(String, String, String)>,
+        ) {
+            let conn = self.db.conn.lock().unwrap();
+            let config = conn
+                .query_row(
+                    "SELECT last_snapshot_json, last_evaluated_at FROM portfolio_alert_configs WHERE id = ?1",
+                    [&self.config_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT breach_key, first_triggered_at, last_seen_at
+                     FROM portfolio_alert_breaches WHERE config_id = ?1 ORDER BY breach_key",
+                )
+                .unwrap();
+            let breaches = statement
+                .query_map([&self.config_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (config.0, config.1, breaches)
+        }
+    }
+
+    #[tokio::test]
+    async fn rebalance_context_uses_current_cache_and_does_not_mutate_persisted_alert_state() {
+        let fixture = ready_breached_rebalance_fixture().await;
+        let before = fixture.persisted_state();
+        let result = fixture.execute().await;
+        assert!(result.ok, "{}", result.content);
+        let payload: Value = serde_json::from_str(&result.content).unwrap();
+
+        assert_eq!(payload["configId"], "config-us");
+        assert_eq!(
+            payload["scope"],
+            json!({ "kind": "MARKET", "market": "US", "accountId": null })
+        );
+        assert_eq!(payload["baseCurrency"], "USD");
+        assert_eq!(payload["totalMarketValue"], 1000.0);
+        assert_eq!(payload["thresholds"]["relativeDeviationPercent"], 20.0);
+        assert_eq!(payload["thresholds"]["concentrationPercent"], 95.0);
+        assert_eq!(payload["activeBreaches"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["positions"].as_array().unwrap().len(), 2);
+        assert!(payload["positions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|position| {
+                position["quoteUpdatedAt"] == "2026-09-06T09:00:00Z"
+                    && position.get("provider").is_none()
+                    && position.get("credentials").is_none()
+            }));
+        assert_eq!(
+            payload["assumptions"],
+            json!({ "additionalCapital": 0, "automaticTrading": false })
+        );
+        let actions = payload["deterministicActions"].as_array().unwrap();
+        assert!(actions
+            .iter()
+            .any(|action| action["side"] == "BUY" && action["amount"] == 400.0));
+        assert!(actions
+            .iter()
+            .any(|action| action["side"] == "SELL" && action["amount"] == -400.0));
+        assert_eq!(fixture.persisted_state(), before);
+    }
+
+    #[tokio::test]
+    async fn rebalance_context_rejects_missing_inactive_and_non_actionable_configurations() {
+        let missing_db = Database::new(":memory:").unwrap();
+        let cache = ExchangeRateCache::new();
+        let quotes = QuoteCache::new();
+        let state = QuoteServiceState::new();
+        let missing_ctx = restricted_context(&missing_db, &cache, &quotes, &state, None, None);
+        let missing = execute_tool(
+            &missing_ctx,
+            "get_rebalance_context",
+            r#"{"config_id":"missing"}"#,
+        )
+        .await;
+        assert!(!missing.ok);
+
+        for case in ["inactive", "empty", "invalid", "stale", "no-active-breach"] {
+            let fixture = ready_breached_rebalance_fixture().await;
+            {
+                let conn = fixture.db.conn.lock().unwrap();
+                match case {
+                    "inactive" => {
+                        conn.execute(
+                            "UPDATE portfolio_alert_configs SET is_active = 0 WHERE id = ?1",
+                            [&fixture.config_id],
+                        )
+                        .unwrap();
+                    }
+                    "empty" => {
+                        conn.execute("DELETE FROM holdings", []).unwrap();
+                    }
+                    "invalid" => {
+                        conn.execute(
+                            "DELETE FROM portfolio_alert_targets WHERE config_id = ?1 AND category_id = 'bonds'",
+                            [&fixture.config_id],
+                        )
+                        .unwrap();
+                    }
+                    "stale" => fixture.quote_cache.clear(),
+                    "no-active-breach" => {
+                        conn.execute(
+                            "DELETE FROM portfolio_alert_breaches WHERE config_id = ?1",
+                            [&fixture.config_id],
+                        )
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let result = fixture.execute().await;
+            assert!(
+                !result.ok,
+                "{case} unexpectedly accepted: {}",
+                result.content
+            );
+        }
+    }
 
     #[tokio::test]
     async fn scoped_portfolio_turn_filters_holdings_and_blocks_unscoped_private_tools() {
@@ -1620,6 +2211,7 @@ mod tests {
             .collect();
         assert!(advertised.contains(&"get_holdings_detail".to_string()));
         assert!(advertised.contains(&"get_stock_fundamentals".to_string()));
+        assert!(advertised.contains(&"get_rebalance_context".to_string()));
         assert!(!advertised.contains(&"get_market_overview".to_string()));
         assert!(!advertised.contains(&"get_transactions".to_string()));
         assert!(!advertised.contains(&"get_option_positions".to_string()));
@@ -1793,7 +2385,7 @@ mod tests {
     #[test]
     fn tool_definitions_are_valid_json() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 22);
+        assert_eq!(defs.len(), 23);
         for d in &defs {
             assert_eq!(d["type"], "function");
             assert!(d["function"]["name"].is_string());
@@ -1809,7 +2401,7 @@ mod tests {
             .iter()
             .map(|d| d["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 22);
+        assert_eq!(names.len(), 23);
     }
 
     #[test]
@@ -1853,6 +2445,34 @@ mod tests {
             .into_iter()
             .collect()
         );
+    }
+
+    #[test]
+    fn rebalance_context_definition_is_exact_and_not_advertised_without_a_trusted_scope() {
+        let definition = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "get_rebalance_context")
+            .expect("get_rebalance_context definition");
+        assert_eq!(
+            definition["function"]["parameters"]["required"],
+            json!(["config_id"])
+        );
+        assert_eq!(
+            definition["function"]["parameters"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            definition["function"]["parameters"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["config_id"]
+        );
+        assert!(!tool_definitions_for_scope(None)
+            .iter()
+            .any(|tool| tool["function"]["name"] == "get_rebalance_context"));
     }
 
     #[test]

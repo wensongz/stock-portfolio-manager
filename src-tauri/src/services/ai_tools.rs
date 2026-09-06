@@ -693,6 +693,17 @@ fn scope_for_trusted_rebalance_preview(
 }
 
 async fn tool_rebalance_context(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+    tool_rebalance_context_inner(ctx, args, || {}).await
+}
+
+async fn tool_rebalance_context_inner<F>(
+    ctx: &ToolCtx<'_>,
+    args: &Value,
+    before_final_validation: F,
+) -> ToolResult
+where
+    F: FnOnce(),
+{
     let Some(object) = args.as_object() else {
         return ToolResult::err_json("再平衡上下文参数必须是对象");
     };
@@ -736,8 +747,8 @@ async fn tool_rebalance_context(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     if ctx.portfolio_scope.as_ref() != Some(&config_scope) {
         return ToolResult::err_json("配置范围与受信任的组合范围不一致");
     }
-    let config = preview.config;
-    let evaluation = preview.evaluation;
+    let config = &preview.config;
+    let evaluation = &preview.evaluation;
     if evaluation.status != crate::models::portfolio_alert::PortfolioAlertDataStatus::Ready
         || evaluation.stale
     {
@@ -749,30 +760,30 @@ async fn tool_rebalance_context(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     if evaluation.active_breaches.is_empty() {
         return ToolResult::err_json("当前没有仍然有效的活动违规，不能生成金额级再平衡建议");
     }
-    let Some(snapshot) = evaluation.snapshot else {
+    let Some(snapshot) = evaluation.snapshot.as_ref() else {
         return ToolResult::err_json("READY 再平衡预览缺少快照");
     };
     let positions = preview
         .positions
-        .into_iter()
+        .iter()
         .map(|position| {
             json!({
-                "accountId": position.account_id,
-                "market": position.market,
-                "symbol": position.symbol,
-                "name": position.name,
-                "categoryId": position.category_id,
-                "categoryName": position.category_name,
-                "categoryColor": position.category_color,
+                "accountId": position.account_id.clone(),
+                "market": position.market.clone(),
+                "symbol": position.symbol.clone(),
+                "name": position.name.clone(),
+                "categoryId": position.category_id.clone(),
+                "categoryName": position.category_name.clone(),
+                "categoryColor": position.category_color.clone(),
                 "shares": position.shares,
                 "currentPrice": position.current_price,
-                "quoteUpdatedAt": position.quote_updated_at,
+                "quoteUpdatedAt": position.quote_updated_at.clone(),
                 "nativeMarketValue": position.native_market_value,
-                "nativeCurrency": position.native_currency,
+                "nativeCurrency": position.native_currency.clone(),
                 "baseMarketValue": position.base_market_value,
-                "baseCurrency": position.base_currency,
+                "baseCurrency": position.base_currency.clone(),
                 "conversionRate": position.conversion_rate,
-                "exchangeRateUpdatedAt": position.exchange_rate_updated_at,
+                "exchangeRateUpdatedAt": position.exchange_rate_updated_at.clone(),
                 "isCash": position.is_cash,
             })
         })
@@ -783,32 +794,52 @@ async fn tool_rebalance_context(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         .filter(|category| category.rebalance_amount != 0.0)
         .map(|category| {
             json!({
-                "categoryId": category.category_id,
-                "categoryName": category.category_name,
+                "categoryId": category.category_id.clone(),
+                "categoryName": category.category_name.clone(),
                 "side": if category.rebalance_amount >= 0.0 { "BUY" } else { "SELL" },
                 "amount": category.rebalance_amount,
             })
         })
         .collect::<Vec<_>>();
 
-    ToolResult::ok_json(json!({
-        "configId": config.id,
-        "scope": config.scope,
-        "baseCurrency": snapshot.base_currency,
+    let content = json!({
+        "configId": config.id.clone(),
+        "scope": config.scope.clone(),
+        "baseCurrency": snapshot.base_currency.clone(),
         "totalMarketValue": snapshot.total_market_value,
         "thresholds": {
             "relativeDeviationPercent": config.deviation_threshold,
             "concentrationPercent": config.concentration_threshold,
         },
-        "allocations": snapshot.categories,
+        "allocations": snapshot.categories.clone(),
         "positions": positions,
-        "activeBreaches": evaluation.active_breaches,
+        "activeBreaches": evaluation.active_breaches.clone(),
         "deterministicActions": actions,
         "assumptions": {
             "additionalCapital": 0,
             "automaticTrading": false,
         },
-    }))
+    })
+    .to_string();
+    before_final_validation();
+    if let Err(error) =
+        portfolio_alert_service::revalidate_trusted_portfolio_alert_preview(ctx.db, &preview)
+    {
+        return ToolResult::err_json(format!("再平衡预览已失效：{error}"));
+    }
+    ToolResult { content, ok: true }
+}
+
+#[cfg(test)]
+async fn tool_rebalance_context_with_before_final_validation_hook<F>(
+    ctx: &ToolCtx<'_>,
+    args: &Value,
+    before_final_validation: F,
+) -> ToolResult
+where
+    F: FnOnce(),
+{
+    tool_rebalance_context_inner(ctx, args, before_final_validation).await
 }
 
 /// Infer a market from a symbol's format when the model omits it. Mirrors the
@@ -1997,8 +2028,8 @@ mod tests {
     }
 
     impl RebalanceFixture {
-        async fn execute(&self) -> ToolResult {
-            let ctx = ToolCtx::for_untrusted_model_turn(
+        fn context(&self) -> ToolCtx<'_> {
+            ToolCtx::for_untrusted_model_turn(
                 &self.db,
                 &self.cache,
                 &self.quote_cache,
@@ -2009,7 +2040,11 @@ mod tests {
                     account_id: None,
                     authorized_rebalance_config_id: Some(self.config_id.clone()),
                 }),
-            );
+            )
+        }
+
+        async fn execute(&self) -> ToolResult {
+            let ctx = self.context();
             execute_tool(
                 &ctx,
                 "get_rebalance_context",
@@ -2048,6 +2083,70 @@ mod tests {
                 .unwrap();
             (config.0, config.1, breaches)
         }
+    }
+
+    #[tokio::test]
+    async fn rebalance_fix_final_validation_rejects_changes_after_json_construction_without_preview_writes(
+    ) {
+        for mutation in ["config", "breach"] {
+            let fixture = ready_breached_rebalance_fixture().await;
+            let before = fixture.persisted_state();
+            let ctx = fixture.context();
+            let result = tool_rebalance_context_with_before_final_validation_hook(
+                &ctx,
+                &json!({ "config_id": fixture.config_id }),
+                || {
+                    let conn = fixture.db.conn.lock().unwrap();
+                    if mutation == "config" {
+                        conn.execute(
+                            "UPDATE portfolio_alert_configs SET is_active = 0 WHERE id = ?1",
+                            [&fixture.config_id],
+                        )
+                        .unwrap();
+                    } else {
+                        conn.execute(
+                            "DELETE FROM portfolio_alert_breaches WHERE config_id = ?1",
+                            [&fixture.config_id],
+                        )
+                        .unwrap();
+                    }
+                },
+            )
+            .await;
+
+            assert!(!result.ok, "{mutation} change returned frozen JSON");
+            let after = fixture.persisted_state();
+            assert_eq!(after.0, before.0, "{mutation} rewrote snapshot");
+            assert_eq!(after.1, before.1, "{mutation} rewrote evaluated_at");
+            if mutation == "config" {
+                assert_eq!(after.2, before.2, "preview changed breach rows");
+            } else {
+                assert!(after.2.is_empty(), "preview recreated resolved breaches");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rebalance_fix_final_validation_returns_the_already_built_payload_when_guard_is_current(
+    ) {
+        let fixture = ready_breached_rebalance_fixture().await;
+        let expected = fixture.execute().await;
+        assert!(expected.ok, "{}", expected.content);
+        let before = fixture.persisted_state();
+        let ctx = fixture.context();
+        let actual = tool_rebalance_context_with_before_final_validation_hook(
+            &ctx,
+            &json!({ "config_id": fixture.config_id }),
+            || {},
+        )
+        .await;
+
+        assert!(actual.ok, "{}", actual.content);
+        assert_eq!(
+            serde_json::from_str::<Value>(&actual.content).unwrap(),
+            serde_json::from_str::<Value>(&expected.content).unwrap()
+        );
+        assert_eq!(fixture.persisted_state(), before);
     }
 
     #[tokio::test]

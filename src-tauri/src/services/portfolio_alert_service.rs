@@ -56,7 +56,7 @@ fn next_mutation_timestamp(
     Ok(timestamp.to_rfc3339_opts(SecondsFormat::Nanos, true))
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct EvaluationGuard {
     config: PortfolioAlertConfig,
     revision: String,
@@ -89,6 +89,8 @@ pub struct TrustedPortfolioAlertPreview {
     pub account_market: Option<String>,
     pub evaluation: PortfolioAlertEvaluation,
     pub positions: Vec<PortfolioAlertPreviewPosition>,
+    validation_guard: EvaluationGuard,
+    validated_active_breaches: Vec<PortfolioAlertBreach>,
 }
 
 struct PreviewCalculation {
@@ -98,6 +100,11 @@ struct PreviewCalculation {
     positions: Vec<PortfolioAlertPositionInput>,
     proposed_breaches: Vec<PortfolioAlertBreach>,
     initial_breaches: Vec<PortfolioAlertBreach>,
+}
+
+struct ValidatedPreviewState {
+    matching_breaches: Vec<PortfolioAlertBreach>,
+    active_breaches: Vec<PortfolioAlertBreach>,
 }
 
 pub fn scope_key(scope: &PortfolioAlertScope) -> Result<String, String> {
@@ -482,31 +489,65 @@ fn verify_evaluation_guard(connection: &Connection, guard: &EvaluationGuard) -> 
 fn validate_preview_state(
     db: &Database,
     calculation: &PreviewCalculation,
-) -> Result<Vec<PortfolioAlertBreach>, String> {
+) -> Result<ValidatedPreviewState, String> {
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
-    verify_evaluation_guard(&conn, &calculation.guard)?;
-    if let Some(expected_market) = calculation.account_market.as_deref() {
-        let account_id = calculation
-            .guard
+    revalidate_preview_guard(
+        &conn,
+        &calculation.guard,
+        calculation.account_market.as_deref(),
+        &calculation.initial_breaches,
+    )?;
+    let current_breaches = calculation.initial_breaches.clone();
+    let matched = intersect_preview_breaches(&current_breaches, &calculation.proposed_breaches);
+    if matched.is_empty() {
+        return Err("portfolio alert has no current matching active breach".to_string());
+    }
+    Ok(ValidatedPreviewState {
+        matching_breaches: matched,
+        active_breaches: current_breaches,
+    })
+}
+
+fn revalidate_preview_guard(
+    connection: &Connection,
+    guard: &EvaluationGuard,
+    expected_account_market: Option<&str>,
+    expected_active_breaches: &[PortfolioAlertBreach],
+) -> Result<(), String> {
+    verify_evaluation_guard(connection, guard)?;
+    if let Some(expected_market) = expected_account_market {
+        let account_id = guard
             .config
             .scope
             .account_id
             .as_deref()
             .ok_or_else(|| "account preview lost its account id".to_string())?;
-        let current_market = account_market(&conn, account_id)?;
+        let current_market = account_market(connection, account_id)?;
         if current_market != expected_market {
             return Err("portfolio alert account market changed during preview".to_string());
         }
     }
-    let current_breaches = load_active_breaches(&conn, &calculation.guard.config.id)?;
-    if current_breaches != calculation.initial_breaches {
+    let current_breaches = load_active_breaches(connection, &guard.config.id)?;
+    if current_breaches != expected_active_breaches {
         return Err("portfolio alert breaches changed during preview".to_string());
     }
-    let matched = intersect_preview_breaches(&current_breaches, &calculation.proposed_breaches);
-    if matched.is_empty() {
-        return Err("portfolio alert has no current matching active breach".to_string());
-    }
-    Ok(matched)
+    Ok(())
+}
+
+/// Re-check the complete database identity captured by a trusted preview.
+/// This is intentionally synchronous and read-only so callers can invoke it
+/// immediately before returning an already-serialized immutable payload.
+pub fn revalidate_trusted_portfolio_alert_preview(
+    db: &Database,
+    preview: &TrustedPortfolioAlertPreview,
+) -> Result<(), String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    revalidate_preview_guard(
+        &conn,
+        &preview.validation_guard,
+        preview.account_market.as_deref(),
+        &preview.validated_active_breaches,
+    )
 }
 
 fn unchanged_evaluation(
@@ -871,13 +912,16 @@ where
     let calculation = calculation
         .ok_or_else(|| "READY portfolio alert preview is missing its calculation".to_string())?;
     before_validate();
-    evaluation.active_breaches = validate_preview_state(db, &calculation)?;
+    let validated_state = validate_preview_state(db, &calculation)?;
+    evaluation.active_breaches = validated_state.matching_breaches;
     let positions = preview_positions(&read_model, &quote_snapshot, exchange_rates, &calculation)?;
     Ok(TrustedPortfolioAlertPreview {
-        config: calculation.guard.config,
+        config: calculation.guard.config.clone(),
         account_market: calculation.account_market,
         evaluation,
         positions,
+        validation_guard: calculation.guard,
+        validated_active_breaches: validated_state.active_breaches,
     })
 }
 

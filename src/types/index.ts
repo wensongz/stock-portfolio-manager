@@ -2,6 +2,8 @@ export type Market = "US" | "CN" | "HK";
 export type Currency = "USD" | "CNY" | "HKD";
 export type TransactionType = "BUY" | "SELL" | "OPEN" | "PAY";
 
+export * from "./portfolioAlert";
+
 export interface Account {
   id: string;
   name: string;

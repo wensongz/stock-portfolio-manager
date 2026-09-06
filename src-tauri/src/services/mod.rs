@@ -14,6 +14,8 @@ pub mod option_review_service;
 pub mod performance_service;
 pub mod portfolio_mutation;
 pub mod portfolio_alert_calculator;
+#[allow(dead_code)]
+pub mod portfolio_alert_service;
 pub mod portfolio_read_service;
 pub mod position_replay;
 pub mod quarterly_service;

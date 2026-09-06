@@ -43,6 +43,8 @@ fn is_valid_number(value: f64) -> bool {
     value.is_finite() && value >= 0.0
 }
 
+const TARGET_PERCENT_SUM_TOLERANCE: f64 = 0.01;
+
 fn validate_inputs(
     config: &PortfolioAlertConfig,
     categories: &[PortfolioAlertCategoryInput],
@@ -61,6 +63,13 @@ fn validate_inputs(
                 target.category_id
             ));
         }
+    }
+    let target_percent_sum: f64 = config.targets.iter().map(|target| target.target_percent).sum();
+    if (target_percent_sum - 100.0).abs() > TARGET_PERCENT_SUM_TOLERANCE {
+        return Err(format!(
+            "target_percent values must sum to 100.0 within {:.2} tolerance",
+            TARGET_PERCENT_SUM_TOLERANCE
+        ));
     }
     for position in positions {
         if !is_valid_number(position.market_value) {
@@ -380,6 +389,16 @@ mod tests {
         }
     }
 
+    fn config_with_market_scope(market: &str) -> PortfolioAlertConfig {
+        let mut config = config_with_targets(20.0, [("growth", 50.0), ("cash", 50.0)]);
+        config.scope = PortfolioAlertScope {
+            kind: PortfolioAlertScopeKind::Market,
+            market: Some(market.to_string()),
+            account_id: None,
+        };
+        config
+    }
+
     fn category(id: &str, name: &str, color: &str, icon: &str, sort_order: i64) -> PortfolioAlertCategoryInput {
         PortfolioAlertCategoryInput {
             id: id.to_string(),
@@ -556,6 +575,10 @@ mod tests {
             .expect("uncategorized row")
     }
 
+    fn sum_rebalance_amounts(snapshot: &PortfolioAlertSnapshot) -> f64 {
+        snapshot.categories.iter().map(|row| row.rebalance_amount).sum()
+    }
+
     #[test]
     fn allocation_uses_relative_deviation_and_strict_greater_than() {
         let config = config_with_targets(20.0, [("growth", 50.0), ("cash", 50.0)]);
@@ -618,6 +641,142 @@ mod tests {
         assert_eq!(snapshot.concentrations[0].symbol, "AAPL");
         assert_eq!(snapshot.concentrations[0].market_value, 25.0);
         assert_eq!(snapshot.concentrations[0].position_percent, 25.0);
+    }
+
+    #[test]
+    fn same_symbol_in_different_markets_stays_separate_for_concentration() {
+        let config = config_with_concentration(10.0);
+        let categories = default_categories();
+        let positions = [
+            position(
+                "acct-a",
+                "US",
+                "AAPL",
+                "Apple",
+                Some("growth"),
+                "Growth",
+                "#00AA00",
+                30.0,
+                false,
+            ),
+            position(
+                "acct-a",
+                "HK",
+                "AAPL",
+                "Apple",
+                Some("growth"),
+                "Growth",
+                "#00AA00",
+                20.0,
+                false,
+            ),
+            position(
+                "acct-a",
+                "US",
+                "cash",
+                "Cash",
+                Some("cash"),
+                "Cash",
+                "#CCCCCC",
+                50.0,
+                true,
+            ),
+        ];
+        let snapshot = snapshot(&config, &categories, &positions);
+
+        assert_eq!(snapshot.concentrations.len(), 2);
+        assert!(snapshot
+            .concentrations
+            .iter()
+            .any(|row| row.market == "US" && row.symbol == "AAPL" && row.market_value == 30.0));
+        assert!(snapshot
+            .concentrations
+            .iter()
+            .any(|row| row.market == "HK" && row.symbol == "AAPL" && row.market_value == 20.0));
+    }
+
+    #[test]
+    fn market_scope_filters_to_the_selected_market() {
+        let config = config_with_market_scope("us");
+        let categories = default_categories();
+        let positions = [
+            position(
+                "acct-a",
+                "US",
+                "growth",
+                "Growth",
+                Some("growth"),
+                "Growth",
+                "#00AA00",
+                60.0,
+                false,
+            ),
+            position(
+                "acct-a",
+                "HK",
+                "growth",
+                "Growth",
+                Some("growth"),
+                "Growth",
+                "#00AA00",
+                40.0,
+                false,
+            ),
+        ];
+        let snapshot = snapshot(&config, &categories, &positions);
+
+        assert_eq!(snapshot.total_market_value, 60.0);
+        assert_eq!(allocation(&snapshot, "growth").current_market_value, 60.0);
+    }
+
+    #[test]
+    fn target_percentages_must_sum_to_one_hundred_percent() {
+        let config = config_with_targets(20.0, [("growth", 60.0), ("cash", 39.98)]);
+        let categories = default_categories();
+        let positions = positions([("growth", 60.0, false), ("cash", 40.0, true)]);
+
+        let result = calculate_portfolio_alert_snapshot(
+            &config,
+            &categories,
+            &positions,
+            "USD",
+            "2026-09-06T00:00:00Z",
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rebalance_amounts_sum_to_zero_with_a_valid_target_mix() {
+        let config = config_with_targets(20.0, [("growth", 37.5), ("cash", 62.5)]);
+        let categories = default_categories();
+        let positions = [
+            position(
+                "acct-a",
+                "US",
+                "growth",
+                "Growth",
+                Some("growth"),
+                "Growth",
+                "#00AA00",
+                30.0,
+                false,
+            ),
+            position(
+                "acct-a",
+                "US",
+                "cash",
+                "Cash",
+                Some("cash"),
+                "Cash",
+                "#CCCCCC",
+                70.0,
+                true,
+            ),
+        ];
+        let snapshot = snapshot(&config, &categories, &positions);
+
+        assert!((sum_rebalance_amounts(&snapshot)).abs() <= 1e-9);
     }
 
     #[test]

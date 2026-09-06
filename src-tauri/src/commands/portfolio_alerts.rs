@@ -29,16 +29,11 @@ pub(crate) async fn evaluate_and_emit_portfolio_alerts(
     quote_cache: &QuoteCache,
     exchange_rate_cache: &ExchangeRateCache,
 ) {
-    evaluate_portfolio_alerts_with_sink(
-        db,
-        quote_cache,
-        exchange_rate_cache,
-        |notification| {
-            if let Err(error) = app_handle.emit("portfolio-alert-triggered", notification) {
-                warn!("Failed to emit portfolio-alert-triggered event: {error}");
-            }
-        },
-    )
+    evaluate_portfolio_alerts_with_sink(db, quote_cache, exchange_rate_cache, |notification| {
+        if let Err(error) = app_handle.emit("portfolio-alert-triggered", notification) {
+            warn!("Failed to emit portfolio-alert-triggered event: {error}");
+        }
+    })
     .await;
 }
 
@@ -207,7 +202,10 @@ mod tests {
             PortfolioAlertBreachDirection::AboveLimit
         );
         assert_eq!(notification.message, "持仓集中度预警：security:US:AAPL");
-        assert_eq!(notification.triggered_at, notification.breach.first_triggered_at);
+        assert_eq!(
+            notification.triggered_at,
+            notification.breach.first_triggered_at
+        );
         assert_eq!(notification.triggered_at, notification.breach.last_seen_at);
         assert!(chrono::DateTime::parse_from_rfc3339(&notification.triggered_at).is_ok());
 

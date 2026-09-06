@@ -64,7 +64,11 @@ fn validate_inputs(
             ));
         }
     }
-    let target_percent_sum: f64 = config.targets.iter().map(|target| target.target_percent).sum();
+    let target_percent_sum: f64 = config
+        .targets
+        .iter()
+        .map(|target| target.target_percent)
+        .sum();
     if (target_percent_sum - 100.0).abs() > TARGET_PERCENT_SUM_TOLERANCE {
         return Err(format!(
             "target_percent values must sum to 100.0 within {:.2} tolerance",
@@ -150,7 +154,8 @@ fn build_category_allocation(
     let current_percent = current_market_value / total_market_value * 100.0;
     let target_market_value = total_market_value * target_percent / 100.0;
     let rebalance_amount = target_market_value - current_market_value;
-    let relative_deviation_percent = relative_deviation_percent(current_market_value, target_market_value);
+    let relative_deviation_percent =
+        relative_deviation_percent(current_market_value, target_market_value);
     let direction = if target_percent == 0.0 {
         (current_market_value > 0.0).then_some(AllocationDirection::Overweight)
     } else if relative_deviation_percent.is_some_and(|value| value > deviation_threshold) {
@@ -195,7 +200,10 @@ pub fn calculate_portfolio_alert_snapshot(
         return Ok(PortfolioAlertCalculation::Empty);
     }
 
-    let total_market_value: f64 = filtered_positions.iter().map(|position| position.market_value).sum();
+    let total_market_value: f64 = filtered_positions
+        .iter()
+        .map(|position| position.market_value)
+        .sum();
     if total_market_value <= 0.0 {
         return Ok(PortfolioAlertCalculation::Empty);
     }
@@ -346,13 +354,13 @@ struct ConcentrationAccumulator {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        calculate_portfolio_alert_snapshot, PortfolioAlertCalculation, PortfolioAlertCategoryInput,
+        PortfolioAlertPositionInput,
+    };
     use crate::models::portfolio_alert::{
         AllocationDirection, PortfolioAlertConfig, PortfolioAlertScope, PortfolioAlertScopeKind,
         PortfolioAlertSnapshot,
-    };
-    use super::{
-        calculate_portfolio_alert_snapshot, PortfolioAlertCalculation,
-        PortfolioAlertCategoryInput, PortfolioAlertPositionInput,
     };
 
     fn config_with_targets<const N: usize>(
@@ -372,9 +380,11 @@ mod tests {
             is_active: true,
             targets: targets
                 .into_iter()
-                .map(|(category_id, target_percent)| crate::models::portfolio_alert::PortfolioAlertTarget {
-                    category_id: category_id.to_string(),
-                    target_percent,
+                .map(|(category_id, target_percent)| {
+                    crate::models::portfolio_alert::PortfolioAlertTarget {
+                        category_id: category_id.to_string(),
+                        target_percent,
+                    }
                 })
                 .collect(),
             last_snapshot: None,
@@ -399,7 +409,13 @@ mod tests {
         config
     }
 
-    fn category(id: &str, name: &str, color: &str, icon: &str, sort_order: i64) -> PortfolioAlertCategoryInput {
+    fn category(
+        id: &str,
+        name: &str,
+        color: &str,
+        icon: &str,
+        sort_order: i64,
+    ) -> PortfolioAlertCategoryInput {
         PortfolioAlertCategoryInput {
             id: id.to_string(),
             name: name.to_string(),
@@ -453,13 +469,12 @@ mod tests {
         items
             .into_iter()
             .map(|(symbol, market_value, is_cash)| {
-                let (category_id, category_name, category_color) = if is_cash
-                    || symbol.eq_ignore_ascii_case("cash")
-                {
-                    (Some("cash"), "Cash", "#CCCCCC")
-                } else {
-                    (Some("growth"), "Growth", "#00AA00")
-                };
+                let (category_id, category_name, category_color) =
+                    if is_cash || symbol.eq_ignore_ascii_case("cash") {
+                        (Some("cash"), "Cash", "#CCCCCC")
+                    } else {
+                        (Some("growth"), "Growth", "#00AA00")
+                    };
                 position(
                     "acct-a",
                     "US",
@@ -539,8 +554,14 @@ mod tests {
         categories: &[PortfolioAlertCategoryInput],
         positions: &[PortfolioAlertPositionInput],
     ) -> PortfolioAlertCalculation {
-        calculate_portfolio_alert_snapshot(config, categories, positions, "USD", "2026-09-06T00:00:00Z")
-            .unwrap()
+        calculate_portfolio_alert_snapshot(
+            config,
+            categories,
+            positions,
+            "USD",
+            "2026-09-06T00:00:00Z",
+        )
+        .unwrap()
     }
 
     fn snapshot(
@@ -576,7 +597,11 @@ mod tests {
     }
 
     fn sum_rebalance_amounts(snapshot: &PortfolioAlertSnapshot) -> f64 {
-        snapshot.categories.iter().map(|row| row.rebalance_amount).sum()
+        snapshot
+            .categories
+            .iter()
+            .map(|row| row.rebalance_amount)
+            .sum()
     }
 
     #[test]
@@ -618,8 +643,28 @@ mod tests {
             &config,
             &categories,
             &[
-                position("acct-a", "US", "cash", "Cash", Some("cash"), "Cash", "#CCCCCC", 60.0, true),
-                position("acct-a", "US", "growth", "Growth", Some("growth"), "Growth", "#00AA00", 40.0, false),
+                position(
+                    "acct-a",
+                    "US",
+                    "cash",
+                    "Cash",
+                    Some("cash"),
+                    "Cash",
+                    "#CCCCCC",
+                    60.0,
+                    true,
+                ),
+                position(
+                    "acct-a",
+                    "US",
+                    "growth",
+                    "Growth",
+                    Some("growth"),
+                    "Growth",
+                    "#00AA00",
+                    40.0,
+                    false,
+                ),
             ],
         );
 
@@ -1030,8 +1075,28 @@ mod tests {
             &config,
             &categories,
             &[
-                position("acct-a", "US", "growth", "Growth", Some("growth"), "Growth", "#00AA00", 20.0, false),
-                position("acct-a", "US", "cash", "Cash", Some("cash"), "Cash", "#CCCCCC", 80.0, true),
+                position(
+                    "acct-a",
+                    "US",
+                    "growth",
+                    "Growth",
+                    Some("growth"),
+                    "Growth",
+                    "#00AA00",
+                    20.0,
+                    false,
+                ),
+                position(
+                    "acct-a",
+                    "US",
+                    "cash",
+                    "Cash",
+                    Some("cash"),
+                    "Cash",
+                    "#CCCCCC",
+                    80.0,
+                    true,
+                ),
             ],
         );
 

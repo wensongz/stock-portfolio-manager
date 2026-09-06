@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   Alert,
@@ -48,6 +48,7 @@ import {
   buildPortfolioAlertDisplayModel,
   buildPortfolioAlertNotificationPresentation,
   buildPortfolioAlertScopeOptions,
+  decideDeletedPortfolioAlertScopeTransition,
   mergePortfolioAlertDraftCategories,
   overallScope,
   resolvePortfolioAlertCurrency,
@@ -145,6 +146,7 @@ export default function PortfolioAlertsTab() {
   const [notificationApi, notificationHolder] = notification.useNotification();
   const [dataReady, setDataReady] = useState(false);
   const [editing, setEditing] = useState(true);
+  const [declinedDeletedScopeKey, setDeclinedDeletedScopeKey] = useState<string | null>(null);
   const [draft, setDraft] = useState<PortfolioAlertDraft>(() =>
     createDraft(overallScope(), [], [], baseCurrency),
   );
@@ -156,6 +158,7 @@ export default function PortfolioAlertsTab() {
   const syncedConfigRef = useRef<string | null>(null);
   const categorySignatureRef = useRef<string | null>(null);
   const selectedScopeKeyRef = useRef(selectedScopeKey);
+  const pendingDeletedConfirmationRef = useRef<string | null>(null);
   const visibleRef = useRef<{ scope: PortfolioAlertScope; config: PortfolioAlertConfig | null }>({
     scope: overallScope(),
     config: null,
@@ -166,18 +169,39 @@ export default function PortfolioAlertsTab() {
     () => buildPortfolioAlertScopeOptions(accounts),
     [accounts],
   );
-  const selectedScope = useMemo(
-    () => scopeOptions.find((option) => option.value === selectedScopeKey)?.scope ?? overallScope(),
+  const selectedScopeOption = useMemo(
+    () => scopeOptions.find((option) => option.value === selectedScopeKey),
     [scopeOptions, selectedScopeKey],
+  );
+  const selectedScope = useMemo(
+    () => selectedScopeOption?.scope
+      ?? (portfolioAlertScopeKey(draft.scope) === selectedScopeKey ? draft.scope : overallScope()),
+    [draft.scope, selectedScopeKey, selectedScopeOption],
   );
   const displayModel = useMemo(
     () => buildPortfolioAlertDisplayModel(currentView, categories),
     [categories, currentView],
   );
+  const tableRows = useMemo(() => {
+    if (!editing || displayModel.rows.length > 0) return displayModel.rows;
+    return buildPortfolioAlertDisplayModel(
+      currentView ? { config: currentView.config, evaluation: null } : undefined,
+      categories,
+    ).rows;
+  }, [categories, currentView, displayModel.rows, editing]);
   const validation = useMemo(() => validatePortfolioAlertDraft(draft), [draft]);
   const dirty = useMemo(
     () => draftFingerprint(draft) !== draftFingerprint(baseline),
     [baseline, draft],
+  );
+  const deletedScopeTransition = useMemo(
+    () => decideDeletedPortfolioAlertScopeTransition(
+      selectedScope,
+      scopeOptions,
+      dirty,
+      declinedDeletedScopeKey,
+    ),
+    [declinedDeletedScopeKey, dirty, scopeOptions, selectedScope],
   );
   const categorySignature = useMemo(
     () => JSON.stringify(categories.map((category) => [
@@ -193,6 +217,26 @@ export default function PortfolioAlertsTab() {
 
   selectedScopeKeyRef.current = selectedScopeKey;
   visibleRef.current = { scope: selectedScope, config: currentView?.config ?? null };
+
+  const resetDraftForScope = useCallback((scope: PortfolioAlertScope) => {
+    const latestCategories = useCategoryStore.getState().categories;
+    const latestAccounts = useAccountStore.getState().accounts;
+    const latestBaseCurrency = useExchangeRateStore.getState().baseCurrency;
+    const nextDraft = createDraft(
+      scope,
+      latestCategories,
+      latestAccounts,
+      latestBaseCurrency,
+    );
+    syncedConfigRef.current = null;
+    pendingDeletedConfirmationRef.current = null;
+    setDeclinedDeletedScopeKey(null);
+    setDraft(nextDraft);
+    setBaseline(nextDraft);
+    setEditing(true);
+    selectScope(scope);
+    void loadScope(scope);
+  }, [loadScope, selectScope]);
 
   useEffect(() => {
     if (initializedRef.current) return;
@@ -210,24 +254,44 @@ export default function PortfolioAlertsTab() {
   }, [dataReady, loadScope, scopeOptions, selectScope, selectedScopeKey]);
 
   useEffect(() => {
-    if (!dataReady || scopeOptions.some((option) => option.value === selectedScopeKey)) return;
-    const fallback = overallScope();
-    syncedConfigRef.current = null;
-    const nextDraft = createDraft(fallback, categories, accounts, baseCurrency);
-    setDraft(nextDraft);
-    setBaseline(nextDraft);
-    setEditing(true);
-    selectScope(fallback);
-    void loadScope(fallback);
+    if (!dataReady) return;
+    if (deletedScopeTransition.action === "NONE") {
+      pendingDeletedConfirmationRef.current = null;
+      if (declinedDeletedScopeKey !== null) setDeclinedDeletedScopeKey(null);
+      return;
+    }
+    if (deletedScopeTransition.action === "FALLBACK") {
+      resetDraftForScope(deletedScopeTransition.fallbackScope);
+      return;
+    }
+    if (deletedScopeTransition.action === "PRESERVE") return;
+    if (pendingDeletedConfirmationRef.current === deletedScopeTransition.transitionKey) return;
+
+    const { fallbackScope, transitionKey } = deletedScopeTransition;
+    pendingDeletedConfirmationRef.current = transitionKey;
+    Modal.confirm({
+      title: "当前账户已被删除",
+      content: "当前配置还有未保存修改。是否放弃修改并切换到整体组合？",
+      okText: "放弃并切换",
+      cancelText: "暂时保留修改",
+      onOk: () => {
+        pendingDeletedConfirmationRef.current = null;
+        if (selectedScopeKeyRef.current === transitionKey) {
+          resetDraftForScope(fallbackScope);
+        }
+      },
+      onCancel: () => {
+        pendingDeletedConfirmationRef.current = null;
+        if (selectedScopeKeyRef.current === transitionKey) {
+          setDeclinedDeletedScopeKey(transitionKey);
+        }
+      },
+    });
   }, [
-    accounts,
-    baseCurrency,
-    categories,
     dataReady,
-    loadScope,
-    scopeOptions,
-    selectScope,
-    selectedScopeKey,
+    declinedDeletedScopeKey,
+    deletedScopeTransition,
+    resetDraftForScope,
   ]);
 
   useEffect(() => {
@@ -308,16 +372,6 @@ export default function PortfolioAlertsTab() {
     if (config?.isActive) void evaluate(config.id, scope);
   }, [evaluate, lastUpdatedAt]);
 
-  const resetDraftForScope = (scope: PortfolioAlertScope) => {
-    const nextDraft = createDraft(scope, categories, accounts, baseCurrency);
-    syncedConfigRef.current = null;
-    setDraft(nextDraft);
-    setBaseline(nextDraft);
-    setEditing(true);
-    selectScope(scope);
-    void loadScope(scope);
-  };
-
   const handleScopeChange = (nextKey: string) => {
     const option = scopeOptions.find((item) => item.value === nextKey);
     if (!option || nextKey === selectedScopeKey) return;
@@ -346,21 +400,22 @@ export default function PortfolioAlertsTab() {
   };
 
   const handleSave = async () => {
-    if (!validation.valid) return;
+    if (!validation.valid || !selectedScopeOption) return;
     const latestAccounts = useAccountStore.getState().accounts;
     const latestBaseCurrency = useExchangeRateStore.getState().baseCurrency;
+    const saveScope = selectedScopeOption.scope;
     const input: SavePortfolioAlertConfigInput = {
       ...mergePortfolioAlertDraftCategories(draft, useCategoryStore.getState().categories),
       id: currentView?.config?.id ?? null,
-      scope: selectedScope,
+      scope: saveScope,
       baseCurrency: resolvePortfolioAlertCurrency(
-        selectedScope,
+        saveScope,
         latestAccounts,
         latestBaseCurrency,
       ),
     };
     await saveConfig(input);
-    const scopeKey = portfolioAlertScopeKey(selectedScope);
+    const scopeKey = portfolioAlertScopeKey(saveScope);
     const saveError = portfolioAlertStore.getState().errorsByScope[scopeKey];
     if (saveError) {
       message.error(`保存失败：${saveError}`);
@@ -528,7 +583,7 @@ export default function PortfolioAlertsTab() {
                 type="primary"
                 icon={<SaveOutlined />}
                 loading={loading}
-                disabled={!validation.valid}
+                disabled={!validation.valid || !selectedScopeOption}
                 onClick={() => void handleSave()}
               >
                 保存配置
@@ -590,6 +645,23 @@ export default function PortfolioAlertsTab() {
       </Card>
 
       {error && <Alert type="error" showIcon title="组合提醒加载失败" description={error} />}
+      {deletedScopeTransition.action === "PRESERVE" && (
+        <Alert
+          type="warning"
+          showIcon
+          title="当前证券账户已被删除"
+          description="未保存修改仍保留在本页。你可以从范围选择器切换并确认放弃，或直接放弃修改回到整体组合。"
+          action={(
+            <Button
+              danger
+              size="small"
+              onClick={() => resetDraftForScope(overallScope())}
+            >
+              放弃修改并切换到整体组合
+            </Button>
+          )}
+        />
+      )}
       {displayModel.banner && (
         <Alert
           type={alertType(displayModel.statusColor)}
@@ -625,7 +697,7 @@ export default function PortfolioAlertsTab() {
             extra={<Text type="secondary">当前合计 {displayModel.totalCurrentLabel}</Text>}
           >
             <Table<PortfolioAlertDisplayRow>
-              dataSource={displayModel.rows}
+              dataSource={tableRows}
               columns={columns}
               rowKey="key"
               pagination={false}
@@ -655,8 +727,17 @@ export default function PortfolioAlertsTab() {
           </Tooltip>
         )}
       >
-        {breachedRows.length === 0 && displayModel.concentrationRows.length === 0 ? (
+        {displayModel.showReadyNormalSuccess ? (
           <Alert type="success" showIcon title="当前无需再平衡" />
+        ) : breachedRows.length === 0 && displayModel.concentrationRows.length === 0 ? (
+          <Alert
+            type={displayModel.statusColor === "success"
+              ? "info"
+              : alertType(displayModel.statusColor)}
+            showIcon
+            title={displayModel.stale ? "历史快照" : displayModel.statusLabel}
+            description={displayModel.banner ?? displayModel.aiDisabledReason ?? "当前状态无法判断是否需要再平衡。"}
+          />
         ) : (
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             <div>

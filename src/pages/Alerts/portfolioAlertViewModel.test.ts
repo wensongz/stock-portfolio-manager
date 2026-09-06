@@ -6,6 +6,7 @@ import {
   buildPortfolioAlertDisplayModel,
   buildPortfolioAlertNotificationPresentation,
   buildPortfolioAlertScopeOptions,
+  decideDeletedPortfolioAlertScopeTransition,
   marketScope,
   mergePortfolioAlertDraftCategories,
   overallScope,
@@ -253,7 +254,10 @@ test("incomplete evaluation shows its prior snapshot as stale and describes miss
       currency: null,
       reason: "cached quote is unavailable",
     }],
-  }));
+  }), [
+    category("growth", "成长", 10),
+    category("cash", "现金", 20),
+  ]);
 
   assert.equal(model.stale, true);
   assert.equal(model.statusLabel, "数据不完整");
@@ -276,6 +280,35 @@ test("empty and invalid configuration states expose distinct guidance", () => {
   assert.equal(invalid.statusLabel, "配置无效");
   assert.match(invalid.banner ?? "", /重新保存/);
   assert.equal(invalid.canAskAi, false);
+});
+
+test("EMPTY never revives a config's cleared last snapshot", () => {
+  const model = buildPortfolioAlertDisplayModel(view({
+    status: "EMPTY",
+    snapshot: null,
+    stale: false,
+  }, {
+    lastSnapshot: snapshot({
+      concentrations: [{
+        market: "US",
+        symbol: "AAPL",
+        normalizedSymbol: "AAPL",
+        name: "Apple",
+        categoryId: "growth",
+        marketValue: 600,
+        positionPercent: 60,
+        thresholdPercent: 20,
+      }],
+    }),
+  }), [
+    category("growth", "成长", 10),
+    category("cash", "现金", 20),
+  ]);
+
+  assert.equal(model.stale, false);
+  assert.deepEqual(model.pieData, []);
+  assert.deepEqual(model.rows, []);
+  assert.deepEqual(model.concentrationRows, []);
 });
 
 test("an unconfigured scope is explicit and defaults to no AI action", () => {
@@ -367,6 +400,26 @@ test("AI is enabled only for a ready evaluation with a currently active breach",
   }, { isActive: false })).canAskAi, false);
 });
 
+test("green ready-normal success is exclusive to active, fresh READY views without breaches", () => {
+  const cases = [
+    ["ready normal", view(), true],
+    ["unconfigured", undefined, false],
+    ["inactive", view({}, { isActive: false }), false],
+    ["empty", view({ status: "EMPTY", snapshot: null }), false],
+    ["incomplete", view({ status: "INCOMPLETE", stale: true }), false],
+    ["invalid", view({ status: "INVALID_CONFIG", stale: true }), false],
+    ["stale ready", view({ status: "READY", stale: true }), false],
+  ];
+
+  for (const [label, candidate, expected] of cases) {
+    assert.equal(
+      buildPortfolioAlertDisplayModel(candidate).showReadyNormalSuccess,
+      expected,
+      label,
+    );
+  }
+});
+
 test("command and event breaches can share one notification presentation", () => {
   const presentation = buildPortfolioAlertNotificationPresentation({
     configId: "config-overall",
@@ -394,4 +447,48 @@ test("fresh categories join display rows in Settings order without making uncate
   assert.equal(model.rows[2].targetPercent, 0);
   assert.equal(model.rows[2].editable, true);
   assert.equal(model.rows[3].editable, false);
+});
+
+test("deleted account fallback is automatic only for a clean draft", () => {
+  const options = buildPortfolioAlertScopeOptions([]);
+
+  assert.deepEqual(
+    decideDeletedPortfolioAlertScopeTransition(
+      accountScope("deleted-account"),
+      options,
+      false,
+      null,
+    ),
+    {
+      action: "FALLBACK",
+      fallbackScope: overallScope(),
+      transitionKey: "account:deleted-account",
+    },
+  );
+});
+
+test("deleted dirty account requires one confirmation and preserves state after cancellation", () => {
+  const selected = accountScope("deleted-account");
+  const options = buildPortfolioAlertScopeOptions([]);
+
+  assert.deepEqual(
+    decideDeletedPortfolioAlertScopeTransition(selected, options, true, null),
+    {
+      action: "CONFIRM",
+      fallbackScope: overallScope(),
+      transitionKey: "account:deleted-account",
+    },
+  );
+  assert.deepEqual(
+    decideDeletedPortfolioAlertScopeTransition(
+      selected,
+      options,
+      true,
+      "account:deleted-account",
+    ),
+    {
+      action: "PRESERVE",
+      transitionKey: "account:deleted-account",
+    },
+  );
 });

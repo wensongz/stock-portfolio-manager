@@ -17,6 +17,11 @@ export interface ScopeOption {
   scope: PortfolioAlertScope;
 }
 
+export type DeletedPortfolioAlertScopeTransition =
+  | { action: "FALLBACK" | "CONFIRM"; fallbackScope: PortfolioAlertScope; transitionKey: string }
+  | { action: "PRESERVE"; transitionKey: string }
+  | { action: "NONE" };
+
 export interface DraftValidation {
   valid: boolean;
   totalTarget: number;
@@ -89,6 +94,7 @@ export interface PortfolioAlertDisplayModel {
   totalTargetLabel: string;
   totalCurrentLabel: string;
   missingDataDescriptions: string[];
+  showReadyNormalSuccess: boolean;
   canAskAi: boolean;
   aiDisabledReason: string | null;
 }
@@ -142,6 +148,26 @@ export function resolvePortfolioAlertScope(
       : `account:${scope.accountId}`;
   return options.find((option) => option.value === key)?.scope
     ?? overallScope();
+}
+
+export function decideDeletedPortfolioAlertScopeTransition(
+  selectedScope: PortfolioAlertScope,
+  options: ScopeOption[],
+  dirty: boolean,
+  declinedTransitionKey: string | null,
+): DeletedPortfolioAlertScopeTransition {
+  if (selectedScope.kind !== "ACCOUNT") return { action: "NONE" };
+  const transitionKey = `account:${selectedScope.accountId}`;
+  if (options.some((option) => option.value === transitionKey)) {
+    return { action: "NONE" };
+  }
+  if (!dirty) {
+    return { action: "FALLBACK", fallbackScope: overallScope(), transitionKey };
+  }
+  if (declinedTransitionKey === transitionKey) {
+    return { action: "PRESERVE", transitionKey };
+  }
+  return { action: "CONFIRM", fallbackScope: overallScope(), transitionKey };
 }
 
 const MARKET_CURRENCIES = {
@@ -356,7 +382,10 @@ export function buildPortfolioAlertDisplayModel(
 ): PortfolioAlertDisplayModel {
   const config = view?.config ?? null;
   const evaluation = view?.evaluation ?? null;
-  const snapshot = evaluation?.snapshot ?? config?.lastSnapshot ?? null;
+  const snapshot = evaluation?.snapshot
+    ?? (evaluation?.stale || (config !== null && !config.isActive && evaluation === null)
+      ? config?.lastSnapshot ?? null
+      : null);
   const currency = snapshot?.baseCurrency ?? config?.baseCurrency ?? "USD";
   const threshold = config?.deviationThreshold ?? 20;
   const sourceRows = snapshot?.categories ?? [];
@@ -369,8 +398,10 @@ export function buildPortfolioAlertDisplayModel(
     config?.targets.map((target) => [target.categoryId, target.targetPercent]) ?? [],
   );
   const uncategorized = sourceRows.find((row) => row.categoryId === null);
-  const mergedRows = categories
-    ? [
+  const mergedRows = evaluation?.status === "EMPTY"
+    ? []
+    : categories
+      ? [
         ...orderedCategories(categories).map((category) => {
           const existing = allocationByCategory.get(category.id);
           const targetPercent = targetByCategory.get(category.id) ?? existing?.targetPercent ?? 0;
@@ -401,17 +432,19 @@ export function buildPortfolioAlertDisplayModel(
               };
         }),
         ...(uncategorized ? [uncategorized] : []),
-      ]
-    : sourceRows;
+        ]
+      : sourceRows;
 
   const rows: PortfolioAlertDisplayRow[] = mergedRows.map((row) => {
-    const status = rowStatus(
-      row.targetPercent,
-      row.currentPercent,
-      row.relativeDeviationPercent,
-      row.direction,
-      threshold,
-    );
+    const status = snapshot
+      ? rowStatus(
+          row.targetPercent,
+          row.currentPercent,
+          row.relativeDeviationPercent,
+          row.direction,
+          threshold,
+        )
+      : "NORMAL";
     const statusLabels: Record<PortfolioAlertRowStatus, string> = {
       NORMAL: "正常",
       OVERWEIGHT: "超配",
@@ -468,6 +501,12 @@ export function buildPortfolioAlertDisplayModel(
       && evaluation?.status === "READY"
       && evaluation.activeBreaches.length > 0,
   );
+  const showReadyNormalSuccess = Boolean(
+    config?.isActive
+      && evaluation?.status === "READY"
+      && !evaluation.stale
+      && evaluation.activeBreaches.length === 0,
+  );
   const aiDisabledReason = readyWithBreach
     ? null
     : !config
@@ -491,7 +530,8 @@ export function buildPortfolioAlertDisplayModel(
     statusLabel: presentation.label,
     statusColor: presentation.color,
     banner: presentation.banner,
-    stale: evaluation?.stale ?? Boolean(snapshot),
+    stale: evaluation?.stale
+      ?? Boolean(config !== null && !config.isActive && snapshot),
     snapshotEvaluatedAt: snapshot?.evaluatedAt ?? null,
     pieData: rows
       .filter((row) => row.currentMarketValue > 0)
@@ -503,6 +543,7 @@ export function buildPortfolioAlertDisplayModel(
     totalTargetLabel: formatPercent(totalTargetPercent),
     totalCurrentLabel: formatPercent(totalCurrentPercent),
     missingDataDescriptions: evaluation?.missingData.map(missingDataDescription) ?? [],
+    showReadyNormalSuccess,
     canAskAi: readyWithBreach,
     aiDisabledReason,
   };

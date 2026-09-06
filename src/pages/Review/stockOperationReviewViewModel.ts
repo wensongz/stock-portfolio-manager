@@ -235,6 +235,7 @@ export function formatOperationCurrency(
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency,
+    currencyDisplay: currency === "CNY" ? "narrowSymbol" : "symbol",
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(value);

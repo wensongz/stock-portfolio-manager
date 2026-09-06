@@ -294,7 +294,7 @@ export default function OptionReviewTab() {
   ) : null;
 
   return (
-    <div className="space-y-4" style={{ minWidth: 0 }}>
+    <div className="flex flex-col gap-4" style={{ minWidth: 0 }}>
       <style>{`
         .option-review-selected-row > td {
           background: color-mix(in srgb, var(--color-info) 12%, transparent) !important;

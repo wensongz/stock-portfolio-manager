@@ -164,6 +164,11 @@ test("formatters distinguish missing values from zero", () => {
   assert.equal(formatOperationWeight(0.0345), "3.45%");
 });
 
+test("currency formatter uses the standard yuan symbol without narrowing HKD", () => {
+  assert.equal(formatOperationCurrency(1234.5, "CNY"), "¥1,234.50");
+  assert.equal(formatOperationCurrency(1234.5, "HKD"), "HK$1,234.50");
+});
+
 const group = (overrides = {}) => ({
   action_count: 2,
   positive_count: 1,

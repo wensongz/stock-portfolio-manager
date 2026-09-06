@@ -38,11 +38,12 @@ export default function StockOperationActionsTable({
     "",
   ).columnTitle;
   const columns: ColumnsType<StockOperationEffect> = [
-    { title: "日期", dataIndex: "trade_date", fixed: "left", width: 100 },
+    { title: "日期", dataIndex: "trade_date", fixed: "left", width: 80 },
     {
       title: identityColumnTitle,
       fixed: "left",
-      width: 175,
+      ellipsis: true,
+      width: 135,
       render: (_, row) => {
         const identity = buildStockOperationIdentityDisplay(
           reportAccountId,
@@ -59,25 +60,25 @@ export default function StockOperationActionsTable({
         );
       },
     },
-    { title: "操作", dataIndex: "action_type", width: 60, render: (value: StockOperationEffect["action_type"]) => ACTION_LABELS[value] },
-    { title: "股数", dataIndex: "quantity", align: "right", width: 60, render: number },
-    { title: "成交均价", dataIndex: "trade_price", align: "right", width: 80, render: number },
+    { title: "操作", dataIndex: "action_type", width: 40, render: (value: StockOperationEffect["action_type"]) => ACTION_LABELS[value] },
+    { title: "股数", dataIndex: "quantity", align: "right", width: 70, render: number },
+    { title: "成交均价", dataIndex: "trade_price", align: "right", width: 60, render: number },
     { title: "成交金额", dataIndex: "trade_notional_local", align: "right", width: 90, render: (value, row) => formatOperationCurrency(value, row.currency) },
     { title: "费用", dataIndex: "fee_local", align: "right", width: 60, render: (value, row) => formatOperationCurrency(value, row.currency) },
-    { title: "股数（前 → 后）", width: 120, render: (_, row) => `${number(row.shares_before)} → ${number(row.shares_after)}` },
-    { title: "权重（前 → 后）估算", width: 130, render: (_, row) => `${formatOperationPercent(row.weight_before)} → ${formatOperationPercent(row.weight_after)}` },
-    { title: "权重变化", dataIndex: "weight_change", align: "right", width: 80, render: formatOperationPercent },
-    { title: "评价日", dataIndex: "evaluation_date", width: 100, render: (value) => value ?? "—" },
-    { title: "期末价", dataIndex: "end_price", align: "right", width: 80, render: number },
-    { title: "本币价格效果", dataIndex: "price_effect_local", align: "right", width: 100, render: (value, row) => formatOperationCurrency(value, row.currency) },
-    { title: `价格效果（${baseCurrency}）`, dataIndex: "price_effect_base", align: "right", width: 110, render: (value) => formatOperationCurrency(value, baseCurrency) },
-    { title: "价格效果率", dataIndex: "price_effect_percent", align: "right", width: 100, render: formatOperationPercent },
+    { title: "股数（前 → 后）", width: 110, render: (_, row) => `${number(row.shares_before)} → ${number(row.shares_after)}` },
+    { title: "权重（前 → 后）估算", width: 110, render: (_, row) => `${formatOperationPercent(row.weight_before)} → ${formatOperationPercent(row.weight_after)}` },
+    { title: "权重变化", dataIndex: "weight_change", align: "right", width: 60, render: formatOperationPercent },
+    { title: "评价日", dataIndex: "evaluation_date", width: 80, render: (value) => value ?? "—" },
+    { title: "期末价", dataIndex: "end_price", align: "right", width: 70, render: number },
+    { title: "本币价格效果", dataIndex: "price_effect_local", align: "right", width: 90, render: (value, row) => formatOperationCurrency(value, row.currency) },
+    { title: `价格效果（${baseCurrency}）`, dataIndex: "price_effect_base", align: "right", width: 90, render: (value) => formatOperationCurrency(value, baseCurrency) },
+    { title: "价格效果率", dataIndex: "price_effect_percent", align: "right", width: 90, render: formatOperationPercent },
     { title: "自动基准", dataIndex: "benchmark_symbol", width: 80, render: (value) => value ?? "—" },
     { title: "基准收益", dataIndex: "benchmark_return", align: "right", width: 80, render: formatOperationPercent },
-    { title: "方向调整相对效果", dataIndex: "directional_excess_return", align: "right", width: 120, render: formatOperationPercent },
+    { title: "方向调整相对效果", dataIndex: "directional_excess_return", align: "right", width: 100, render: formatOperationPercent },
     {
       title: "事实标签 / 数据说明",
-      width: 200,
+      width: 220,
       render: (_, row) => (
         <Space wrap>
           {row.fact_labels.map((label) => <Tag key={label}>{label}</Tag>)}

@@ -39,7 +39,8 @@ export default function StockOperationSecurityTable({
     {
       title: identityColumnTitle,
       fixed: "left",
-      width: 180,
+      ellipsis: true,
+      width: 160,
       render: (_, row) => {
         const identity = buildStockOperationIdentityDisplay(
           reportAccountId,
@@ -56,7 +57,7 @@ export default function StockOperationSecurityTable({
         );
       },
     },
-    { title: "建 / 加 / 减 / 清", width: 100, render: (_, row) => `${row.open_count} / ${row.add_count} / ${row.reduce_count} / ${row.close_count}` },
+    { title: "建 / 加 / 减 / 清", width: 90, render: (_, row) => `${row.open_count} / ${row.add_count} / ${row.reduce_count} / ${row.close_count}` },
     { title: "净增减股数", dataIndex: "net_shares", align: "right", width: 80, render: number },
     {
       title: "买入 / 卖出金额",

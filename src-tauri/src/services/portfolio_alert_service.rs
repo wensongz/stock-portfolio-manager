@@ -62,6 +62,44 @@ struct EvaluationGuard {
     revision: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PortfolioAlertPreviewPosition {
+    pub account_id: String,
+    pub market: String,
+    pub symbol: String,
+    pub name: String,
+    pub category_id: Option<String>,
+    pub category_name: String,
+    pub category_color: String,
+    pub shares: f64,
+    pub current_price: f64,
+    pub quote_updated_at: Option<String>,
+    pub native_market_value: f64,
+    pub native_currency: String,
+    pub base_market_value: f64,
+    pub base_currency: String,
+    pub conversion_rate: f64,
+    pub exchange_rate_updated_at: Option<String>,
+    pub is_cash: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrustedPortfolioAlertPreview {
+    pub config: PortfolioAlertConfig,
+    pub account_market: Option<String>,
+    pub evaluation: PortfolioAlertEvaluation,
+    pub positions: Vec<PortfolioAlertPreviewPosition>,
+}
+
+struct PreviewCalculation {
+    guard: EvaluationGuard,
+    account_market: Option<String>,
+    base_currency: String,
+    positions: Vec<PortfolioAlertPositionInput>,
+    proposed_breaches: Vec<PortfolioAlertBreach>,
+    initial_breaches: Vec<PortfolioAlertBreach>,
+}
+
 pub fn scope_key(scope: &PortfolioAlertScope) -> Result<String, String> {
     match scope.kind {
         PortfolioAlertScopeKind::Overall
@@ -441,6 +479,36 @@ fn verify_evaluation_guard(connection: &Connection, guard: &EvaluationGuard) -> 
     Ok(())
 }
 
+fn validate_preview_state(
+    db: &Database,
+    calculation: &PreviewCalculation,
+) -> Result<Vec<PortfolioAlertBreach>, String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    verify_evaluation_guard(&conn, &calculation.guard)?;
+    if let Some(expected_market) = calculation.account_market.as_deref() {
+        let account_id = calculation
+            .guard
+            .config
+            .scope
+            .account_id
+            .as_deref()
+            .ok_or_else(|| "account preview lost its account id".to_string())?;
+        let current_market = account_market(&conn, account_id)?;
+        if current_market != expected_market {
+            return Err("portfolio alert account market changed during preview".to_string());
+        }
+    }
+    let current_breaches = load_active_breaches(&conn, &calculation.guard.config.id)?;
+    if current_breaches != calculation.initial_breaches {
+        return Err("portfolio alert breaches changed during preview".to_string());
+    }
+    let matched = intersect_preview_breaches(&current_breaches, &calculation.proposed_breaches);
+    if matched.is_empty() {
+        return Err("portfolio alert has no current matching active breach".to_string());
+    }
+    Ok(matched)
+}
+
 fn unchanged_evaluation(
     config: &PortfolioAlertConfig,
     status: PortfolioAlertDataStatus,
@@ -504,6 +572,108 @@ fn proposed_breaches(
         );
     }
     proposed
+}
+
+fn intersect_preview_breaches(
+    persisted: &[PortfolioAlertBreach],
+    proposed: &[PortfolioAlertBreach],
+) -> Vec<PortfolioAlertBreach> {
+    proposed
+        .iter()
+        .filter_map(|current| {
+            persisted
+                .iter()
+                .find(|saved| {
+                    saved.breach_key == current.breach_key
+                        && saved.breach_kind == current.breach_kind
+                        && saved.direction == current.direction
+                })
+                .map(|saved| PortfolioAlertBreach {
+                    first_triggered_at: saved.first_triggered_at.clone(),
+                    last_seen_at: saved.last_seen_at.clone(),
+                    ..current.clone()
+                })
+        })
+        .collect()
+}
+
+fn preview_positions(
+    read_model: &PortfolioReadModel,
+    quote_snapshot: &QuoteCache,
+    exchange_rates: Option<&ExchangeRates>,
+    calculation: &PreviewCalculation,
+) -> Result<Vec<PortfolioAlertPreviewPosition>, String> {
+    let mut calculated = calculation.positions.clone();
+    read_model
+        .holdings()
+        .iter()
+        .filter(|holding| {
+            scope_matches_holding(
+                &calculation.guard.config,
+                calculation.account_market.as_deref(),
+                holding,
+            )
+        })
+        .map(|holding| {
+            let symbol = normalize_stock_symbol(&holding.symbol)
+                .unwrap_or_else(|| holding.symbol.trim().to_ascii_uppercase());
+            let index = calculated
+                .iter()
+                .position(|position| {
+                    position.account_id == holding.account_id
+                        && position.market == holding.market.trim().to_ascii_uppercase()
+                        && position.symbol == symbol
+                })
+                .ok_or_else(|| format!("preview position {symbol} was not calculated"))?;
+            let base_position = calculated.remove(index);
+            let is_cash = base_position.is_cash;
+            let native_currency = holding.currency.trim().to_ascii_uppercase();
+            let native_market_value = if is_cash {
+                holding.shares
+            } else {
+                holding.market_value
+            };
+            let conversion_rate = if native_currency == calculation.base_currency {
+                1.0
+            } else if native_market_value != 0.0 {
+                base_position.market_value / native_market_value
+            } else {
+                convert_currency(
+                    1.0,
+                    &native_currency,
+                    &calculation.base_currency,
+                    exchange_rates
+                        .ok_or_else(|| "preview exchange rates are unavailable".to_string())?,
+                )
+            };
+            Ok(PortfolioAlertPreviewPosition {
+                account_id: holding.account_id.clone(),
+                market: holding.market.trim().to_ascii_uppercase(),
+                symbol,
+                name: holding.name.clone(),
+                category_id: read_model
+                    .category_id_for_holding(&holding.id)
+                    .map(str::to_string),
+                category_name: holding.category_name.clone(),
+                category_color: holding.category_color.clone(),
+                shares: holding.shares,
+                current_price: if is_cash { 1.0 } else { holding.current_price },
+                quote_updated_at: (!is_cash)
+                    .then(|| quote_snapshot.get_stale(&holding.market, &holding.symbol))
+                    .flatten()
+                    .map(|quote| quote.updated_at),
+                native_market_value,
+                native_currency: native_currency.clone(),
+                base_market_value: base_position.market_value,
+                base_currency: calculation.base_currency.clone(),
+                conversion_rate,
+                exchange_rate_updated_at: (native_currency != calculation.base_currency)
+                    .then(|| exchange_rates.map(|rates| rates.updated_at.clone()))
+                    .flatten(),
+                is_cash,
+            })
+        })
+        .collect()
 }
 
 fn breach_kind_sql(kind: &PortfolioAlertBreachKind) -> &'static str {
@@ -645,6 +815,7 @@ pub async fn evaluate_portfolio_alert(
         || {},
     )
     .await
+    .map(|(evaluation, _)| evaluation)
 }
 
 /// Recalculate an alert from the current in-memory quote snapshot without
@@ -655,11 +826,33 @@ pub async fn preview_portfolio_alert(
     exchange_rates: Option<&ExchangeRates>,
     config_id: &str,
     evaluated_at: &str,
-) -> Result<PortfolioAlertEvaluation, String> {
+) -> Result<TrustedPortfolioAlertPreview, String> {
+    preview_portfolio_alert_inner(
+        db,
+        quote_cache,
+        exchange_rates,
+        config_id,
+        evaluated_at,
+        || {},
+    )
+    .await
+}
+
+async fn preview_portfolio_alert_inner<F>(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    exchange_rates: Option<&ExchangeRates>,
+    config_id: &str,
+    evaluated_at: &str,
+    before_validate: F,
+) -> Result<TrustedPortfolioAlertPreview, String>
+where
+    F: FnOnce(),
+{
     let quote_snapshot = quote_cache.snapshot();
     let read_model =
         PortfolioReadModel::load(db, &quote_snapshot, None, QuoteReadMode::CacheOnly).await?;
-    evaluate_portfolio_alert_inner(
+    let (mut evaluation, calculation) = evaluate_portfolio_alert_inner(
         db,
         exchange_rates,
         config_id,
@@ -667,6 +860,46 @@ pub async fn preview_portfolio_alert(
         &read_model,
         false,
         || {},
+    )
+    .await?;
+    if evaluation.status != PortfolioAlertDataStatus::Ready || evaluation.stale {
+        return Err(format!(
+            "portfolio alert preview is unavailable: status {:?}, stale={}",
+            evaluation.status, evaluation.stale
+        ));
+    }
+    let calculation = calculation
+        .ok_or_else(|| "READY portfolio alert preview is missing its calculation".to_string())?;
+    before_validate();
+    evaluation.active_breaches = validate_preview_state(db, &calculation)?;
+    let positions = preview_positions(&read_model, &quote_snapshot, exchange_rates, &calculation)?;
+    Ok(TrustedPortfolioAlertPreview {
+        config: calculation.guard.config,
+        account_market: calculation.account_market,
+        evaluation,
+        positions,
+    })
+}
+
+#[cfg(test)]
+async fn preview_portfolio_alert_with_before_validate_hook<F>(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    exchange_rates: Option<&ExchangeRates>,
+    config_id: &str,
+    evaluated_at: &str,
+    before_validate: F,
+) -> Result<TrustedPortfolioAlertPreview, String>
+where
+    F: FnOnce(),
+{
+    preview_portfolio_alert_inner(
+        db,
+        quote_cache,
+        exchange_rates,
+        config_id,
+        evaluated_at,
+        before_validate,
     )
     .await
 }
@@ -741,7 +974,7 @@ where
         )
         .await
         {
-            Ok(evaluation) => {
+            Ok((evaluation, _)) => {
                 notifications.extend(evaluation.newly_triggered.into_iter().map(|breach| {
                     PortfolioAlertNotification {
                         config_id: config.id.clone(),
@@ -801,7 +1034,7 @@ async fn evaluate_portfolio_alert_inner<F>(
     read_model: &PortfolioReadModel,
     persist: bool,
     before_persist: F,
-) -> Result<PortfolioAlertEvaluation, String>
+) -> Result<(PortfolioAlertEvaluation, Option<PreviewCalculation>), String>
 where
     F: Fn(),
 {
@@ -829,14 +1062,17 @@ where
             before_persist();
             persist_empty_transition(db, config_id, evaluated_at, &guard)?;
         }
-        return Ok(PortfolioAlertEvaluation {
-            status: PortfolioAlertDataStatus::Empty,
-            snapshot: None,
-            stale: false,
-            missing_data: vec![],
-            active_breaches: vec![],
-            newly_triggered: vec![],
-        });
+        return Ok((
+            PortfolioAlertEvaluation {
+                status: PortfolioAlertDataStatus::Empty,
+                snapshot: None,
+                stale: false,
+                missing_data: vec![],
+                active_breaches: vec![],
+                newly_triggered: vec![],
+            },
+            None,
+        ));
     }
 
     let existing_breaches = {
@@ -883,11 +1119,14 @@ where
         }
     }
     if !missing_data.is_empty() {
-        return Ok(unchanged_evaluation(
-            &config,
-            PortfolioAlertDataStatus::Incomplete,
-            missing_data,
-            existing_breaches,
+        return Ok((
+            unchanged_evaluation(
+                &config,
+                PortfolioAlertDataStatus::Incomplete,
+                missing_data,
+                existing_breaches,
+            ),
+            None,
         ));
     }
 
@@ -897,11 +1136,14 @@ where
         .map(|target| target.target_percent)
         .sum();
     if !target_total_is_within_tolerance(target_total) {
-        return Ok(unchanged_evaluation(
-            &config,
-            PortfolioAlertDataStatus::InvalidConfig,
-            vec![],
-            existing_breaches,
+        return Ok((
+            unchanged_evaluation(
+                &config,
+                PortfolioAlertDataStatus::InvalidConfig,
+                vec![],
+                existing_breaches,
+            ),
+            None,
         ));
     }
 
@@ -951,14 +1193,17 @@ where
             before_persist();
             persist_empty_transition(db, config_id, evaluated_at, &guard)?;
         }
-        return Ok(PortfolioAlertEvaluation {
-            status: PortfolioAlertDataStatus::Empty,
-            snapshot: None,
-            stale: false,
-            missing_data: vec![],
-            active_breaches: vec![],
-            newly_triggered: vec![],
-        });
+        return Ok((
+            PortfolioAlertEvaluation {
+                status: PortfolioAlertDataStatus::Empty,
+                snapshot: None,
+                stale: false,
+                missing_data: vec![],
+                active_breaches: vec![],
+                newly_triggered: vec![],
+            },
+            None,
+        ));
     }
     let negative_positions = positions
         .iter()
@@ -971,11 +1216,14 @@ where
         })
         .collect::<Vec<_>>();
     if !negative_positions.is_empty() {
-        return Ok(unchanged_evaluation(
-            &config,
-            PortfolioAlertDataStatus::Incomplete,
-            negative_positions,
-            existing_breaches,
+        return Ok((
+            unchanged_evaluation(
+                &config,
+                PortfolioAlertDataStatus::Incomplete,
+                negative_positions,
+                existing_breaches,
+            ),
+            None,
         ));
     }
 
@@ -991,37 +1239,56 @@ where
                 before_persist();
                 persist_empty_transition(db, config_id, evaluated_at, &guard)?;
             }
-            Ok(PortfolioAlertEvaluation {
-                status: PortfolioAlertDataStatus::Empty,
-                snapshot: None,
-                stale: false,
-                missing_data: vec![],
-                active_breaches: vec![],
-                newly_triggered: vec![],
-            })
+            Ok((
+                PortfolioAlertEvaluation {
+                    status: PortfolioAlertDataStatus::Empty,
+                    snapshot: None,
+                    stale: false,
+                    missing_data: vec![],
+                    active_breaches: vec![],
+                    newly_triggered: vec![],
+                },
+                None,
+            ))
         }
         PortfolioAlertCalculation::Ready(snapshot) => {
             let proposed = proposed_breaches(config_id, &snapshot, evaluated_at);
-            let (active_breaches, newly_triggered) = if persist {
+            let (active_breaches, newly_triggered, preview_calculation) = if persist {
                 before_persist();
-                persist_ready_transition(db, config_id, &snapshot, &proposed, evaluated_at, &guard)?
+                let (active, newly_triggered) = persist_ready_transition(
+                    db,
+                    config_id,
+                    &snapshot,
+                    &proposed,
+                    evaluated_at,
+                    &guard,
+                )?;
+                (active, newly_triggered, None)
             } else {
                 (
-                    existing_breaches
-                        .into_iter()
-                        .filter(|breach| proposed.contains_key(&breach.breach_key))
-                        .collect(),
                     vec![],
+                    vec![],
+                    Some(PreviewCalculation {
+                        guard,
+                        account_market,
+                        base_currency,
+                        positions,
+                        proposed_breaches: proposed.into_values().collect(),
+                        initial_breaches: existing_breaches,
+                    }),
                 )
             };
-            Ok(PortfolioAlertEvaluation {
-                status: PortfolioAlertDataStatus::Ready,
-                snapshot: Some(snapshot),
-                stale: false,
-                missing_data: vec![],
-                active_breaches,
-                newly_triggered,
-            })
+            Ok((
+                PortfolioAlertEvaluation {
+                    status: PortfolioAlertDataStatus::Ready,
+                    snapshot: Some(snapshot),
+                    stale: false,
+                    missing_data: vec![],
+                    active_breaches,
+                    newly_triggered,
+                },
+                preview_calculation,
+            ))
         }
     }
 }
@@ -1050,6 +1317,7 @@ where
         before_persist,
     )
     .await
+    .map(|(evaluation, _)| evaluation)
 }
 
 pub async fn save_and_evaluate_portfolio_alert_config(
@@ -1920,11 +2188,11 @@ mod tests {
             &db,
             "holding-cash",
             "acct-us",
-            "$CASH-USD",
+            "$CASH-CNY",
             "US",
             Some("growth"),
-            100.0,
-            "USD",
+            500.0,
+            "CNY",
         );
         let config = save_portfolio_alert_config(
             &db,
@@ -1961,6 +2229,268 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    fn alert_state(db: &Database, config_id: &str) -> (Option<String>, Option<String>, i64) {
+        let conn = db.conn.lock().unwrap();
+        let (snapshot, evaluated_at) = conn
+            .query_row(
+                "SELECT last_snapshot_json, last_evaluated_at
+                 FROM portfolio_alert_configs WHERE id = ?1",
+                [config_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let breaches = conn
+            .query_row(
+                "SELECT COUNT(*) FROM portfolio_alert_breaches WHERE config_id = ?1",
+                [config_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (snapshot, evaluated_at, breaches)
+    }
+
+    async fn persist_fixture_breach(fixture: &EvaluationFixture) {
+        let result = evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            "2026-09-06T09:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(!result.active_breaches.is_empty());
+    }
+
+    #[test]
+    fn rebalance_fix_intersection_requires_key_kind_and_direction_and_keeps_proposed_identity() {
+        let proposed = PortfolioAlertBreach {
+            config_id: "config-1".to_string(),
+            breach_key: "category:growth".to_string(),
+            breach_kind: PortfolioAlertBreachKind::CategoryDeviation,
+            direction: PortfolioAlertBreachDirection::Underweight,
+            first_triggered_at: "preview-first".to_string(),
+            last_seen_at: "preview-last".to_string(),
+        };
+        let wrong_direction = PortfolioAlertBreach {
+            direction: PortfolioAlertBreachDirection::Overweight,
+            first_triggered_at: "persisted-first".to_string(),
+            last_seen_at: "persisted-last".to_string(),
+            ..proposed.clone()
+        };
+        assert!(intersect_preview_breaches(&[wrong_direction], &[proposed.clone()]).is_empty());
+        let wrong_kind = PortfolioAlertBreach {
+            breach_kind: PortfolioAlertBreachKind::Concentration,
+            direction: PortfolioAlertBreachDirection::AboveLimit,
+            first_triggered_at: "persisted-first".to_string(),
+            last_seen_at: "persisted-last".to_string(),
+            ..proposed.clone()
+        };
+        assert!(intersect_preview_breaches(&[wrong_kind], &[proposed.clone()]).is_empty());
+
+        let persisted = PortfolioAlertBreach {
+            first_triggered_at: "persisted-first".to_string(),
+            last_seen_at: "persisted-last".to_string(),
+            ..proposed.clone()
+        };
+        let matched = intersect_preview_breaches(&[persisted], &[proposed]);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(
+            matched[0].breach_kind,
+            PortfolioAlertBreachKind::CategoryDeviation
+        );
+        assert_eq!(
+            matched[0].direction,
+            PortfolioAlertBreachDirection::Underweight
+        );
+        assert_eq!(matched[0].first_triggered_at, "persisted-first");
+        assert_eq!(matched[0].last_seen_at, "persisted-last");
+    }
+
+    #[tokio::test]
+    async fn rebalance_fix_preview_rejects_config_active_or_revision_changes_without_writes() {
+        for mutation in ["inactive", "revision"] {
+            let fixture = evaluation_fixture();
+            persist_fixture_breach(&fixture).await;
+            let before = alert_state(&fixture.db, &fixture.config_id);
+            let result = preview_portfolio_alert_with_before_validate_hook(
+                &fixture.db,
+                &fixture.quote_cache,
+                Some(&fixture.rates),
+                &fixture.config_id,
+                "2026-09-06T10:00:00Z",
+                || {
+                    let conn = fixture.db.conn.lock().unwrap();
+                    if mutation == "inactive" {
+                        conn.execute(
+                            "UPDATE portfolio_alert_configs SET is_active = 0 WHERE id = ?1",
+                            [&fixture.config_id],
+                        )
+                        .unwrap();
+                    } else {
+                        conn.execute(
+                            "UPDATE portfolio_alert_configs
+                             SET deviation_threshold = 25, updated_at = 'changed'
+                             WHERE id = ?1",
+                            [&fixture.config_id],
+                        )
+                        .unwrap();
+                    }
+                },
+            )
+            .await;
+            assert!(result.is_err(), "{mutation} was accepted");
+            let after = alert_state(&fixture.db, &fixture.config_id);
+            assert_eq!(after.0, before.0, "{mutation} rewrote snapshot");
+            assert_eq!(after.1, before.1, "{mutation} rewrote evaluated_at");
+            assert_eq!(after.2, before.2, "{mutation} rewrote breaches");
+        }
+    }
+
+    #[tokio::test]
+    async fn rebalance_fix_preview_revalidates_account_market_and_active_breaches() {
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        seed_account(&db, "acct-us", "US");
+        seed_holding(
+            &db,
+            "holding-aapl",
+            "acct-us",
+            "AAPL",
+            "US",
+            Some("growth"),
+            10.0,
+            "USD",
+        );
+        let config = save_portfolio_alert_config(
+            &db,
+            input(account_scope("acct-us"), 20.0, 60.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        let quote_cache = QuoteCache::new();
+        quote_cache.set(quote("US", "AAPL", 100.0));
+        evaluate_portfolio_alert(&db, &quote_cache, None, &config.id, "2026-09-06T09:00:00Z")
+            .await
+            .unwrap();
+
+        let before_market_change = alert_state(&db, &config.id);
+        let changed_market = preview_portfolio_alert_with_before_validate_hook(
+            &db,
+            &quote_cache,
+            None,
+            &config.id,
+            "2026-09-06T10:00:00Z",
+            || {
+                db.conn
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE accounts SET market = 'CN' WHERE id = 'acct-us'", [])
+                    .unwrap();
+            },
+        )
+        .await;
+        assert!(changed_market.is_err());
+        assert_eq!(alert_state(&db, &config.id), before_market_change);
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE accounts SET market = 'US' WHERE id = 'acct-us'", [])
+            .unwrap();
+        let before_breach_resolution = alert_state(&db, &config.id);
+        let resolved = preview_portfolio_alert_with_before_validate_hook(
+            &db,
+            &quote_cache,
+            None,
+            &config.id,
+            "2026-09-06T10:00:00Z",
+            || {
+                db.conn
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "DELETE FROM portfolio_alert_breaches WHERE config_id = ?1",
+                        [&config.id],
+                    )
+                    .unwrap();
+            },
+        )
+        .await;
+        assert!(resolved.is_err());
+        let after_breach_resolution = alert_state(&db, &config.id);
+        assert_eq!(after_breach_resolution.0, before_breach_resolution.0);
+        assert_eq!(after_breach_resolution.1, before_breach_resolution.1);
+        assert_eq!(after_breach_resolution.2, 0);
+    }
+
+    #[tokio::test]
+    async fn rebalance_fix_preview_returns_frozen_positions_and_values_cash_at_one() {
+        let fixture = evaluation_fixture();
+        persist_fixture_breach(&fixture).await;
+        let preview = preview_portfolio_alert_with_before_validate_hook(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            "2026-09-06T10:00:00Z",
+            || {
+                fixture
+                    .db
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE holdings SET shares = 99 WHERE id = 'holding-aapl'",
+                        [],
+                    )
+                    .unwrap();
+                fixture.quote_cache.set(quote("US", "AAPL", 999.0));
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            preview
+                .evaluation
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .total_market_value,
+            1100.0
+        );
+        let stock = preview
+            .positions
+            .iter()
+            .find(|position| position.symbol == "AAPL")
+            .unwrap();
+        assert_eq!(stock.shares, 10.0);
+        assert_eq!(stock.current_price, 100.0);
+        assert_eq!(stock.native_market_value, 1000.0);
+        assert_eq!(stock.base_market_value, 1000.0);
+        assert_eq!(
+            stock.quote_updated_at.as_deref(),
+            Some("2026-09-06T09:00:00Z")
+        );
+
+        let cash = preview
+            .positions
+            .iter()
+            .find(|position| position.symbol == "$CASH-CNY")
+            .unwrap();
+        assert_eq!(cash.current_price, 1.0);
+        assert_eq!(cash.native_market_value, 500.0);
+        assert_eq!(cash.base_market_value, 100.0);
+        assert_eq!(cash.native_currency, "CNY");
+        assert_eq!(cash.base_currency, "USD");
+        assert_eq!(cash.conversion_rate, 0.2);
+        assert_eq!(
+            cash.exchange_rate_updated_at.as_deref(),
+            Some("2026-09-06T09:00:00Z")
+        );
+        assert_eq!(cash.quote_updated_at, None);
     }
 
     #[tokio::test]

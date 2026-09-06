@@ -308,21 +308,25 @@ mod tests {
         assert!(PortfolioScope {
             market: Some("CN".to_string()),
             account_id: None,
+            ..PortfolioScope::default()
         }
         .matches_holding(&holding));
         assert!(!PortfolioScope {
             market: Some("US".to_string()),
             account_id: None,
+            ..PortfolioScope::default()
         }
         .matches_holding(&holding));
         assert!(PortfolioScope {
             market: None,
             account_id: Some("account-a".to_string()),
+            ..PortfolioScope::default()
         }
         .matches_holding(&holding));
         assert!(!PortfolioScope {
             market: None,
             account_id: Some("account-b".to_string()),
+            ..PortfolioScope::default()
         }
         .matches_holding(&holding));
     }

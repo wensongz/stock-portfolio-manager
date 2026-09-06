@@ -32,9 +32,7 @@ use crate::services::performance_service::{self, PerformanceFilter};
 use crate::services::portfolio_alert_service;
 use crate::services::portfolio_read_service::{PortfolioReadModel, QuoteReadMode};
 use crate::services::quote_provider_service;
-use crate::services::quote_service::{
-    self, is_cash_symbol, resolve_index_secid, QuoteCache, QuoteServiceState,
-};
+use crate::services::quote_service::{self, resolve_index_secid, QuoteCache, QuoteServiceState};
 use crate::services::stock_operation_builder::normalize_stock_symbol;
 use crate::services::stock_operation_review_service;
 use chrono::{Duration, NaiveDate, Utc};
@@ -501,7 +499,7 @@ pub(crate) fn tool_definitions_for_scope(scope: Option<&PortfolioScope>) -> Vec<
         .filter(|definition| {
             let name = definition["function"]["name"].as_str().unwrap_or_default();
             if name == "get_rebalance_context" {
-                return scope.is_some();
+                return scope.is_some_and(|scope| scope.allows_tool(name));
             }
             scope.is_none_or(|scope| scope.allows_tool(name))
         })
@@ -583,13 +581,11 @@ impl ToolResult {
 /// produced (may be empty for no-arg tools). Unknown tool names return an
 /// error JSON so the model can apologise rather than the chat hanging.
 pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, arguments: &str) -> ToolResult {
-    if name == "get_rebalance_context" && ctx.portfolio_scope.is_none() {
-        return ToolResult::err_json("再平衡上下文只能由受信任的组合提醒入口读取");
-    }
-    if ctx
-        .portfolio_scope
-        .as_ref()
-        .is_some_and(|scope| !scope.allows_tool(name))
+    if name != "get_rebalance_context"
+        && ctx
+            .portfolio_scope
+            .as_ref()
+            .is_some_and(|scope| !scope.allows_tool(name))
     {
         return ToolResult::err_json("该工具超出当前组合复盘的数据范围");
     }
@@ -601,6 +597,25 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, arguments: &str) -> Too
             Err(e) => return ToolResult::err_json(format!("参数解析失败：{e}")),
         }
     };
+    if name == "get_rebalance_context" {
+        let requested_id = args
+            .as_object()
+            .filter(|object| object.len() == 1)
+            .and_then(|object| object.get("config_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let authorized_id = ctx
+            .portfolio_scope
+            .as_ref()
+            .and_then(PortfolioScope::authorized_rebalance_config_id);
+        if requested_id.is_none() || requested_id != authorized_id {
+            return ToolResult::err_json(format!(
+                "再平衡上下文只能读取受信任入口授权的配置 {}",
+                authorized_id.unwrap_or("（无）")
+            ));
+        }
+    }
     match name {
         "get_market_overview" => tool_market_overview(ctx).await,
         "get_stock_quote" => tool_stock_quote(ctx, &args).await,
@@ -640,37 +655,38 @@ async fn tool_market_overview(ctx: &ToolCtx<'_>) -> ToolResult {
     }
 }
 
-fn scope_for_rebalance_config(
-    db: &Database,
-    config: &crate::models::portfolio_alert::PortfolioAlertConfig,
+fn scope_for_trusted_rebalance_preview(
+    preview: &portfolio_alert_service::TrustedPortfolioAlertPreview,
 ) -> Result<PortfolioScope, String> {
     use crate::models::portfolio_alert::PortfolioAlertScopeKind;
 
-    match config.scope.kind {
-        PortfolioAlertScopeKind::Overall => Ok(PortfolioScope::default()),
-        PortfolioAlertScopeKind::Market => Ok(PortfolioScope {
-            market: config.scope.market.clone(),
+    let authorized_rebalance_config_id = Some(preview.config.id.clone());
+    match preview.config.scope.kind {
+        PortfolioAlertScopeKind::Overall => Ok(PortfolioScope {
+            market: None,
             account_id: None,
+            authorized_rebalance_config_id,
+        }),
+        PortfolioAlertScopeKind::Market => Ok(PortfolioScope {
+            market: preview.config.scope.market.clone(),
+            account_id: None,
+            authorized_rebalance_config_id,
         }),
         PortfolioAlertScopeKind::Account => {
-            let account_id = config
+            let account_id = preview
+                .config
                 .scope
                 .account_id
                 .clone()
                 .ok_or_else(|| "账户范围配置缺少账户 ID".to_string())?;
-            let market = db
-                .conn
-                .lock()
-                .map_err(|error| error.to_string())?
-                .query_row(
-                    "SELECT market FROM accounts WHERE id = ?1",
-                    [&account_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .map_err(|_| format!("account {account_id} not found"))?;
+            let market = preview
+                .account_market
+                .clone()
+                .ok_or_else(|| "账户范围预览缺少已验证市场".to_string())?;
             Ok(PortfolioScope {
                 market: Some(market),
                 account_id: Some(account_id),
+                authorized_rebalance_config_id,
             })
         }
     }
@@ -691,22 +707,6 @@ async fn tool_rebalance_context(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     else {
         return ToolResult::err_json("config_id 必须是非空字符串");
     };
-    let config = match portfolio_alert_service::get_portfolio_alert_config_by_id(ctx.db, config_id)
-    {
-        Ok(config) => config,
-        Err(error) => return ToolResult::err_json(error),
-    };
-    if !config.is_active {
-        return ToolResult::err_json("组合提醒配置未启用");
-    }
-    let config_scope = match scope_for_rebalance_config(ctx.db, &config) {
-        Ok(scope) => scope,
-        Err(error) => return ToolResult::err_json(error),
-    };
-    if ctx.portfolio_scope.as_ref() != Some(&config_scope) {
-        return ToolResult::err_json("配置范围与受信任的组合范围不一致");
-    }
-
     // Deliberately stale/cache-only: this trusted prefill must never start a
     // quote or exchange-rate network refresh.
     let rates = match ctx.cache.get_stale() {
@@ -717,7 +717,7 @@ async fn tool_rebalance_context(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         },
     };
     let evaluated_at = Utc::now().to_rfc3339();
-    let evaluation = match portfolio_alert_service::preview_portfolio_alert(
+    let preview = match portfolio_alert_service::preview_portfolio_alert(
         ctx.db,
         ctx.quote_cache,
         rates.as_ref(),
@@ -726,9 +726,18 @@ async fn tool_rebalance_context(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     )
     .await
     {
-        Ok(evaluation) => evaluation,
+        Ok(preview) => preview,
         Err(error) => return ToolResult::err_json(format!("生成再平衡预览失败：{error}")),
     };
+    let config_scope = match scope_for_trusted_rebalance_preview(&preview) {
+        Ok(scope) => scope,
+        Err(error) => return ToolResult::err_json(error),
+    };
+    if ctx.portfolio_scope.as_ref() != Some(&config_scope) {
+        return ToolResult::err_json("配置范围与受信任的组合范围不一致");
+    }
+    let config = preview.config;
+    let evaluation = preview.evaluation;
     if evaluation.status != crate::models::portfolio_alert::PortfolioAlertDataStatus::Ready
         || evaluation.stale
     {
@@ -743,35 +752,28 @@ async fn tool_rebalance_context(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let Some(snapshot) = evaluation.snapshot else {
         return ToolResult::err_json("READY 再平衡预览缺少快照");
     };
-    let read_model =
-        match PortfolioReadModel::load(ctx.db, ctx.quote_cache, None, QuoteReadMode::CacheOnly)
-            .await
-        {
-            Ok(model) => model,
-            Err(error) => return ToolResult::err_json(format!("读取当前持仓失败：{error}")),
-        };
-    let positions = read_model
-        .holdings()
-        .iter()
-        .filter(|holding| config_scope.matches_holding(holding))
-        .map(|holding| {
-            let quote_updated_at = ctx
-                .quote_cache
-                .get_stale(&holding.market, &holding.symbol)
-                .map(|quote| quote.updated_at);
+    let positions = preview
+        .positions
+        .into_iter()
+        .map(|position| {
             json!({
-                "accountId": holding.account_id,
-                "market": holding.market,
-                "symbol": holding.symbol,
-                "name": holding.name,
-                "categoryId": read_model.category_id_for_holding(&holding.id),
-                "categoryName": holding.category_name,
-                "shares": holding.shares,
-                "currentPrice": holding.current_price,
-                "quoteUpdatedAt": quote_updated_at,
-                "marketValue": holding.market_value,
-                "currency": holding.currency,
-                "isCash": is_cash_symbol(&holding.symbol),
+                "accountId": position.account_id,
+                "market": position.market,
+                "symbol": position.symbol,
+                "name": position.name,
+                "categoryId": position.category_id,
+                "categoryName": position.category_name,
+                "categoryColor": position.category_color,
+                "shares": position.shares,
+                "currentPrice": position.current_price,
+                "quoteUpdatedAt": position.quote_updated_at,
+                "nativeMarketValue": position.native_market_value,
+                "nativeCurrency": position.native_currency,
+                "baseMarketValue": position.base_market_value,
+                "baseCurrency": position.base_currency,
+                "conversionRate": position.conversion_rate,
+                "exchangeRateUpdatedAt": position.exchange_rate_updated_at,
+                "isCash": position.is_cash,
             })
         })
         .collect::<Vec<_>>();
@@ -1814,6 +1816,7 @@ mod tests {
             Some(PortfolioScope {
                 market: market.map(str::to_string),
                 account_id: account_id.map(str::to_string),
+                ..PortfolioScope::default()
             }),
         )
     }
@@ -1871,6 +1874,7 @@ mod tests {
         let scope = PortfolioScope {
             market: Some("US".to_string()),
             account_id: Some("acct-us".to_string()),
+            ..PortfolioScope::default()
         };
         assert_eq!(
             filter_search_result_for_scope(
@@ -1994,13 +1998,17 @@ mod tests {
 
     impl RebalanceFixture {
         async fn execute(&self) -> ToolResult {
-            let ctx = restricted_context(
+            let ctx = ToolCtx::for_untrusted_model_turn(
                 &self.db,
                 &self.cache,
                 &self.quote_cache,
                 &self.quote_state,
-                Some("US"),
-                None,
+                "trusted prefill",
+                Some(PortfolioScope {
+                    market: Some("US".to_string()),
+                    account_id: None,
+                    authorized_rebalance_config_id: Some(self.config_id.clone()),
+                }),
             );
             execute_tool(
                 &ctx,
@@ -2040,6 +2048,77 @@ mod tests {
                 .unwrap();
             (config.0, config.1, breaches)
         }
+    }
+
+    #[tokio::test]
+    async fn rebalance_fix_executor_requires_and_enforces_the_exact_config_capability() {
+        let fixture = ready_breached_rebalance_fixture().await;
+        let no_capability = restricted_context(
+            &fixture.db,
+            &fixture.cache,
+            &fixture.quote_cache,
+            &fixture.quote_state,
+            Some("US"),
+            None,
+        );
+        let rejected = execute_tool(
+            &no_capability,
+            "get_rebalance_context",
+            r#"{"config_id":"config-us"}"#,
+        )
+        .await;
+        assert!(!rejected.ok);
+        assert!(rejected.content.contains("受信任"), "{}", rejected.content);
+
+        let authorized_scope = PortfolioScope {
+            market: Some("US".to_string()),
+            account_id: None,
+            authorized_rebalance_config_id: Some("config-us".to_string()),
+        };
+        assert!(tool_definitions_for_scope(Some(&authorized_scope))
+            .iter()
+            .any(|tool| tool["function"]["name"] == "get_rebalance_context"));
+        let authorized = ToolCtx::for_untrusted_model_turn(
+            &fixture.db,
+            &fixture.cache,
+            &fixture.quote_cache,
+            &fixture.quote_state,
+            "trusted prefill",
+            Some(authorized_scope),
+        );
+        let wrong_id = execute_tool(
+            &authorized,
+            "get_rebalance_context",
+            r#"{"config_id":"same-scope-other-id"}"#,
+        )
+        .await;
+        assert!(!wrong_id.ok);
+        assert!(
+            wrong_id.content.contains("config-us"),
+            "{}",
+            wrong_id.content
+        );
+        assert!(
+            !wrong_id.content.contains("not found"),
+            "{}",
+            wrong_id.content
+        );
+
+        let direct = ToolCtx::for_untrusted_model_turn(
+            &fixture.db,
+            &fixture.cache,
+            &fixture.quote_cache,
+            &fixture.quote_state,
+            "unscoped",
+            None,
+        );
+        let rejected = execute_tool(
+            &direct,
+            "get_rebalance_context",
+            r#"{"config_id":"config-us"}"#,
+        )
+        .await;
+        assert!(!rejected.ok);
     }
 
     #[tokio::test]
@@ -2173,6 +2252,7 @@ mod tests {
         let scope = PortfolioScope {
             market: None,
             account_id: Some("account-a".to_string()),
+            ..PortfolioScope::default()
         };
         let ctx = ToolCtx::for_untrusted_model_turn(
             &db,
@@ -2211,7 +2291,7 @@ mod tests {
             .collect();
         assert!(advertised.contains(&"get_holdings_detail".to_string()));
         assert!(advertised.contains(&"get_stock_fundamentals".to_string()));
-        assert!(advertised.contains(&"get_rebalance_context".to_string()));
+        assert!(!advertised.contains(&"get_rebalance_context".to_string()));
         assert!(!advertised.contains(&"get_market_overview".to_string()));
         assert!(!advertised.contains(&"get_transactions".to_string()));
         assert!(!advertised.contains(&"get_option_positions".to_string()));
@@ -2734,6 +2814,7 @@ mod tests {
             Some(PortfolioScope {
                 market: None,
                 account_id: Some("account-a".to_string()),
+                ..PortfolioScope::default()
             }),
         );
 
@@ -2778,6 +2859,7 @@ mod tests {
             Some(PortfolioScope {
                 market: None,
                 account_id: Some("account-b".to_string()),
+                ..PortfolioScope::default()
             }),
         );
 

@@ -48,6 +48,7 @@ pub use title::generate_title;
 pub(crate) struct PortfolioScope {
     pub market: Option<String>,
     pub account_id: Option<String>,
+    pub authorized_rebalance_config_id: Option<String>,
 }
 
 impl PortfolioScope {
@@ -76,6 +77,9 @@ impl PortfolioScope {
     }
 
     pub(crate) fn allows_tool(&self, name: &str) -> bool {
+        if name == "get_rebalance_context" {
+            return self.authorized_rebalance_config_id.is_some();
+        }
         if !self.is_restricted() {
             return true;
         }
@@ -95,8 +99,11 @@ impl PortfolioScope {
                 | "get_stock_fundamentals"
                 | "get_technical_indicators"
                 | "get_financial_statements"
-                | "get_rebalance_context"
         )
+    }
+
+    pub(crate) fn authorized_rebalance_config_id(&self) -> Option<&str> {
+        self.authorized_rebalance_config_id.as_deref()
     }
 }
 
@@ -204,6 +211,9 @@ pub(crate) fn validated_portfolio_scope(
             .as_str()
             .expect("validated config id");
         let config = portfolio_alert_service::get_portfolio_alert_config_by_id(db, config_id)?;
+        if !config.is_active {
+            return Err("组合提醒配置未启用".to_string());
+        }
         let (market, account_id) = match config.scope.kind {
             crate::models::portfolio_alert::PortfolioAlertScopeKind::Overall => (None, None),
             crate::models::portfolio_alert::PortfolioAlertScopeKind::Market => {
@@ -227,7 +237,11 @@ pub(crate) fn validated_portfolio_scope(
                 (Some(market), Some(account_id))
             }
         };
-        return Ok(Some(PortfolioScope { market, account_id }));
+        return Ok(Some(PortfolioScope {
+            market,
+            account_id,
+            authorized_rebalance_config_id: Some(config_id.to_string()),
+        }));
     }
     if context.name != "get_portfolio_overview" {
         return Ok(None);
@@ -254,7 +268,11 @@ pub(crate) fn validated_portfolio_scope(
             .and_then(|value| value.as_str())
             .map(str::to_string),
     };
-    Ok(Some(PortfolioScope { market, account_id }))
+    Ok(Some(PortfolioScope {
+        market,
+        account_id,
+        authorized_rebalance_config_id: None,
+    }))
 }
 
 #[cfg(test)]
@@ -301,7 +319,9 @@ mod prefilled_tool_tests {
                  VALUES ('config-market-us', 'market:US', 'MARKET', 'US', NULL, 'USD',
                          20, 20, 1, '2026-09-06', '2026-09-06'),
                         ('config-acct-us', 'account:acct-us', 'ACCOUNT', NULL, 'acct-us', 'USD',
-                         20, 20, 1, '2026-09-06', '2026-09-06');",
+                         20, 20, 1, '2026-09-06', '2026-09-06'),
+                        ('config-inactive', 'market:HK', 'MARKET', 'HK', NULL, 'HKD',
+                         20, 20, 0, '2026-09-06', '2026-09-06');",
             )
             .unwrap();
         }
@@ -311,6 +331,7 @@ mod prefilled_tool_tests {
             Some(PortfolioScope {
                 market: Some("US".to_string()),
                 account_id: None,
+                authorized_rebalance_config_id: Some("config-market-us".to_string()),
             })
         );
         let account = validated_portfolio_scope(&db, Some(&rebalance_prefill("config-acct-us")))
@@ -319,6 +340,45 @@ mod prefilled_tool_tests {
         assert_eq!(account.account_id.as_deref(), Some("acct-us"));
         assert_eq!(account.market.as_deref(), Some("US"));
         assert!(validated_portfolio_scope(&db, Some(&rebalance_prefill("missing"))).is_err());
+        assert!(
+            validated_portfolio_scope(&db, Some(&rebalance_prefill("config-inactive"))).is_err()
+        );
+    }
+
+    #[test]
+    fn rebalance_fix_capability_is_issued_only_for_the_exact_rebalance_prefill() {
+        let db = Database::new(":memory:").unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO portfolio_alert_configs
+                    (id, scope_key, scope_kind, market, account_id, base_currency,
+                     deviation_threshold, concentration_threshold, is_active, created_at, updated_at)
+                 VALUES ('config-overall', 'overall', 'OVERALL', NULL, NULL, 'USD',
+                         20, 20, 1, '2026-09-06', '2026-09-06');",
+            )
+            .unwrap();
+
+        let overview = PrefilledToolContext {
+            name: "get_portfolio_overview".to_string(),
+            arguments: json!({}),
+        };
+        let overview_scope = validated_portfolio_scope(&db, Some(&overview))
+            .unwrap()
+            .unwrap();
+        assert_eq!(overview_scope.authorized_rebalance_config_id(), None);
+        assert!(!overview_scope.allows_tool("get_rebalance_context"));
+
+        let rebalance_scope =
+            validated_portfolio_scope(&db, Some(&rebalance_prefill("config-overall")))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            rebalance_scope.authorized_rebalance_config_id(),
+            Some("config-overall")
+        );
+        assert!(rebalance_scope.allows_tool("get_rebalance_context"));
     }
 
     #[test]
@@ -385,6 +445,7 @@ mod prefilled_tool_tests {
             Some(PortfolioScope {
                 market: Some("CN".to_string()),
                 account_id: None,
+                authorized_rebalance_config_id: None,
             })
         );
         let market_scope = validated_portfolio_scope(&db, Some(&market))
@@ -404,6 +465,7 @@ mod prefilled_tool_tests {
             Some(PortfolioScope {
                 market: Some("US".to_string()),
                 account_id: Some("account-a".to_string()),
+                authorized_rebalance_config_id: None,
             })
         );
 

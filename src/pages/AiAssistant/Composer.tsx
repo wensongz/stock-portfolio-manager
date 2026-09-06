@@ -8,6 +8,7 @@ import {
 } from "@ant-design/icons";
 import { useAiStore } from "../../stores/aiStore";
 import type { AiModelInfo, Skill } from "../../types";
+import { isComposerPrimaryActionDisabled } from "./composerPrimaryAction";
 
 const { Text } = Typography;
 const { TextArea } = Input;
@@ -308,7 +309,11 @@ export function Composer({
         <button
           type="button"
           onClick={sending ? stopGeneration : handleSend}
-          disabled={pending || (!sending && !canSend)}
+          disabled={isComposerPrimaryActionDisabled({
+            pending,
+            sending,
+            canSend,
+          })}
           aria-label={sending ? "停止生成" : "发送"}
           className="flex items-center justify-center text-white transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
           style={{

@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   cancelAiPrefillAutoSendOperation,
   createAiPrefillAutoSendOperation,
+  decideAiPrefillAutoSendStart,
   decideAiSessionTransition,
   runAiPrefillAutoSend,
   shouldAutoSendPrefill,
@@ -35,6 +36,7 @@ function lifecycleHarness(createResult) {
     selectionRevision: 7,
     currentSessionId: null,
     staging: { ownerToken: null, skillIds: [], toolContext: null },
+    stagingRevision: 0,
   };
   const dependencies = {
     stageOwnedContext: (ownerToken, skill, toolContext) => {
@@ -53,6 +55,7 @@ function lifecycleHarness(createResult) {
         state.staging = { ownerToken: null, skillIds: [], toolContext: null };
       }
     },
+    getStagingRevision: () => state.stagingRevision,
     createSession: async () => {
       calls.push(["create"]);
       return createResult instanceof Promise ? await createResult : createResult;
@@ -96,6 +99,119 @@ test("missing configuration waits without consuming the request", () => {
   if (shouldSend) consumed = true;
   assert.equal(shouldSend, false);
   assert.equal(consumed, false);
+});
+
+test("auto-send reserves before readiness and a manual selection cancels it permanently", () => {
+  const operation = createAiPrefillAutoSendOperation(7, 3, null);
+  const calls = [];
+  let consumed = false;
+
+  assert.equal(decideAiPrefillAutoSendStart({
+    operation,
+    configured: false,
+    sending: true,
+    selectionRevision: 7,
+    currentSessionId: null,
+    stagingRevision: 3,
+  }), "WAIT");
+  assert.equal(operation.phase, "RESERVED");
+
+  const afterManualSelection = decideAiPrefillAutoSendStart({
+    operation,
+    configured: true,
+    sending: false,
+    selectionRevision: 8,
+    currentSessionId: "session-manual",
+    stagingRevision: 3,
+  });
+  assert.equal(afterManualSelection, "CANCEL");
+  consumed = true;
+  cancelAiPrefillAutoSendOperation(operation, {
+    clearOwnedContext: () => calls.push("clear"),
+  });
+
+  assert.equal(decideAiPrefillAutoSendStart({
+    operation,
+    configured: true,
+    sending: false,
+    selectionRevision: 8,
+    currentSessionId: "session-manual",
+    stagingRevision: 3,
+  }), "IGNORE");
+  assert.equal(consumed, true);
+  assert.deepEqual(calls, ["clear"]);
+});
+
+test("a staging change while waiting cancels before staging or creating", async () => {
+  const operation = createAiPrefillAutoSendOperation(7, 3, null);
+  const harness = lifecycleHarness(Promise.resolve("orphan-session"));
+  harness.state.stagingRevision = 4;
+
+  assert.equal(decideAiPrefillAutoSendStart({
+    operation,
+    configured: true,
+    sending: false,
+    selectionRevision: 7,
+    currentSessionId: null,
+    stagingRevision: 4,
+  }), "CANCEL");
+  cancelAiPrefillAutoSendOperation(operation, harness.dependencies);
+  assert.deepEqual(
+    await runAiPrefillAutoSend(validRebalanceRequest(), operation, harness.dependencies),
+    { status: "cancelled" },
+  );
+  assert.equal(harness.calls.some((call) => call[0] === "stage"), false);
+  assert.equal(harness.calls.some((call) => call[0] === "create"), false);
+  assert.equal(harness.calls.some((call) => call[0] === "send"), false);
+});
+
+test("an unchanged reservation starts once when readiness opens", async () => {
+  const operation = createAiPrefillAutoSendOperation(7, 0, null);
+  const harness = lifecycleHarness(Promise.resolve("session-created"));
+
+  assert.equal(decideAiPrefillAutoSendStart({
+    operation,
+    configured: false,
+    sending: false,
+    selectionRevision: 7,
+    currentSessionId: null,
+    stagingRevision: 0,
+  }), "WAIT");
+  assert.equal(decideAiPrefillAutoSendStart({
+    operation,
+    configured: true,
+    sending: false,
+    selectionRevision: 7,
+    currentSessionId: null,
+    stagingRevision: 0,
+  }), "START");
+
+  await runAiPrefillAutoSend(validRebalanceRequest(), operation, harness.dependencies);
+  assert.equal(harness.calls.filter((call) => call[0] === "create").length, 1);
+  assert.equal(harness.calls.filter((call) => call[0] === "send").length, 1);
+  assert.equal(decideAiPrefillAutoSendStart({
+    operation,
+    configured: true,
+    sending: false,
+    selectionRevision: 8,
+    currentSessionId: "session-created",
+    stagingRevision: 0,
+  }), "IGNORE");
+});
+
+test("an already-selected session cancels before owned staging or detached create", async () => {
+  const operation = createAiPrefillAutoSendOperation(7, 0, null);
+  const harness = lifecycleHarness(Promise.resolve("orphan-session"));
+  harness.state.selectionRevision = 8;
+  harness.state.currentSessionId = "session-manual";
+
+  assert.deepEqual(
+    await runAiPrefillAutoSend(validRebalanceRequest(), operation, harness.dependencies),
+    { status: "cancelled" },
+  );
+  assert.equal(operation.phase, "CANCELLED");
+  assert.equal(harness.calls.some((call) => call[0] === "stage"), false);
+  assert.equal(harness.calls.some((call) => call[0] === "create"), false);
 });
 
 test("a non-auto legacy request keeps its composer seed and ordered staging", () => {

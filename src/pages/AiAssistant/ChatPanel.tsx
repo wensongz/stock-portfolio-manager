@@ -30,9 +30,9 @@ import type { AiPrefillRequest } from "./prefill";
 import {
   cancelAiPrefillAutoSendOperation,
   createAiPrefillAutoSendOperation,
+  decideAiPrefillAutoSendStart,
   decideAiSessionTransition,
   runAiPrefillAutoSend,
-  shouldAutoSendPrefill,
   stageNonAutoAiPrefill,
 } from "./aiPrefillAutoSend";
 import type { AiPrefillAutoSendOperation } from "./aiPrefillAutoSend";
@@ -138,6 +138,7 @@ export function ChatPanel({
     stageAiPrefillForNextTurn,
     ownsAiPrefillStaging,
     clearAiPrefillStaging,
+    stagingRevision,
   } = useChatStore();
   // Read the staged explicit selection so the Composer can render "待激活"
   // chips. Subscribing via the store keeps the chips reactive as the user
@@ -163,12 +164,26 @@ export function ChatPanel({
   const selectSessionIfRevision = useChatSessionStore(
     (s) => s.selectSessionIfRevision,
   );
+  const selectionRevision = useChatSessionStore((s) => s.selectionRevision);
   // Used by the "background stream" banner's "回到该会话" button to jump
   // directly to the session that's currently generating in the background.
   const setCurrentSession = useChatSessionStore((s) => s.setCurrentSession);
 
+  const [reservedAutoSendOperation] = useState<AiPrefillAutoSendOperation | null>(
+    () => {
+      if (!initialRequest?.autoSend) return null;
+      const sessionState = useChatSessionStore.getState();
+      return createAiPrefillAutoSendOperation(
+        sessionState.selectionRevision,
+        useChatStore.getState().stagingRevision,
+        sessionState.currentSessionId,
+      );
+    },
+  );
   const [input, setInput] = useState("");
-  const [autoSendPending, setAutoSendPending] = useState(false);
+  const [autoSendPending, setAutoSendPending] = useState(
+    reservedAutoSendOperation !== null,
+  );
   const initialPrefillConsumedRef = useRef(false);
   // Seed for the random suggestion picker. Bumping it reshuffles which 6 of
   // SUGGESTION_POOL are shown in the empty state ("换一批" button).
@@ -190,7 +205,9 @@ export function ChatPanel({
   // selection can therefore never be mistaken for a session created by this
   // panel, even while backend creation is deferred.
   const expectedCreatedSessionIdRef = useRef<string | null>(null);
-  const autoSendOperationRef = useRef<AiPrefillAutoSendOperation | null>(null);
+  const autoSendOperationRef = useRef<AiPrefillAutoSendOperation | null>(
+    reservedAutoSendOperation,
+  );
 
   useEffect(() => {
     if (
@@ -248,6 +265,7 @@ export function ChatPanel({
     if (transition === "CANCEL_AUTO_AND_LOAD") {
       const operation = autoSendOperationRef.current;
       if (operation) {
+        initialPrefillConsumedRef.current = true;
         cancelAiPrefillAutoSendOperation(operation, {
           clearOwnedContext: clearAiPrefillStaging,
         });
@@ -296,26 +314,42 @@ export function ChatPanel({
   const notConfigured = !configLoading && !configuredForAutoSend;
 
   useEffect(() => {
-    if (!shouldAutoSendPrefill({
-      request: initialRequest,
-      consumed: initialPrefillConsumedRef.current,
+    if (!initialRequest?.autoSend) return;
+    const operation = autoSendOperationRef.current;
+    if (!operation) return;
+
+    const startDecision = decideAiPrefillAutoSendStart({
+      operation,
       configured: configuredForAutoSend,
       sending,
-    })) {
+      selectionRevision,
+      currentSessionId: sessionId,
+      stagingRevision,
+    });
+    if (startDecision === "WAIT" || startDecision === "IGNORE") {
+      return;
+    }
+    if (startDecision === "CANCEL") {
+      initialPrefillConsumedRef.current = true;
+      cancelAiPrefillAutoSendOperation(operation, {
+        clearOwnedContext: clearAiPrefillStaging,
+      });
+      if (autoSendOperationRef.current === operation) {
+        autoSendOperationRef.current = null;
+        setAutoSendPending(false);
+      }
       return;
     }
 
+    // The reservation prevents earlier rerenders from duplicating work. Mark
+    // the route request consumed immediately before starting orchestration.
     initialPrefillConsumedRef.current = true;
-    const operation = createAiPrefillAutoSendOperation(
-      useChatSessionStore.getState().selectionRevision,
-    );
-    autoSendOperationRef.current = operation;
-    setAutoSendPending(true);
     void runAiPrefillAutoSend(initialRequest!, operation, {
       stageOwnedContext: stageAiPrefillForNextTurn,
       ownsStagedContext: ownsAiPrefillStaging,
       clearOwnedContext: clearAiPrefillStaging,
       createSession: async () => (await createDetachedSession()).id,
+      getStagingRevision: () => useChatStore.getState().stagingRevision,
       getSelectionState: () => {
         const state = useChatSessionStore.getState();
         return {
@@ -354,9 +388,12 @@ export function ChatPanel({
     createDetachedSession,
     initialRequest,
     ownsAiPrefillStaging,
+    selectionRevision,
     selectSessionIfRevision,
     sendMessage,
     sending,
+    sessionId,
+    stagingRevision,
     stageAiPrefillForNextTurn,
     touchSession,
   ]);

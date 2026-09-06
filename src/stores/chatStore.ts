@@ -131,6 +131,8 @@ interface ChatState {
   pendingActiveSkills: string[];
   pendingToolContext: AiToolContext | null;
   pendingPrefillOwnerToken: string | null;
+  /** Monotonic revision for user-facing next-turn staging mutations. */
+  stagingRevision: number;
 }
 
 // Module-scope guards so the streaming listeners are registered at most once.
@@ -269,6 +271,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   pendingActiveSkills: [],
   pendingToolContext: null,
   pendingPrefillOwnerToken: null,
+  stagingRevision: 0,
 
   init: () => {
     if (listenersBound) return;
@@ -934,16 +937,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setContextEnabled: (enabled) => set({ contextEnabled: enabled }),
 
   setActiveSkillsForNextTurn: (skillIds) => {
-    set({ pendingActiveSkills: skillIds.slice(), pendingPrefillOwnerToken: null });
+    set((state) => ({
+      pendingActiveSkills: skillIds.slice(),
+      pendingToolContext: state.pendingPrefillOwnerToken
+        ? null
+        : state.pendingToolContext,
+      pendingPrefillOwnerToken: null,
+      stagingRevision: state.stagingRevision + 1,
+    }));
   },
 
   setToolContextForNextTurn: (context) => {
-    set({
+    set((state) => ({
+      pendingActiveSkills: state.pendingPrefillOwnerToken
+        ? []
+        : state.pendingActiveSkills,
       pendingToolContext: context
         ? { name: context.name, arguments: { ...context.arguments } }
         : null,
       pendingPrefillOwnerToken: null,
-    });
+      stagingRevision: state.stagingRevision + 1,
+    }));
   },
 
   stageAiPrefillForNextTurn: (ownerToken, skillId, context) => {

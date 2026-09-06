@@ -8,7 +8,7 @@ interface AiPrefillStagingDependencies {
 }
 
 export type AiPrefillAutoSendPhase =
-  | "READY"
+  | "RESERVED"
   | "CREATING"
   | "CLAIMING"
   | "SENDING"
@@ -19,6 +19,8 @@ export type AiPrefillAutoSendPhase =
 export interface AiPrefillAutoSendOperation {
   readonly token: string;
   readonly selectionRevision: number;
+  readonly stagingRevision: number;
+  readonly initialSessionId: string | null;
   phase: AiPrefillAutoSendPhase;
   expectedSessionId: string | null;
 }
@@ -27,12 +29,16 @@ let nextOperationId = 0;
 
 export function createAiPrefillAutoSendOperation(
   selectionRevision: number,
+  stagingRevision = 0,
+  initialSessionId: string | null = null,
 ): AiPrefillAutoSendOperation {
   nextOperationId += 1;
   return {
     token: `ai-prefill-${nextOperationId}`,
     selectionRevision,
-    phase: "READY",
+    stagingRevision,
+    initialSessionId,
+    phase: "RESERVED",
     expectedSessionId: null,
   };
 }
@@ -62,7 +68,7 @@ function operationOwnsPendingCreation(
 ): operation is AiPrefillAutoSendOperation {
   return Boolean(
     operation &&
-      (operation.phase === "READY" ||
+      (operation.phase === "RESERVED" ||
         operation.phase === "CREATING" ||
         operation.phase === "CLAIMING"),
   );
@@ -81,6 +87,32 @@ function operationOwnsExpectedSession(
 
 function operationWasCancelled(operation: AiPrefillAutoSendOperation): boolean {
   return operation.phase === "CANCELLED";
+}
+
+export type AiPrefillAutoSendStartDecision =
+  | "CANCEL"
+  | "IGNORE"
+  | "START"
+  | "WAIT";
+
+export function decideAiPrefillAutoSendStart(input: {
+  operation: AiPrefillAutoSendOperation;
+  configured: boolean;
+  sending: boolean;
+  selectionRevision: number;
+  currentSessionId: string | null;
+  stagingRevision: number;
+}): AiPrefillAutoSendStartDecision {
+  if (input.operation.phase !== "RESERVED") return "IGNORE";
+  if (
+    input.operation.initialSessionId !== null ||
+    input.currentSessionId !== input.operation.initialSessionId ||
+    input.selectionRevision !== input.operation.selectionRevision ||
+    input.stagingRevision !== input.operation.stagingRevision
+  ) {
+    return "CANCEL";
+  }
+  return !input.configured || input.sending ? "WAIT" : "START";
 }
 
 export type AiSessionTransitionDecision =
@@ -155,6 +187,7 @@ export interface AiPrefillAutoSendDependencies extends OwnedContextCleanup {
     tool: AiToolContext,
   ) => boolean;
   createSession: () => Promise<string>;
+  getStagingRevision: () => number;
   getSelectionState: () => SelectionState;
   claimSession: (expectedRevision: number, sessionId: string) => boolean;
   sendMessage: (prompt: string, sessionId: string) => Promise<ChatSendResult>;
@@ -194,6 +227,18 @@ export async function runAiPrefillAutoSend(
 ): Promise<AiPrefillAutoSendResult> {
   const toolContext = exactTrustedRebalanceContext(request);
   if (operation.phase === "CANCELLED") return { status: "cancelled" };
+
+  const initialSelection = dependencies.getSelectionState();
+  if (
+    operation.phase !== "RESERVED" ||
+    operation.initialSessionId !== null ||
+    initialSelection.currentSessionId !== operation.initialSessionId ||
+    initialSelection.revision !== operation.selectionRevision ||
+    dependencies.getStagingRevision() !== operation.stagingRevision
+  ) {
+    cancelAiPrefillAutoSendOperation(operation, dependencies);
+    return { status: "cancelled" };
+  }
 
   operation.phase = "CREATING";
   dependencies.stageOwnedContext(

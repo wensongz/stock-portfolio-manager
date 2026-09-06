@@ -53,6 +53,7 @@ beforeEach(() => {
     pendingActiveSkills: [],
     pendingToolContext: null,
     pendingPrefillOwnerToken: null,
+    stagingRevision: 0,
   });
 });
 
@@ -79,6 +80,46 @@ test("owned prefill staging is not cleared after a user replaces it", () => {
   assert.deepEqual(useChatStore.getState().pendingActiveSkills, ["stock-review"]);
   assert.deepEqual(useChatStore.getState().pendingToolContext, exactContext);
   assert.equal(useChatStore.getState().pendingPrefillOwnerToken, null);
+});
+
+test("a skill-only edit revokes ownership and clears the owned tool only", () => {
+  const rebalanceContext = {
+    name: "get_rebalance_context",
+    arguments: { config_id: "config-us" },
+  };
+  useChatStore.getState().stageAiPrefillForNextTurn(
+    "operation-skill",
+    "portfolio-rebalance",
+    rebalanceContext,
+  );
+
+  useChatStore.getState().setActiveSkillsForNextTurn(["stock-review"]);
+  useChatStore.getState().clearAiPrefillStaging("operation-skill");
+
+  assert.deepEqual(useChatStore.getState().pendingActiveSkills, ["stock-review"]);
+  assert.equal(useChatStore.getState().pendingToolContext, null);
+  assert.equal(useChatStore.getState().pendingPrefillOwnerToken, null);
+  assert.equal(useChatStore.getState().stagingRevision, 1);
+});
+
+test("a tool-only edit revokes ownership and clears the owned skill only", () => {
+  const rebalanceContext = {
+    name: "get_rebalance_context",
+    arguments: { config_id: "config-us" },
+  };
+  useChatStore.getState().stageAiPrefillForNextTurn(
+    "operation-tool",
+    "portfolio-rebalance",
+    rebalanceContext,
+  );
+
+  useChatStore.getState().setToolContextForNextTurn(exactContext);
+  useChatStore.getState().clearAiPrefillStaging("operation-tool");
+
+  assert.deepEqual(useChatStore.getState().pendingActiveSkills, []);
+  assert.deepEqual(useChatStore.getState().pendingToolContext, exactContext);
+  assert.equal(useChatStore.getState().pendingPrefillOwnerToken, null);
+  assert.equal(useChatStore.getState().stagingRevision, 1);
 });
 
 test("sendMessage returns explicit success and caught-backend-failure outcomes", async () => {

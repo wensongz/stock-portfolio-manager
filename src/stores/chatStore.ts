@@ -173,6 +173,11 @@ interface BackgroundStream {
 }
 let backgroundStream: BackgroundStream | null = null;
 
+// A slow session read must never overwrite a newer session view. This stays
+// module-scoped with the streaming ownership guards because a read may resolve
+// after React has switched sessions or cleared the chat view.
+let sessionLoadGeneration = 0;
+
 function sameToolContext(
   left: AiToolContext | null,
   right: AiToolContext,
@@ -475,6 +480,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   loadSessionMessages: async (sessionId) => {
+    const loadGeneration = ++sessionLoadGeneration;
+    const isCurrentLoad = () =>
+      sessionLoadGeneration === loadGeneration && get().viewSessionId === sessionId;
     // Record the view session first so listeners (e.g. a background `done`)
     // know whether the finishing turn is currently on screen.
     set({ viewSessionId: sessionId });
@@ -485,6 +493,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // buffer directly and promote the stream back to the foreground: clear
     // backgroundStream so subsequent deltas route to the live state.
     if (bg && bg.sessionId === sessionId) {
+      if (!isCurrentLoad()) return;
       backgroundStream = null;
       set({
         messages: bg.messages,
@@ -497,6 +506,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const records = await invoke<ChatMessageRecord[]>("get_chat_messages", {
         sessionId,
       });
+      if (!isCurrentLoad()) return;
       set({
         messages: records.map((r) => ({
           id: r.id,
@@ -545,11 +555,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
         error: null,
       });
     } catch (err) {
-      set({ error: String(err) });
+      if (isCurrentLoad()) set({ error: String(err) });
     }
   },
 
   resetForSessionSwitch: async () => {
+    // Invalidate every outstanding DB load before clearing or parking the
+    // current view; otherwise an older read can repopulate this new view.
+    sessionLoadGeneration += 1;
     // When switching sessions with an in-flight stream, we DON'T abort the
     // stream — we park it into `backgroundStream` so it can finish in the
     // background. The `delta`/`usage` listeners will accumulate tokens into

@@ -163,6 +163,20 @@ pub(super) fn deduplicate_symbols(symbols: Vec<(String, String)>) -> Vec<(String
         .collect()
 }
 
+fn order_quotes_by_request(
+    requested: &[(String, String)],
+    quotes: Vec<StockQuote>,
+) -> Vec<StockQuote> {
+    let mut quotes_by_key: HashMap<(String, String), StockQuote> = quotes
+        .into_iter()
+        .map(|quote| (quote_key(&quote.market, &quote.symbol), quote))
+        .collect();
+    requested
+        .iter()
+        .filter_map(|(symbol, market)| quotes_by_key.remove(&quote_key(market, symbol)))
+        .collect()
+}
+
 /// Batch fetch quotes using the cache with specified providers.
 /// Duplicate symbols are automatically deduplicated so that each symbol is
 /// looked up and fetched only once, even when held in multiple accounts.
@@ -209,7 +223,7 @@ pub async fn fetch_quotes_batch_cached_with_providers(
             }
         }
         return Ok(QuoteFetchResult {
-            data: result,
+            data: order_quotes_by_request(&unique_symbols, result),
             warning: fresh.warning,
             did_refresh: fresh.did_refresh,
             refresh_complete,
@@ -220,7 +234,7 @@ pub async fn fetch_quotes_batch_cached_with_providers(
 
     if missing.is_empty() {
         return Ok(QuoteFetchResult {
-            data: result,
+            data: order_quotes_by_request(&unique_symbols, result),
             warning: None,
             did_refresh: false,
             refresh_complete: false,
@@ -255,7 +269,7 @@ pub async fn fetch_quotes_batch_cached_with_providers(
     }
 
     Ok(QuoteFetchResult {
-        data: result,
+        data: order_quotes_by_request(&unique_symbols, result),
         warning: fresh.warning,
         did_refresh: fresh.did_refresh,
         refresh_complete,

@@ -135,7 +135,7 @@ pub(super) fn plan_yahoo_quote_batches(
     symbols: &[(String, String)],
 ) -> (Vec<Vec<YahooBatchRequestSymbol>>, Vec<(String, String)>) {
     let mut planned: Vec<YahooBatchRequestSymbol> = Vec::new();
-    let mut index_by_api_symbol: std::collections::HashMap<String, usize> =
+    let mut index_by_api_symbol: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
     let mut invalid = Vec::new();
 
@@ -147,7 +147,10 @@ pub(super) fn plan_yahoo_quote_batches(
                 continue;
             }
         };
-        let key = api_symbol.to_ascii_uppercase();
+        let key = (
+            market.trim().to_ascii_uppercase(),
+            api_symbol.to_ascii_uppercase(),
+        );
         if let Some(existing_index) = index_by_api_symbol.get(&key).copied() {
             planned[existing_index]
                 .aliases
@@ -246,7 +249,7 @@ pub(super) fn parse_yahoo_spark_body(
                 .map(|(symbol, market)| (symbol, market)),
         );
         for (original_symbol, market) in original_symbols {
-            if !seen.insert(original_symbol.clone()) {
+            if !seen.insert((market.clone(), original_symbol.clone())) {
                 continue;
             }
             quotes.push(StockQuote {

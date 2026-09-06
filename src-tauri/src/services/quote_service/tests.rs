@@ -282,6 +282,37 @@ fn eastmoney_batch_parser_fans_one_api_quote_out_to_aliases() {
 }
 
 #[test]
+fn eastmoney_batch_parser_keeps_same_literal_symbol_in_us_and_hk() {
+    let symbols = vec![
+        ("0700".to_string(), "US".to_string()),
+        ("0700".to_string(), "HK".to_string()),
+    ];
+    let (batches, invalid) = plan_eastmoney_quote_batches(&symbols);
+    assert!(invalid.is_empty());
+    let body = r#"{
+        "rc": 0,
+        "data": {"diff": [
+            {"f2":7.0,"f12":"0700","f13":105,"f14":"US 0700"},
+            {"f2":700.0,"f12":"00700","f13":116,"f14":"HK 0700"}
+        ]}
+    }"#;
+
+    let quotes = parse_eastmoney_batch_body(body, &batches[0]).unwrap();
+
+    assert_eq!(
+        quotes
+            .iter()
+            .map(|quote| (
+                quote.market.as_str(),
+                quote.symbol.as_str(),
+                quote.current_price
+            ))
+            .collect::<Vec<_>>(),
+        vec![("US", "0700", 7.0), ("HK", "0700", 700.0)]
+    );
+}
+
+#[test]
 fn xueqiu_history_count_is_inclusive_for_short_weekday_window() {
     let monday = chrono::NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
     let friday = chrono::NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
@@ -973,6 +1004,84 @@ fn test_fetch_quotes_batch_cached_deduplicates_symbols() {
 }
 
 #[test]
+fn cached_batch_returns_requested_order_across_cache_hits_and_fetched_misses() {
+    let cache = QuoteCache::new();
+    let mut cached = sample_quote("AAPL", "US");
+    cached.current_price = 101.0;
+    cache.set(cached);
+    let requested = vec![
+        ("$CASH-USD".to_string(), "US".to_string()),
+        ("AAPL".to_string(), "US".to_string()),
+    ];
+    let state = QuoteServiceState::new();
+
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(fetch_quotes_batch_cached_with_providers(
+            &state,
+            &cache,
+            requested,
+            "invalid-provider",
+            "invalid-provider",
+            "invalid-provider",
+            false,
+        ))
+        .unwrap();
+
+    assert_eq!(
+        result
+            .data
+            .iter()
+            .map(|quote| (
+                quote.market.as_str(),
+                quote.symbol.as_str(),
+                quote.current_price
+            ))
+            .collect::<Vec<_>>(),
+        vec![("US", "$CASH-USD", 1.0), ("US", "AAPL", 101.0)]
+    );
+}
+
+#[test]
+fn forced_cached_batch_returns_stale_fallbacks_in_requested_order() {
+    let cache = QuoteCache::new();
+    let mut stale = sample_quote("AAPL", "US");
+    stale.current_price = 101.0;
+    cache.set(stale);
+    let requested = vec![
+        ("AAPL".to_string(), "US".to_string()),
+        ("$CASH-USD".to_string(), "US".to_string()),
+    ];
+    let state = QuoteServiceState::new();
+
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(fetch_quotes_batch_cached_with_providers(
+            &state,
+            &cache,
+            requested,
+            "invalid-provider",
+            "invalid-provider",
+            "invalid-provider",
+            true,
+        ))
+        .unwrap();
+
+    assert_eq!(
+        result
+            .data
+            .iter()
+            .map(|quote| (
+                quote.market.as_str(),
+                quote.symbol.as_str(),
+                quote.current_price
+            ))
+            .collect::<Vec<_>>(),
+        vec![("US", "AAPL", 101.0), ("US", "$CASH-USD", 1.0)]
+    );
+}
+
+#[test]
 fn test_quote_cache_update_overwrites() {
     let cache = QuoteCache::new();
     let mut quote = sample_quote("AAPL", "US");
@@ -1232,6 +1341,36 @@ fn yahoo_spark_parser_maps_fields_and_omits_missing_or_unusable_symbols() {
     assert_eq!(quotes[1].market, "HK");
     assert_eq!(quotes[1].name, "Tencent Holdings Limited");
     assert!((quotes[1].change_percent - (5.0 / 615.0 * 100.0)).abs() < 0.001);
+}
+
+#[test]
+fn yahoo_spark_parser_keeps_same_literal_symbol_in_us_and_hk() {
+    let symbols = vec![
+        ("0700".to_string(), "US".to_string()),
+        ("0700".to_string(), "HK".to_string()),
+    ];
+    let (batches, invalid) = plan_yahoo_quote_batches(&symbols);
+    assert!(invalid.is_empty());
+    let body = r#"{
+        "spark": {"result": [
+            {"symbol":"0700","response":[{"meta":{"symbol":"0700","regularMarketPrice":7.0}}]},
+            {"symbol":"0700.HK","response":[{"meta":{"symbol":"0700.HK","regularMarketPrice":700.0}}]}
+        ], "error": null}
+    }"#;
+
+    let quotes = parse_yahoo_spark_body(body, &batches[0]).unwrap();
+
+    assert_eq!(
+        quotes
+            .iter()
+            .map(|quote| (
+                quote.market.as_str(),
+                quote.symbol.as_str(),
+                quote.current_price
+            ))
+            .collect::<Vec<_>>(),
+        vec![("US", "0700", 7.0), ("HK", "0700", 700.0)]
+    );
 }
 
 #[test]
@@ -1854,6 +1993,57 @@ fn test_xueqiu_realtime_aliases_share_one_api_symbol_and_fan_out() {
         returned_symbols,
         vec!["BRK-B", "BRK.B", "aapl", "AAPL", "00700", "0700.HK"]
     );
+}
+
+#[test]
+fn xueqiu_realtime_parser_keeps_same_literal_symbol_in_us_and_hk() {
+    let symbols = vec![
+        ("0700".to_string(), "US".to_string()),
+        ("0700".to_string(), "HK".to_string()),
+    ];
+    let (batches, invalid) = plan_xueqiu_realtime_batches(&symbols);
+    assert!(invalid.is_empty());
+    let body = r#"{
+        "data": [
+            {"symbol":"0700","current":7.0},
+            {"symbol":"00700","current":700.0}
+        ],
+        "error_code": 0
+    }"#;
+
+    let quotes = parse_xueqiu_realtime_body(body, &batches[0]).unwrap();
+
+    assert_eq!(
+        quotes
+            .iter()
+            .map(|quote| (
+                quote.market.as_str(),
+                quote.symbol.as_str(),
+                quote.current_price
+            ))
+            .collect::<Vec<_>>(),
+        vec![("US", "0700", 7.0), ("HK", "0700", 700.0)]
+    );
+}
+
+#[test]
+fn xueqiu_realtime_planner_never_aliases_an_ambiguous_cross_market_api_symbol() {
+    // Both inputs normalize to Xueqiu's literal API symbol 00700. They are
+    // separate securities, so they cannot share an alias/fan-out request.
+    let symbols = vec![
+        ("00700".to_string(), "US".to_string()),
+        ("700".to_string(), "HK".to_string()),
+    ];
+
+    let (batches, invalid) = plan_xueqiu_realtime_batches(&symbols);
+
+    assert!(invalid.is_empty());
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].len(), 2);
+    assert_eq!(batches[0][0].market, "US");
+    assert_eq!(batches[0][1].market, "HK");
+    assert!(batches[0][0].aliases.is_empty());
+    assert!(batches[0][1].aliases.is_empty());
 }
 
 // ---- Xueqiu response parsing tests ----

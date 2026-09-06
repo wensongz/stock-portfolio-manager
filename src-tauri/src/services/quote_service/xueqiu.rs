@@ -682,12 +682,15 @@ pub(super) fn plan_xueqiu_realtime_batches(
     symbols: &[(String, String)],
 ) -> (Vec<Vec<XueqiuRealtimeRequestSymbol>>, Vec<(String, String)>) {
     let mut planned: Vec<XueqiuRealtimeRequestSymbol> = Vec::new();
-    let mut index_by_api_symbol: HashMap<String, usize> = HashMap::new();
+    let mut index_by_api_symbol: HashMap<(String, String), usize> = HashMap::new();
     let mut invalid = Vec::new();
     for (symbol, market) in symbols {
         match to_xueqiu_realtime_symbol(symbol, market) {
             Ok(api_symbol) => {
-                let key = api_symbol.to_ascii_uppercase();
+                let key = (
+                    market.trim().to_ascii_uppercase(),
+                    api_symbol.to_ascii_uppercase(),
+                );
                 if let Some(existing_index) = index_by_api_symbol.get(&key).copied() {
                     planned[existing_index]
                         .aliases
@@ -748,18 +751,28 @@ pub(super) fn parse_xueqiu_realtime_body(
     let data = response
         .data
         .ok_or_else(|| "No data from Xueqiu realtime quotes".to_string())?;
-    let request_by_api_symbol: HashMap<String, &XueqiuRealtimeRequestSymbol> = request_symbols
-        .iter()
-        .map(|symbol| (symbol.api_symbol.to_ascii_uppercase(), symbol))
-        .collect();
+    let mut request_by_api_symbol: HashMap<String, Vec<&XueqiuRealtimeRequestSymbol>> =
+        HashMap::new();
+    for request_symbol in request_symbols {
+        request_by_api_symbol
+            .entry(request_symbol.api_symbol.to_ascii_uppercase())
+            .or_default()
+            .push(request_symbol);
+    }
     let mut seen = HashSet::new();
     let mut quotes = Vec::new();
     for item in data {
         let Some(api_symbol) = item.symbol.as_deref() else {
             continue;
         };
-        let Some(request_symbol) = request_by_api_symbol.get(&api_symbol.to_ascii_uppercase())
+        let Some(request_symbols) = request_by_api_symbol.get(&api_symbol.to_ascii_uppercase())
         else {
+            continue;
+        };
+        // A cross-market API-symbol collision cannot be assigned safely from
+        // Xueqiu's response shape, which carries no market. Leave it missing
+        // so the orchestration layer fetches each market-specific fallback.
+        let [request_symbol] = request_symbols.as_slice() else {
             continue;
         };
         let Some(current_price) = item.current else {
@@ -782,7 +795,7 @@ pub(super) fn parse_xueqiu_realtime_body(
                     .map(|(symbol, market)| (symbol, market)),
             );
         for (original_symbol, market) in original_symbols {
-            if !seen.insert(original_symbol.clone()) {
+            if !seen.insert((market.clone(), original_symbol.clone())) {
                 continue;
             }
             quotes.push(StockQuote {

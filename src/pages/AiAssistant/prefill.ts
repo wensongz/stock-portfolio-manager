@@ -210,32 +210,37 @@ export function readPersistedAiPrefillContext(
 export function readPersistedRebalanceSessionBinding(
   toolCallsByTurn: ToolCallInfo[][],
 ): PersistedRebalanceSessionBinding {
-  const rebalanceCalls = toolCallsByTurn
+  const reservedCalls = toolCallsByTurn
     .flat()
-    .filter(
-      (call) =>
-        call.id === HOST_PREFILLED_TOOL_CALL_ID &&
-        call.name === "get_rebalance_context",
-    );
-  if (rebalanceCalls.length === 0) return { kind: "none" };
+    .filter((call) => call.id === HOST_PREFILLED_TOOL_CALL_ID);
+  if (reservedCalls.length === 0) return { kind: "none" };
 
   let configId: string | null = null;
-  for (const call of rebalanceCalls) {
+  let sawRebalance = false;
+  let sawOrdinaryPrefill = false;
+  for (const call of reservedCalls) {
     if (call.origin !== "host_prefill" || call.status !== "success") {
       return { kind: "invalid" };
     }
     const persisted = readPersistedAiPrefillContext([call]);
-    const currentConfigId = persisted?.toolContext.arguments.config_id;
+    if (!persisted) return { kind: "invalid" };
+    if (persisted.activeSkill !== "portfolio-rebalance") {
+      if (sawRebalance) return { kind: "invalid" };
+      sawOrdinaryPrefill = true;
+      continue;
+    }
+    if (sawOrdinaryPrefill) return { kind: "invalid" };
+    const currentConfigId = persisted.toolContext.arguments.config_id;
     if (
-      persisted?.activeSkill !== "portfolio-rebalance" ||
       typeof currentConfigId !== "string" ||
       !currentConfigId.trim() ||
       (configId !== null && configId !== currentConfigId)
-    ) {
-      return { kind: "invalid" };
-    }
+    ) return { kind: "invalid" };
+    sawRebalance = true;
     configId = currentConfigId;
   }
+
+  if (!sawRebalance) return { kind: "none" };
 
   return {
     kind: "bound",

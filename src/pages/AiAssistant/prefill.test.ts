@@ -10,6 +10,7 @@ import {
   readAiPrefillRequest,
   readAiPrefillToolContext,
   readPersistedAiPrefillContext,
+  readPersistedRebalanceSessionBinding,
   readPersistedAiToolContext,
   resolveAiPrefillSessionId,
 } from "./prefill.ts";
@@ -390,4 +391,49 @@ test("persisted context reconstruction still requires a completed reserved tool 
     ...genuineHostCall,
     arguments: JSON.stringify({ ...JSON.parse(persistedArgumentsJson), extra: "no" }),
   }]), null);
+});
+
+test("rebalance session binding rejects every malformed reserved-host record", () => {
+  const rebalance = {
+    ...genuineHostCall,
+    name: "get_rebalance_context",
+    arguments: JSON.stringify({ config_id: "config-us" }),
+  };
+  for (const malformed of [
+    { ...rebalance, name: "get_rebalance_contex" },
+    { ...rebalance, origin: "model" },
+    { ...rebalance, status: "error" },
+    { ...rebalance, arguments: "{" },
+  ]) {
+    assert.deepEqual(readPersistedRebalanceSessionBinding([[malformed]]), {
+      kind: "invalid",
+    });
+  }
+});
+
+test("rebalance session binding rejects mixed reserved records but leaves valid ordinary prefills ordinary", () => {
+  const rebalance = {
+    ...genuineHostCall,
+    name: "get_rebalance_context",
+    arguments: JSON.stringify({ config_id: "config-us" }),
+  };
+  assert.deepEqual(readPersistedRebalanceSessionBinding([[rebalance, genuineHostCall]]), {
+    kind: "invalid",
+  });
+  assert.deepEqual(readPersistedRebalanceSessionBinding([[rebalance, {
+    ...genuineHostCall,
+    name: "unknown_reserved_tool",
+  }]]), { kind: "invalid" });
+  assert.deepEqual(readPersistedRebalanceSessionBinding([[rebalance, {
+    ...rebalance,
+    arguments: JSON.stringify({ config_id: "config-hk" }),
+  }]]), { kind: "invalid" });
+  assert.deepEqual(readPersistedRebalanceSessionBinding([[genuineHostCall]]), {
+    kind: "none",
+  });
+  assert.deepEqual(readPersistedRebalanceSessionBinding([[{
+    ...genuineHostCall,
+    name: "get_portfolio_overview",
+    arguments: JSON.stringify({ market: "US" }),
+  }]]), { kind: "none" });
 });

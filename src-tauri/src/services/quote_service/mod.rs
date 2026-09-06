@@ -498,9 +498,9 @@ pub async fn fetch_quotes_batch_with_providers(
     for batch in yahoo_batches {
         match fetch_yahoo_quotes_batch(&batch).await {
             Ok(batch_quotes) => {
-                let fetched: std::collections::HashSet<&str> = batch_quotes
+                let fetched: std::collections::HashSet<(String, String)> = batch_quotes
                     .iter()
-                    .map(|quote| quote.symbol.as_str())
+                    .map(|quote| quote_key(&quote.market, &quote.symbol))
                     .collect();
                 for request_symbol in &batch {
                     let original_symbols =
@@ -512,7 +512,7 @@ pub async fn fetch_quotes_batch_with_providers(
                                     .map(|(symbol, market)| (symbol, market)),
                             );
                     for (symbol, market) in original_symbols {
-                        if !fetched.contains(symbol.as_str()) {
+                        if !fetched.contains(&quote_key(market, symbol)) {
                             yahoo_fallback_symbols.push((symbol.clone(), market.clone()));
                         }
                     }
@@ -560,9 +560,9 @@ pub async fn fetch_quotes_batch_with_providers(
     for batch in xueqiu_batches {
         match fetch_xueqiu_realtime_batch(state, &batch).await {
             Ok(batch_quotes) => {
-                let fetched: std::collections::HashSet<&str> = batch_quotes
+                let fetched: std::collections::HashSet<(String, String)> = batch_quotes
                     .iter()
-                    .map(|quote| quote.symbol.as_str())
+                    .map(|quote| quote_key(&quote.market, &quote.symbol))
                     .collect();
                 let mut response_omitted_symbol = false;
                 for request_symbol in &batch {
@@ -575,7 +575,7 @@ pub async fn fetch_quotes_batch_with_providers(
                                     .map(|(symbol, market)| (symbol, market)),
                             );
                     for (symbol, market) in original_symbols {
-                        if !fetched.contains(symbol.as_str()) {
+                        if !fetched.contains(&quote_key(market, symbol)) {
                             response_omitted_symbol = true;
                             xueqiu_fallback_symbols.push((symbol.clone(), market.clone()));
                         }
@@ -605,8 +605,10 @@ pub async fn fetch_quotes_batch_with_providers(
     // EastMoney is both a selectable provider and Xueqiu's first fallback.
     // Combining both queues ensures an unavailable Xueqiu batch does not turn
     // into one EastMoney request per holding.
-    let after_xueqiu: std::collections::HashSet<(String, String)> =
-        xueqiu_fallback_symbols.iter().cloned().collect();
+    let after_xueqiu: std::collections::HashSet<(String, String)> = xueqiu_fallback_symbols
+        .iter()
+        .map(|(symbol, market)| quote_key(market, symbol))
+        .collect();
     let mut eastmoney_symbols = provider_plan.eastmoney_symbols;
     eastmoney_symbols.extend(xueqiu_fallback_symbols);
     let eastmoney_symbols = deduplicate_symbols(eastmoney_symbols);
@@ -616,9 +618,9 @@ pub async fn fetch_quotes_batch_with_providers(
     for batch in eastmoney_batches {
         match fetch_eastmoney_quotes_batch(&batch).await {
             Ok(batch_quotes) => {
-                let fetched: std::collections::HashSet<&str> = batch_quotes
+                let fetched: std::collections::HashSet<(String, String)> = batch_quotes
                     .iter()
-                    .map(|quote| quote.symbol.as_str())
+                    .map(|quote| quote_key(&quote.market, &quote.symbol))
                     .collect();
                 for request_symbol in &batch {
                     let original_symbols =
@@ -630,7 +632,7 @@ pub async fn fetch_quotes_batch_with_providers(
                                     .map(|(symbol, market)| (symbol, market)),
                             );
                     for (symbol, market) in original_symbols {
-                        if !fetched.contains(symbol.as_str()) {
+                        if !fetched.contains(&quote_key(market, symbol)) {
                             per_symbol_fallback.push((symbol.clone(), market.clone()));
                         }
                     }
@@ -653,7 +655,7 @@ pub async fn fetch_quotes_batch_with_providers(
     // otherwise valid instrument. Preserve the former per-symbol behaviour in
     // those cases, including Yahoo after an earlier Xueqiu failure.
     for (symbol, market) in deduplicate_symbols(per_symbol_fallback) {
-        if after_xueqiu.contains(&(symbol.clone(), market.clone())) {
+        if after_xueqiu.contains(&quote_key(&market, &symbol)) {
             match fetch_quote_after_xueqiu_failure(&symbol, &market).await {
                 Ok(quote) => {
                     did_refresh = true;

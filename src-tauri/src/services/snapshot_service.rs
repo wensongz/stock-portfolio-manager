@@ -5,7 +5,9 @@ use crate::models::DailyPortfolioValue;
 use crate::services::exchange_rate_service::ExchangeRateCache;
 use crate::services::quote_provider_service;
 #[cfg(test)]
-use crate::services::quote_service::{fetch_quotes_batch_cached_with_providers, QuoteCache};
+use crate::services::quote_service::{
+    fetch_quotes_batch_cached_with_providers, quote_key, QuoteCache,
+};
 use crate::services::quote_service::{fetch_stock_history, QuoteServiceState};
 use chrono::{Datelike, NaiveDate, Timelike};
 use tracing::{info, warn};
@@ -15,6 +17,16 @@ use tracing::{info, warn};
 /// around the start of the backfill window still have a prior trading-day
 /// close available for forward-fill.
 const SUSPENSION_LOOKBACK_DAYS: i64 = 30;
+
+#[cfg(test)]
+fn quote_prices_by_identity(
+    quotes: &[crate::models::StockQuote],
+) -> std::collections::HashMap<(String, String), f64> {
+    quotes
+        .iter()
+        .map(|quote| (quote_key(&quote.market, &quote.symbol), quote.current_price))
+        .collect()
+}
 
 /// Return the latest date for which all markets are guaranteed to have
 /// closing prices available.
@@ -121,10 +133,7 @@ pub async fn take_daily_snapshot(
         .await?
         .data
     };
-    let quote_map: std::collections::HashMap<String, f64> = quotes
-        .iter()
-        .map(|q| (q.symbol.clone(), q.current_price))
-        .collect();
+    let quote_map = quote_prices_by_identity(&quotes);
 
     // 3. Get exchange rates (async)
     let rates = crate::services::exchange_rate_service::get_cached_rates(cache, db).await?;
@@ -140,7 +149,9 @@ pub async fn take_daily_snapshot(
     let mut snapshots: Vec<DailyHoldingSnapshot> = Vec::new();
 
     for holding in &holdings {
-        let close_price = *quote_map.get(&holding.symbol).unwrap_or(&0.0);
+        let close_price = *quote_map
+            .get(&quote_key(&holding.market, &holding.symbol))
+            .unwrap_or(&0.0);
         let market_value = holding.shares * close_price;
         let cost = holding.shares * holding.avg_cost;
 
@@ -1861,6 +1872,27 @@ mod tests {
         let values = get_daily_values(&db, date, date).unwrap();
         assert_eq!(values.len(), 1);
         assert!((values[0].total_value - (-50.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn daily_snapshot_quote_prices_keep_same_literal_symbol_in_each_market() {
+        let prices = quote_prices_by_identity(&[
+            crate::models::StockQuote {
+                symbol: "0700".to_string(),
+                market: "US".to_string(),
+                current_price: 7.0,
+                ..Default::default()
+            },
+            crate::models::StockQuote {
+                symbol: "0700".to_string(),
+                market: "HK".to_string(),
+                current_price: 700.0,
+                ..Default::default()
+            },
+        ]);
+
+        assert_eq!(prices.get(&quote_key("US", "0700")), Some(&7.0));
+        assert_eq!(prices.get(&quote_key("HK", "0700")), Some(&700.0));
     }
 
     #[test]

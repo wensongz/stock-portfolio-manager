@@ -212,7 +212,7 @@ pub(super) fn parse_eastmoney_batch_body(
                 .map(|(symbol, market)| (symbol, market)),
         );
         for (original_symbol, market) in original_symbols {
-            if !seen.insert(original_symbol.clone()) {
+            if !seen.insert((market.clone(), original_symbol.clone())) {
                 continue;
             }
             quotes.push(StockQuote {
@@ -556,7 +556,7 @@ pub(super) fn plan_eastmoney_quote_batches(
     symbols: &[(String, String)],
 ) -> (Vec<Vec<EastMoneyBatchRequestSymbol>>, Vec<(String, String)>) {
     let mut planned: Vec<EastMoneyBatchRequestSymbol> = Vec::new();
-    let mut index_by_secids: std::collections::HashMap<Vec<String>, usize> =
+    let mut index_by_secids: std::collections::HashMap<(String, Vec<String>), usize> =
         std::collections::HashMap::new();
     let mut invalid = Vec::new();
 
@@ -568,13 +568,14 @@ pub(super) fn plan_eastmoney_quote_batches(
                 continue;
             }
         };
-        if let Some(existing_index) = index_by_secids.get(&api_secids).copied() {
+        let key = (market.trim().to_ascii_uppercase(), api_secids.clone());
+        if let Some(existing_index) = index_by_secids.get(&key).copied() {
             planned[existing_index]
                 .aliases
                 .push((symbol.clone(), market.clone()));
             continue;
         }
-        index_by_secids.insert(api_secids.clone(), planned.len());
+        index_by_secids.insert(key, planned.len());
         planned.push(EastMoneyBatchRequestSymbol {
             original_symbol: symbol.clone(),
             market: market.clone(),

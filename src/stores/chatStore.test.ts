@@ -368,6 +368,72 @@ test("rebalance follow-up fails closed when reserved host provenance is malforme
   assert.equal(useChatStore.getState().messages.length, 2);
 });
 
+test("out-of-order session loads cannot replace the current ordinary session with rebalance provenance", async () => {
+  const loadA = deferred();
+  const loadB = deferred();
+  const requests = [];
+  const savedSnapshots = [];
+  const rebalanceUser = persistedMessage("rebalance-user", "session-a", "rebalance now");
+  const rebalanceAssistant = {
+    ...persistedMessage("rebalance-assistant", "session-a", "plan"),
+    role: "assistant",
+    tool_calls: JSON.stringify([{
+      id: "prefilled-stock-review",
+      name: "get_rebalance_context",
+      arguments: JSON.stringify({ config_id: "config-us" }),
+      status: "success",
+      origin: "host_prefill",
+    }]),
+  };
+  const ordinaryUser = persistedMessage("ordinary-user", "session-b", "ordinary history");
+  invokeImpl = async (command, args) => {
+    if (command === "get_chat_messages") {
+      return args.sessionId === "session-a" ? loadA.promise : loadB.promise;
+    }
+    if (command === "chat_with_ai") {
+      requests.push(args.req);
+      return;
+    }
+    if (command === "save_chat_messages") {
+      savedSnapshots.push(args);
+      return;
+    }
+    if (command === "touch_chat_session") return;
+    throw new Error(`unexpected command ${command}`);
+  };
+
+  const loadingA = useChatStore.getState().loadSessionMessages("session-a");
+  const loadingB = useChatStore.getState().loadSessionMessages("session-b");
+  loadB.resolve([ordinaryUser]);
+  await loadingB;
+  loadA.resolve([rebalanceUser, rebalanceAssistant]);
+  await loadingA;
+
+  assert.equal(useChatStore.getState().viewSessionId, "session-b");
+  assert.deepEqual(
+    useChatStore.getState().messages.map((message) => message.content),
+    ["ordinary history"],
+  );
+  const sent = await useChatStore.getState().sendMessage("ordinary follow-up", "session-b");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(sent, { ok: true });
+  assert.deepEqual(requests, [{
+    messages: [
+      { role: "user", content: "ordinary history\n\nordinary follow-up" },
+    ],
+    includeContext: true,
+    activeSkills: [],
+    toolContext: null,
+  }]);
+  assert.equal(savedSnapshots.length, 1);
+  assert.equal(savedSnapshots[0].sessionId, "session-b");
+  assert.deepEqual(
+    savedSnapshots[0].messages.map((message) => message.content),
+    ["ordinary history", "ordinary follow-up"],
+  );
+});
+
 test("switching away lets a background reply finish without overwriting the new session", async () => {
   const savedSnapshots = [];
   const otherRecord = persistedMessage("other-user", "session-other", "other session");

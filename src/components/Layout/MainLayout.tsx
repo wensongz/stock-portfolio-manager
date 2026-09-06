@@ -17,6 +17,7 @@ import {
   RobotOutlined,
   GiftOutlined,
 } from "@ant-design/icons";
+import { ALERTS_MENU_LABEL } from "../../pages/Alerts/alertsCopy";
 
 const { Sider, Content } = Layout;
 
@@ -32,7 +33,7 @@ const menuItems = [
   { key: "/dividends", icon: <GiftOutlined />, label: "分红分析" },
   { key: "/review", icon: <HistoryOutlined />, label: "操作复盘" },
   { key: "/ai-assistant", icon: <RobotOutlined />, label: "AI 助手" },
-  { key: "/alerts", icon: <BellOutlined />, label: "价格提醒" },
+  { key: "/alerts", icon: <BellOutlined />, label: ALERTS_MENU_LABEL },
   { key: "/import", icon: <ImportOutlined />, label: "导入导出" },
   { key: "/settings", icon: <SettingOutlined />, label: "设置" },
 ];

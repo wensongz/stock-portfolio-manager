@@ -3,11 +3,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  cancelAiPrefillAutoSendOperation,
+  createAiPrefillAutoSendOperation,
   decideAiSessionTransition,
-  stageNonAutoAiPrefill,
   runAiPrefillAutoSend,
   shouldAutoSendPrefill,
+  stageNonAutoAiPrefill,
 } from "./aiPrefillAutoSend.ts";
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
 
 function validRebalanceRequest(configId = "config-us") {
   return {
@@ -19,6 +27,61 @@ function validRebalanceRequest(configId = "config-us") {
       arguments: { config_id: configId },
     },
   };
+}
+
+function lifecycleHarness(createResult) {
+  const calls = [];
+  const state = {
+    selectionRevision: 7,
+    currentSessionId: null,
+    staging: { ownerToken: null, skillIds: [], toolContext: null },
+  };
+  const dependencies = {
+    stageOwnedContext: (ownerToken, skill, toolContext) => {
+      calls.push(["stage", ownerToken, skill, toolContext]);
+      state.staging = { ownerToken, skillIds: [skill], toolContext };
+    },
+    ownsStagedContext: (ownerToken, skill, toolContext) => (
+      state.staging.ownerToken === ownerToken &&
+      state.staging.skillIds.length === 1 &&
+      state.staging.skillIds[0] === skill &&
+      JSON.stringify(state.staging.toolContext) === JSON.stringify(toolContext)
+    ),
+    clearOwnedContext: (ownerToken) => {
+      calls.push(["clear", ownerToken]);
+      if (state.staging.ownerToken === ownerToken) {
+        state.staging = { ownerToken: null, skillIds: [], toolContext: null };
+      }
+    },
+    createSession: async () => {
+      calls.push(["create"]);
+      return createResult instanceof Promise ? await createResult : createResult;
+    },
+    getSelectionState: () => ({
+      revision: state.selectionRevision,
+      currentSessionId: state.currentSessionId,
+    }),
+    claimSession: (expectedRevision, sessionId) => {
+      calls.push(["claim", expectedRevision, sessionId]);
+      if (
+        state.selectionRevision !== expectedRevision ||
+        state.currentSessionId !== null
+      ) {
+        return false;
+      }
+      state.currentSessionId = sessionId;
+      state.selectionRevision += 1;
+      return true;
+    },
+    sendMessage: async (prompt, sessionId) => {
+      calls.push(["send", sessionId, prompt]);
+      state.staging = { ownerToken: null, skillIds: [], toolContext: null };
+      return { ok: true };
+    },
+    touchSession: async (sessionId) => calls.push(["touch", sessionId]),
+    renameSession: async (sessionId, prompt) => calls.push(["rename", sessionId, prompt]),
+  };
+  return { calls, state, dependencies };
 }
 
 test("missing configuration waits without consuming the request", () => {
@@ -36,7 +99,7 @@ test("missing configuration waits without consuming the request", () => {
 });
 
 test("a non-auto legacy request keeps its composer seed and ordered staging", () => {
-  const calls: unknown[] = [];
+  const calls = [];
   const request = {
     prompt: "复盘 AAPL",
     activeSkill: "stock-review",
@@ -64,20 +127,11 @@ test("a non-auto legacy request keeps its composer seed and ordered staging", ()
   ]);
 });
 
-test("sending rerenders do not start a duplicate auto-send", () => {
-  assert.equal(shouldAutoSendPrefill({
-    request: validRebalanceRequest(),
-    consumed: false,
-    configured: true,
-    sending: true,
-  }), false);
-});
-
-test("a consumed request never resends after sending finishes or the session id changes", () => {
+test("sending and consumed rerenders never start a duplicate auto-send", () => {
   const request = validRebalanceRequest();
   assert.equal(shouldAutoSendPrefill({
     request,
-    consumed: true,
+    consumed: false,
     configured: true,
     sending: true,
   }), false);
@@ -89,98 +143,185 @@ test("a consumed request never resends after sending finishes or the session id 
   }), false);
 });
 
-test("the expected null-to-new session transition keeps the in-flight auto-send", () => {
-  const first = decideAiSessionTransition({
-    nextSessionId: "session-new",
-    loadedSessionId: null,
-    expectingSessionCreation: true,
-  });
-  assert.equal(first, "KEEP_IN_FLIGHT");
+test("deferred creation treats a manual session selection as cancel-and-load", async () => {
+  const creation = deferred();
+  const harness = lifecycleHarness(creation.promise);
+  const operation = createAiPrefillAutoSendOperation(7);
+  const running = runAiPrefillAutoSend(
+    validRebalanceRequest(),
+    operation,
+    harness.dependencies,
+  );
+  assert.equal(operation.phase, "CREATING");
 
-  const rerender = decideAiSessionTransition({
-    nextSessionId: "session-new",
-    loadedSessionId: "session-new",
-    expectingSessionCreation: false,
+  harness.state.currentSessionId = "session-manual";
+  harness.state.selectionRevision = 8;
+  const transition = decideAiSessionTransition({
+    nextSessionId: "session-manual",
+    loadedSessionId: null,
+    expectedCreatedSessionId: null,
+    autoSendOperation: operation,
   });
-  assert.equal(rerender, "UNCHANGED");
+  assert.equal(transition, "CANCEL_AUTO_AND_LOAD");
+  cancelAiPrefillAutoSendOperation(operation, harness.dependencies);
+  creation.resolve("session-late");
+
+  assert.deepEqual(await running, { status: "cancelled" });
+  assert.equal(harness.state.currentSessionId, "session-manual");
+  assert.equal(harness.calls.some((call) => call[0] === "claim"), false);
+  assert.equal(harness.calls.some((call) => call[0] === "send"), false);
 });
 
-test("ordinary session transitions retain clear and history-load behavior", () => {
+test("an arbitrary non-null session is never mistaken for the owned created session", () => {
+  const operation = createAiPrefillAutoSendOperation(3);
+  operation.phase = "CLAIMING";
+  operation.expectedSessionId = "session-created";
+
   assert.equal(decideAiSessionTransition({
-    nextSessionId: null,
-    loadedSessionId: "session-old",
-    expectingSessionCreation: false,
-  }), "CLEAR");
+    nextSessionId: "session-manual",
+    loadedSessionId: null,
+    expectedCreatedSessionId: null,
+    autoSendOperation: operation,
+  }), "CANCEL_AUTO_AND_LOAD");
   assert.equal(decideAiSessionTransition({
-    nextSessionId: "session-history",
-    loadedSessionId: "session-old",
-    expectingSessionCreation: false,
+    nextSessionId: "session-created",
+    loadedSessionId: null,
+    expectedCreatedSessionId: null,
+    autoSendOperation: operation,
+  }), "KEEP_IN_FLIGHT");
+});
+
+test("after cancellation a manually selected session loads normally", () => {
+  const operation = createAiPrefillAutoSendOperation(3);
+  cancelAiPrefillAutoSendOperation(operation, { clearOwnedContext: () => {} });
+
+  assert.equal(decideAiSessionTransition({
+    nextSessionId: "session-manual",
+    loadedSessionId: null,
+    expectedCreatedSessionId: null,
+    autoSendOperation: operation,
   }), "LOAD");
 });
 
-test("auto-send stages trusted context before creating exactly one new session", async () => {
-  const calls: unknown[] = [];
-  const request = validRebalanceRequest("config-us");
+test("changing staged skill or tool during creation aborts without erasing user values", async () => {
+  const creation = deferred();
+  const harness = lifecycleHarness(creation.promise);
+  const operation = createAiPrefillAutoSendOperation(7);
+  const running = runAiPrefillAutoSend(
+    validRebalanceRequest(),
+    operation,
+    harness.dependencies,
+  );
 
-  const sessionId = await runAiPrefillAutoSend(request, {
-    stageSkill: (skill) => calls.push(["skill", skill]),
-    stageTool: (tool) => calls.push(["tool", tool]),
-    createSession: async () => {
-      calls.push(["create"]);
-      return "session-new";
+  harness.state.staging = {
+    ownerToken: null,
+    skillIds: ["stock-review"],
+    toolContext: {
+      name: "get_stock_review",
+      arguments: {
+        start_date: "2026-01-01",
+        end_date: "2026-09-06",
+        base_currency: "USD",
+      },
     },
-    sendMessage: async (prompt, sid) => calls.push(["send", sid, prompt]),
-    touchSession: async (sid) => calls.push(["touch", sid]),
-    renameSession: async (sid, prompt) => calls.push(["rename", sid, prompt]),
-  });
+  };
+  creation.resolve("session-created");
 
-  assert.equal(sessionId, "session-new");
-  assert.deepEqual(calls, [
-    ["skill", "portfolio-rebalance"],
-    ["tool", { name: "get_rebalance_context", arguments: { config_id: "config-us" } }],
-    ["create"],
-    ["send", "session-new", "请根据当前违规生成再平衡建议。"],
-    ["touch", "session-new"],
-    ["rename", "session-new", "请根据当前违规生成再平衡建议。"],
-  ]);
-  assert.equal(calls.some((call) => JSON.stringify(call).includes("session-old")), false);
-  assert.equal(calls.filter((call) => call[0] === "create").length, 1);
-  assert.equal(calls.filter((call) => call[0] === "send").length, 1);
+  assert.deepEqual(await running, { status: "cancelled" });
+  assert.deepEqual(harness.state.staging, {
+    ownerToken: null,
+    skillIds: ["stock-review"],
+    toolContext: {
+      name: "get_stock_review",
+      arguments: {
+        start_date: "2026-01-01",
+        end_date: "2026-09-06",
+        base_currency: "USD",
+      },
+    },
+  });
+  assert.equal(harness.calls.some((call) => call[0] === "send"), false);
 });
 
-test("send failure propagates and a consumed request is not retried automatically", async () => {
-  const calls: string[] = [];
-  const failure = new Error("stream failed");
-  const request = validRebalanceRequest();
-  let consumed = false;
-  const dependencies = {
-    stageSkill: () => calls.push("skill"),
-    stageTool: () => calls.push("tool"),
-    createSession: async () => {
-      calls.push("create:session-new");
-      return "session-new";
+test("unchanged ownership claims the exact created ID and sends once", async () => {
+  const harness = lifecycleHarness(Promise.resolve("session-created"));
+  const operation = createAiPrefillAutoSendOperation(7);
+
+  const result = await runAiPrefillAutoSend(
+    validRebalanceRequest(),
+    operation,
+    harness.dependencies,
+  );
+
+  assert.deepEqual(result, { status: "sent", sessionId: "session-created" });
+  assert.equal(operation.phase, "SUCCEEDED");
+  assert.equal(harness.state.currentSessionId, "session-created");
+  assert.deepEqual(harness.calls.map((call) => call[0]), [
+    "stage",
+    "create",
+    "claim",
+    "send",
+    "touch",
+    "rename",
+  ]);
+  assert.deepEqual(harness.calls[0].slice(2), [
+    "portfolio-rebalance",
+    {
+      name: "get_rebalance_context",
+      arguments: { config_id: "config-us" },
     },
-    sendMessage: async (_prompt, sessionId) => {
-      calls.push(`send:${sessionId}`);
-      throw failure;
-    },
-    touchSession: async (sessionId) => calls.push(`touch:${sessionId}`),
-    renameSession: async (sessionId) => calls.push(`rename:${sessionId}`),
+  ]);
+  assert.deepEqual(harness.calls.filter((call) => call[0] === "claim"), [
+    ["claim", 7, "session-created"],
+  ]);
+  assert.deepEqual(harness.calls.filter((call) => call[0] === "send"), [
+    ["send", "session-created", "请根据当前违规生成再平衡建议。"],
+  ]);
+});
+
+test("blank created session ID fails before claim, send, touch, or rename", async () => {
+  const harness = lifecycleHarness(Promise.resolve("   "));
+  const operation = createAiPrefillAutoSendOperation(7);
+
+  await assert.rejects(
+    runAiPrefillAutoSend(validRebalanceRequest(), operation, harness.dependencies),
+    /会话 ID/,
+  );
+
+  assert.equal(operation.phase, "FAILED");
+  for (const forbidden of ["claim", "send", "touch", "rename"]) {
+    assert.equal(harness.calls.some((call) => call[0] === forbidden), false);
+  }
+  assert.deepEqual(harness.state.staging, {
+    ownerToken: null,
+    skillIds: [],
+    toolContext: null,
+  });
+});
+
+test("a real failed send outcome propagates without touch, rename, or retry", async () => {
+  const harness = lifecycleHarness(Promise.resolve("session-created"));
+  harness.dependencies.sendMessage = async (_prompt, sessionId) => {
+    harness.calls.push(["send-failed", sessionId]);
+    harness.state.staging = { ownerToken: null, skillIds: [], toolContext: null };
+    return { ok: false, error: "backend failed" };
   };
+  const operation = createAiPrefillAutoSendOperation(7);
+  let consumed = false;
+  const request = validRebalanceRequest();
 
   if (shouldAutoSendPrefill({ request, consumed, configured: true, sending: false })) {
     consumed = true;
-    await assert.rejects(runAiPrefillAutoSend(request, dependencies), failure);
-  }
-  if (shouldAutoSendPrefill({ request, consumed, configured: true, sending: false })) {
-    await runAiPrefillAutoSend(request, dependencies);
+    await assert.rejects(
+      runAiPrefillAutoSend(request, operation, harness.dependencies),
+      /backend failed/,
+    );
   }
 
   assert.equal(consumed, true);
-  assert.deepEqual(calls, [
-    "skill",
-    "tool",
-    "create:session-new",
-    "send:session-new",
-  ]);
+  assert.equal(operation.phase, "FAILED");
+  assert.equal(harness.calls.filter((call) => call[0] === "send-failed").length, 1);
+  assert.equal(harness.calls.some((call) => call[0] === "touch"), false);
+  assert.equal(harness.calls.some((call) => call[0] === "rename"), false);
+  assert.equal(shouldAutoSendPrefill({ request, consumed, configured: true, sending: false }), false);
 });

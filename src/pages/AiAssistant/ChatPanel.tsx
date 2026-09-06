@@ -28,11 +28,14 @@ import { Composer } from "./Composer";
 import { MessageRow } from "./MessageRow";
 import type { AiPrefillRequest } from "./prefill";
 import {
+  cancelAiPrefillAutoSendOperation,
+  createAiPrefillAutoSendOperation,
   decideAiSessionTransition,
   runAiPrefillAutoSend,
   shouldAutoSendPrefill,
   stageNonAutoAiPrefill,
 } from "./aiPrefillAutoSend";
+import type { AiPrefillAutoSendOperation } from "./aiPrefillAutoSend";
 
 const { Title, Text } = Typography;
 
@@ -132,6 +135,9 @@ export function ChatPanel({
     resetForSessionSwitch,
     setActiveSkillsForNextTurn,
     setToolContextForNextTurn,
+    stageAiPrefillForNextTurn,
+    ownsAiPrefillStaging,
+    clearAiPrefillStaging,
   } = useChatStore();
   // Read the staged explicit selection so the Composer can render "待激活"
   // chips. Subscribing via the store keeps the chips reactive as the user
@@ -151,12 +157,18 @@ export function ChatPanel({
   }, [pendingActiveSkillIds, skills]);
   const touchSession = useChatSessionStore((s) => s.touchSession);
   const autoRenameIfDefault = useChatSessionStore((s) => s.autoRenameIfDefault);
-  const createSession = useChatSessionStore((s) => s.createSession);
+  const createDetachedSession = useChatSessionStore(
+    (s) => s.createDetachedSession,
+  );
+  const selectSessionIfRevision = useChatSessionStore(
+    (s) => s.selectSessionIfRevision,
+  );
   // Used by the "background stream" banner's "回到该会话" button to jump
   // directly to the session that's currently generating in the background.
   const setCurrentSession = useChatSessionStore((s) => s.setCurrentSession);
 
   const [input, setInput] = useState("");
+  const [autoSendPending, setAutoSendPending] = useState(false);
   const initialPrefillConsumedRef = useRef(false);
   // Seed for the random suggestion picker. Bumping it reshuffles which 6 of
   // SUGGESTION_POOL are shown in the empty state ("换一批" button).
@@ -174,22 +186,11 @@ export function ChatPanel({
   );
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const loadedSessionRef = useRef<string | null>(null);
-  // Set BEFORE calling ensureSession() when sending from the welcome screen.
-  // It tells the session-change effect that the *next* sessionId change
-  // (null → newly created id) is the send-from-welcome flow and must NOT
-  // reload — the in-memory user + assistant placeholder is about to be
-  // pushed and a reload (DB still empty) would wipe it, bouncing the UI
-  // back to the welcome screen.
-  //
-  // This flag must be set *before* the await on ensureSession, not after.
-  // createSession() synchronously commits currentSessionId to the store,
-  // which schedules a React re-render; that re-render (and this effect) can
-  // run during the await, before any code after ensureSession gets a chance
-  // to run. Setting the flag post-await loses the race.
-  //
-  // One-shot: consumed and cleared by the effect on the first sessionId
-  // change after being set, so it can't suppress a later genuine switch.
-  const expectingSessionCreation = useRef(false);
+  // Exact IDs replace the old broad "expecting some session" flag. A manual
+  // selection can therefore never be mistaken for a session created by this
+  // panel, even while backend creation is deferred.
+  const expectedCreatedSessionIdRef = useRef<string | null>(null);
+  const autoSendOperationRef = useRef<AiPrefillAutoSendOperation | null>(null);
 
   useEffect(() => {
     if (
@@ -230,23 +231,38 @@ export function ChatPanel({
     const transition = decideAiSessionTransition({
       nextSessionId: sessionId,
       loadedSessionId: loadedSessionRef.current,
-      expectingSessionCreation: expectingSessionCreation.current,
+      expectedCreatedSessionId: expectedCreatedSessionIdRef.current,
+      autoSendOperation: autoSendOperationRef.current,
     });
     if (transition === "CLEAR") {
       // Switching to "new chat" welcome screen: clear the loaded session
       // marker and wipe the in-memory messages so the welcome hero shows
       // instead of the previous conversation. Abort any in-flight stream.
       loadedSessionRef.current = null;
-      expectingSessionCreation.current = false;
+      expectedCreatedSessionIdRef.current = null;
       void resetForSessionSwitch();
       return;
     }
     if (transition === "UNCHANGED") return;
     if (!sessionId) return;
+    if (transition === "CANCEL_AUTO_AND_LOAD") {
+      const operation = autoSendOperationRef.current;
+      if (operation) {
+        cancelAiPrefillAutoSendOperation(operation, {
+          clearOwnedContext: clearAiPrefillStaging,
+        });
+        if (autoSendOperationRef.current === operation) {
+          autoSendOperationRef.current = null;
+          setAutoSendPending(false);
+        }
+      }
+    }
     loadedSessionRef.current = sessionId;
     // Sending from welcome screen: skip reload, keep in-flight messages.
     if (transition === "KEEP_IN_FLIGHT") {
-      expectingSessionCreation.current = false;
+      if (expectedCreatedSessionIdRef.current === sessionId) {
+        expectedCreatedSessionIdRef.current = null;
+      }
       return;
     }
     (async () => {
@@ -255,7 +271,12 @@ export function ChatPanel({
     })();
     // Intentionally exclude messages.length — see comment above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, resetForSessionSwitch, loadSessionMessages]);
+  }, [
+    clearAiPrefillStaging,
+    sessionId,
+    resetForSessionSwitch,
+    loadSessionMessages,
+  ]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -285,46 +306,112 @@ export function ChatPanel({
     }
 
     initialPrefillConsumedRef.current = true;
-    expectingSessionCreation.current = true;
-    void runAiPrefillAutoSend(initialRequest!, {
-      stageSkill: (skill) => setActiveSkillsForNextTurn([skill]),
-      stageTool: setToolContextForNextTurn,
-      createSession: async () => (await createSession()).id,
+    const operation = createAiPrefillAutoSendOperation(
+      useChatSessionStore.getState().selectionRevision,
+    );
+    autoSendOperationRef.current = operation;
+    setAutoSendPending(true);
+    void runAiPrefillAutoSend(initialRequest!, operation, {
+      stageOwnedContext: stageAiPrefillForNextTurn,
+      ownsStagedContext: ownsAiPrefillStaging,
+      clearOwnedContext: clearAiPrefillStaging,
+      createSession: async () => (await createDetachedSession()).id,
+      getSelectionState: () => {
+        const state = useChatSessionStore.getState();
+        return {
+          revision: state.selectionRevision,
+          currentSessionId: state.currentSessionId,
+        };
+      },
+      claimSession: (expectedRevision, createdSessionId) => {
+        expectedCreatedSessionIdRef.current = createdSessionId;
+        const claimed = selectSessionIfRevision(
+          expectedRevision,
+          createdSessionId,
+        );
+        if (!claimed) expectedCreatedSessionIdRef.current = null;
+        return claimed;
+      },
       sendMessage,
       touchSession,
       renameSession: autoRenameIfDefault,
+    }).then(() => {
+      if (autoSendOperationRef.current === operation) {
+        autoSendOperationRef.current = null;
+        setAutoSendPending(false);
+      }
     }).catch((error) => {
-      expectingSessionCreation.current = false;
-      message.error("自动发送再平衡请求失败：" + String(error));
+      if (autoSendOperationRef.current === operation) {
+        autoSendOperationRef.current = null;
+        setAutoSendPending(false);
+        message.error("自动发送再平衡请求失败：" + String(error));
+      }
     });
   }, [
     autoRenameIfDefault,
+    clearAiPrefillStaging,
     configuredForAutoSend,
-    createSession,
+    createDetachedSession,
     initialRequest,
+    ownsAiPrefillStaging,
+    selectSessionIfRevision,
     sendMessage,
     sending,
-    setActiveSkillsForNextTurn,
-    setToolContextForNextTurn,
+    stageAiPrefillForNextTurn,
     touchSession,
   ]);
+
+  // React StrictMode performs a synthetic cleanup/remount. Deferring cleanup
+  // by one microtask lets that remount retain the same owned operation, while
+  // a real unmount invalidates it before a late create result can dispatch.
+  const mountGenerationRef = useRef(0);
+  useEffect(() => {
+    const generation = ++mountGenerationRef.current;
+    return () => {
+      queueMicrotask(() => {
+        if (mountGenerationRef.current !== generation) return;
+        const operation = autoSendOperationRef.current;
+        if (operation) {
+          cancelAiPrefillAutoSendOperation(operation, {
+            clearOwnedContext: clearAiPrefillStaging,
+          });
+          autoSendOperationRef.current = null;
+        }
+      });
+    };
+  }, [clearAiPrefillStaging]);
 
   // Resolve the effective session id, creating one on the fly if the user is
   // composing in the no-session welcome state. Returns null if creation
   // failed (so the caller can bail out).
   const ensureSession = async (): Promise<string | null> => {
     if (sessionId) return sessionId;
+    const expectedRevision = useChatSessionStore.getState().selectionRevision;
     try {
-      const s = await createSession();
+      const s = await createDetachedSession();
+      if (!s.id.trim()) throw new Error("创建会话返回了无效的会话 ID");
+      expectedCreatedSessionIdRef.current = s.id;
+      if (!selectSessionIfRevision(expectedRevision, s.id)) {
+        expectedCreatedSessionIdRef.current = null;
+        return null;
+      }
       return s.id;
     } catch (err) {
+      expectedCreatedSessionIdRef.current = null;
       message.error("创建会话失败：" + String(err));
       return null;
     }
   };
 
+  const blockWhileAutoSendPending = (): boolean => {
+    if (!autoSendPending) return false;
+    message.warning("正在创建再平衡建议会话，请稍候或先切换会话取消");
+    return true;
+  };
+
   const handleSend = async () => {
     if (!input.trim()) return;
+    if (blockWhileAutoSendPending()) return;
     if (notConfigured) {
       message.warning("请先在「设置 → AI 配置」中完成配置");
       return;
@@ -343,19 +430,10 @@ export function ChatPanel({
     const text = input;
     const wasEmpty = messages.length === 0;
     setInput("");
-    // Sending from the welcome screen: ensureSession will create a session
-    // and currentSessionId flips null → newId. Set the expectation flag
-    // BEFORE the await so the session-change effect (which can run during
-    // the await) skips its reload — otherwise resetForSessionSwitch wipes
-    // the in-memory placeholder and the UI bounces back to the welcome hero.
-    const wasNewChat = !sessionId;
-    if (wasNewChat) expectingSessionCreation.current = true;
     const sid = await ensureSession();
-    if (!sid) {
-      expectingSessionCreation.current = false;
-      return;
-    }
-    await sendMessage(text, sid);
+    if (!sid) return;
+    const result = await sendMessage(text, sid);
+    if (!result.ok) return;
     await touchSession(sid);
     if (wasEmpty) {
       void autoRenameIfDefault(sid, text);
@@ -364,6 +442,7 @@ export function ChatPanel({
 
   const handleSuggestion = async (s: string) => {
     if (notConfigured) return;
+    if (blockWhileAutoSendPending()) return;
     if (sending) {
       message.warning(
         streamingInBackground
@@ -373,14 +452,10 @@ export function ChatPanel({
       return;
     }
     const wasEmpty = messages.length === 0;
-    const wasNewChat = !sessionId;
-    if (wasNewChat) expectingSessionCreation.current = true;
     const sid = await ensureSession();
-    if (!sid) {
-      expectingSessionCreation.current = false;
-      return;
-    }
-    await sendMessage(s, sid);
+    if (!sid) return;
+    const result = await sendMessage(s, sid);
+    if (!result.ok) return;
     await touchSession(sid);
     if (wasEmpty) {
       void autoRenameIfDefault(sid, s);
@@ -399,6 +474,7 @@ export function ChatPanel({
   // repeated `/` picks; the staged chips above the composer let them review
   // and remove individual picks before sending.
   const handlePickSkill = (skill: Skill) => {
+    if (blockWhileAutoSendPending()) return;
     const current = pendingActiveSkillIds.filter((id) => id !== skill.id);
     setActiveSkillsForNextTurn([...current, skill.id]);
     message.success(`已激活技能：${skill.name}（发送时生效）`);
@@ -406,6 +482,7 @@ export function ChatPanel({
 
   // Remove a single staged skill via the × on its chip.
   const handleRemoveStagedSkill = (skillId: string) => {
+    if (blockWhileAutoSendPending()) return;
     setActiveSkillsForNextTurn(pendingActiveSkillIds.filter((id) => id !== skillId));
   };
 
@@ -417,6 +494,7 @@ export function ChatPanel({
       message.warning("请先在「设置 → AI 配置」中完成配置");
       return;
     }
+    if (blockWhileAutoSendPending()) return;
     if (sending) {
       message.warning("AI 正在回复中，请等待当前回复完成");
       return;
@@ -424,14 +502,10 @@ export function ChatPanel({
     setActiveSkillsForNextTurn([skill.id]);
     const prompt = `请使用「${skill.name}」技能帮我分析当前的投资组合。`;
     const wasEmpty = messages.length === 0;
-    const wasNewChat = !sessionId;
-    if (wasNewChat) expectingSessionCreation.current = true;
     const sid = await ensureSession();
-    if (!sid) {
-      expectingSessionCreation.current = false;
-      return;
-    }
-    await sendMessage(prompt, sid);
+    if (!sid) return;
+    const result = await sendMessage(prompt, sid);
+    if (!result.ok) return;
     await touchSession(sid);
     if (wasEmpty) {
       void autoRenameIfDefault(sid, prompt);
@@ -444,6 +518,7 @@ export function ChatPanel({
   };
 
   const hasMessages = messages.length > 0;
+  const interactionBlocked = sending || autoSendPending;
 
   return (
     <div className="flex flex-col h-full">
@@ -483,7 +558,7 @@ export function ChatPanel({
               <Button
                 size="small"
                 icon={<DeleteOutlined />}
-                disabled={sending || messages.length === 0}
+                disabled={interactionBlocked || messages.length === 0}
               >
                 清空对话
               </Button>
@@ -543,12 +618,12 @@ export function ChatPanel({
                   // disabled whenever ANY stream is in flight (foreground or
                   // backgrounded). Allowing edit-while-backgrounding would let
                   // the user submit, only for editAndResend to silently no-op.
-                  canEdit={!sending}
+                  canEdit={!interactionBlocked}
                   onEdit={(text) => {
                     if (sessionId) editAndResend(m.id, text, sessionId);
                   }}
                   onRetry={
-                    m.error && sessionId
+                    m.error && sessionId && !autoSendPending
                       ? () => void retryLastTurn(sessionId)
                       : undefined
                   }
@@ -557,7 +632,7 @@ export function ChatPanel({
                   // assistant answer that isn't the in-flight streaming row.
                   // Disabled entirely while a stream is running.
                   onRegenerate={
-                    sessionId && !m.error && !sending
+                    sessionId && !m.error && !interactionBlocked
                       ? () => void regenerateMessage(m.id, sessionId)
                       : undefined
                   }
@@ -574,6 +649,7 @@ export function ChatPanel({
               handleSend={handleSend}
               stopGeneration={stopGeneration}
               sending={sending}
+              pending={autoSendPending}
               notConfigured={!!notConfigured}
               skills={enabledSkills}
               onPickSkill={handlePickSkill}
@@ -630,6 +706,7 @@ export function ChatPanel({
                 handleSend={handleSend}
                 stopGeneration={stopGeneration}
                 sending={sending}
+                pending={autoSendPending}
                 notConfigured={!!notConfigured}
                 size="large"
                 skills={enabledSkills}
@@ -651,7 +728,11 @@ export function ChatPanel({
                   >
                     <Tag
                       color="purple"
-                      style={{ cursor: "pointer", marginInlineEnd: 0 }}
+                      style={{
+                        cursor: autoSendPending ? "not-allowed" : "pointer",
+                        marginInlineEnd: 0,
+                        opacity: autoSendPending ? 0.5 : 1,
+                      }}
                       onClick={() => handleQuickSkill(s)}
                     >
                       {s.name}
@@ -679,7 +760,7 @@ export function ChatPanel({
               {suggestions.map((s) => (
                 <Button
                   key={s}
-                  disabled={!!notConfigured}
+                  disabled={!!notConfigured || autoSendPending}
                   onClick={() => handleSuggestion(s)}
                   style={{ textAlign: "left", whiteSpace: "normal", height: "auto", padding: "10px 14px" }}
                 >

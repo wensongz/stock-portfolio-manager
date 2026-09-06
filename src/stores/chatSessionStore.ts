@@ -9,20 +9,37 @@ import type { ChatSession } from "../types";
 // reference to the wrong id, causing "session not found" later.
 let pendingCreate: Promise<ChatSession> | null = null;
 
+function requestSessionCreation(): Promise<ChatSession> {
+  if (pendingCreate) return pendingCreate;
+  const request = invoke<ChatSession>("create_chat_session", { name: null });
+  pendingCreate = request;
+  const release = () => {
+    if (pendingCreate === request) pendingCreate = null;
+  };
+  void request.then(release, release);
+  return request;
+}
+
 interface ChatSessionState {
   sessions: ChatSession[];
   /** The currently-active session id, or null before the initial load. */
   currentSessionId: string | null;
+  /** Monotonic counter for explicit/claimed session selections. */
+  selectionRevision: number;
   loading: boolean;
   error: string | null;
 
   fetchSessions: () => Promise<void>;
   createSession: () => Promise<ChatSession>;
+  /** Create and register a session without changing the user's selection. */
+  createDetachedSession: () => Promise<ChatSession>;
   renameSession: (id: string, name: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
   /** Mark a session as the active one (does NOT load messages — the chat
    * store is responsible for loading messages on switch). */
   setCurrentSession: (id: string | null) => void;
+  /** Select only if no selection action occurred since expectedRevision. */
+  selectSessionIfRevision: (expectedRevision: number, id: string) => boolean;
   /** Bump a session's updated_at on the backend and reorder the local list so
    * the most-recently-used session floats to the top. */
   touchSession: (id: string) => Promise<void>;
@@ -38,6 +55,7 @@ interface ChatSessionState {
 export const useChatSessionStore = create<ChatSessionState>((set, get) => ({
   sessions: [],
   currentSessionId: null,
+  selectionRevision: 0,
   loading: false,
   error: null,
 
@@ -52,22 +70,32 @@ export const useChatSessionStore = create<ChatSessionState>((set, get) => ({
   },
 
   createSession: async () => {
+    const expectedRevision = get().selectionRevision;
     // Reuse an in-flight creation so concurrent callers (double-click,
     // StrictMode re-render) get the same session instead of creating two.
-    if (pendingCreate) return pendingCreate;
-    pendingCreate = (async () => {
-      const session = await invoke<ChatSession>("create_chat_session", { name: null });
-      set((state) => ({
-        sessions: [session, ...state.sessions],
+    const session = await requestSessionCreation();
+    set((state) => {
+      const sessions = state.sessions.some((row) => row.id === session.id)
+        ? state.sessions
+        : [session, ...state.sessions];
+      if (state.selectionRevision !== expectedRevision) return { sessions };
+      return {
+        sessions,
         currentSessionId: session.id,
-      }));
-      return session;
-    })();
-    try {
-      return await pendingCreate;
-    } finally {
-      pendingCreate = null;
-    }
+        selectionRevision: state.selectionRevision + 1,
+      };
+    });
+    return session;
+  },
+
+  createDetachedSession: async () => {
+    const session = await requestSessionCreation();
+    set((state) => ({
+      sessions: state.sessions.some((row) => row.id === session.id)
+        ? state.sessions
+        : [session, ...state.sessions],
+    }));
+    return session;
   },
 
   renameSession: async (id, name) => {
@@ -92,11 +120,38 @@ export const useChatSessionStore = create<ChatSessionState>((set, get) => ({
             ? remaining[0].id
             : null
           : state.currentSessionId;
-      return { sessions: remaining, currentSessionId: nextCurrent };
+      return {
+        sessions: remaining,
+        currentSessionId: nextCurrent,
+        ...(nextCurrent !== state.currentSessionId
+          ? { selectionRevision: state.selectionRevision + 1 }
+          : {}),
+      };
     });
   },
 
-  setCurrentSession: (id) => set({ currentSessionId: id }),
+  setCurrentSession: (id) => set((state) => ({
+    currentSessionId: id,
+    selectionRevision: state.selectionRevision + 1,
+  })),
+
+  selectSessionIfRevision: (expectedRevision, id) => {
+    let claimed = false;
+    set((state) => {
+      if (
+        state.selectionRevision !== expectedRevision ||
+        !state.sessions.some((session) => session.id === id)
+      ) {
+        return state;
+      }
+      claimed = true;
+      return {
+        currentSessionId: id,
+        selectionRevision: state.selectionRevision + 1,
+      };
+    });
+    return claimed;
+  },
 
   touchSession: async (id) => {
     await invoke("touch_chat_session", { id }).catch((e) => {

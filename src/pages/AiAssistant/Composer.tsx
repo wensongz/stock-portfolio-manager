@@ -12,7 +12,7 @@ import type { AiModelInfo, Skill } from "../../types";
 const { Text } = Typography;
 const { TextArea } = Input;
 
-function ModelSwitcher() {
+function ModelSwitcher({ disabled = false }: { disabled?: boolean }) {
   const { config, fetchModels, updateConfig } = useAiStore();
   const [models, setModels] = useState<AiModelInfo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -72,6 +72,7 @@ function ModelSwitcher() {
       value={config?.model}
       options={options}
       loading={loading}
+      disabled={disabled}
       onChange={handleChange}
       notFoundContent={loading ? "加载中..." : "暂无模型列表"}
       placeholder="选择模型"
@@ -86,6 +87,7 @@ export function Composer({
   handleSend,
   stopGeneration,
   sending,
+  pending = false,
   notConfigured,
   size = "default",
   skills,
@@ -99,6 +101,8 @@ export function Composer({
   handleSend: () => void;
   stopGeneration: () => void;
   sending: boolean;
+  /** A trusted one-shot request owns the composer while its session is created. */
+  pending?: boolean;
   notConfigured: boolean;
   size?: "default" | "large";
   /** Skills available for `/` autocomplete. */
@@ -111,14 +115,14 @@ export function Composer({
   onRemoveStagedSkill: (skillId: string) => void;
 }) {
   const minRows = size === "large" ? 2 : 1;
-  const canSend = input.trim().length > 0 && !notConfigured;
+  const canSend = input.trim().length > 0 && !notConfigured && !pending;
 
   // `/` autocomplete: when the text ends with `/` (optionally followed by a
   // filter prefix with no intervening whitespace), show a filtered skill list.
   // Picking one stages the skill for explicit activation and removes the `/…`
   // token from the input.
   const slashMatch = input.match(/(^|\s)\/([^\s/]*)$/);
-  const slashOpen = !!slashMatch && skills.length > 0;
+  const slashOpen = !pending && !!slashMatch && skills.length > 0;
   const slashFilter = slashMatch ? slashMatch[2].toLowerCase() : "";
   const filteredSkills = useMemo(() => {
     if (!slashOpen) return [];
@@ -204,7 +208,7 @@ export function Composer({
               key={s.id}
               color="purple"
               icon={<ThunderboltOutlined />}
-              closable
+              closable={!pending}
               onClose={() => onRemoveStagedSkill(s.id)}
               style={{ marginInlineEnd: 0 }}
             >
@@ -286,7 +290,7 @@ export function Composer({
               : "输入问题，Ctrl/⌘+Enter 发送。输入 / 选择技能"
           }
           autoSize={{ minRows, maxRows: 8 }}
-          disabled={notConfigured}
+          disabled={notConfigured || pending}
           // Borderless: the outer wrapper provides the border so the bottom
           // toolbar (model switcher + send button) sits flush inside it.
           variant="borderless"
@@ -300,11 +304,11 @@ export function Composer({
       {/* Bottom toolbar inside the input box: model switcher on the left,
           send/stop button on the right — like the reference screenshot. */}
       <div className="flex items-center justify-between px-2 pb-2 pt-1">
-        <ModelSwitcher />
+        <ModelSwitcher disabled={pending} />
         <button
           type="button"
           onClick={sending ? stopGeneration : handleSend}
-          disabled={!sending && !canSend}
+          disabled={pending || (!sending && !canSend)}
           aria-label={sending ? "停止生成" : "发送"}
           className="flex items-center justify-center text-white transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
           style={{

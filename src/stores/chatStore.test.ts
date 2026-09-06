@@ -52,7 +52,71 @@ beforeEach(() => {
     viewSessionId: null,
     pendingActiveSkills: [],
     pendingToolContext: null,
+    pendingPrefillOwnerToken: null,
   });
+});
+
+test("owned prefill staging is not cleared after a user replaces it", () => {
+  const rebalanceContext = {
+    name: "get_rebalance_context",
+    arguments: { config_id: "config-us" },
+  };
+  useChatStore.getState().stageAiPrefillForNextTurn(
+    "operation-1",
+    "portfolio-rebalance",
+    rebalanceContext,
+  );
+  assert.equal(useChatStore.getState().ownsAiPrefillStaging(
+    "operation-1",
+    "portfolio-rebalance",
+    rebalanceContext,
+  ), true);
+
+  useChatStore.getState().setActiveSkillsForNextTurn(["stock-review"]);
+  useChatStore.getState().setToolContextForNextTurn(exactContext);
+  useChatStore.getState().clearAiPrefillStaging("operation-1");
+
+  assert.deepEqual(useChatStore.getState().pendingActiveSkills, ["stock-review"]);
+  assert.deepEqual(useChatStore.getState().pendingToolContext, exactContext);
+  assert.equal(useChatStore.getState().pendingPrefillOwnerToken, null);
+});
+
+test("sendMessage returns explicit success and caught-backend-failure outcomes", async () => {
+  const savedSnapshots = [];
+  invokeImpl = async (command, args) => {
+    if (command === "plugin:event|listen") {
+      eventHandlers.set(args.event, callbacks.get(args.handler));
+      return args.handler;
+    }
+    if (command === "save_chat_messages") {
+      savedSnapshots.push(args.messages);
+      return;
+    }
+    if (command === "touch_chat_session") return;
+    if (command === "chat_with_ai") return;
+    throw new Error(`unexpected command ${command}`);
+  };
+  useChatStore.getState().init();
+  await Promise.resolve();
+
+  const success = await useChatStore.getState().sendMessage("works", "session-success");
+  assert.deepEqual(success, { ok: true });
+  eventHandlers.get("ai-chat-done")({ payload: null });
+
+  invokeImpl = async (command, args) => {
+    if (command === "save_chat_messages") {
+      savedSnapshots.push(args.messages);
+      return;
+    }
+    if (command === "touch_chat_session") return;
+    if (command === "chat_with_ai") throw new Error("backend failed");
+    throw new Error(`unexpected command ${command}`);
+  };
+  const failure = await useChatStore.getState().sendMessage("fails", "session-failure");
+
+  assert.deepEqual(failure, { ok: false, error: "Error: backend failed" });
+  assert.equal(useChatStore.getState().sending, false);
+  assert.equal(useChatStore.getState().messages.at(-1).error, "Error: backend failed");
 });
 
 test("host provenance survives model-id collision, persistence, reload, regeneration, and a later live turn", async () => {

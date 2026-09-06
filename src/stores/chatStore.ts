@@ -25,6 +25,10 @@ import {
   updateMessageById,
 } from "./chat/streamReducer.ts";
 
+export type ChatSendResult =
+  | { ok: true }
+  | { ok: false; error: string };
+
 interface ChatState {
   messages: ChatMessageWithMeta[];
   sending: boolean;
@@ -62,7 +66,7 @@ interface ChatState {
    * for the lifetime of the app. Safe to call from every component mount.
    */
   init: () => void;
-  sendMessage: (content: string, sessionId: string) => Promise<void>;
+  sendMessage: (content: string, sessionId: string) => Promise<ChatSendResult>;
   editAndResend: (
     messageId: string,
     newContent: string,
@@ -105,6 +109,20 @@ interface ChatState {
   setActiveSkillsForNextTurn: (skillIds: string[]) => void;
   /** Stage an exact host-approved read-tool scope for the next outbound turn. */
   setToolContextForNextTurn: (context: AiToolContext | null) => void;
+  /** Atomically stage a trusted auto-prefill under an operation owner. */
+  stageAiPrefillForNextTurn: (
+    ownerToken: string,
+    skillId: string,
+    context: AiToolContext,
+  ) => void;
+  /** Check that neither the user nor another operation replaced the staging. */
+  ownsAiPrefillStaging: (
+    ownerToken: string,
+    skillId: string,
+    context: AiToolContext,
+  ) => boolean;
+  /** Clear only staging still owned by this operation. */
+  clearAiPrefillStaging: (ownerToken: string) => void;
   /**
    * Skill ids currently staged for the next send (set via `/` / `@` / quick
    * chip). Read by the Composer to render "待激活" chips with a remove (×)
@@ -112,6 +130,7 @@ interface ChatState {
    */
   pendingActiveSkills: string[];
   pendingToolContext: AiToolContext | null;
+  pendingPrefillOwnerToken: string | null;
 }
 
 // Module-scope guards so the streaming listeners are registered at most once.
@@ -151,6 +170,17 @@ interface BackgroundStream {
 }
 let backgroundStream: BackgroundStream | null = null;
 
+function sameToolContext(
+  left: AiToolContext | null,
+  right: AiToolContext,
+): boolean {
+  return Boolean(
+    left &&
+      left.name === right.name &&
+      JSON.stringify(left.arguments) === JSON.stringify(right.arguments),
+  );
+}
+
 // Explicitly activated skill ids for the *next* outbound turn. Kept in the
 // store as `pendingActiveSkills` so the UI can render "待激活" chips. Set by
 // `setActiveSkillsForNextTurn`; consumed and cleared by `sendMessage` /
@@ -177,7 +207,9 @@ function failStreamingMessage(
   // itself is scrolled out of view. Keep the message short — the full error
   // text lives on the message row.
   const short = errorMsg.length > 120 ? errorMsg.slice(0, 120) + "…" : errorMsg;
-  antdMessage.error("AI 回复失败：" + short);
+  if (typeof document !== "undefined") {
+    antdMessage.error("AI 回复失败：" + short);
+  }
 }
 
 /**
@@ -236,6 +268,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   viewSessionId: null,
   pendingActiveSkills: [],
   pendingToolContext: null,
+  pendingPrefillOwnerToken: null,
 
   init: () => {
     if (listenersBound) return;
@@ -541,7 +574,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   sendMessage: async (content, sessionId) => {
     const trimmed = content.trim();
-    if (!trimmed || get().sending) return;
+    if (!trimmed) return { ok: false, error: "消息内容不能为空" };
+    if (get().sending) return { ok: false, error: "AI 正在回复中" };
 
     const now = Date.now();
     const userMsg: ChatMessageWithMeta = {
@@ -556,7 +590,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const activeSkills = get().pendingActiveSkills;
     const consumedToolContext = consumeAiPrefillToolContext(get().pendingToolContext);
     const toolContext = consumedToolContext.current;
-    set({ pendingActiveSkills: [], pendingToolContext: consumedToolContext.next });
+    set({
+      pendingActiveSkills: [],
+      pendingToolContext: consumedToolContext.next,
+      pendingPrefillOwnerToken: null,
+    });
     const assistantMsg: ChatMessageWithMeta = {
       id: newId(),
       role: "assistant",
@@ -608,11 +646,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
           toolContext,
         },
       });
+      return { ok: true };
     } catch (err) {
       // invoke() rejects when the backend returns Err — mark the placeholder
       // as failed so the UI shows a retryable error card instead of an empty
       // bubble. (The streaming `ai-chat-error` path handles mid-stream errors.)
-      failStreamingMessage(set, String(err));
+      const error = String(err);
+      failStreamingMessage(set, error);
+      return { ok: false, error };
     }
   },
 
@@ -632,7 +673,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const activeSkills = get().pendingActiveSkills;
     const consumedToolContext = consumeAiPrefillToolContext(get().pendingToolContext);
     const toolContext = consumedToolContext.current;
-    set({ pendingActiveSkills: [], pendingToolContext: consumedToolContext.next });
+    set({
+      pendingActiveSkills: [],
+      pendingToolContext: consumedToolContext.next,
+      pendingPrefillOwnerToken: null,
+    });
     const assistantMsg: ChatMessageWithMeta = {
       id: newId(),
       role: "assistant",
@@ -889,7 +934,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setContextEnabled: (enabled) => set({ contextEnabled: enabled }),
 
   setActiveSkillsForNextTurn: (skillIds) => {
-    set({ pendingActiveSkills: skillIds.slice() });
+    set({ pendingActiveSkills: skillIds.slice(), pendingPrefillOwnerToken: null });
   },
 
   setToolContextForNextTurn: (context) => {
@@ -897,7 +942,41 @@ export const useChatStore = create<ChatState>((set, get) => ({
       pendingToolContext: context
         ? { name: context.name, arguments: { ...context.arguments } }
         : null,
+      pendingPrefillOwnerToken: null,
     });
+  },
+
+  stageAiPrefillForNextTurn: (ownerToken, skillId, context) => {
+    set({
+      pendingActiveSkills: [skillId],
+      pendingToolContext: {
+        name: context.name,
+        arguments: { ...context.arguments },
+      },
+      pendingPrefillOwnerToken: ownerToken,
+    });
+  },
+
+  ownsAiPrefillStaging: (ownerToken, skillId, context) => {
+    const state = get();
+    return (
+      state.pendingPrefillOwnerToken === ownerToken &&
+      state.pendingActiveSkills.length === 1 &&
+      state.pendingActiveSkills[0] === skillId &&
+      sameToolContext(state.pendingToolContext, context)
+    );
+  },
+
+  clearAiPrefillStaging: (ownerToken) => {
+    set((state) =>
+      state.pendingPrefillOwnerToken === ownerToken
+        ? {
+            pendingActiveSkills: [],
+            pendingToolContext: null,
+            pendingPrefillOwnerToken: null,
+          }
+        : state,
+    );
   },
 }));
 

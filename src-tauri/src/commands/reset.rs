@@ -33,6 +33,9 @@ pub(crate) fn reset_database_state(conn: &mut Connection, now: &str) -> Result<(
         "stock_splits",
         "transactions",
         "holdings",
+        "portfolio_alert_breaches",
+        "portfolio_alert_targets",
+        "portfolio_alert_configs",
         "accounts",
         "cached_quotes",
         "cached_exchange_rates",
@@ -166,6 +169,40 @@ mod tests {
     use super::reset_database_state;
     use crate::db::Database;
     use crate::models::ai_config::AiConfig;
+
+    fn row_count(conn: &rusqlite::Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn factory_reset_clears_all_portfolio_alert_rows() {
+        let db = Database::new(":memory:").unwrap();
+        let mut conn = db.conn.lock().unwrap();
+        conn.execute_batch(
+            "INSERT INTO categories (id, name, color, icon, created_at)
+               VALUES ('category-1', 'Growth', '#F97316', '🚀', '2026-09-06');
+             INSERT INTO portfolio_alert_configs
+               (id, scope_key, scope_kind, base_currency, deviation_threshold,
+                concentration_threshold, is_active, created_at, updated_at)
+               VALUES ('config-1', 'overall', 'OVERALL', 'USD', 20, 20, 1, '2026-09-06', '2026-09-06');
+             INSERT INTO portfolio_alert_targets (config_id, category_id, target_percent)
+               VALUES ('config-1', 'category-1', 100);
+             INSERT INTO portfolio_alert_breaches
+               (config_id, breach_key, breach_kind, direction, first_triggered_at, last_seen_at)
+               VALUES ('config-1', 'category:category-1', 'CATEGORY_DEVIATION', 'OVERWEIGHT',
+                       '2026-09-06', '2026-09-06');",
+        )
+        .unwrap();
+
+        reset_database_state(&mut conn, "2026-09-06T10:00:00Z").unwrap();
+
+        assert_eq!(row_count(&conn, "portfolio_alert_breaches"), 0);
+        assert_eq!(row_count(&conn, "portfolio_alert_targets"), 0);
+        assert_eq!(row_count(&conn, "portfolio_alert_configs"), 0);
+    }
 
     #[test]
     fn reset_restores_every_persisted_default_and_clears_user_data() {

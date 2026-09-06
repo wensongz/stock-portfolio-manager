@@ -294,6 +294,7 @@ pub(super) fn create_current_schema(conn: &Connection) -> Result<()> {
          );",
     )?;
 
+    create_portfolio_alert_schema(conn)?;
     create_portfolio_query_indexes(conn)?;
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -315,6 +316,52 @@ pub(super) fn create_current_schema(conn: &Connection) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+pub(super) fn create_portfolio_alert_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS portfolio_alert_configs (
+           id TEXT PRIMARY KEY,
+           scope_key TEXT NOT NULL UNIQUE,
+           scope_kind TEXT NOT NULL CHECK (scope_kind IN ('OVERALL', 'MARKET', 'ACCOUNT')),
+           market TEXT,
+           account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+           base_currency TEXT NOT NULL CHECK (base_currency IN ('USD', 'CNY', 'HKD')),
+           deviation_threshold REAL NOT NULL DEFAULT 20 CHECK (deviation_threshold >= 0 AND deviation_threshold <= 100),
+           concentration_threshold REAL NOT NULL DEFAULT 20 CHECK (concentration_threshold > 0 AND concentration_threshold <= 100),
+           is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+           last_snapshot_json TEXT,
+           last_evaluated_at TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           CHECK (
+               (scope_kind = 'OVERALL' AND market IS NULL AND account_id IS NULL) OR
+               (scope_kind = 'MARKET' AND market IN ('CN', 'US', 'HK') AND account_id IS NULL) OR
+               (scope_kind = 'ACCOUNT' AND market IS NULL AND account_id IS NOT NULL)
+           )
+         );
+         CREATE INDEX IF NOT EXISTS idx_portfolio_alert_configs_is_active
+           ON portfolio_alert_configs(is_active);
+
+         CREATE TABLE IF NOT EXISTS portfolio_alert_targets (
+           config_id TEXT NOT NULL REFERENCES portfolio_alert_configs(id) ON DELETE CASCADE,
+           category_id TEXT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+           target_percent REAL NOT NULL CHECK (target_percent >= 0 AND target_percent <= 100),
+           PRIMARY KEY (config_id, category_id)
+         );
+
+         CREATE TABLE IF NOT EXISTS portfolio_alert_breaches (
+           config_id TEXT NOT NULL REFERENCES portfolio_alert_configs(id) ON DELETE CASCADE,
+           breach_key TEXT NOT NULL,
+           breach_kind TEXT NOT NULL CHECK (breach_kind IN ('CATEGORY_DEVIATION', 'CONCENTRATION')),
+           direction TEXT NOT NULL CHECK (direction IN ('OVERWEIGHT', 'UNDERWEIGHT', 'ABOVE_LIMIT')),
+           first_triggered_at TEXT NOT NULL,
+           last_seen_at TEXT NOT NULL,
+           PRIMARY KEY (config_id, breach_key)
+         );
+         CREATE INDEX IF NOT EXISTS idx_portfolio_alert_breaches_config_id
+           ON portfolio_alert_breaches(config_id);",
+    )
 }
 
 pub(super) fn create_portfolio_query_indexes(conn: &Connection) -> Result<()> {

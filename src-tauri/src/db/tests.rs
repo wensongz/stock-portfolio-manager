@@ -11,6 +11,130 @@ mod tests {
         Database::new(":memory:").expect("failed to create in-memory database")
     }
 
+    fn schema_version(conn: &Connection) -> i64 {
+        conn.pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap()
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    fn price_alert_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM price_alerts", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn target_count(conn: &Connection, config_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM portfolio_alert_targets WHERE config_id = ?1",
+            [config_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn version_three_database_with_price_alert() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE price_alerts (
+               id TEXT PRIMARY KEY NOT NULL,
+               holding_id TEXT,
+               symbol TEXT NOT NULL,
+               name TEXT NOT NULL,
+               market TEXT NOT NULL,
+               alert_type TEXT NOT NULL,
+               threshold REAL NOT NULL,
+               is_active INTEGER NOT NULL,
+               is_triggered INTEGER NOT NULL,
+               triggered_at TEXT,
+               created_at TEXT NOT NULL
+             );
+             INSERT INTO price_alerts VALUES
+               ('price-alert-1', NULL, 'AAPL', 'Apple', 'US', 'PRICE_ABOVE', 200, 1, 0, NULL, 'old');
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn migrated_database() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_migrations(&mut conn).unwrap();
+        conn
+    }
+
+    fn seed_account_and_category(conn: &Connection, account_id: &str, category_id: &str) {
+        conn.execute(
+            "INSERT INTO accounts (id, name, market, created_at, updated_at)
+             VALUES (?1, 'Test account', 'US', '2026-09-06', '2026-09-06')",
+            [account_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO categories (id, name, color, icon, created_at)
+             VALUES (?1, 'Growth', '#F97316', '🚀', '2026-09-06')",
+            [category_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_market_config(conn: &Connection, id: &str, market: &str) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO portfolio_alert_configs
+               (id, scope_key, scope_kind, market, account_id, base_currency,
+                deviation_threshold, concentration_threshold, is_active, created_at, updated_at)
+             VALUES (?1, ?2, 'MARKET', ?3, NULL, 'USD', 20, 20, 1, '2026-09-06', '2026-09-06')",
+            rusqlite::params![id, format!("market:{market}"), market],
+        )
+    }
+
+    fn insert_target(conn: &Connection, config_id: &str, category_id: &str, target_percent: f64) {
+        conn.execute(
+            "INSERT INTO portfolio_alert_targets (config_id, category_id, target_percent)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![config_id, category_id, target_percent],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_v4_adds_portfolio_alert_tables_without_touching_price_alerts() {
+        let mut conn = version_three_database_with_price_alert();
+
+        run_migrations(&mut conn).unwrap();
+
+        assert_eq!(schema_version(&conn), 4);
+        for table in [
+            "portfolio_alert_configs",
+            "portfolio_alert_targets",
+            "portfolio_alert_breaches",
+        ] {
+            assert!(table_exists(&conn, table));
+        }
+        assert_eq!(price_alert_count(&conn), 1);
+    }
+
+    #[test]
+    fn portfolio_alert_scope_is_unique_and_deleted_category_targets_cascade() {
+        let conn = migrated_database();
+        seed_account_and_category(&conn, "acct-1", "cat-growth");
+        insert_market_config(&conn, "config-1", "US").unwrap();
+        insert_target(&conn, "config-1", "cat-growth", 60.0);
+
+        let duplicate = insert_market_config(&conn, "config-2", "US");
+        assert!(duplicate.is_err());
+
+        conn.execute("DELETE FROM categories WHERE id = 'cat-growth'", [])
+            .unwrap();
+        assert_eq!(target_count(&conn, "config-1"), 0);
+    }
+
     #[test]
     fn test_database_creation() {
         let db = create_test_db();
@@ -1440,7 +1564,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(reopened_definitions, definitions);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 3);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 4);
     }
 
     #[test]

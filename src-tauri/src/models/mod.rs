@@ -10,6 +10,8 @@ pub mod option;
 pub mod option_review;
 pub mod option_share_lot;
 pub mod performance;
+#[allow(dead_code)]
+pub mod portfolio_alert;
 pub mod quarterly;
 pub mod quote;
 pub mod quote_provider;

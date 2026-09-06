@@ -664,7 +664,7 @@ async fn tool_stock_quote(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         } else {
             "US"
         };
-        if let Some(cached) = ctx.quote_cache.get(&symbol) {
+        if let Some(cached) = ctx.quote_cache.get(market, &symbol) {
             return ToolResult::ok_json(json!(cached));
         }
         return match quote_service::fetch_index_quote_eastmoney(secid, &symbol, market).await {
@@ -684,7 +684,7 @@ async fn tool_stock_quote(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 
     // Serve from cache first (fast, offline-friendly); only hit the network on
     // a miss, exactly like the holding-quote command does.
-    if let Some(cached) = ctx.quote_cache.get(&symbol) {
+    if let Some(cached) = ctx.quote_cache.get(&market, &symbol) {
         return ToolResult::ok_json(json!(cached));
     }
     let config = match quote_provider_service::get_quote_provider_config(ctx.db) {
@@ -1329,19 +1329,24 @@ async fn tool_dividend_income(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 async fn tool_check_alerts(ctx: &ToolCtx<'_>) -> ToolResult {
     // First list the user's configured alerts; then, if we have cached quotes,
     // check which have triggered. check_alerts needs a quote map keyed by
-    // symbol → (price, change_pct, pnl_pct); we build it from the cache.
+    // normalized (market, symbol) → (price, change_pct, pnl_pct); we build it
+    // from the cache.
     let alerts = match alert_service::get_alerts(ctx.db) {
         Ok(a) => a,
         Err(e) => return ToolResult::err_json(format!("读取价格提醒失败：{e}")),
     };
-    let mut quote_map: std::collections::HashMap<String, (f64, f64, f64)> =
+    let mut quote_map: std::collections::HashMap<(String, String), (f64, f64, f64)> =
         std::collections::HashMap::new();
     for a in &alerts {
-        if quote_map.contains_key(&a.symbol) {
+        let key = (
+            a.market.trim().to_ascii_uppercase(),
+            a.symbol.trim().to_ascii_uppercase(),
+        );
+        if quote_map.contains_key(&key) {
             continue;
         }
-        if let Some(q) = ctx.quote_cache.get(&a.symbol) {
-            quote_map.insert(a.symbol.clone(), (q.current_price, q.change_percent, 0.0));
+        if let Some(q) = ctx.quote_cache.get(&a.market, &a.symbol) {
+            quote_map.insert(key, (q.current_price, q.change_percent, 0.0));
         }
     }
     let triggered = match alert_service::check_alerts(ctx.db, &quote_map) {
@@ -1644,6 +1649,7 @@ mod tests {
         let quote_cache = QuoteCache::new();
         quote_cache.set(crate::models::StockQuote {
             symbol: "AAPL".to_string(),
+            market: "US".to_string(),
             current_price: 2.0,
             ..Default::default()
         });
@@ -1661,6 +1667,53 @@ mod tests {
 
         assert!(!result.ok, "{}", result.content);
         assert!(result.content.contains("forced alert tool failure"));
+    }
+
+    #[tokio::test]
+    async fn alert_check_keeps_identical_symbols_in_different_markets_separate() {
+        let db = Database::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO price_alerts
+                     (id, holding_id, symbol, name, market, alert_type, threshold,
+                      is_active, is_triggered, triggered_at, created_at)
+                 VALUES ('us-same', NULL, 'SAME', 'US Same', 'US', 'PRICE_ABOVE', 1,
+                         1, 0, NULL, '2026-09-03T02:00:00Z'),
+                        ('cn-same', NULL, 'SAME', 'CN Same', 'CN', 'PRICE_BELOW', 1,
+                         1, 0, NULL, '2026-09-03T01:00:00Z');",
+            )
+            .unwrap();
+        }
+        let cache = ExchangeRateCache::new();
+        let quote_cache = QuoteCache::new();
+        quote_cache.set(crate::models::StockQuote {
+            symbol: "SAME".to_string(),
+            market: "US".to_string(),
+            current_price: 2.0,
+            ..Default::default()
+        });
+        quote_cache.set(crate::models::StockQuote {
+            symbol: "SAME".to_string(),
+            market: "CN".to_string(),
+            current_price: 0.5,
+            ..Default::default()
+        });
+        let quote_state = QuoteServiceState::new();
+        let ctx = ToolCtx::for_untrusted_model_turn(
+            &db,
+            &cache,
+            &quote_cache,
+            &quote_state,
+            "untrusted",
+            None,
+        );
+
+        let result = execute_tool(&ctx, "check_price_alerts", "{}").await;
+        let payload: Value = serde_json::from_str(&result.content).unwrap();
+
+        assert!(result.ok, "{}", result.content);
+        assert_eq!(payload["triggered_count"], 2);
     }
 
     #[test]

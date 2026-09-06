@@ -224,7 +224,7 @@ pub async fn get_market_overview(
 /// A failure returns `None` rather than propagating, so one bad index can't
 /// blank the whole overview.
 async fn fetch_index_quote(quote_cache: &QuoteCache, spec: &IndexSpec) -> Option<StockQuote> {
-    if let Some(cached) = quote_cache.get(spec.symbol) {
+    if let Some(cached) = quote_cache.get(spec.market, spec.symbol) {
         return Some(cached);
     }
     match quote_service::fetch_index_quote_eastmoney(spec.eastmoney, spec.symbol, spec.market).await

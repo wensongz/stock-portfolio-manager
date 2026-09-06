@@ -9,9 +9,16 @@ struct CachedQuote {
     _cached_at: Instant,
 }
 
-/// In-memory cache for stock quotes, keyed by symbol.
+/// In-memory cache for stock quotes, keyed by normalized market and symbol.
 pub struct QuoteCache {
-    inner: Mutex<HashMap<String, CachedQuote>>,
+    inner: Mutex<HashMap<(String, String), CachedQuote>>,
+}
+
+fn quote_key(market: &str, symbol: &str) -> (String, String) {
+    (
+        market.trim().to_ascii_uppercase(),
+        symbol.trim().to_ascii_uppercase(),
+    )
 }
 
 impl QuoteCache {
@@ -23,22 +30,24 @@ impl QuoteCache {
 
     /// Returns a cached quote if it exists (no TTL – the cache is only
     /// refreshed when the caller explicitly requests it).
-    pub fn get(&self, symbol: &str) -> Option<StockQuote> {
+    pub fn get(&self, market: &str, symbol: &str) -> Option<StockQuote> {
         let lock = self.inner.lock().unwrap();
-        lock.get(symbol).map(|c| c.quote.clone())
+        lock.get(&quote_key(market, symbol))
+            .map(|c| c.quote.clone())
     }
 
     /// Returns a cached quote even if stale (for offline fallback).
-    pub fn get_stale(&self, symbol: &str) -> Option<StockQuote> {
+    pub fn get_stale(&self, market: &str, symbol: &str) -> Option<StockQuote> {
         let lock = self.inner.lock().unwrap();
-        lock.get(symbol).map(|c| c.quote.clone())
+        lock.get(&quote_key(market, symbol))
+            .map(|c| c.quote.clone())
     }
 
     /// Cache a single quote.
     pub fn set(&self, quote: StockQuote) {
         let mut lock = self.inner.lock().unwrap();
         lock.insert(
-            quote.symbol.clone(),
+            quote_key(&quote.market, &quote.symbol),
             CachedQuote {
                 quote,
                 _cached_at: Instant::now(),
@@ -52,7 +61,7 @@ impl QuoteCache {
         let now = Instant::now();
         for q in quotes {
             lock.insert(
-                q.symbol.clone(),
+                quote_key(&q.market, &q.symbol),
                 CachedQuote {
                     quote: q.clone(),
                     _cached_at: now,
@@ -68,7 +77,8 @@ impl QuoteCache {
         let mut lock = self.inner.lock().unwrap();
         let now = Instant::now();
         for quote in quotes {
-            if let Some(cached) = lock.get(&quote.symbol).map(|entry| &entry.quote) {
+            let key = quote_key(&quote.market, &quote.symbol);
+            if let Some(cached) = lock.get(&key).map(|entry| &entry.quote) {
                 if quote.name.trim().is_empty() || quote.name == quote.symbol {
                     quote.name = cached.name.clone();
                 }
@@ -81,7 +91,7 @@ impl QuoteCache {
                 quote.turnover_rate = quote.turnover_rate.or(cached.turnover_rate);
             }
             lock.insert(
-                quote.symbol.clone(),
+                key,
                 CachedQuote {
                     quote: quote.clone(),
                     _cached_at: now,
@@ -100,7 +110,7 @@ impl QuoteCache {
         let mut cached = Vec::new();
         let mut missing = Vec::new();
         for (symbol, market) in symbols {
-            if let Some(entry) = lock.get(symbol.as_str()) {
+            if let Some(entry) = lock.get(&quote_key(market, symbol)) {
                 cached.push(entry.quote.clone());
             } else {
                 missing.push((symbol.clone(), market.clone()));
@@ -119,13 +129,14 @@ impl QuoteCache {
 }
 
 /// Deduplicate a list of (symbol, market) pairs, keeping only the first
-/// occurrence of each symbol.  This avoids redundant API calls when the same
-/// stock is held in multiple accounts.
+/// occurrence of each normalized market/symbol pair. This avoids redundant
+/// API calls when the same stock is held in multiple accounts without merging
+/// identical symbol text from different markets.
 pub(super) fn deduplicate_symbols(symbols: Vec<(String, String)>) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
     symbols
         .into_iter()
-        .filter(|(symbol, _)| seen.insert(symbol.clone()))
+        .filter(|(symbol, market)| seen.insert(quote_key(market, symbol)))
         .collect()
 }
 
@@ -159,12 +170,15 @@ pub async fn fetch_quotes_batch_cached_with_providers(
         cache.merge_and_set_batch(&mut fresh.data);
 
         // Fall back to stale cache for any symbols that failed to fetch
-        let fetched_symbols: std::collections::HashSet<String> =
-            fresh.data.iter().map(|q| q.symbol.clone()).collect();
+        let fetched_symbols = fresh
+            .data
+            .iter()
+            .map(|quote| quote_key(&quote.market, &quote.symbol))
+            .collect::<std::collections::HashSet<_>>();
         let mut result = fresh.data;
-        for (symbol, _) in &unique_symbols {
-            if !fetched_symbols.contains(symbol) {
-                if let Some(stale) = cache.get_stale(symbol) {
+        for (symbol, market) in &unique_symbols {
+            if !fetched_symbols.contains(&quote_key(market, symbol)) {
+                if let Some(stale) = cache.get_stale(market, symbol) {
                     result.push(stale);
                 }
             }
@@ -199,11 +213,13 @@ pub async fn fetch_quotes_batch_cached_with_providers(
 
     // For any symbols that were missing from fresh results (fetch failed),
     // try to use stale cache as fallback
-    let fetched_symbols: std::collections::HashSet<String> =
-        result.iter().map(|q| q.symbol.clone()).collect();
-    for (symbol, _) in &missing {
-        if !fetched_symbols.contains(symbol) {
-            if let Some(stale) = cache.get_stale(symbol) {
+    let fetched_symbols = result
+        .iter()
+        .map(|quote| quote_key(&quote.market, &quote.symbol))
+        .collect::<std::collections::HashSet<_>>();
+    for (symbol, market) in &missing {
+        if !fetched_symbols.contains(&quote_key(market, symbol)) {
+            if let Some(stale) = cache.get_stale(market, symbol) {
                 result.push(stale);
             }
         }

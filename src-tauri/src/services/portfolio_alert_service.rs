@@ -19,12 +19,47 @@ use crate::{
         stock_operation_builder::normalize_stock_symbol,
     },
 };
-use chrono::Utc;
+use chrono::{SecondsFormat, TimeDelta, Utc};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
 const TOTAL_TOLERANCE: f64 = 0.01;
+
+fn next_mutation_timestamp(
+    connection: &Connection,
+    config_id: Option<&str>,
+) -> Result<String, String> {
+    let now = Utc::now();
+    let previous = config_id
+        .map(|id| {
+            connection
+                .query_row(
+                    "SELECT updated_at FROM portfolio_alert_configs WHERE id = ?1",
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())
+        })
+        .transpose()?
+        .flatten()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+        .map(|value| value.with_timezone(&Utc));
+    let timestamp = match previous {
+        Some(previous) if previous >= now => previous
+            .checked_add_signed(TimeDelta::nanoseconds(1))
+            .ok_or_else(|| "portfolio alert mutation timestamp overflow".to_string())?,
+        _ => now,
+    };
+    Ok(timestamp.to_rfc3339_opts(SecondsFormat::Nanos, true))
+}
+
+#[derive(Clone)]
+struct EvaluationGuard {
+    config: PortfolioAlertConfig,
+    revision: String,
+}
 
 pub fn scope_key(scope: &PortfolioAlertScope) -> Result<String, String> {
     match scope.kind {
@@ -110,6 +145,12 @@ pub fn save_portfolio_alert_config(
         (None, None) => Uuid::new_v4().to_string(),
     };
     let now = Utc::now().to_rfc3339();
+    let revision = next_mutation_timestamp(
+        &transaction,
+        existing
+            .as_ref()
+            .map(|(existing_id, _)| existing_id.as_str()),
+    )?;
     let (scope_kind, market, account_id) = scope_columns(&input.scope)?;
 
     if existing.is_some() {
@@ -124,7 +165,7 @@ pub fn save_portfolio_alert_config(
                     input.deviation_threshold,
                     input.concentration_threshold,
                     input.is_active as i32,
-                    now,
+                    revision,
                     id,
                 ],
             )
@@ -147,7 +188,7 @@ pub fn save_portfolio_alert_config(
                 "INSERT INTO portfolio_alert_configs
                  (id, scope_key, scope_kind, market, account_id, base_currency,
                   deviation_threshold, concentration_threshold, is_active, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     id,
                     key,
@@ -159,6 +200,7 @@ pub fn save_portfolio_alert_config(
                     input.concentration_threshold,
                     input.is_active as i32,
                     now,
+                    revision,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -190,7 +232,11 @@ pub fn set_portfolio_alert_active(
     let rows = transaction
         .execute(
             "UPDATE portfolio_alert_configs SET is_active = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![is_active as i32, Utc::now().to_rfc3339(), config_id],
+            rusqlite::params![
+                is_active as i32,
+                next_mutation_timestamp(&transaction, Some(config_id))?,
+                config_id
+            ],
         )
         .map_err(|error| error.to_string())?;
     if rows == 0 {
@@ -358,6 +404,42 @@ fn load_active_breaches(
     Ok(breaches)
 }
 
+fn load_evaluation_guard(
+    connection: &Connection,
+    config: &PortfolioAlertConfig,
+) -> Result<EvaluationGuard, String> {
+    let revision = connection
+        .query_row(
+            "SELECT updated_at FROM portfolio_alert_configs WHERE id = ?1",
+            [&config.id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(EvaluationGuard {
+        config: config.clone(),
+        revision,
+    })
+}
+
+fn verify_evaluation_guard(connection: &Connection, guard: &EvaluationGuard) -> Result<(), String> {
+    let current = load_config_by_column(connection, "id", &guard.config.id)?
+        .ok_or_else(|| "portfolio alert configuration changed during evaluation".to_string())?;
+    if !current.is_active {
+        return Err("portfolio alert configuration became inactive during evaluation".to_string());
+    }
+    let current_revision: String = connection
+        .query_row(
+            "SELECT updated_at FROM portfolio_alert_configs WHERE id = ?1",
+            [&guard.config.id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if current_revision != guard.revision || current != guard.config {
+        return Err("portfolio alert configuration changed during evaluation".to_string());
+    }
+    Ok(())
+}
+
 fn unchanged_evaluation(
     config: &PortfolioAlertConfig,
     status: PortfolioAlertDataStatus,
@@ -444,9 +526,11 @@ fn persist_ready_transition(
     snapshot: &PortfolioAlertSnapshot,
     proposed: &BTreeMap<String, PortfolioAlertBreach>,
     evaluated_at: &str,
+    guard: &EvaluationGuard,
 ) -> Result<(Vec<PortfolioAlertBreach>, Vec<PortfolioAlertBreach>), String> {
     let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
     let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    verify_evaluation_guard(&transaction, guard)?;
     let existing = load_active_breaches(&transaction, config_id)?
         .into_iter()
         .map(|breach| (breach.breach_key.clone(), breach))
@@ -520,9 +604,11 @@ fn persist_empty_transition(
     db: &Database,
     config_id: &str,
     evaluated_at: &str,
+    guard: &EvaluationGuard,
 ) -> Result<(), String> {
     let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
     let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    verify_evaluation_guard(&transaction, guard)?;
     transaction
         .execute(
             "DELETE FROM portfolio_alert_breaches WHERE config_id = ?1",
@@ -546,14 +632,40 @@ pub async fn evaluate_portfolio_alert(
     config_id: &str,
     evaluated_at: &str,
 ) -> Result<PortfolioAlertEvaluation, String> {
-    let (config, categories, base_currency, account_market) = {
+    evaluate_portfolio_alert_inner(
+        db,
+        quote_cache,
+        exchange_rates,
+        config_id,
+        evaluated_at,
+        || {},
+    )
+    .await
+}
+
+async fn evaluate_portfolio_alert_inner<F>(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    exchange_rates: Option<&ExchangeRates>,
+    config_id: &str,
+    evaluated_at: &str,
+    before_persist: F,
+) -> Result<PortfolioAlertEvaluation, String>
+where
+    F: Fn(),
+{
+    let (config, guard, categories, base_currency, account_market) = {
         let conn = db.conn.lock().map_err(|error| error.to_string())?;
         let config = load_config_by_column(&conn, "id", config_id)?
             .ok_or_else(|| format!("portfolio alert configuration {config_id} not found"))?;
+        if !config.is_active {
+            return Err("portfolio alert configuration is inactive".to_string());
+        }
+        let guard = load_evaluation_guard(&conn, &config)?;
         let categories = load_categories(&conn)?;
         let (base_currency, account_market) =
             evaluation_currency_and_account_market(&conn, &config)?;
-        (config, categories, base_currency, account_market)
+        (config, guard, categories, base_currency, account_market)
     };
     let read_model =
         PortfolioReadModel::load(db, quote_cache, None, QuoteReadMode::CacheOnly).await?;
@@ -564,7 +676,8 @@ pub async fn evaluate_portfolio_alert(
         .collect::<Vec<_>>();
 
     if scoped_holdings.is_empty() {
-        persist_empty_transition(db, config_id, evaluated_at)?;
+        before_persist();
+        persist_empty_transition(db, config_id, evaluated_at, &guard)?;
         return Ok(PortfolioAlertEvaluation {
             status: PortfolioAlertDataStatus::Empty,
             snapshot: None,
@@ -589,10 +702,7 @@ pub async fn evaluate_portfolio_alert(
             holding.market.trim().to_ascii_uppercase(),
             holding.symbol.trim().to_ascii_uppercase(),
         );
-        if read_model.missing_quote_keys().contains(&key)
-            || !holding.current_price.is_finite()
-            || holding.current_price < 0.0
-        {
+        if read_model.missing_quote_keys().contains(&key) || !holding.current_price.is_finite() {
             if reported_missing_quotes.insert(key.clone()) {
                 missing_data.push(MissingPortfolioAlertData {
                     market: Some(key.0),
@@ -681,6 +791,41 @@ pub async fn evaluate_portfolio_alert(
         })
         .collect::<Vec<_>>();
 
+    let total_market_value = positions
+        .iter()
+        .map(|position| position.market_value)
+        .sum::<f64>();
+    if total_market_value <= 0.0 {
+        before_persist();
+        persist_empty_transition(db, config_id, evaluated_at, &guard)?;
+        return Ok(PortfolioAlertEvaluation {
+            status: PortfolioAlertDataStatus::Empty,
+            snapshot: None,
+            stale: false,
+            missing_data: vec![],
+            active_breaches: vec![],
+            newly_triggered: vec![],
+        });
+    }
+    let negative_positions = positions
+        .iter()
+        .filter(|position| position.market_value < 0.0)
+        .map(|position| MissingPortfolioAlertData {
+            market: Some(position.market.clone()),
+            symbol: Some(position.symbol.clone()),
+            currency: None,
+            reason: "cached quote has a negative value".to_string(),
+        })
+        .collect::<Vec<_>>();
+    if !negative_positions.is_empty() {
+        return Ok(unchanged_evaluation(
+            &config,
+            PortfolioAlertDataStatus::Incomplete,
+            negative_positions,
+            existing_breaches,
+        ));
+    }
+
     match calculate_portfolio_alert_snapshot(
         &config,
         &categories,
@@ -689,7 +834,8 @@ pub async fn evaluate_portfolio_alert(
         evaluated_at,
     )? {
         PortfolioAlertCalculation::Empty => {
-            persist_empty_transition(db, config_id, evaluated_at)?;
+            before_persist();
+            persist_empty_transition(db, config_id, evaluated_at, &guard)?;
             Ok(PortfolioAlertEvaluation {
                 status: PortfolioAlertDataStatus::Empty,
                 snapshot: None,
@@ -701,8 +847,15 @@ pub async fn evaluate_portfolio_alert(
         }
         PortfolioAlertCalculation::Ready(snapshot) => {
             let proposed = proposed_breaches(config_id, &snapshot, evaluated_at);
-            let (active_breaches, newly_triggered) =
-                persist_ready_transition(db, config_id, &snapshot, &proposed, evaluated_at)?;
+            before_persist();
+            let (active_breaches, newly_triggered) = persist_ready_transition(
+                db,
+                config_id,
+                &snapshot,
+                &proposed,
+                evaluated_at,
+                &guard,
+            )?;
             Ok(PortfolioAlertEvaluation {
                 status: PortfolioAlertDataStatus::Ready,
                 snapshot: Some(snapshot),
@@ -713,6 +866,29 @@ pub async fn evaluate_portfolio_alert(
             })
         }
     }
+}
+
+#[cfg(test)]
+async fn evaluate_portfolio_alert_with_before_persist_hook<F>(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    exchange_rates: Option<&ExchangeRates>,
+    config_id: &str,
+    evaluated_at: &str,
+    before_persist: F,
+) -> Result<PortfolioAlertEvaluation, String>
+where
+    F: Fn(),
+{
+    evaluate_portfolio_alert_inner(
+        db,
+        quote_cache,
+        exchange_rates,
+        config_id,
+        evaluated_at,
+        before_persist,
+    )
+    .await
 }
 
 pub async fn save_and_evaluate_portfolio_alert_config(
@@ -2268,5 +2444,211 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert_eq!(last_seen, "old");
+    }
+
+    #[tokio::test]
+    async fn overall_evaluation_uses_same_symbol_quotes_from_two_markets() {
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        seed_account(&db, "acct-us", "US");
+        seed_account(&db, "acct-cn", "CN");
+        seed_holding(
+            &db,
+            "us",
+            "acct-us",
+            "SAME",
+            "US",
+            Some("growth"),
+            10.0,
+            "USD",
+        );
+        seed_holding(
+            &db,
+            "cn",
+            "acct-cn",
+            "SAME",
+            "CN",
+            Some("growth"),
+            10.0,
+            "CNY",
+        );
+        let config = save_portfolio_alert_config(
+            &db,
+            input(overall_scope(), 20.0, 100.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        let cache = crate::services::quote_service::QuoteCache::new();
+        cache.set(quote("US", "SAME", 10.0));
+        cache.set(quote("CN", "SAME", 20.0));
+
+        let result = evaluate_portfolio_alert(
+            &db,
+            &cache,
+            Some(&rates()),
+            &config.id,
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, PortfolioAlertDataStatus::Ready);
+        assert_eq!(result.snapshot.unwrap().total_market_value, 140.0);
+    }
+
+    #[tokio::test]
+    async fn finite_negative_scoped_total_returns_empty_not_incomplete() {
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        seed_account(&db, "acct-us", "US");
+        seed_holding(
+            &db,
+            "negative",
+            "acct-us",
+            "NEG",
+            "US",
+            Some("growth"),
+            2.0,
+            "USD",
+        );
+        let config = save_portfolio_alert_config(
+            &db,
+            input(overall_scope(), 20.0, 20.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        let cache = crate::services::quote_service::QuoteCache::new();
+        cache.set(quote("US", "NEG", -5.0));
+
+        let result = evaluate_portfolio_alert(&db, &cache, None, &config.id, "negative")
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, PortfolioAlertDataStatus::Empty);
+        assert!(result.missing_data.is_empty());
+        assert!(result.active_breaches.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evaluation_loaded_before_save_cannot_commit_old_snapshot_or_breaches() {
+        let fixture = evaluation_fixture();
+        let db = std::sync::Arc::new(fixture.db);
+        let cache = std::sync::Arc::new(fixture.quote_cache);
+        let rates = std::sync::Arc::new(fixture.rates);
+        let config_id = fixture.config_id;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let task = {
+            let db = db.clone();
+            let cache = cache.clone();
+            let rates = rates.clone();
+            let config_id = config_id.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                evaluate_portfolio_alert_with_before_persist_hook(
+                    &db,
+                    &cache,
+                    Some(&rates),
+                    &config_id,
+                    "old-evaluation",
+                    move || {
+                        barrier.wait();
+                        barrier.wait();
+                    },
+                )
+                .await
+            })
+        };
+        barrier.wait();
+        let mut changed = input(overall_scope(), 20.0, 95.0, [("growth", 100.0)]);
+        changed.id = Some(config_id.clone());
+        save_portfolio_alert_config(&db, changed).unwrap();
+        barrier.wait();
+
+        let error = task.await.unwrap().unwrap_err();
+
+        assert!(error.contains("changed during evaluation"));
+        let current = get_portfolio_alert_config_by_id(&db, &config_id).unwrap();
+        assert!(current.last_snapshot.is_none());
+        assert!(current.last_evaluated_at.is_none());
+        assert_eq!(breach_count(&db), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evaluation_loaded_before_disable_cannot_recreate_state() {
+        let fixture = evaluation_fixture();
+        let db = std::sync::Arc::new(fixture.db);
+        let cache = std::sync::Arc::new(fixture.quote_cache);
+        let rates = std::sync::Arc::new(fixture.rates);
+        let config_id = fixture.config_id;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let task = {
+            let db = db.clone();
+            let cache = cache.clone();
+            let rates = rates.clone();
+            let config_id = config_id.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                evaluate_portfolio_alert_with_before_persist_hook(
+                    &db,
+                    &cache,
+                    Some(&rates),
+                    &config_id,
+                    "old-evaluation",
+                    move || {
+                        barrier.wait();
+                        barrier.wait();
+                    },
+                )
+                .await
+            })
+        };
+        barrier.wait();
+        set_portfolio_alert_active(&db, &config_id, false).unwrap();
+        barrier.wait();
+
+        let error = task.await.unwrap().unwrap_err();
+
+        assert!(error.contains("changed during evaluation") || error.contains("inactive"));
+        let current = get_portfolio_alert_config_by_id(&db, &config_id).unwrap();
+        assert!(!current.is_active);
+        assert!(current.last_snapshot.is_none());
+        assert!(current.last_evaluated_at.is_none());
+        assert_eq!(breach_count(&db), 0);
+    }
+
+    #[test]
+    fn identical_save_advances_a_parseable_guard_revision() {
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        let config = save_portfolio_alert_config(
+            &db,
+            input(overall_scope(), 20.0, 60.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        let before: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT updated_at FROM portfolio_alert_configs WHERE id = ?1",
+                [&config.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut identical = input(overall_scope(), 20.0, 60.0, [("growth", 100.0)]);
+        identical.id = Some(config.id.clone());
+        save_portfolio_alert_config(&db, identical).unwrap();
+        let after: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT updated_at FROM portfolio_alert_configs WHERE id = ?1",
+                [&config.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_ne!(before, after);
+        assert!(chrono::DateTime::parse_from_rfc3339(&before).is_ok());
+        assert!(chrono::DateTime::parse_from_rfc3339(&after).is_ok());
     }
 }

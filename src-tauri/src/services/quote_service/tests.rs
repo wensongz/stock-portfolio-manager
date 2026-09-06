@@ -687,8 +687,8 @@ fn sample_quote(symbol: &str, market: &str) -> StockQuote {
 #[test]
 fn test_quote_cache_empty() {
     let cache = QuoteCache::new();
-    assert!(cache.get("AAPL").is_none());
-    assert!(cache.get_stale("AAPL").is_none());
+    assert!(cache.get("US", "AAPL").is_none());
+    assert!(cache.get_stale("US", "AAPL").is_none());
 }
 
 #[test]
@@ -696,7 +696,7 @@ fn test_quote_cache_set_and_get() {
     let cache = QuoteCache::new();
     let quote = sample_quote("AAPL", "US");
     cache.set(quote.clone());
-    let cached = cache.get("AAPL").expect("should have cached quote");
+    let cached = cache.get("US", "AAPL").expect("should have cached quote");
     assert_eq!(cached.symbol, "AAPL");
     assert!((cached.current_price - 100.0).abs() < 0.001);
 }
@@ -706,7 +706,9 @@ fn test_quote_cache_stale_fallback() {
     let cache = QuoteCache::new();
     let quote = sample_quote("AAPL", "US");
     cache.set(quote);
-    let stale = cache.get_stale("AAPL").expect("should have stale quote");
+    let stale = cache
+        .get_stale("US", "AAPL")
+        .expect("should have stale quote");
     assert_eq!(stale.symbol, "AAPL");
 }
 
@@ -719,10 +721,10 @@ fn test_quote_cache_set_batch() {
         sample_quote("sh600519", "CN"),
     ];
     cache.set_batch(&quotes);
-    assert!(cache.get("AAPL").is_some());
-    assert!(cache.get("GOOGL").is_some());
-    assert!(cache.get("sh600519").is_some());
-    assert!(cache.get("MSFT").is_none());
+    assert!(cache.get("US", "AAPL").is_some());
+    assert!(cache.get("US", "GOOGL").is_some());
+    assert!(cache.get("CN", "sh600519").is_some());
+    assert!(cache.get("US", "MSFT").is_none());
 }
 
 #[test]
@@ -761,7 +763,7 @@ fn test_quote_cache_merge_and_set_batch_preserves_rich_metadata() {
     assert_eq!(realtime.market_cap, Some(3_200_000_000_000.0));
     assert_eq!(realtime.turnover_rate, Some(0.61));
     assert_eq!(
-        cache.get("AAPL").unwrap().current_price,
+        cache.get("US", "AAPL").unwrap().current_price,
         realtime.current_price
     );
 }
@@ -910,11 +912,32 @@ fn test_quote_cache_update_overwrites() {
     let cache = QuoteCache::new();
     let mut quote = sample_quote("AAPL", "US");
     cache.set(quote.clone());
-    assert!((cache.get("AAPL").unwrap().current_price - 100.0).abs() < 0.001);
+    assert!((cache.get("US", "AAPL").unwrap().current_price - 100.0).abs() < 0.001);
 
     quote.current_price = 200.0;
     cache.set(quote);
-    assert!((cache.get("AAPL").unwrap().current_price - 200.0).abs() < 0.001);
+    assert!((cache.get("US", "AAPL").unwrap().current_price - 200.0).abs() < 0.001);
+}
+
+#[test]
+fn quote_cache_keys_identical_symbols_by_normalized_market_and_symbol() {
+    let cache = QuoteCache::new();
+    let mut us = sample_quote(" same ", " us ");
+    us.current_price = 10.0;
+    let mut cn = sample_quote("SAME", "CN");
+    cn.current_price = 20.0;
+
+    cache.set(us);
+    cache.set(cn);
+
+    assert_eq!(cache.get("US", "SAME").unwrap().current_price, 10.0);
+    assert_eq!(cache.get(" cn ", " same ").unwrap().current_price, 20.0);
+    let (quotes, missing) = cache.get_batch(&[
+        (" SAME ".to_string(), " us ".to_string()),
+        ("same".to_string(), "CN".to_string()),
+    ]);
+    assert!(missing.is_empty());
+    assert_eq!(quotes.len(), 2);
 }
 
 #[test]
@@ -925,7 +948,7 @@ fn test_quote_cache_no_ttl_expiry() {
     let quote = sample_quote("AAPL", "US");
     cache.set(quote);
     // Immediately retrievable
-    assert!(cache.get("AAPL").is_some());
+    assert!(cache.get("US", "AAPL").is_some());
     // get_batch should also return it (not as "missing")
     let (cached, missing) = cache.get_batch(&[("AAPL".to_string(), "US".to_string())]);
     assert_eq!(cached.len(), 1);

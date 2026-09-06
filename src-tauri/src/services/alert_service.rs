@@ -123,10 +123,11 @@ pub fn delete_alert(db: &Database, id: &str) -> Result<bool, String> {
 }
 
 /// Check all active alerts against provided quote data.
-/// `quotes` is a map of symbol -> (current_price, change_percent, pnl_percent)
+/// `quotes` is keyed by normalized (market, symbol) and stores
+/// (current_price, change_percent, pnl_percent).
 pub fn check_alerts(
     db: &Database,
-    quotes: &std::collections::HashMap<String, (f64, f64, f64)>,
+    quotes: &std::collections::HashMap<(String, String), (f64, f64, f64)>,
 ) -> Result<Vec<TriggeredAlert>, String> {
     let mut conn = db.conn.lock().map_err(|e| e.to_string())?;
     let transaction = conn.transaction().map_err(|e| e.to_string())?;
@@ -138,7 +139,11 @@ pub fn check_alerts(
         if !alert.is_active || alert.is_triggered {
             continue;
         }
-        let Some(&(price, change_pct, pnl_pct)) = quotes.get(&alert.symbol) else {
+        let key = (
+            alert.market.trim().to_ascii_uppercase(),
+            alert.symbol.trim().to_ascii_uppercase(),
+        );
+        let Some(&(price, change_pct, pnl_pct)) = quotes.get(&key) else {
             continue;
         };
 
@@ -251,8 +256,8 @@ mod tests {
     fn alert_update_failure_rolls_back_every_triggered_status() {
         let db = seeded_alert_db();
         let quotes = HashMap::from([
-            ("FIRST".to_string(), (2.0, 0.0, 0.0)),
-            ("SECOND".to_string(), (2.0, 0.0, 0.0)),
+            (("US".to_string(), "FIRST".to_string()), (2.0, 0.0, 0.0)),
+            (("US".to_string(), "SECOND".to_string()), (2.0, 0.0, 0.0)),
         ]);
 
         let error = check_alerts(&db, &quotes).unwrap_err();

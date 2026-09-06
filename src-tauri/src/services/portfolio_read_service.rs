@@ -468,9 +468,9 @@ mod tests {
         assert_eq!(cached_cash.market_value, 14.0);
         assert_eq!(fetched_cash.current_price, 1.0);
         assert_eq!(fetched_cash.market_value, 3.0);
-        assert_eq!(cache.get("$CASH-USD").unwrap().current_price, 7.0);
-        assert_eq!(cache.get("$CASH-CNY").unwrap().current_price, 1.0);
-        assert_eq!(cache.get("AAPL").unwrap().current_price, 12.0);
+        assert_eq!(cache.get("US", "$CASH-USD").unwrap().current_price, 7.0);
+        assert_eq!(cache.get("CN", "$CASH-CNY").unwrap().current_price, 1.0);
+        assert_eq!(cache.get("US", "AAPL").unwrap().current_price, 12.0);
     }
 
     #[tokio::test]
@@ -638,6 +638,64 @@ mod tests {
         assert_eq!(
             lookup.get(&("CN".to_string(), "SAME".to_string())),
             Some(&(20.0, 2.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_only_load_resolves_identical_symbols_from_two_markets() {
+        let db = seeded_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, name, market, description, created_at, updated_at)
+                 VALUES ('acct-cn', 'CN Broker', 'CN', '', '2026-01-01', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
+                 VALUES ('holding-cn-same', 'acct-cn', 'AAPL', 'CN Same', 'CN', 'growth', 10, 10, 'CNY', '2026-01-01', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+        }
+        let cache = QuoteCache::new();
+        cache.set(StockQuote {
+            symbol: " aapl ".to_string(),
+            market: " us ".to_string(),
+            current_price: 12.0,
+            ..StockQuote::default()
+        });
+        cache.set(StockQuote {
+            symbol: "AAPL".to_string(),
+            market: "CN".to_string(),
+            current_price: 20.0,
+            ..StockQuote::default()
+        });
+
+        let model = PortfolioReadModel::load(&db, &cache, None, QuoteReadMode::CacheOnly)
+            .await
+            .unwrap();
+
+        assert!(model.missing_quote_keys().is_empty());
+        assert_eq!(
+            model
+                .holdings()
+                .iter()
+                .find(|holding| holding.market == "US")
+                .unwrap()
+                .current_price,
+            12.0
+        );
+        assert_eq!(
+            model
+                .holdings()
+                .iter()
+                .find(|holding| holding.market == "CN")
+                .unwrap()
+                .current_price,
+            20.0
         );
     }
 }

@@ -303,7 +303,7 @@ pub async fn get_us_quote(
     quote_state: State<'_, QuoteServiceState>,
     symbol: String,
 ) -> Result<QuoteCommandResult<StockQuote>, String> {
-    if let Some(cached) = quote_cache.get(&symbol) {
+    if let Some(cached) = quote_cache.get("US", &symbol) {
         return finish_quote_command(
             &db,
             QuoteFetchResult {
@@ -329,7 +329,7 @@ pub async fn get_hk_quote(
     quote_state: State<'_, QuoteServiceState>,
     symbol: String,
 ) -> Result<QuoteCommandResult<StockQuote>, String> {
-    if let Some(cached) = quote_cache.get(&symbol) {
+    if let Some(cached) = quote_cache.get("HK", &symbol) {
         return finish_quote_command(
             &db,
             QuoteFetchResult {
@@ -355,7 +355,7 @@ pub async fn get_cn_quote(
     quote_state: State<'_, QuoteServiceState>,
     symbol: String,
 ) -> Result<QuoteCommandResult<StockQuote>, String> {
-    if let Some(cached) = quote_cache.get(&symbol) {
+    if let Some(cached) = quote_cache.get("CN", &symbol) {
         return finish_quote_command(
             &db,
             QuoteFetchResult {

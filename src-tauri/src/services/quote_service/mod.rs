@@ -66,6 +66,9 @@ pub struct QuoteFetchResult<T> {
     pub data: T,
     pub warning: Option<String>,
     pub did_refresh: bool,
+    /// True only when every requested symbol was resolved with a fresh quote.
+    /// A stale-cache fallback or unresolved provider request makes this false.
+    pub refresh_complete: bool,
 }
 
 pub(crate) fn merge_quote_warning(current: &mut Option<String>, candidate: Option<String>) {
@@ -163,12 +166,14 @@ pub async fn fetch_us_quote_with_provider(
                 data,
                 warning: None,
                 did_refresh: true,
+                refresh_complete: true,
             }),
         "xueqiu" => match fetch_xueqiu_us_quote(state, symbol).await {
             Ok(data) => Ok(QuoteFetchResult {
                 data,
                 warning: None,
                 did_refresh: true,
+                refresh_complete: true,
             }),
             Err(e) => {
                 let warning = quote_warning_for_error(&e);
@@ -181,6 +186,7 @@ pub async fn fetch_us_quote_with_provider(
                         data,
                         warning,
                         did_refresh: true,
+                        refresh_complete: true,
                     }),
                     Err(e2) => {
                         warn!(
@@ -193,6 +199,7 @@ pub async fn fetch_us_quote_with_provider(
                                 data,
                                 warning,
                                 did_refresh: true,
+                                refresh_complete: true,
                             })
                             .map_err(|fallback| format!("{e}; fallback failed: {fallback}"))
                     }
@@ -205,6 +212,7 @@ pub async fn fetch_us_quote_with_provider(
                 data,
                 warning: None,
                 did_refresh: true,
+                refresh_complete: true,
             }),
     }
 }
@@ -226,12 +234,14 @@ pub async fn fetch_hk_quote_with_provider(
                 data,
                 warning: None,
                 did_refresh: true,
+                refresh_complete: true,
             }),
         "xueqiu" => match fetch_xueqiu_hk_quote(state, symbol).await {
             Ok(data) => Ok(QuoteFetchResult {
                 data,
                 warning: None,
                 did_refresh: true,
+                refresh_complete: true,
             }),
             Err(e) => {
                 let warning = quote_warning_for_error(&e);
@@ -244,6 +254,7 @@ pub async fn fetch_hk_quote_with_provider(
                         data,
                         warning,
                         did_refresh: true,
+                        refresh_complete: true,
                     }),
                     Err(e2) => {
                         warn!(
@@ -256,6 +267,7 @@ pub async fn fetch_hk_quote_with_provider(
                                 data,
                                 warning,
                                 did_refresh: true,
+                                refresh_complete: true,
                             })
                             .map_err(|fallback| format!("{e}; fallback failed: {fallback}"))
                     }
@@ -268,6 +280,7 @@ pub async fn fetch_hk_quote_with_provider(
                 data,
                 warning: None,
                 did_refresh: true,
+                refresh_complete: true,
             }),
     }
 }
@@ -298,6 +311,7 @@ pub async fn fetch_cn_quote_with_provider(
                 data,
                 warning: None,
                 did_refresh: true,
+                refresh_complete: true,
             }),
             Err(e) => {
                 let warning = quote_warning_for_error(&e);
@@ -311,6 +325,7 @@ pub async fn fetch_cn_quote_with_provider(
                         data,
                         warning,
                         did_refresh: true,
+                        refresh_complete: true,
                     })
                     .map_err(|fallback| format!("{e}; fallback failed: {fallback}"))
             }
@@ -322,6 +337,7 @@ pub async fn fetch_cn_quote_with_provider(
                 data,
                 warning: None,
                 did_refresh: true,
+                refresh_complete: true,
             }),
     }
 }
@@ -434,6 +450,7 @@ pub async fn fetch_quotes_batch_with_providers(
     let mut quotes = Vec::new();
     let mut warning = None;
     let mut did_refresh = false;
+    let mut had_provider_failure = false;
     let provider_plan =
         plan_quote_provider_requests(&unique_symbols, us_provider, hk_provider, cn_provider);
 
@@ -453,11 +470,13 @@ pub async fn fetch_quotes_batch_with_providers(
         match result {
             Ok(mut result) => {
                 restore_original_symbol(&mut result.data, &symbol);
+                had_provider_failure |= !result.refresh_complete || result.warning.is_some();
                 merge_quote_warning(&mut warning, result.warning);
                 did_refresh |= result.did_refresh;
                 quotes.push(result.data);
             }
             Err(e) => {
+                had_provider_failure = true;
                 warn!("failed to fetch quote for {} ({}): {}", symbol, market, e);
                 merge_quote_warning(&mut warning, quote_warning_for_error(&e));
             }
@@ -486,6 +505,7 @@ pub async fn fetch_quotes_batch_with_providers(
                             );
                     for (symbol, market) in original_symbols {
                         if !fetched.contains(symbol.as_str()) {
+                            had_provider_failure = true;
                             yahoo_fallback_symbols.push((symbol.clone(), market.clone()));
                         }
                     }
@@ -494,6 +514,7 @@ pub async fn fetch_quotes_batch_with_providers(
                 quotes.extend(batch_quotes);
             }
             Err(error) => {
+                had_provider_failure = true;
                 warn!("Yahoo spark batch failed: {}", error);
                 for request_symbol in batch {
                     yahoo_fallback_symbols
@@ -510,10 +531,13 @@ pub async fn fetch_quotes_batch_with_providers(
                 did_refresh = true;
                 quotes.push(quote);
             }
-            Err(error) => warn!(
-                "failed to fetch Yahoo fallback quote for {} ({}): {}",
-                symbol, market, error
-            ),
+            Err(error) => {
+                had_provider_failure = true;
+                warn!(
+                    "failed to fetch Yahoo fallback quote for {} ({}): {}",
+                    symbol, market, error
+                );
+            }
         }
     }
 
@@ -523,6 +547,7 @@ pub async fn fetch_quotes_batch_with_providers(
     let (xueqiu_batches, mut xueqiu_fallback_symbols) =
         plan_xueqiu_realtime_batches(&provider_plan.xueqiu_symbols);
     if !xueqiu_fallback_symbols.is_empty() {
+        had_provider_failure = true;
         merge_quote_warning(
             &mut warning,
             quote_warning_for_error("Xueqiu realtime symbol normalization failed"),
@@ -553,6 +578,7 @@ pub async fn fetch_quotes_batch_with_providers(
                     }
                 }
                 if response_omitted_symbol {
+                    had_provider_failure = true;
                     merge_quote_warning(
                         &mut warning,
                         quote_warning_for_error("Xueqiu realtime response omitted a symbol"),
@@ -562,6 +588,7 @@ pub async fn fetch_quotes_batch_with_providers(
                 quotes.extend(batch_quotes);
             }
             Err(error) => {
+                had_provider_failure = true;
                 warn!("Xueqiu realtime batch failed: {}", error);
                 merge_quote_warning(&mut warning, quote_warning_for_error(&error));
                 for request_symbol in batch {
@@ -591,6 +618,7 @@ pub async fn fetch_quotes_batch_with_providers(
                     .iter()
                     .map(|quote| quote.symbol.as_str())
                     .collect();
+                let mut response_omitted_symbol = false;
                 for request_symbol in &batch {
                     let original_symbols =
                         std::iter::once((&request_symbol.original_symbol, &request_symbol.market))
@@ -602,14 +630,17 @@ pub async fn fetch_quotes_batch_with_providers(
                             );
                     for (symbol, market) in original_symbols {
                         if !fetched.contains(symbol.as_str()) {
+                            response_omitted_symbol = true;
                             per_symbol_fallback.push((symbol.clone(), market.clone()));
                         }
                     }
                 }
+                had_provider_failure |= response_omitted_symbol;
                 did_refresh |= !batch_quotes.is_empty();
                 quotes.extend(batch_quotes);
             }
             Err(error) => {
+                had_provider_failure = true;
                 warn!("EastMoney realtime batch failed: {}", error);
                 for request_symbol in batch {
                     per_symbol_fallback
@@ -630,10 +661,13 @@ pub async fn fetch_quotes_batch_with_providers(
                     did_refresh = true;
                     quotes.push(quote);
                 }
-                Err(error) => warn!(
-                    "failed to fetch fallback quote for {} ({}): {}",
-                    symbol, market, error
-                ),
+                Err(error) => {
+                    had_provider_failure = true;
+                    warn!(
+                        "failed to fetch fallback quote for {} ({}): {}",
+                        symbol, market, error
+                    );
+                }
             }
             continue;
         }
@@ -647,14 +681,18 @@ pub async fn fetch_quotes_batch_with_providers(
         match result {
             Ok(mut result) => {
                 restore_original_symbol(&mut result.data, &symbol);
+                had_provider_failure |= !result.refresh_complete || result.warning.is_some();
                 merge_quote_warning(&mut warning, result.warning);
                 did_refresh |= result.did_refresh;
                 quotes.push(result.data);
             }
-            Err(error) => warn!(
-                "failed to fetch EastMoney fallback quote for {} ({}): {}",
-                symbol, market, error
-            ),
+            Err(error) => {
+                had_provider_failure = true;
+                warn!(
+                    "failed to fetch EastMoney fallback quote for {} ({}): {}",
+                    symbol, market, error
+                );
+            }
         }
     }
 
@@ -667,12 +705,16 @@ pub async fn fetch_quotes_batch_with_providers(
     let quotes = unique_symbols
         .iter()
         .filter_map(|(symbol, _)| quotes_by_symbol.remove(symbol))
-        .collect();
+        .collect::<Vec<_>>();
 
+    let refresh_complete = did_refresh
+        && !had_provider_failure
+        && cache::has_complete_fresh_refresh(&unique_symbols, &quotes);
     Ok(QuoteFetchResult {
         data: quotes,
         warning,
         did_refresh,
+        refresh_complete,
     })
 }
 

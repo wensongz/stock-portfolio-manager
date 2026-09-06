@@ -175,16 +175,12 @@ pub fn run() {
                 {
                     Ok(fetch) => {
                         // Persist the freshly fetched quotes to the database.
-                        if fetch.did_refresh {
-                            if let Err(error) =
-                                services::quote_service::save_quotes_to_db(&db, &fetch.data)
-                            {
-                                warn!("Background refresh: failed to persist quotes: {}", error);
-                            }
-                        }
+                        let persistence_succeeded =
+                            commands::quotes::persist_holding_quote_refresh(&db, &fetch);
                         commands::quotes::run_alert_evaluation_after_holding_refresh(
                             None,
-                            fetch.did_refresh,
+                            &fetch,
+                            persistence_succeeded,
                             || async {
                                 commands::portfolio_alerts::evaluate_and_emit_portfolio_alerts(
                                     &handle,

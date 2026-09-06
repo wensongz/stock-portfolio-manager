@@ -44,13 +44,71 @@ pub(crate) async fn evaluate_and_emit_portfolio_alerts(
     .await
     {
         Ok(notifications) => {
-            for notification in notifications {
+            emit_portfolio_alert_notifications(notifications, |notification| {
                 if let Err(error) = app_handle.emit("portfolio-alert-triggered", notification) {
                     warn!("Failed to emit portfolio-alert-triggered event: {error}");
                 }
-            }
+            });
         }
         Err(error) => warn!("Portfolio alert evaluation after quote refresh failed: {error}"),
+    }
+}
+
+pub(crate) fn emit_portfolio_alert_notifications<F>(
+    notifications: Vec<crate::models::portfolio_alert::PortfolioAlertNotification>,
+    mut emit: F,
+) where
+    F: FnMut(crate::models::portfolio_alert::PortfolioAlertNotification),
+{
+    for notification in notifications {
+        emit(notification);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::portfolio_alert::{
+        PortfolioAlertBreach, PortfolioAlertBreachDirection, PortfolioAlertBreachKind,
+        PortfolioAlertNotification, PortfolioAlertScopeKind,
+    };
+
+    fn notification(key: &str) -> PortfolioAlertNotification {
+        PortfolioAlertNotification {
+            config_id: "config-us".to_string(),
+            scope: PortfolioAlertScope {
+                kind: PortfolioAlertScopeKind::Market,
+                market: Some("US".to_string()),
+                account_id: None,
+            },
+            breach: PortfolioAlertBreach {
+                config_id: "config-us".to_string(),
+                breach_key: key.to_string(),
+                breach_kind: PortfolioAlertBreachKind::Concentration,
+                direction: PortfolioAlertBreachDirection::AboveLimit,
+                first_triggered_at: "2026-09-06T10:00:00Z".to_string(),
+                last_seen_at: "2026-09-06T10:00:00Z".to_string(),
+            },
+            message: "持仓集中度预警".to_string(),
+            triggered_at: "2026-09-06T10:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn emitted_event_count_matches_new_breach_payload_count() {
+        // This catches an event loop that drops or coalesces newly inserted
+        // breach payloads after batch evaluation.
+        let mut emitted_keys = Vec::new();
+
+        emit_portfolio_alert_notifications(
+            vec![
+                notification("security:US:AAPL"),
+                notification("security:US:MSFT"),
+            ],
+            |notification| emitted_keys.push(notification.breach.breach_key),
+        );
+
+        assert_eq!(emitted_keys, vec!["security:US:AAPL", "security:US:MSFT"]);
     }
 }
 

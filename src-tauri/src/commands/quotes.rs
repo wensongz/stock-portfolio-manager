@@ -75,17 +75,27 @@ pub async fn get_holding_quotes(
     exchange_rate_cache: State<'_, ExchangeRateCache>,
     refresh_symbols: Option<Vec<(String, String)>>,
 ) -> Result<QuoteCommandResult<Vec<HoldingWithQuote>>, String> {
-    let (outcome, did_refresh) = get_holding_quotes_inner_with_refresh_status(
+    let (outcome, fetch, persistence_succeeded) = get_holding_quotes_inner_with_refresh_status(
         &db,
         &quote_cache,
         &quote_state,
         refresh_symbols.clone(),
     )
     .await?;
-    run_alert_evaluation_after_holding_refresh(refresh_symbols.as_deref(), did_refresh, || async {
-        evaluate_and_emit_portfolio_alerts(&app_handle, &db, &quote_cache, &exchange_rate_cache)
+    run_alert_evaluation_after_holding_refresh(
+        refresh_symbols.as_deref(),
+        &fetch,
+        persistence_succeeded,
+        || async {
+            evaluate_and_emit_portfolio_alerts(
+                &app_handle,
+                &db,
+                &quote_cache,
+                &exchange_rate_cache,
+            )
             .await;
-    })
+        },
+    )
     .await;
     Ok(outcome)
 }
@@ -98,7 +108,7 @@ pub async fn get_holding_quotes_inner(
 ) -> Result<QuoteCommandResult<Vec<HoldingWithQuote>>, String> {
     get_holding_quotes_inner_with_refresh_status(db, quote_cache, quote_state, refresh_symbols)
         .await
-        .map(|(outcome, _)| outcome)
+        .map(|(outcome, _, _)| outcome)
 }
 
 async fn get_holding_quotes_inner_with_refresh_status(
@@ -106,7 +116,14 @@ async fn get_holding_quotes_inner_with_refresh_status(
     quote_cache: &QuoteCache,
     quote_state: &QuoteServiceState,
     refresh_symbols: Option<Vec<(String, String)>>,
-) -> Result<(QuoteCommandResult<Vec<HoldingWithQuote>>, bool), String> {
+) -> Result<
+    (
+        QuoteCommandResult<Vec<HoldingWithQuote>>,
+        QuoteFetchResult<()>,
+        bool,
+    ),
+    String,
+> {
     let config = quote_provider_service::get_quote_provider_config(db)?;
     // Load holdings from DB (synchronous) and pre-compute realized PnL for cleared positions.
     // realized_pnl_map: holding_id -> (realized_pnl, total_buy_cost)
@@ -181,8 +198,10 @@ async fn get_holding_quotes_inner_with_refresh_status(
                 false,
             )
             .await?;
+            let cache_fill_incomplete = all.did_refresh && !all.refresh_complete;
             merge_quote_warning(&mut all.warning, targeted.warning);
             all.did_refresh |= targeted.did_refresh;
+            all.refresh_complete = targeted.refresh_complete && !cache_fill_incomplete;
             all
         }
         Some(_) => {
@@ -213,11 +232,7 @@ async fn get_holding_quotes_inner_with_refresh_status(
         }
     };
     // Persist freshly fetched quotes to the database
-    if fetch.did_refresh {
-        if let Err(e) = save_quotes_to_db(db, &fetch.data) {
-            warn!("Failed to persist quotes to DB: {}", e);
-        }
-    }
+    let persistence_succeeded = persist_holding_quote_refresh(db, &fetch);
     let quote_map: std::collections::HashMap<String, StockQuote> = fetch
         .data
         .drain(..)
@@ -279,28 +294,61 @@ async fn get_holding_quotes_inner_with_refresh_status(
         })
         .collect();
 
-    let did_refresh = fetch.did_refresh;
+    let refresh_status = QuoteFetchResult {
+        data: (),
+        warning: fetch.warning.clone(),
+        did_refresh: fetch.did_refresh,
+        refresh_complete: fetch.refresh_complete,
+    };
     let outcome = finish_quote_command(
         db,
         QuoteFetchResult {
             data: result,
             warning: fetch.warning,
-            did_refresh,
+            did_refresh: refresh_status.did_refresh,
+            refresh_complete: refresh_status.refresh_complete,
         },
     )?;
-    Ok((outcome, did_refresh))
+    Ok((outcome, refresh_status, persistence_succeeded))
 }
 
 pub(crate) async fn run_alert_evaluation_after_holding_refresh<F, Fut>(
     refresh_symbols: Option<&[(String, String)]>,
-    did_refresh: bool,
+    fetch: &QuoteFetchResult<impl Sized>,
+    persistence_succeeded: bool,
     evaluate: F,
 ) where
     F: FnOnce() -> Fut,
     Fut: Future<Output = ()>,
 {
-    if did_refresh && refresh_symbols.is_none_or(|symbols| !symbols.is_empty()) {
-        evaluate().await;
+    let requested_refresh = refresh_symbols.is_none_or(|symbols| !symbols.is_empty());
+    if !requested_refresh {
+        return;
+    }
+    if !fetch.did_refresh || !fetch.refresh_complete {
+        warn!("Skipping portfolio alert evaluation because holding quote refresh was incomplete");
+        return;
+    }
+    if !persistence_succeeded {
+        warn!("Skipping portfolio alert evaluation because refreshed quotes were not persisted");
+        return;
+    }
+    evaluate().await;
+}
+
+pub(crate) fn persist_holding_quote_refresh(
+    db: &Database,
+    fetch: &QuoteFetchResult<Vec<StockQuote>>,
+) -> bool {
+    if !fetch.did_refresh {
+        return false;
+    }
+    match save_quotes_to_db(db, &fetch.data) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!("Failed to persist quotes to DB; skipping portfolio alert evaluation: {error}");
+            false
+        }
     }
 }
 
@@ -353,6 +401,7 @@ pub async fn get_us_quote(
                 data: cached,
                 warning: None,
                 did_refresh: false,
+                refresh_complete: false,
             },
         );
     }
@@ -379,6 +428,7 @@ pub async fn get_hk_quote(
                 data: cached,
                 warning: None,
                 did_refresh: false,
+                refresh_complete: false,
             },
         );
     }
@@ -405,6 +455,7 @@ pub async fn get_cn_quote(
                 data: cached,
                 warning: None,
                 did_refresh: false,
+                refresh_complete: false,
             },
         );
     }
@@ -427,31 +478,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_empty_symbol_holding_refresh_does_not_trigger_portfolio_alert_evaluation() {
-        // This catches the public cache-only `Some(vec![])` path accidentally
-        // running portfolio-alert evaluation after serving cached quotes.
+    async fn holding_refresh_orchestration_evaluates_only_complete_persisted_requests() {
+        // This catches partial/stale results, failed persistence, or the
+        // public cache-only `Some(vec![])` path triggering portfolio alerts.
+        let complete = QuoteFetchResult {
+            data: vec![StockQuote {
+                market: "US".to_string(),
+                symbol: "AAPL".to_string(),
+                current_price: 100.0,
+                ..StockQuote::default()
+            }],
+            warning: None,
+            did_refresh: true,
+            refresh_complete: true,
+        };
+        let partial = QuoteFetchResult {
+            data: Vec::<StockQuote>::new(),
+            warning: Some("stale fallback".to_string()),
+            did_refresh: true,
+            refresh_complete: false,
+        };
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed_calls = calls.clone();
+        let persisted_db = Database::new(":memory:").unwrap();
+        let persistence_succeeded = persist_holding_quote_refresh(&persisted_db, &complete);
+        assert!(persistence_succeeded);
+        assert_eq!(
+            crate::services::quote_service::load_quotes_from_db(&persisted_db)
+                .unwrap()
+                .len(),
+            1
+        );
 
-        run_alert_evaluation_after_holding_refresh(Some(&[]), true, move || async move {
-            observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        })
-        .await;
+        let failed_persistence_db = Database::new(":memory:").unwrap();
+        failed_persistence_db
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE cached_quotes", [])
+            .unwrap();
+        let persistence_failed = persist_holding_quote_refresh(&failed_persistence_db, &complete);
+        assert!(!persistence_failed);
 
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn actual_holding_refresh_runs_the_shared_portfolio_alert_hook() {
-        // This catches a full refresh path that completes without the shared
-        // portfolio-alert follow-up.
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed_calls = calls.clone();
-
-        run_alert_evaluation_after_holding_refresh(None, true, move || async move {
-            observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        })
-        .await;
+        for (request, fetch, persisted) in [
+            (None, &complete, persistence_succeeded),
+            (None, &partial, true),
+            (Some(Vec::new()), &complete, true),
+            (
+                Some(vec![("AAPL".to_string(), "US".to_string())]),
+                &complete,
+                persistence_failed,
+            ),
+        ] {
+            let observed_calls = calls.clone();
+            run_alert_evaluation_after_holding_refresh(
+                request.as_deref(),
+                fetch,
+                persisted,
+                move || async move {
+                    observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+            .await;
+        }
 
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -474,6 +562,7 @@ mod tests {
                 data: Vec::<StockQuote>::new(),
                 warning: None,
                 did_refresh: false,
+                refresh_complete: false,
             },
         )
         .unwrap();
@@ -497,6 +586,7 @@ mod tests {
                 data: Vec::<StockQuote>::new(),
                 warning: Some("fallback".to_string()),
                 did_refresh: true,
+                refresh_complete: true,
             },
         )
         .unwrap();

@@ -633,12 +633,14 @@ pub async fn evaluate_portfolio_alert(
     config_id: &str,
     evaluated_at: &str,
 ) -> Result<PortfolioAlertEvaluation, String> {
+    let read_model =
+        PortfolioReadModel::load(db, quote_cache, None, QuoteReadMode::CacheOnly).await?;
     evaluate_portfolio_alert_inner(
         db,
-        quote_cache,
         exchange_rates,
         config_id,
         evaluated_at,
+        &read_model,
         || {},
     )
     .await
@@ -653,6 +655,26 @@ pub async fn evaluate_all_active_portfolio_alerts(
     exchange_rates: Option<&ExchangeRates>,
     evaluated_at: &str,
 ) -> Result<Vec<PortfolioAlertNotification>, String> {
+    evaluate_all_active_portfolio_alerts_inner(
+        db,
+        quote_cache,
+        exchange_rates,
+        evaluated_at,
+        |_| {},
+    )
+    .await
+}
+
+async fn evaluate_all_active_portfolio_alerts_inner<F>(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    exchange_rates: Option<&ExchangeRates>,
+    evaluated_at: &str,
+    mut before_config: F,
+) -> Result<Vec<PortfolioAlertNotification>, String>
+where
+    F: FnMut(usize),
+{
     let active_ids = {
         let conn = db.conn.lock().map_err(|error| error.to_string())?;
         let mut statement = conn
@@ -665,9 +687,13 @@ pub async fn evaluate_all_active_portfolio_alerts(
             .map_err(|error| error.to_string())?;
         ids
     };
+    let quote_snapshot = quote_cache.snapshot();
+    let read_model =
+        PortfolioReadModel::load(db, &quote_snapshot, None, QuoteReadMode::CacheOnly).await?;
 
     let mut notifications = Vec::new();
-    for config_id in active_ids {
+    for (index, config_id) in active_ids.into_iter().enumerate() {
+        before_config(index);
         let config = match get_portfolio_alert_config_by_id(db, &config_id) {
             Ok(config) if config.is_active => config,
             Ok(_) => continue,
@@ -679,8 +705,15 @@ pub async fn evaluate_all_active_portfolio_alerts(
                 continue;
             }
         };
-        match evaluate_portfolio_alert(db, quote_cache, exchange_rates, &config_id, evaluated_at)
-            .await
+        match evaluate_portfolio_alert_inner(
+            db,
+            exchange_rates,
+            &config_id,
+            evaluated_at,
+            &read_model,
+            || {},
+        )
+        .await
         {
             Ok(evaluation) => {
                 notifications.extend(evaluation.newly_triggered.into_iter().map(|breach| {
@@ -702,6 +735,27 @@ pub async fn evaluate_all_active_portfolio_alerts(
     Ok(notifications)
 }
 
+#[cfg(test)]
+async fn evaluate_all_active_with_before_config_hook<F>(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    exchange_rates: Option<&ExchangeRates>,
+    evaluated_at: &str,
+    before_config: F,
+) -> Result<Vec<PortfolioAlertNotification>, String>
+where
+    F: FnMut(usize),
+{
+    evaluate_all_active_portfolio_alerts_inner(
+        db,
+        quote_cache,
+        exchange_rates,
+        evaluated_at,
+        before_config,
+    )
+    .await
+}
+
 fn portfolio_alert_notification_message(breach: &PortfolioAlertBreach) -> String {
     match breach.breach_kind {
         PortfolioAlertBreachKind::CategoryDeviation => {
@@ -715,10 +769,10 @@ fn portfolio_alert_notification_message(breach: &PortfolioAlertBreach) -> String
 
 async fn evaluate_portfolio_alert_inner<F>(
     db: &Database,
-    quote_cache: &QuoteCache,
     exchange_rates: Option<&ExchangeRates>,
     config_id: &str,
     evaluated_at: &str,
+    read_model: &PortfolioReadModel,
     before_persist: F,
 ) -> Result<PortfolioAlertEvaluation, String>
 where
@@ -737,8 +791,6 @@ where
             evaluation_currency_and_account_market(&conn, &config)?;
         (config, guard, categories, base_currency, account_market)
     };
-    let read_model =
-        PortfolioReadModel::load(db, quote_cache, None, QuoteReadMode::CacheOnly).await?;
     let scoped_holdings = read_model
         .holdings()
         .iter()
@@ -950,12 +1002,14 @@ async fn evaluate_portfolio_alert_with_before_persist_hook<F>(
 where
     F: Fn(),
 {
+    let read_model =
+        PortfolioReadModel::load(db, quote_cache, None, QuoteReadMode::CacheOnly).await?;
     evaluate_portfolio_alert_inner(
         db,
-        quote_cache,
         exchange_rates,
         config_id,
         evaluated_at,
+        &read_model,
         before_persist,
     )
     .await
@@ -2030,6 +2084,75 @@ mod tests {
                 .as_deref(),
             Some("2026-09-06T10:00:00Z")
         );
+    }
+
+    #[tokio::test]
+    async fn evaluate_all_active_uses_one_frozen_quote_snapshot_for_every_scope() {
+        // This catches later configurations rereading the live cache after a
+        // concurrent quote update changed it during the batch.
+        let db = configured_db();
+        seed_categories(&db, ["growth", "cash"]);
+        seed_account(&db, "acct-us", "US");
+        seed_holding(
+            &db,
+            "holding-aapl",
+            "acct-us",
+            "AAPL",
+            "US",
+            Some("growth"),
+            1.0,
+            "USD",
+        );
+        seed_holding(
+            &db,
+            "holding-cash",
+            "acct-us",
+            "$CASH-USD",
+            "US",
+            Some("cash"),
+            100.0,
+            "USD",
+        );
+        save_portfolio_alert_config(
+            &db,
+            input_with_id(
+                "config-a".to_string(),
+                market_scope("US"),
+                20.0,
+                90.0,
+                [("growth", 50.0), ("cash", 50.0)],
+            ),
+        )
+        .unwrap();
+        save_portfolio_alert_config(
+            &db,
+            input_with_id(
+                "config-b".to_string(),
+                overall_scope(),
+                20.0,
+                90.0,
+                [("growth", 50.0), ("cash", 50.0)],
+            ),
+        )
+        .unwrap();
+        let quote_cache = crate::services::quote_service::QuoteCache::new();
+        quote_cache.set(quote("US", "AAPL", 100.0));
+
+        let notifications = evaluate_all_active_with_before_config_hook(
+            &db,
+            &quote_cache,
+            Some(&rates()),
+            "2026-09-06T10:00:00Z",
+            |index| {
+                if index == 1 {
+                    quote_cache.set(quote("US", "AAPL", 300.0));
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(notifications.is_empty());
     }
 
     #[tokio::test]

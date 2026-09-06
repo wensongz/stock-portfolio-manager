@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
+#[derive(Clone)]
 struct CachedQuote {
     quote: StockQuote,
     _cached_at: Instant,
@@ -126,6 +127,28 @@ impl QuoteCache {
         let mut lock = self.inner.lock().unwrap();
         lock.clear();
     }
+
+    /// Freeze the current quote values for a multi-configuration calculation.
+    /// The copy preserves normalized tuple keys and cache timestamps while
+    /// remaining independent from later live-cache updates.
+    pub fn snapshot(&self) -> Self {
+        let lock = self.inner.lock().unwrap();
+        QuoteCache {
+            inner: Mutex::new(lock.clone()),
+        }
+    }
+}
+
+pub(super) fn has_complete_fresh_refresh(
+    requested: &[(String, String)],
+    fresh_quotes: &[StockQuote],
+) -> bool {
+    !requested.is_empty()
+        && requested.iter().all(|(symbol, market)| {
+            fresh_quotes
+                .iter()
+                .any(|quote| quote_key(&quote.market, &quote.symbol) == quote_key(market, symbol))
+        })
 }
 
 /// Deduplicate a list of (symbol, market) pairs, keeping only the first
@@ -175,6 +198,8 @@ pub async fn fetch_quotes_batch_cached_with_providers(
             .iter()
             .map(|quote| quote_key(&quote.market, &quote.symbol))
             .collect::<std::collections::HashSet<_>>();
+        let refresh_complete =
+            fresh.refresh_complete && has_complete_fresh_refresh(&unique_symbols, &fresh.data);
         let mut result = fresh.data;
         for (symbol, market) in &unique_symbols {
             if !fetched_symbols.contains(&quote_key(market, symbol)) {
@@ -187,6 +212,7 @@ pub async fn fetch_quotes_batch_cached_with_providers(
             data: result,
             warning: fresh.warning,
             did_refresh: fresh.did_refresh,
+            refresh_complete,
         });
     }
 
@@ -197,6 +223,7 @@ pub async fn fetch_quotes_batch_cached_with_providers(
             data: result,
             warning: None,
             did_refresh: false,
+            refresh_complete: false,
         });
     }
 
@@ -208,6 +235,8 @@ pub async fn fetch_quotes_batch_cached_with_providers(
         cn_provider,
     )
     .await?;
+    let refresh_complete =
+        fresh.refresh_complete && has_complete_fresh_refresh(&missing, &fresh.data);
     cache.merge_and_set_batch(&mut fresh.data);
     result.extend(fresh.data);
 
@@ -229,5 +258,37 @@ pub async fn fetch_quotes_batch_cached_with_providers(
         data: result,
         warning: fresh.warning,
         did_refresh: fresh.did_refresh,
+        refresh_complete,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quote(market: &str, symbol: &str) -> StockQuote {
+        StockQuote {
+            market: market.to_string(),
+            symbol: symbol.to_string(),
+            current_price: 1.0,
+            ..StockQuote::default()
+        }
+    }
+
+    #[test]
+    fn complete_refresh_requires_every_requested_quote_to_be_fresh() {
+        // This catches a partial provider result being treated as complete
+        // merely because at least one quote was refreshed.
+        let requested = vec![
+            ("AAPL".to_string(), "US".to_string()),
+            ("0700".to_string(), "HK".to_string()),
+        ];
+        let fresh = vec![quote("US", "AAPL")];
+
+        assert!(!has_complete_fresh_refresh(&requested, &fresh));
+        assert!(has_complete_fresh_refresh(
+            &requested,
+            &[quote("US", "AAPL"), quote("HK", "0700")],
+        ));
+    }
 }

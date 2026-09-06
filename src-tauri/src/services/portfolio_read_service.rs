@@ -125,6 +125,7 @@ impl PortfolioReadModel {
                     data: cached,
                     warning: None,
                     did_refresh: false,
+                    refresh_complete: false,
                 }
             }
             QuoteReadMode::RefreshMissing => {

@@ -5,6 +5,7 @@ pub mod ai_tools;
 pub mod alert_service;
 pub mod backup_service;
 pub mod exchange_rate_service;
+pub mod holding_edit;
 pub mod http_client;
 pub mod import_export_service;
 pub mod indicators;

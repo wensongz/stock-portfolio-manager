@@ -31,7 +31,8 @@ pub struct OptionContract {
     pub expiry_date: String,
     pub strike_price: f64,
     pub option_type: String,       // "P" or "C"
-    pub contracts: i64,            // number of contracts
+    pub contracts: i64,            // original opening quantity, preserving its recorded sign
+    pub remaining_contracts: i64,  // unmatched quantity with the same sign; zero when completed
     pub open_price: f64,           // sell to open price
     pub open_amount: f64,          // total premium received
     pub commission: f64,           // commission paid on open

@@ -1,8 +1,6 @@
 use crate::db::Database;
 use crate::models::Holding;
-use crate::services::portfolio_mutation::{
-    create_holding_in, validate_holding_values, CreateHoldingInput,
-};
+use crate::services::portfolio_mutation::{create_holding_in, CreateHoldingInput};
 use tauri::State;
 
 #[tauri::command(rename_all = "camelCase")]
@@ -115,52 +113,20 @@ pub fn update_holding(
     avg_cost: f64,
     currency: String,
 ) -> Result<Holding, String> {
-    validate_holding_values(&market, &symbol, shares, avg_cost, &currency)?;
-
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
-    let now = chrono::Utc::now().to_rfc3339();
-    let rows_affected = conn
-        .execute(
-            "UPDATE holdings SET account_id = ?2, symbol = ?3, name = ?4, market = ?5,
-             category_id = ?6, shares = ?7, avg_cost = ?8, currency = ?9, updated_at = ?10
-             WHERE id = ?1",
-            rusqlite::params![
-                id,
-                account_id,
-                symbol,
-                name,
-                market,
-                category_id,
-                shares,
-                avg_cost,
-                currency,
-                now
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-    if rows_affected == 0 {
-        return Err(format!("Holding with id {} not found", id));
-    }
-    let created_at: String = conn
-        .query_row(
-            "SELECT created_at FROM holdings WHERE id = ?1",
-            rusqlite::params![id],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(Holding {
+    crate::services::holding_edit::update_holding(
+        db.inner(),
         id,
-        account_id,
-        symbol,
-        name,
-        market,
-        category_id,
-        shares,
-        avg_cost,
-        currency,
-        created_at,
-        updated_at: now,
-    })
+        CreateHoldingInput {
+            account_id,
+            symbol,
+            name,
+            market,
+            category_id,
+            shares,
+            avg_cost,
+            currency,
+        },
+    )
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -191,7 +157,7 @@ pub fn delete_holding(db: State<Database>, id: String) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_holding_values;
+    use crate::services::portfolio_mutation::validate_holding_values;
 
     #[test]
     fn validate_holding_values_rejects_invalid_average_cost() {

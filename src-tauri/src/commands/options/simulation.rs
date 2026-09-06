@@ -80,7 +80,7 @@ pub(super) fn simulate_sell_put_inner(
                 None => false,
             };
             let cash_needed = if would_be_assigned {
-                put.strike_price * put.contracts.abs() as f64 * shares_per_contract
+                put.strike_price * put.remaining_contracts.abs() as f64 * shares_per_contract
             } else {
                 0.0
             };
@@ -89,7 +89,7 @@ pub(super) fn simulate_sell_put_inner(
             sim_contracts.push(PutContractSimulation {
                 option_symbol: put.option_symbol.clone(),
                 strike_price: put.strike_price,
-                contracts: put.contracts,
+                contracts: put.remaining_contracts,
                 would_be_assigned,
                 cash_needed,
             });
@@ -157,7 +157,7 @@ pub(super) fn simulate_sell_call_inner(
                 None => false,
             };
             let shares_needed = if would_be_assigned {
-                call.contracts.abs() * shares_per_contract
+                call.remaining_contracts.abs() * shares_per_contract
             } else {
                 0
             };
@@ -166,7 +166,7 @@ pub(super) fn simulate_sell_call_inner(
             sim_contracts.push(CallContractSimulation {
                 option_symbol: call.option_symbol.clone(),
                 strike_price: call.strike_price,
-                contracts: call.contracts,
+                contracts: call.remaining_contracts,
                 would_be_assigned,
                 shares_needed,
             });

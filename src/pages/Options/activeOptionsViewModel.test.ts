@@ -11,6 +11,7 @@ const contract = (overrides: Record<string, unknown>) => ({
   strike_price: 200,
   option_type: "P",
   contracts: -1,
+  remaining_contracts: overrides.contracts ?? -1,
   open_price: 2,
   open_amount: 200,
   commission: -1,
@@ -101,6 +102,23 @@ test("active summaries preserve signed Put and Call contract totals", async () =
 
   assert.equal(row.putContracts, -5);
   assert.equal(row.callContracts, -4);
+});
+
+test("partial closes reduce active Put and Call totals without scaling campaign cash premium", async () => {
+  const { buildActiveUnderlyingSummaries } = await import("./activeOptionsViewModel.ts");
+  const [row] = buildActiveUnderlyingSummaries(
+    [
+      contract({ contracts: -10, remaining_contracts: -6 }),
+      contract({ id: "contract-call", option_type: "C", contracts: -5, remaining_contracts: -3 }),
+    ],
+    [review({})],
+    "2026-09-03",
+  );
+
+  assert.equal(row.putContracts, -6);
+  assert.equal(row.callContracts, -3);
+  assert.equal(row.netPremium, 145);
+  assert.equal(row.totalRecords, 2);
 });
 
 test("active summaries aggregate active-only net premium and expiry risk by underlying", async () => {

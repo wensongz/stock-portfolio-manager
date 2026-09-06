@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import {
   Typography,
+  Alert,
   Button,
   Table,
   Space,
@@ -43,6 +44,7 @@ import type {
   QuoteCommandResult,
 } from "../../types";
 import dayjs from "dayjs";
+import { canEditOpening } from "./holdingEditPolicy";
 
 const { Title, Text } = Typography;
 
@@ -157,6 +159,25 @@ export default function HoldingsPage() {
   const [holdingMoomooCsvImportModalOpen, setHoldingMoomooCsvImportModalOpen] = useState(false);
   const [holdingFirstradeCsvImportModalOpen, setHoldingFirstradeCsvImportModalOpen] = useState(false);
   const [editingHolding, setEditingHolding] = useState<Holding | null>(null);
+  const [editHistory, setEditHistory] = useState<{ id: string; editable: boolean; error?: boolean } | null>(null);
+  const financialFieldsLocked = !!editingHolding &&
+    (editHistory?.id !== editingHolding.id || !editHistory.editable);
+  const identityFieldsLocked = financialFieldsLocked || !!editingHolding && isCashSymbol(editingHolding.symbol);
+
+  useEffect(() => {
+    if (!editingHolding) { setEditHistory(null); return; }
+    let cancelled = false;
+    const holding = editingHolding;
+    setEditHistory(null);
+    invoke<Transaction[]>("get_transactions", { accountId: holding.account_id })
+      .then((transactions) => {
+        if (!cancelled) setEditHistory({ id: holding.id, editable: canEditOpening(holding, transactions) });
+      })
+      .catch(() => {
+        if (!cancelled) setEditHistory({ id: holding.id, editable: false, error: true });
+      });
+    return () => { cancelled = true; };
+  }, [editingHolding]);
   const [detailModalOpen, setDetailModalOpen] = useState(false);
   const [detailHolding, setDetailHolding] = useState<HoldingWithQuote | null>(null);
   const [detailTransactions, setDetailTransactions] = useState<Transaction[]>([]);
@@ -315,38 +336,7 @@ export default function HoldingsPage() {
     shares: number;
     avgCost: number;
     currency: Currency;
-  }) => {
-    // When editing a non-cash holding, warn if shares or avgCost changed and there are 2+ transactions
-    if (
-      editingHolding &&
-      !isCashSymbol(editingHolding.symbol) &&
-      (values.shares !== editingHolding.shares || values.avgCost !== editingHolding.avg_cost)
-    ) {
-      try {
-        const txns = await invoke<Transaction[]>("get_transactions", {
-          accountId: editingHolding.account_id,
-          symbol: editingHolding.symbol,
-        });
-        if (txns.length >= 2) {
-          Modal.confirm({
-            title: "修改提醒",
-            content:
-              "该持仓已有多条交易记录，直接修改持仓股数或平均成本价会导致与交易记录计算结果不一致。建议通过「交易记录」添加或导入该持仓的交易来更新持仓信息，取消本次修改操作。确定要继续保存吗？",
-            okText: "继续保存",
-            okButtonProps: { style: { backgroundColor: "var(--color-bg-elevated)", color: "var(--color-text)", borderColor: "var(--color-border)" } },
-            cancelText: "取消",
-            cancelButtonProps: { type: "primary" },
-            autoFocusButton: "cancel",
-            onOk: () => doSubmit(values),
-          });
-          return;
-        }
-      } catch {
-        // If fetching transactions fails, proceed with saving
-      }
-    }
-    doSubmit(values);
-  };
+  }) => doSubmit(values);
 
   const doSubmit = async (values: {
     accountId: string;
@@ -916,6 +906,22 @@ export default function HoldingsPage() {
         cancelText="取消"
         width={600}
       >
+        {editingHolding && (
+          <Alert
+            showIcon
+            type={editHistory?.error ? "warning" : "info"}
+            style={{ marginBottom: 16 }}
+            title={editHistory?.error
+              ? "无法读取交易记录，暂仅可编辑名称和类别。请关闭后重试。"
+              : editHistory?.id !== editingHolding.id
+                ? "正在检查交易记录…"
+                : financialFieldsLocked
+                  ? isCashSymbol(editingHolding.symbol)
+                    ? "该现金持仓已有资金流水。余额变动请在交易记录中记录存入或提取，此处仅可编辑名称和类别。"
+                    : "该持仓已有交易记录。买卖、分红请在交易记录中修正，此处仅可编辑名称和类别。"
+                  : "此处修改将同步修正期初记录，并保留原期初日期，重算后仍保持一致。"}
+          />
+        )}
         <Form form={form} layout="vertical" onFinish={handleSubmit}>
           <Form.Item
             name="accountId"
@@ -923,7 +929,7 @@ export default function HoldingsPage() {
             style={{ marginBottom: 12 }}
             rules={[{ required: true, message: "请选择账户" }]}
           >
-            <Select placeholder="选择证券账户" onChange={handleAccountChange}>
+            <Select placeholder="选择证券账户" onChange={handleAccountChange} disabled={identityFieldsLocked}>
               {accounts.map((a) => (
                 <Select.Option key={a.id} value={a.id}>
                   [{a.market}] {a.name}
@@ -940,6 +946,7 @@ export default function HoldingsPage() {
                 rules={[{ required: true, message: "请输入股票代码" }]}
               >
                 <AutoComplete
+                  disabled={identityFieldsLocked}
                   options={filteredSymbolOptions}
                   onSearch={setSymbolSearch}
                   onSelect={handleSymbolSelect}
@@ -980,7 +987,10 @@ export default function HoldingsPage() {
                 rules={[{ required: true, message: "请输入持仓股数" }]}
               >
                 <InputNumber
-                  {...shareInputProps(selectedFormMarket)}
+                  {...(editingHolding && isCashSymbol(editingHolding.symbol)
+                    ? { min: 0, precision: 2, placeholder: "现金余额" }
+                    : shareInputProps(selectedFormMarket))}
+                  disabled={financialFieldsLocked}
                   style={{ width: "100%" }}
                 />
               </Form.Item>
@@ -992,7 +1002,7 @@ export default function HoldingsPage() {
                 style={{ marginBottom: 12 }}
                 rules={[{ required: true, message: "请输入平均成本价" }]}
               >
-                <InputNumber min={0} precision={4} style={{ width: "100%" }} placeholder="买入均价" />
+                <InputNumber min={0} precision={4} style={{ width: "100%" }} placeholder="买入均价" disabled={financialFieldsLocked || !!editingHolding && isCashSymbol(editingHolding.symbol)} />
               </Form.Item>
             </Col>
           </Row>
@@ -1004,7 +1014,7 @@ export default function HoldingsPage() {
                 style={{ marginBottom: 0 }}
                 rules={[{ required: true, message: "请选择市场" }]}
               >
-                <Select placeholder="选择市场">
+                <Select placeholder="选择市场" disabled={identityFieldsLocked}>
                   <Select.Option value="US">🇺🇸 美股</Select.Option>
                   <Select.Option value="CN">🇨🇳 A股</Select.Option>
                   <Select.Option value="HK">🇭🇰 港股</Select.Option>
@@ -1018,7 +1028,7 @@ export default function HoldingsPage() {
                 style={{ marginBottom: 0 }}
                 rules={[{ required: true, message: "请选择币种" }]}
               >
-                <Select placeholder="选择币种">
+                <Select placeholder="选择币种" disabled={identityFieldsLocked}>
                   <Select.Option value="USD">USD 美元</Select.Option>
                   <Select.Option value="CNY">CNY 人民币</Select.Option>
                   <Select.Option value="HKD">HKD 港元</Select.Option>

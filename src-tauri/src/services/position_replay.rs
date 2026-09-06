@@ -77,7 +77,7 @@ pub(crate) fn replay_transactions(
             }
             "BUY" => {
                 let new_shares = projection.shares + transaction.shares;
-                if new_shares <= POSITION_EPSILON {
+                if new_shares <= 0.0 {
                     return Err("BUY must leave a positive historical position".to_string());
                 }
                 projection.avg_cost = (projection.shares * projection.avg_cost
@@ -88,13 +88,19 @@ pub(crate) fn replay_transactions(
             }
             "SELL" => {
                 let remaining = projection.shares - transaction.shares;
-                if remaining < -POSITION_EPSILON {
+                // Allow a few floating-point ulps for sums such as 0.1 + 0.7,
+                // not an absolute epsilon that erases real tiny positions.
+                // The cap also preserves representable residuals at large sizes.
+                let tolerance =
+                    (4.0 * f64::EPSILON * projection.shares.abs().max(transaction.shares.abs()))
+                        .min(POSITION_EPSILON);
+                if remaining < -tolerance {
                     return Err(format!(
                         "SELL of {} exceeds historical position of {}",
                         transaction.shares, projection.shares
                     ));
                 }
-                let remaining = if remaining.abs() <= POSITION_EPSILON {
+                let remaining = if remaining.abs() <= tolerance {
                     0.0
                 } else {
                     remaining
@@ -110,7 +116,7 @@ pub(crate) fn replay_transactions(
                 }
                 projection.shares = remaining;
             }
-            "PAY" if adjust_sell_pay_cost && projection.shares > POSITION_EPSILON => {
+            "PAY" if adjust_sell_pay_cost && projection.shares > 0.0 => {
                 let net_amount = transaction.total_amount - transaction.commission;
                 projection.avg_cost =
                     (projection.shares * projection.avg_cost - net_amount) / projection.shares;
@@ -415,6 +421,33 @@ mod tests {
         let error = replay_transactions(&transactions, false).unwrap_err();
 
         assert!(error.contains("historical position"), "got: {error}");
+    }
+
+    #[test]
+    fn replay_preserves_real_tiny_positions_and_rejects_real_oversells() {
+        let position = replay_transactions(
+            &[
+                transaction("BUY", 1e-10, 10.0, 1e-9, 0.0),
+                transaction("SELL", 5e-11, 10.0, 5e-10, 0.0),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(position.shares, 5e-11);
+
+        for (held, sold) in [(0.8, 0.8000000001), (1e-10, 2e-10)] {
+            assert!(
+                replay_transactions(
+                    &[
+                        transaction("BUY", held, 10.0, held * 10.0, 0.0),
+                        transaction("SELL", sold, 10.0, sold * 10.0, 0.0),
+                    ],
+                    false
+                )
+                .is_err(),
+                "accepted oversell of {sold} with {held} held"
+            );
+        }
     }
 
     #[test]

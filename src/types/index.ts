@@ -1024,7 +1024,10 @@ export interface OptionContract {
   expiry_date: string;
   strike_price: number;
   option_type: "P" | "C";
+  /** Original opening quantity, preserving its recorded sign. */
   contracts: number;
+  /** Unmatched quantity with the same sign; zero when completed. */
+  remaining_contracts: number;
   open_price: number;
   open_amount: number;
   commission: number;

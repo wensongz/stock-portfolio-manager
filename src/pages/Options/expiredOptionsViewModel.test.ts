@@ -21,6 +21,7 @@ const contract = (overrides: Record<string, unknown>) => ({
   strike_price: 200,
   option_type: "P",
   contracts: 1,
+  remaining_contracts: 0,
   open_price: 2,
   open_amount: 200,
   commission: 1,

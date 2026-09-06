@@ -1,6 +1,5 @@
 use crate::models::{Holding, Transaction};
 use crate::services::position_replay::{rebuild_position_group, PositionKey};
-use crate::services::quote_provider_service::market_adjusts_sell_pay_cost;
 use crate::services::quote_service::{cash_display_name, is_cash_symbol, CASH_SYMBOL_PREFIX};
 use rusqlite::{Connection, OptionalExtension};
 
@@ -112,6 +111,16 @@ pub(crate) fn validate_transaction_values(input: &CreateTransactionInput) -> Res
         if !value.is_finite() {
             return Err(format!("Transaction {label} must be finite"));
         }
+    }
+    // OPEN stores a cost baseline, which may legitimately be negative after
+    // distributions. Trade proceeds and dividend amounts use unsigned gross
+    // amounts; direction comes from the transaction type. Keep signed
+    // commissions so broker fee refunds remain representable.
+    if input.transaction_type != "OPEN" && input.total_amount < 0.0 {
+        return Err("Transaction total_amount must be non-negative".to_string());
+    }
+    if matches!(input.transaction_type.as_str(), "BUY" | "SELL") && input.price < 0.0 {
+        return Err("Transaction price must be non-negative".to_string());
     }
     Ok(())
 }
@@ -291,14 +300,52 @@ pub fn create_holding_in(conn: &Connection, input: &CreateHoldingInput) -> Resul
     })
 }
 
+/// Recover the existing balance of a legacy position that has no ledger yet.
+/// Its creation time is the only known baseline date; never backdate it merely
+/// to make a historical import pass.
+fn ensure_legacy_opening(
+    conn: &Connection,
+    holding_id: &str,
+    input: &CreateTransactionInput,
+) -> Result<(), String> {
+    let has_history: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM transactions WHERE account_id=?1 AND UPPER(symbol)=UPPER(?2))",
+        rusqlite::params![input.account_id, input.symbol],
+        |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if has_history || input.transaction_type == "OPEN" {
+        return Ok(());
+    }
+    let created_at: String = conn
+        .query_row(
+            "SELECT created_at FROM holdings WHERE id=?1",
+            [holding_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if input.traded_at < created_at {
+        return Err(
+            "该持仓没有交易历史，成交时间早于已知期初日期；请先核查并补齐期初记录。".into(),
+        );
+    }
+    conn.execute(
+        "INSERT INTO transactions (id,holding_id,account_id,symbol,name,market,transaction_type,shares,price,total_amount,commission,currency,traded_at,notes,created_at)
+         SELECT ?1,id,account_id,symbol,name,market,'OPEN',shares,avg_cost,shares*avg_cost,0,currency,created_at,'legacy:initial-position',created_at
+         FROM holdings WHERE id=?2",
+        rusqlite::params![uuid::Uuid::new_v4().to_string(), holding_id],
+    ).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 pub fn create_transaction_in(
     conn: &Connection,
     input: &CreateTransactionInput,
 ) -> Result<Transaction, String> {
+    require_caller_transaction(conn)?;
     validate_transaction_values(input)?;
     let transaction_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
-    let mut holding_id: Option<String> = conn
+    let holding_id: Option<String> = conn
         .query_row(
             "SELECT id FROM holdings WHERE account_id = ?1 AND UPPER(symbol) = UPPER(?2)",
             rusqlite::params![input.account_id, input.symbol],
@@ -307,99 +354,12 @@ pub fn create_transaction_in(
         .optional()
         .map_err(|error| error.to_string())?;
 
-    if !is_cash_symbol(&input.symbol) && holding_id.is_none() && input.transaction_type == "BUY" {
-        let new_holding_id = uuid::Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT INTO holdings (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0.0, 0.0, ?6, ?7, ?8)",
-            rusqlite::params![
-                new_holding_id,
-                input.account_id,
-                input.symbol,
-                input.name,
-                input.market,
-                input.currency,
-                now,
-                now
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        holding_id = Some(new_holding_id);
-    }
-
-    if input.transaction_type == "SELL" && !is_cash_symbol(&input.symbol) && holding_id.is_none() {
-        return Err(format!(
-            "Cannot sell {}: no holding exists in this account",
-            input.symbol
-        ));
-    }
-    if is_cash_symbol(&input.symbol) && input.transaction_type == "SELL" {
-        validate_cash_withdrawal(conn, &input.account_id, &input.symbol, input.total_amount)?;
-    }
-
     if !is_cash_symbol(&input.symbol) {
-        if let Some(ref id) = holding_id {
-            let (current_shares, current_avg_cost): (f64, f64) = conn
-                .query_row(
-                    "SELECT shares, avg_cost FROM holdings WHERE id = ?1",
-                    rusqlite::params![id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(|error| error.to_string())?;
-            if input.transaction_type == "SELL" && input.shares > current_shares {
-                return Err(format!(
-                    "Cannot sell {} shares of {}: only {} shares held",
-                    input.shares, input.symbol, current_shares
-                ));
-            }
-
-            let adjust = market_adjusts_sell_pay_cost(conn, &input.market);
-            let (new_shares, new_avg_cost) = match input.transaction_type.as_str() {
-                "BUY" => {
-                    let total_shares = current_shares + input.shares;
-                    let average = if total_shares > 0.0 {
-                        (current_shares * current_avg_cost
-                            + input.shares * input.price
-                            + input.commission)
-                            / total_shares
-                    } else {
-                        input.price
-                    };
-                    (total_shares, average)
-                }
-                "PAY" => {
-                    let net_amount = input.total_amount - input.commission;
-                    let average = if adjust && current_shares > 0.0 {
-                        (current_shares * current_avg_cost - net_amount) / current_shares
-                    } else {
-                        current_avg_cost
-                    };
-                    (current_shares, average)
-                }
-                "SELL" => {
-                    let remaining = current_shares - input.shares;
-                    let average = if adjust {
-                        if remaining > 0.0 {
-                            (current_shares * current_avg_cost - input.total_amount
-                                + input.commission)
-                                / remaining
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        current_avg_cost
-                    };
-                    (remaining, average)
-                }
-                "OPEN" => (current_shares, current_avg_cost),
-                _ => unreachable!("validated transaction type"),
-            };
-            conn.execute(
-                "UPDATE holdings SET shares = ?2, avg_cost = ?3, updated_at = ?4 WHERE id = ?1",
-                rusqlite::params![id, new_shares, new_avg_cost, now],
-            )
-            .map_err(|error| error.to_string())?;
+        if let Some(id) = holding_id.as_deref() {
+            ensure_legacy_opening(conn, id, input)?;
         }
+    } else if input.transaction_type == "SELL" {
+        validate_cash_withdrawal(conn, &input.account_id, &input.symbol, input.total_amount)?;
     }
 
     conn.execute(
@@ -424,6 +384,10 @@ pub fn create_transaction_in(
         ],
     )
     .map_err(|error| error.to_string())?;
+
+    if !is_cash_symbol(&input.symbol) {
+        rebuild_position_group(conn, &PositionKey::new(&input.account_id, &input.symbol))?;
+    }
 
     let delta = cash_delta(
         &input.transaction_type,
@@ -759,7 +723,8 @@ mod tests {
     #[test]
     fn create_transaction_in_updates_position_and_cash_together() {
         let db = database_with_account();
-        let conn = db.conn.lock().unwrap();
+        let mut connection = db.conn.lock().unwrap();
+        let conn = connection.transaction().unwrap();
 
         create_transaction_in(
             &conn,
@@ -890,5 +855,183 @@ mod tests {
         }
 
         assert_eq!(portfolio_counts(&database), (2, 2.0, 0.0));
+    }
+
+    #[test]
+    fn inserting_an_earlier_buy_uses_historical_average_cost() {
+        let database = database_with_account();
+        let mut conn = database.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        for input in [
+            stock_transaction("BUY", 10.0, 10.0, 100.0, "2026-01-01"),
+            stock_transaction("SELL", 5.0, 30.0, 150.0, "2026-01-03"),
+            stock_transaction("BUY", 10.0, 20.0, 200.0, "2026-01-02"),
+        ] {
+            create_transaction_in(&tx, &input).unwrap();
+        }
+        let position: (f64, f64) = tx
+            .query_row(
+                "SELECT shares, avg_cost FROM holdings WHERE symbol='AAPL'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(position, (15.0, 15.0));
+    }
+
+    #[test]
+    fn inserting_a_sell_before_its_buy_rejects_and_rolls_back() {
+        let database = database_with_account();
+        {
+            let mut conn = database.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            create_transaction_in(
+                &tx,
+                &stock_transaction("BUY", 10.0, 10.0, 100.0, "2026-01-02"),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let before = portfolio_counts(&database);
+        {
+            let mut conn = database.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            let error = create_transaction_in(
+                &tx,
+                &stock_transaction("SELL", 1.0, 20.0, 20.0, "2026-01-01"),
+            )
+            .unwrap_err();
+            assert!(error.contains("historical position"), "{error}");
+            tx.rollback().unwrap();
+        }
+        assert_eq!(portfolio_counts(&database), before);
+    }
+
+    #[test]
+    fn fractional_buys_can_be_sold_in_full_without_a_dust_position() {
+        let database = database_with_account();
+        let mut conn = database.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        for input in [
+            stock_transaction("BUY", 0.1, 10.0, 1.0, "2026-01-01"),
+            stock_transaction("BUY", 0.7, 10.0, 7.0, "2026-01-02"),
+            stock_transaction("SELL", 0.8, 10.0, 8.0, "2026-01-03"),
+        ] {
+            create_transaction_in(&tx, &input).unwrap();
+        }
+        let shares: f64 = tx
+            .query_row("SELECT shares FROM holdings WHERE symbol='AAPL'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(shares, 0.0);
+    }
+
+    #[test]
+    fn negative_buy_amount_is_rejected_before_any_account_write() {
+        let database = database_with_account();
+        let mut conn = database.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        let error = create_transaction_in(
+            &tx,
+            &stock_transaction("BUY", 1.0, 10.0, -100.0, "2026-01-01"),
+        )
+        .unwrap_err();
+        assert!(error.contains("total_amount"), "{error}");
+        let counts: (i64, i64) = tx
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM holdings), (SELECT COUNT(*) FROM transactions)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[test]
+    fn financial_validation_preserves_rebates_and_signed_open_baselines() {
+        for kind in ["BUY", "SELL", "PAY"] {
+            let mut input = stock_transaction(kind, 1.0, 10.0, -1.0, "2026-01-01");
+            assert!(
+                super::validate_transaction_values(&input).is_err(),
+                "{kind} negative amount"
+            );
+            input.total_amount = 0.0;
+            input.price = 0.0;
+            input.commission = -0.01;
+            assert!(
+                super::validate_transaction_values(&input).is_ok(),
+                "{kind} zero value with fee refund"
+            );
+        }
+        for kind in ["BUY", "SELL"] {
+            let input = stock_transaction(kind, 1.0, -10.0, 10.0, "2026-01-01");
+            assert!(
+                super::validate_transaction_values(&input).is_err(),
+                "{kind} negative price"
+            );
+        }
+        let open = stock_transaction("OPEN", 10.0, -2.0, -20.0, "2026-01-01");
+        assert!(super::validate_transaction_values(&open).is_ok());
+    }
+
+    #[test]
+    fn historyless_holding_gets_a_dated_open_before_its_first_trade() {
+        let database = database_with_account();
+        let mut conn = database.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute("INSERT INTO holdings (id,account_id,symbol,name,market,shares,avg_cost,currency,created_at,updated_at) VALUES ('legacy','account-1','AAPL','Apple','US',10,20,'USD','2026-01-01','2026-01-01')", []).unwrap();
+        create_transaction_in(
+            &tx,
+            &stock_transaction("BUY", 10.0, 30.0, 300.0, "2026-01-02"),
+        )
+        .unwrap();
+        create_transaction_in(
+            &tx,
+            &stock_transaction("SELL", 5.0, 40.0, 200.0, "2026-01-03"),
+        )
+        .unwrap();
+        let baseline: (f64, f64, String) = tx
+            .query_row(
+                "SELECT shares,price,traded_at FROM transactions WHERE transaction_type='OPEN'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(baseline, (10.0, 20.0, "2026-01-01".into()));
+        let position: (f64, f64) = tx
+            .query_row(
+                "SELECT shares,avg_cost FROM holdings WHERE id='legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(position, (15.0, 25.0));
+        let cash: f64 = tx
+            .query_row(
+                "SELECT shares FROM holdings WHERE symbol='$CASH-USD'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cash, -100.0);
+    }
+
+    #[test]
+    fn first_legacy_trade_cannot_silently_move_the_opening_date() {
+        let database = database_with_account();
+        let mut conn = database.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute("INSERT INTO holdings (id,account_id,symbol,name,market,shares,avg_cost,currency,created_at,updated_at) VALUES ('legacy','account-1','AAPL','Apple','US',10,20,'USD','2026-01-02','2026-01-02')", []).unwrap();
+        let error = create_transaction_in(
+            &tx,
+            &stock_transaction("BUY", 1.0, 10.0, 10.0, "2026-01-01"),
+        )
+        .unwrap_err();
+        assert!(error.contains("期初"), "{error}");
+        let count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

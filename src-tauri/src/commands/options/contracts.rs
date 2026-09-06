@@ -193,7 +193,8 @@ pub fn get_option_contracts_inner(
         .iter()
         .filter(|record| record.action == "SELL" && record.code.starts_with('O'))
         .map(|open| {
-            let is_complete = result.remaining_open.get(&open.id).copied().unwrap_or(0) == 0;
+            let remaining = result.remaining_open.get(&open.id).copied().unwrap_or(0);
+            let is_complete = remaining == 0;
             let completing_close = is_complete
                 .then(|| {
                     result
@@ -220,6 +221,7 @@ pub fn get_option_contracts_inner(
                 strike_price: open.strike_price,
                 option_type: open.option_type.clone(),
                 contracts: open.quantity,
+                remaining_contracts: remaining * open.quantity.signum(),
                 open_price: open.price,
                 open_amount: open.amount,
                 commission: open.commission,

@@ -196,6 +196,7 @@ export default function OptionsPage() {
     strike_price: number;
     option_type: string;
     contracts: number;
+    remaining_contracts: number;
     open_price: number;
     open_amount: number;
     commission: number;
@@ -226,6 +227,7 @@ export default function OptionsPage() {
           strike_price: c.strike_price,
           option_type: c.option_type,
           contracts: c.contracts,
+          remaining_contracts: c.remaining_contracts,
           open_price: c.open_price,
           open_amount: c.open_amount,
           commission: c.commission,
@@ -237,6 +239,7 @@ export default function OptionsPage() {
       }
       // Multiple contracts with same symbol: sum contracts, aggregate amounts
       const totalContracts = items.reduce((sum, c) => sum + c.contracts, 0);
+      const remainingContracts = items.reduce((sum, c) => sum + c.remaining_contracts, 0);
       const totalAmount = items.reduce((sum, c) => sum + c.open_amount, 0);
       const totalCommission = items.reduce((sum, c) => sum + c.commission, 0);
       const first = items[0];
@@ -248,6 +251,7 @@ export default function OptionsPage() {
         strike_price: first.strike_price,
         option_type: first.option_type,
         contracts: totalContracts,
+        remaining_contracts: remainingContracts,
         open_price: first.open_price,
         open_amount: totalAmount,
         commission: totalCommission,
@@ -563,10 +567,16 @@ export default function OptionsPage() {
       ),
     },
     {
-      title: "合约数",
+      title: "开仓合约数",
       dataIndex: "contracts",
       key: "contracts",
-      width: 70,
+      width: 110,
+    },
+    {
+      title: "未平仓合约数",
+      dataIndex: "remaining_contracts",
+      key: "remaining_contracts",
+      width: 110,
     },
     {
       title: "开仓价",
@@ -576,7 +586,7 @@ export default function OptionsPage() {
       render: (v: number) => `$${v.toFixed(2)}`,
     },
     {
-      title: "权利金",
+      title: "开仓权利金",
       dataIndex: "open_amount",
       key: "open_amount",
       width: 100,
@@ -604,7 +614,7 @@ export default function OptionsPage() {
 
   // Table columns for expired contracts
   const expiredColumns = [
-    ...activeColumns,
+    ...activeColumns.filter((column) => column.key !== "remaining_contracts"),
     {
       title: "结果",
       dataIndex: "status",
@@ -662,7 +672,7 @@ export default function OptionsPage() {
       width: 125,
     },
     {
-      title: "Put / Call（合约数）",
+      title: "Put / Call（未平仓）",
       key: "optionMix",
       align: "right",
       width: 125,

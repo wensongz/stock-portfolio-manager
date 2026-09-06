@@ -21,6 +21,186 @@ fn db_with_account() -> (Database, String) {
     (db, account_id)
 }
 
+fn insert_exposure_record(
+    db: &Database,
+    account_id: &str,
+    option_type: &str,
+    id: &str,
+    quantity: i64,
+    is_open: bool,
+    traded_at: &str,
+) {
+    db.conn
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO option_records
+             (id, account_id, option_symbol, underlying, expiry_date, strike_price,
+              option_type, action, code, quantity, price, amount, commission, fee,
+              traded_at, created_at, contract_status)
+             VALUES (?1, ?2, ?3, 'AAPL', '18SEP26', 100, ?4, ?5, ?6, ?7,
+                     2, ?8, 1, 0, ?9, ?9, 'active')",
+            rusqlite::params![
+                id,
+                account_id,
+                format!("AAPL 18SEP26 100 {option_type}"),
+                option_type,
+                if is_open { "SELL" } else { "BUY" },
+                if is_open { "O" } else { "C" },
+                quantity,
+                quantity.abs() as f64 * 200.0,
+                traded_at,
+            ],
+        )
+        .unwrap();
+}
+
+#[test]
+fn test_partial_close_exposes_remaining_quantity_without_changing_opening_facts() {
+    for (option_type, open_quantity, remaining_quantity) in [("P", 10, 6), ("C", -10, -6)] {
+        let (db, account_id) = db_with_account();
+        insert_exposure_record(
+            &db,
+            &account_id,
+            option_type,
+            "open",
+            open_quantity,
+            true,
+            "2026-08-01",
+        );
+        insert_exposure_record(
+            &db,
+            &account_id,
+            option_type,
+            "close",
+            4,
+            false,
+            "2026-08-02",
+        );
+
+        let contracts = get_option_contracts_inner(&db, &account_id).unwrap();
+        let contract = &contracts[0];
+        assert_eq!(contract.status, "active");
+        assert_eq!(contract.contracts, open_quantity);
+        assert_eq!(contract.open_amount, 2_000.0);
+        assert_eq!(contract.commission, 1.0);
+        assert_eq!(contract.close_price, None);
+        assert_eq!(
+            serde_json::to_value(contract).unwrap()["remaining_contracts"],
+            remaining_quantity
+        );
+    }
+}
+
+#[test]
+fn test_partial_close_sell_put_simulation_uses_only_six_remaining_contracts() {
+    let (db, account_id) = db_with_account();
+    insert_exposure_record(&db, &account_id, "P", "open", 10, true, "2026-08-01");
+    insert_exposure_record(&db, &account_id, "P", "close", 4, false, "2026-08-02");
+
+    let simulations = simulation::simulate_sell_put_inner(
+        &db,
+        &account_id,
+        vec![StockPriceInput {
+            symbol: "AAPL".into(),
+            price: 90.0,
+        }],
+    )
+    .unwrap();
+
+    assert_eq!(simulations[0].total_cash_needed, 60_000.0);
+    assert_eq!(simulations[0].contracts[0].contracts, 6);
+    assert_eq!(simulations[0].contracts[0].cash_needed, 60_000.0);
+}
+
+#[test]
+fn test_partial_close_sell_call_simulation_uses_only_six_remaining_contracts() {
+    let (db, account_id) = db_with_account();
+    insert_exposure_record(&db, &account_id, "C", "open", -10, true, "2026-08-01");
+    insert_exposure_record(&db, &account_id, "C", "close", 4, false, "2026-08-02");
+
+    let simulations = simulation::simulate_sell_call_inner(
+        &db,
+        &account_id,
+        vec![StockPriceInput {
+            symbol: "AAPL".into(),
+            price: 110.0,
+        }],
+    )
+    .unwrap();
+
+    assert_eq!(simulations[0].total_shares_needed, 600);
+    assert_eq!(simulations[0].contracts[0].contracts, -6);
+    assert_eq!(simulations[0].contracts[0].shares_needed, 600);
+}
+
+#[test]
+fn test_partial_close_simulations_follow_fifo_until_all_opens_are_closed() {
+    for option_type in ["P", "C"] {
+        let (db, account_id) = db_with_account();
+        for (id, quantity, is_open, date) in [
+            ("open-old", -10, true, "2026-08-01"),
+            ("open-new", -5, true, "2026-08-02"),
+            ("close-first", 4, false, "2026-08-03"),
+            ("close-second", 8, false, "2026-08-04"),
+        ] {
+            insert_exposure_record(&db, &account_id, option_type, id, quantity, is_open, date);
+        }
+        let price = if option_type == "P" { 90.0 } else { 110.0 };
+        let prices = || {
+            vec![StockPriceInput {
+                symbol: "AAPL".into(),
+                price,
+            }]
+        };
+        if option_type == "P" {
+            let simulations =
+                simulation::simulate_sell_put_inner(&db, &account_id, prices()).unwrap();
+            assert_eq!(simulations[0].contracts.len(), 1);
+            assert_eq!(simulations[0].contracts[0].contracts, -3);
+            assert_eq!(simulations[0].total_cash_needed, 30_000.0);
+        } else {
+            let simulations =
+                simulation::simulate_sell_call_inner(&db, &account_id, prices()).unwrap();
+            assert_eq!(simulations[0].contracts.len(), 1);
+            assert_eq!(simulations[0].contracts[0].contracts, -3);
+            assert_eq!(simulations[0].total_shares_needed, 300);
+        }
+
+        insert_exposure_record(
+            &db,
+            &account_id,
+            option_type,
+            "close-final",
+            3,
+            false,
+            "2026-08-05",
+        );
+        let contracts = get_option_contracts_inner(&db, &account_id).unwrap();
+        assert!(contracts.iter().all(|contract| contract.status == "closed"));
+        assert!(contracts
+            .iter()
+            .all(|contract| serde_json::to_value(contract).unwrap()["remaining_contracts"] == 0));
+        assert_eq!(
+            contracts
+                .iter()
+                .map(|contract| contract.contracts.abs())
+                .sum::<i64>(),
+            15
+        );
+        assert!(
+            simulation::simulate_sell_put_inner(&db, &account_id, prices())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            simulation::simulate_sell_call_inner(&db, &account_id, prices())
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
 /// A sample IBKR-style English-header options trade CSV.
 /// All close records have a matching open record (same symbol, enough quantity).
 const ENGLISH_CSV: &str = "\

@@ -347,7 +347,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "get_option_positions",
-                "description": "查询期权持仓（卖出期权记录）：按账户列出期权合约，含标的、行权价、到期日、类型（看涨/看跌）、收取权利金、状态（活跃/到期/被行权/平仓）。适用于\"期权持仓\"\"卖了多少期权\"\"到期日\"等。需要 accountId。",
+                "description": "查询期权持仓（卖出期权记录）：按账户列出期权合约，含标的、行权价、到期日、类型（看涨/看跌）、收取权利金、状态（活跃/到期/被行权/平仓）。contracts 是原始开仓量，remaining_contracts 是部分平仓后剩余未平仓量，均保留原始符号；当前风险、现金和交付股数必须使用 remaining_contracts 的绝对值，不能使用原始开仓量。open_amount 仍是原始开仓权利金，不按剩余量缩放。适用于\"期权持仓\"\"卖了多少期权\"\"到期日\"等。需要 accountId。",
                 "parameters": {
                     "type": "object",
                     "properties": {

@@ -122,12 +122,12 @@ export function buildActiveUnderlyingSummaries(
       totalRecords,
       putContracts: items.reduce(
         (total, contract) =>
-          contract.option_type === "P" ? total + contract.contracts : total,
+          contract.option_type === "P" ? total + contract.remaining_contracts : total,
         0,
       ),
       callContracts: items.reduce(
         (total, contract) =>
-          contract.option_type === "C" ? total + contract.contracts : total,
+          contract.option_type === "C" ? total + contract.remaining_contracts : total,
         0,
       ),
       averageNetPremiumPerRecord:

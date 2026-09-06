@@ -13,6 +13,7 @@ pub mod option_matching;
 pub mod option_review_service;
 pub mod performance_service;
 pub mod portfolio_mutation;
+pub mod portfolio_alert_calculator;
 pub mod portfolio_read_service;
 pub mod position_replay;
 pub mod quarterly_service;

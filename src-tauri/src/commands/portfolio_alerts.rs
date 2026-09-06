@@ -88,6 +88,7 @@ mod tests {
     };
     use crate::db::Database;
     use crate::models::portfolio_alert::{
+        PortfolioAlertBreachDirection, PortfolioAlertBreachKind, PortfolioAlertScope,
         PortfolioAlertScopeKind, PortfolioAlertTarget, SavePortfolioAlertConfigInput,
     };
     use crate::models::StockQuote;
@@ -185,8 +186,55 @@ mod tests {
 
         let emitted = emitted.lock().unwrap();
         assert_eq!(emitted.len(), 1);
-        assert_eq!(emitted[0].config_id, config_id);
-        assert_eq!(emitted[0].breach.breach_key, "security:US:AAPL");
+        let notification = &emitted[0];
+        assert_eq!(notification.config_id, config_id);
+        assert_eq!(
+            notification.scope,
+            PortfolioAlertScope {
+                kind: PortfolioAlertScopeKind::Market,
+                market: Some("US".to_string()),
+                account_id: None,
+            }
+        );
+        assert_eq!(notification.breach.config_id, notification.config_id);
+        assert_eq!(notification.breach.breach_key, "security:US:AAPL");
+        assert_eq!(
+            notification.breach.breach_kind,
+            PortfolioAlertBreachKind::Concentration
+        );
+        assert_eq!(
+            notification.breach.direction,
+            PortfolioAlertBreachDirection::AboveLimit
+        );
+        assert_eq!(notification.message, "持仓集中度预警：security:US:AAPL");
+        assert_eq!(notification.triggered_at, notification.breach.first_triggered_at);
+        assert_eq!(notification.triggered_at, notification.breach.last_seen_at);
+        assert!(chrono::DateTime::parse_from_rfc3339(&notification.triggered_at).is_ok());
+
+        let persisted = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT breach_key, breach_kind, direction, first_triggered_at, last_seen_at
+                 FROM portfolio_alert_breaches WHERE config_id = ?1",
+                [&notification.config_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(persisted.0, notification.breach.breach_key);
+        assert_eq!(persisted.1, "CONCENTRATION");
+        assert_eq!(persisted.2, "ABOVE_LIMIT");
+        assert_eq!(persisted.3, notification.breach.first_triggered_at);
+        assert_eq!(persisted.4, notification.breach.last_seen_at);
     }
 
     #[tokio::test]

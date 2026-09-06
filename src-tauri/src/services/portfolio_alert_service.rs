@@ -266,10 +266,19 @@ fn validate_input_basics(input: &SavePortfolioAlertConfigInput) -> Result<(), St
         }
         total += target.target_percent;
     }
-    if !total.is_finite() || (total - 100.0).abs() > TOTAL_TOLERANCE + 1e-9 {
+    if !target_total_is_within_tolerance(total) {
         return Err("target percentages must total 100 within 0.01".to_string());
     }
     Ok(())
+}
+
+fn target_total_is_within_tolerance(total: f64) -> bool {
+    if !total.is_finite() {
+        return false;
+    }
+    let lower_bound = (100.0 - TOTAL_TOLERANCE).next_down();
+    let upper_bound = (100.0 + TOTAL_TOLERANCE).next_up();
+    total >= lower_bound && total <= upper_bound
 }
 
 fn validate_scope_currency(
@@ -744,6 +753,18 @@ mod tests {
                 )
             )
             .is_ok());
+        }
+        for total in [99.989_999_999_999, 100.010_000_000_001] {
+            assert!(save_portfolio_alert_config(
+                &db,
+                input(
+                    overall_scope(),
+                    20.0,
+                    20.0,
+                    [("growth", 60.0), ("bonds", total - 60.0)]
+                )
+            )
+            .is_err());
         }
         for (deviation, concentration) in [
             (f64::NAN, 20.0),

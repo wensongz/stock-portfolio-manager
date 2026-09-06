@@ -32,7 +32,6 @@ import type {
   PortfolioAlertScope,
   SavePortfolioAlertConfigInput,
 } from "../../types";
-import PieChart from "../../components/charts/PieChart";
 import { useAccountStore } from "../../stores/accountStore";
 import { useCategoryStore } from "../../stores/categoryStore";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
@@ -112,6 +111,75 @@ function formatEvaluatedAt(value: string | null): string {
   if (!value) return "尚无成功评估";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN");
+}
+
+interface PortfolioAlertStatusBannerProps {
+  banner: string;
+  statusColor: string;
+  statusLabel: string;
+}
+
+export function PortfolioAlertStatusBanner({
+  banner,
+  statusColor,
+  statusLabel,
+}: PortfolioAlertStatusBannerProps) {
+  return (
+    <Alert
+      type={alertType(statusColor)}
+      showIcon
+      title={(
+        <Space size="small" wrap>
+          <Text strong>{statusLabel}</Text>
+          <Text>{banner}</Text>
+        </Space>
+      )}
+    />
+  );
+}
+
+interface PortfolioAlertTargetEditorProps {
+  rows: PortfolioAlertTargetEditorRow[];
+  targetErrors: Record<string, string>;
+  onTargetChange: (categoryId: string, targetPercent: number | null) => void;
+}
+
+export function PortfolioAlertTargetEditor({
+  rows,
+  targetErrors,
+  onTargetChange,
+}: PortfolioAlertTargetEditorProps) {
+  return (
+    <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+      {rows.map((row) => {
+        const fieldError = targetErrors[row.categoryId];
+        return (
+          <div
+            key={row.key}
+            className="rounded-lg border border-slate-200 p-3 dark:border-slate-700"
+          >
+            <div className="mb-2 flex items-center gap-2">
+              <span style={{ fontSize: 20 }}>{row.icon}</span>
+              <Badge color={row.color} />
+              <Text>{row.name}</Text>
+            </div>
+            <InputNumber
+              min={0}
+              max={100}
+              precision={2}
+              value={Number.isFinite(row.targetPercent) ? row.targetPercent : null}
+              status={fieldError ? "error" : undefined}
+              addonAfter="%"
+              onChange={(value) => onTargetChange(row.categoryId, value)}
+              rootClassName="w-full"
+              style={{ flex: 1, minWidth: 0, width: "auto" }}
+            />
+            {fieldError && <div><Text type="danger">{fieldError}</Text></div>}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 export default function PortfolioAlertsTab() {
@@ -423,6 +491,7 @@ export default function PortfolioAlertsTab() {
       title: "投资类别",
       dataIndex: "name",
       key: "name",
+      width: 120,
       render: (_: string, row: PortfolioAlertDisplayRow) => (
         <Space>
           <span style={{ fontSize: 20 }}>{row.icon}</span>
@@ -436,37 +505,37 @@ export default function PortfolioAlertsTab() {
       title: "目标占比",
       dataIndex: "targetPercentLabel",
       key: "targetPercent",
-      width: 110,
+      width: 80,
     },
     {
       title: "当前占比",
       dataIndex: "currentPercentLabel",
       key: "currentPercent",
-      width: 110,
+      width: 80,
     },
     {
       title: "相对偏离",
       dataIndex: "relativeDeviationLabel",
       key: "relativeDeviation",
-      width: 110,
+      width: 80,
     },
     {
       title: `当前金额 (${displayModel.currency})`,
       dataIndex: "currentMarketValueLabel",
       key: "currentMarketValue",
-      width: 160,
+      width: 140,
     },
     {
       title: `目标金额 (${displayModel.currency})`,
       dataIndex: "targetMarketValueLabel",
       key: "targetMarketValue",
-      width: 160,
+      width: 140,
     },
     {
       title: `再平衡金额 (${displayModel.currency})`,
       dataIndex: "rebalanceAmountLabel",
       key: "rebalanceAmount",
-      width: 175,
+      width: 140,
       render: (label: string, row: PortfolioAlertDisplayRow) => (
         <Text type={row.rebalanceAmount < 0 ? "danger" : row.rebalanceAmount > 0 ? "success" : undefined}>
           {label}
@@ -477,7 +546,7 @@ export default function PortfolioAlertsTab() {
       title: "状态",
       dataIndex: "statusLabel",
       key: "status",
-      width: 90,
+      width: 80,
       render: (label: string, row: PortfolioAlertDisplayRow) => (
         <Tag color={row.statusColor}>{label}</Tag>
       ),
@@ -487,7 +556,7 @@ export default function PortfolioAlertsTab() {
   const breachedRows = displayModel.rows.filter((row) => row.status !== "NORMAL");
 
   return (
-    <div className="space-y-4">
+    <div className="flex flex-col gap-3">
       <Card>
         <div className="flex flex-wrap items-center justify-between gap-4">
           <Space wrap size="middle">
@@ -549,39 +618,45 @@ export default function PortfolioAlertsTab() {
 
         <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
-            <Text strong>统一相对偏离阈值</Text>
-            <InputNumber
-              min={0}
-              max={100}
-              precision={2}
-              value={Number.isFinite(draft.deviationThreshold) ? draft.deviationThreshold : null}
-              status={validation.deviationError ? "error" : undefined}
-              disabled={!editing}
-              addonAfter="%"
-              onChange={(value) => setDraft((current) => ({
-                ...current,
-                deviationThreshold: value ?? Number.NaN,
-              }))}
-              style={{ width: "100%", marginTop: 8 }}
-            />
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+              <Text strong className="shrink-0">统一相对偏离阈值</Text>
+              <InputNumber
+                min={0}
+                max={100}
+                precision={2}
+                value={Number.isFinite(draft.deviationThreshold) ? draft.deviationThreshold : null}
+                status={validation.deviationError ? "error" : undefined}
+                disabled={!editing}
+                addonAfter="%"
+                onChange={(value) => setDraft((current) => ({
+                  ...current,
+                  deviationThreshold: value ?? Number.NaN,
+                }))}
+                rootClassName="w-56"
+                style={{ flex: 1, minWidth: 0, width: "auto" }}
+              />
+            </div>
             {validation.deviationError && <Text type="danger">{validation.deviationError}</Text>}
           </div>
           <div>
-            <Text strong>单票集中度阈值</Text>
-            <InputNumber
-              min={0.01}
-              max={100}
-              precision={2}
-              value={Number.isFinite(draft.concentrationThreshold) ? draft.concentrationThreshold : null}
-              status={validation.concentrationError ? "error" : undefined}
-              disabled={!editing}
-              addonAfter="%"
-              onChange={(value) => setDraft((current) => ({
-                ...current,
-                concentrationThreshold: value ?? Number.NaN,
-              }))}
-              style={{ width: "100%", marginTop: 8 }}
-            />
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+              <Text strong className="shrink-0">单票集中度阈值</Text>
+              <InputNumber
+                min={0.01}
+                max={100}
+                precision={2}
+                value={Number.isFinite(draft.concentrationThreshold) ? draft.concentrationThreshold : null}
+                status={validation.concentrationError ? "error" : undefined}
+                disabled={!editing}
+                addonAfter="%"
+                onChange={(value) => setDraft((current) => ({
+                  ...current,
+                  concentrationThreshold: value ?? Number.NaN,
+                }))}
+                rootClassName="w-56"
+                style={{ flex: 1, minWidth: 0, width: "auto" }}
+              />
+            </div>
             {validation.concentrationError && <Text type="danger">{validation.concentrationError}</Text>}
           </div>
         </div>
@@ -603,34 +678,11 @@ export default function PortfolioAlertsTab() {
             {workspaceRows.targetEditorRows.length === 0 ? (
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="请先在设置中创建投资类别" />
             ) : (
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-                {workspaceRows.targetEditorRows.map((row: PortfolioAlertTargetEditorRow) => {
-                  const fieldError = validation.targetErrors[row.categoryId];
-                  return (
-                    <div
-                      key={row.key}
-                      className="rounded-lg border border-slate-200 p-3 dark:border-slate-700"
-                    >
-                      <div className="mb-2 flex items-center gap-2">
-                        <span style={{ fontSize: 20 }}>{row.icon}</span>
-                        <Badge color={row.color} />
-                        <Text>{row.name}</Text>
-                      </div>
-                      <InputNumber
-                        min={0}
-                        max={100}
-                        precision={2}
-                        value={Number.isFinite(row.targetPercent) ? row.targetPercent : null}
-                        status={fieldError ? "error" : undefined}
-                        addonAfter="%"
-                        onChange={(value) => updateTarget(row.categoryId, value)}
-                        style={{ width: "100%" }}
-                      />
-                      {fieldError && <div><Text type="danger">{fieldError}</Text></div>}
-                    </div>
-                  );
-                })}
-              </div>
+              <PortfolioAlertTargetEditor
+                rows={workspaceRows.targetEditorRows}
+                targetErrors={validation.targetErrors}
+                onTargetChange={updateTarget}
+              />
             )}
           </div>
         )}
@@ -655,11 +707,10 @@ export default function PortfolioAlertsTab() {
         />
       )}
       {displayModel.banner && (
-        <Alert
-          type={alertType(displayModel.statusColor)}
-          showIcon
-          title={displayModel.statusLabel}
-          description={displayModel.banner}
+        <PortfolioAlertStatusBanner
+          banner={displayModel.banner}
+          statusColor={displayModel.statusColor}
+          statusLabel={displayModel.statusLabel}
         />
       )}
       {displayModel.missingDataDescriptions.length > 0 && (
@@ -672,33 +723,20 @@ export default function PortfolioAlertsTab() {
       )}
 
       <Spin spinning={loading || categoriesLoading}>
-        <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(300px,0.8fr)_minmax(640px,1.7fr)]">
-          <Card title="当前类别占比">
-            {displayModel.pieData.length > 0 ? (
-              <PieChart
-                data={displayModel.pieData}
-                height={340}
-                currencyCode={displayModel.currency}
-              />
-            ) : (
-              <Empty description="暂无可展示的组合快照" />
-            )}
-          </Card>
-          <Card
-            title="目标、当前与再平衡"
-            extra={<Text type="secondary">当前合计 {displayModel.totalCurrentLabel}</Text>}
-          >
-            <Table<PortfolioAlertDisplayRow>
-              dataSource={workspaceRows.evaluatedRows}
-              columns={columns}
-              rowKey="key"
-              pagination={false}
-              scroll={{ x: 1210 }}
-              locale={{ emptyText: "暂无可展示的评估结果" }}
-              size="middle"
-            />
-          </Card>
-        </div>
+        <Card
+          title="目标、当前与再平衡"
+          extra={<Text type="secondary">当前合计 {displayModel.totalCurrentLabel}</Text>}
+        >
+          <Table<PortfolioAlertDisplayRow>
+            dataSource={workspaceRows.evaluatedRows}
+            columns={columns}
+            rowKey="key"
+            pagination={false}
+            scroll={{ x: "max-content" }}
+            locale={{ emptyText: "暂无可展示的评估结果" }}
+            size="middle"
+          />
+        </Card>
       </Spin>
 
       <Card
@@ -743,7 +781,7 @@ export default function PortfolioAlertsTab() {
                       <Tag color={row.statusColor}>{row.statusLabel}</Tag>
                       <Text>{row.icon} {row.name}</Text>
                       <Text type={row.rebalanceAmount < 0 ? "danger" : "success"}>
-                        {row.rebalanceAmount < 0 ? "建议减配" : "建议增配"} {row.rebalanceAmountLabel.replace("-", "")}
+                        {row.rebalanceAmount < 0 ? "建议减配" : "建议增配"} {row.rebalanceAmountLabel.replace("-", "")} {displayModel.currency}
                       </Text>
                     </Space>
                   </List.Item>

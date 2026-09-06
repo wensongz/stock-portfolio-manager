@@ -58,12 +58,6 @@ export interface PortfolioAlertDisplayRow {
   statusColor: string;
 }
 
-export interface PortfolioAlertPieRow {
-  name: string;
-  value: number;
-  color: string;
-}
-
 export interface PortfolioAlertTargetEditorRow {
   key: string;
   categoryId: string;
@@ -100,7 +94,6 @@ export interface PortfolioAlertDisplayModel {
   banner: string | null;
   stale: boolean;
   snapshotEvaluatedAt: string | null;
-  pieData: PortfolioAlertPieRow[];
   rows: PortfolioAlertDisplayRow[];
   concentrationRows: PortfolioAlertConcentrationRow[];
   totalTargetPercent: number;
@@ -437,6 +430,16 @@ export function buildPortfolioAlertDisplayModel(
     config?.targets.map((target) => [target.categoryId, target.targetPercent]) ?? [],
   );
   const uncategorized = sourceRows.find((row) => row.categoryId === null);
+  const showUncategorized = uncategorized
+    ? [
+      uncategorized.targetPercent,
+      uncategorized.currentPercent,
+      uncategorized.relativeDeviationPercent,
+      uncategorized.currentMarketValue,
+      uncategorized.targetMarketValue,
+      uncategorized.rebalanceAmount,
+    ].some((value) => value !== null && value !== 0)
+    : false;
   const mergedRows = evaluation?.status === "EMPTY" || snapshot === null
     ? []
     : categories
@@ -470,9 +473,9 @@ export function buildPortfolioAlertDisplayModel(
                 direction: targetPercent > 0 ? "UNDERWEIGHT" as const : null,
               };
         }),
-        ...(uncategorized ? [uncategorized] : []),
+        ...(uncategorized && showUncategorized ? [uncategorized] : []),
         ]
-      : sourceRows;
+      : sourceRows.filter((row) => row.categoryId !== null || showUncategorized);
 
   const rows: PortfolioAlertDisplayRow[] = mergedRows.map((row) => {
     const status = snapshot
@@ -512,9 +515,9 @@ export function buildPortfolioAlertDisplayModel(
       relativeDeviationLabel: row.relativeDeviationPercent === null
         ? "—"
         : formatPercent(row.relativeDeviationPercent),
-      currentMarketValueLabel: formatAmount(row.currentMarketValue, currency),
-      targetMarketValueLabel: formatAmount(row.targetMarketValue, currency),
-      rebalanceAmountLabel: formatAmount(row.rebalanceAmount, currency),
+      currentMarketValueLabel: formatNumber(row.currentMarketValue),
+      targetMarketValueLabel: formatNumber(row.targetMarketValue),
+      rebalanceAmountLabel: formatNumber(row.rebalanceAmount),
       status,
       statusLabel: statusLabels[status],
       statusColor: statusColors[status],
@@ -572,9 +575,6 @@ export function buildPortfolioAlertDisplayModel(
     stale: evaluation?.stale
       ?? Boolean(config !== null && !config.isActive && snapshot),
     snapshotEvaluatedAt: snapshot?.evaluatedAt ?? null,
-    pieData: rows
-      .filter((row) => row.currentMarketValue > 0)
-      .map((row) => ({ name: row.name, value: row.currentMarketValue, color: row.color })),
     rows,
     concentrationRows,
     totalTargetPercent,

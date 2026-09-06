@@ -235,14 +235,38 @@ test("draft validation rejects non-finite and out-of-range fields", () => {
   assert.match(result.concentrationError, /大于 0%/);
 });
 
-test("chart rows retain unrounded values while labels are formatted", () => {
+test("display rows retain raw values while table amount labels omit repeated currency", () => {
   const model = buildPortfolioAlertDisplayModel(view());
 
-  assert.equal(model.pieData[0].value, 600.123456);
   assert.equal(model.rows[0].currentMarketValue, 600.123456);
   assert.equal(model.rows[0].rebalanceAmount, -100.123456);
   assert.equal(model.rows[0].currentPercentLabel, "60.00%");
-  assert.equal(model.rows[0].rebalanceAmountLabel, "-100.12 USD");
+  assert.equal(model.rows[0].currentMarketValueLabel, "600.12");
+  assert.equal(model.rows[0].targetMarketValueLabel, "500.00");
+  assert.equal(model.rows[0].rebalanceAmountLabel, "-100.12");
+});
+
+test("an uncategorized row is omitted only when every displayed number is zero or empty", () => {
+  const zeroUncategorized = allocation({
+    categoryId: null,
+    categoryName: "未分类",
+    categoryColor: "#999999",
+    categoryIcon: "❓",
+    targetPercent: 0,
+    currentPercent: 0,
+    relativeDeviationPercent: null,
+    currentMarketValue: 0,
+    targetMarketValue: 0,
+    rebalanceAmount: 0,
+    direction: null,
+  });
+  for (const categories of [undefined, [category("growth", "成长", 10)]]) {
+    const model = buildPortfolioAlertDisplayModel(view({
+      snapshot: snapshot({ categories: [allocation(), zeroUncategorized] }),
+    }), categories);
+
+    assert.deepEqual(model.rows.map((row) => row.name), ["成长"]);
+  }
 });
 
 test("incomplete evaluation shows its prior snapshot as stale and describes missing data", () => {
@@ -262,7 +286,7 @@ test("incomplete evaluation shows its prior snapshot as stale and describes miss
 
   assert.equal(model.stale, true);
   assert.equal(model.statusLabel, "数据不完整");
-  assert.deepEqual(model.pieData.map((row) => row.name), ["成长", "现金", "未分类"]);
+  assert.deepEqual(model.rows.map((row) => row.name), ["成长", "现金", "未分类"]);
   assert.match(model.banner ?? "", /等待有效数据/);
   assert.match(model.missingDataDescriptions[0], /US AAPL/);
   assert.equal(model.canAskAi, false);
@@ -307,7 +331,6 @@ test("EMPTY never revives a config's cleared last snapshot", () => {
   ]);
 
   assert.equal(model.stale, false);
-  assert.deepEqual(model.pieData, []);
   assert.deepEqual(model.rows, []);
   assert.deepEqual(model.concentrationRows, []);
 });

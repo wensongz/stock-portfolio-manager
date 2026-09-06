@@ -27,7 +27,7 @@ export default function ImportBatchHistory({ accountId = null, refreshKey = 0 }:
   };
   return <Card title="导入批次历史" extra={<Button disabled={loading || busy} onClick={()=>setReload((value)=>value+1)}>刷新</Button>}>
     {error && <Alert type="error" title="无法读取导入批次" description={error} showIcon />}
-    <Table rowKey="id" size="small" loading={loading} dataSource={batches} pagination={{pageSize:10}} scroll={{x:"max-content"}} columns={[
+    <Table rowKey="id" size="small" loading={loading} dataSource={batches} pagination={{defaultPageSize:10}} scroll={{x:"max-content"}} columns={[
       {title:"创建时间",dataIndex:"created_at"}, {title:"文件 / 来源",key:"source",render:(_,row)=>row.file_name || row.source},
       {title:"账户",dataIndex:"account_id"},
       {title:"状态",dataIndex:"status",render:(status:string)=><Tag>{({preview:"待导入",applied:"已提交",undone:"已撤销"} as Record<string,string>)[status] || status}</Tag>},

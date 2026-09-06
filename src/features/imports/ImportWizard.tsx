@@ -97,7 +97,7 @@ export default function ImportWizard<Row extends ImportRow>({
           <Table<Row>
             rowKey="key"
             size="small"
-            pagination={{ pageSize: 20, showSizeChanger: true }}
+            pagination={{ defaultPageSize: 20, showSizeChanger: true }}
             scroll={{ x: "max-content", y: 480 }}
             columns={tableColumns}
             dataSource={wizard.rows}

@@ -66,7 +66,7 @@ export default function ImportBatchPanel({batch, onChange, onImported, onBusyCha
     {undone && <Alert type="info" title="此批次已撤销，不可再次提交" />}
     {(error || batch.conflict) && <Alert type="error" title="批次操作受阻" description={error || batch.conflict} showIcon />}
     <Alert type="info" title="明确重复和已导入行不可选择；疑似重复默认不选，勾选即确认仍需导入。失败行可勾选重试。" />
-    <Table rowKey="key" size="small" dataSource={batch.rows} scroll={{x:"max-content"}} pagination={{pageSize:10}}
+    <Table rowKey="key" size="small" dataSource={batch.rows} scroll={{x:"max-content"}} pagination={{defaultPageSize:10}}
       rowSelection={{selectedRowKeys:selected, onChange:(keys)=>setSelected(keys.map(String)), getCheckboxProps:(row)=>({disabled:busy || undone || !selectableBatchRow(row)})}}
       columns={[
         {title:"证券", key:"symbol", render:(_, row)=>String(row.data.symbol ?? "")},

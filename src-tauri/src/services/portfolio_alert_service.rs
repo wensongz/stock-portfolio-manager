@@ -1,13 +1,27 @@
 use crate::{
     db::Database,
     models::portfolio_alert::{
-        PortfolioAlertConfig, PortfolioAlertScope, PortfolioAlertScopeKind, PortfolioAlertSnapshot,
-        PortfolioAlertTarget, SavePortfolioAlertConfigInput,
+        AllocationDirection, MissingPortfolioAlertData, PortfolioAlertBreach,
+        PortfolioAlertBreachDirection, PortfolioAlertBreachKind, PortfolioAlertConfig,
+        PortfolioAlertDataStatus, PortfolioAlertEvaluation, PortfolioAlertScope,
+        PortfolioAlertScopeKind, PortfolioAlertSnapshot, PortfolioAlertTarget, PortfolioAlertView,
+        SavePortfolioAlertConfigInput,
+    },
+    models::ExchangeRates,
+    services::{
+        exchange_rate_service::convert_currency,
+        portfolio_alert_calculator::{
+            calculate_portfolio_alert_snapshot, PortfolioAlertCalculation,
+            PortfolioAlertCategoryInput, PortfolioAlertPositionInput,
+        },
+        portfolio_read_service::{PortfolioReadModel, QuoteReadMode},
+        quote_service::{is_cash_symbol, QuoteCache},
+        stock_operation_builder::normalize_stock_symbol,
     },
 };
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
 const TOTAL_TOLERANCE: f64 = 0.01;
@@ -196,6 +210,554 @@ pub fn set_portfolio_alert_active(
         .ok_or_else(|| format!("portfolio alert configuration {config_id} not found"))?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(config)
+}
+
+fn load_categories(connection: &Connection) -> Result<Vec<PortfolioAlertCategoryInput>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, name, color, icon, sort_order
+             FROM categories ORDER BY sort_order, id",
+        )
+        .map_err(|error| error.to_string())?;
+    let categories = statement
+        .query_map([], |row| {
+            Ok(PortfolioAlertCategoryInput {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                color: row.get(2)?,
+                icon: row.get(3)?,
+                sort_order: row.get(4)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(categories)
+}
+
+fn account_market(connection: &Connection, account_id: &str) -> Result<String, String> {
+    connection
+        .query_row(
+            "SELECT market FROM accounts WHERE id = ?1",
+            [account_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("account {account_id} not found"))
+}
+
+fn evaluation_currency_and_account_market(
+    connection: &Connection,
+    config: &PortfolioAlertConfig,
+) -> Result<(String, Option<String>), String> {
+    match config.scope.kind {
+        PortfolioAlertScopeKind::Overall => Ok((config.base_currency.clone(), None)),
+        PortfolioAlertScopeKind::Market => {
+            let market = validated_market(config.scope.market.as_deref())?;
+            Ok((native_currency(market).to_string(), None))
+        }
+        PortfolioAlertScopeKind::Account => {
+            let account_id = config
+                .scope
+                .account_id
+                .as_deref()
+                .ok_or_else(|| "account scope requires an account id".to_string())?;
+            let market = account_market(connection, account_id)?;
+            Ok((
+                native_currency(validated_market(Some(&market))?).to_string(),
+                Some(market),
+            ))
+        }
+    }
+}
+
+fn scope_matches_holding(
+    config: &PortfolioAlertConfig,
+    account_market: Option<&str>,
+    holding: &crate::models::HoldingDetail,
+) -> bool {
+    match config.scope.kind {
+        PortfolioAlertScopeKind::Overall => true,
+        PortfolioAlertScopeKind::Market => config
+            .scope
+            .market
+            .as_deref()
+            .is_some_and(|market| market.eq_ignore_ascii_case(&holding.market)),
+        PortfolioAlertScopeKind::Account => {
+            config
+                .scope
+                .account_id
+                .as_deref()
+                .is_some_and(|account_id| account_id == holding.account_id)
+                && account_market.is_none_or(|market| market.eq_ignore_ascii_case(&holding.market))
+        }
+    }
+}
+
+fn required_fx_is_valid(from: &str, to: &str, rates: &ExchangeRates) -> bool {
+    let valid = |value: f64| value.is_finite() && value > 0.0;
+    if from == to {
+        return true;
+    }
+    match (from, to) {
+        ("USD", "CNY") | ("CNY", "USD") => valid(rates.usd_cny),
+        ("USD", "HKD") | ("HKD", "USD") => valid(rates.usd_hkd),
+        ("CNY", "HKD") | ("HKD", "CNY") => valid(rates.usd_cny) && valid(rates.usd_hkd),
+        _ => false,
+    }
+}
+
+fn load_active_breaches(
+    connection: &Connection,
+    config_id: &str,
+) -> Result<Vec<PortfolioAlertBreach>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT breach_key, breach_kind, direction, first_triggered_at, last_seen_at
+             FROM portfolio_alert_breaches WHERE config_id = ?1 ORDER BY breach_key",
+        )
+        .map_err(|error| error.to_string())?;
+    let breaches = statement
+        .query_map([config_id], |row| {
+            let kind = match row.get::<_, String>(1)?.as_str() {
+                "CATEGORY_DEVIATION" => PortfolioAlertBreachKind::CategoryDeviation,
+                "CONCENTRATION" => PortfolioAlertBreachKind::Concentration,
+                value => {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        format!("invalid breach kind {value}").into(),
+                    ))
+                }
+            };
+            let direction = match row.get::<_, String>(2)?.as_str() {
+                "OVERWEIGHT" => PortfolioAlertBreachDirection::Overweight,
+                "UNDERWEIGHT" => PortfolioAlertBreachDirection::Underweight,
+                "ABOVE_LIMIT" => PortfolioAlertBreachDirection::AboveLimit,
+                value => {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        format!("invalid breach direction {value}").into(),
+                    ))
+                }
+            };
+            Ok(PortfolioAlertBreach {
+                config_id: config_id.to_string(),
+                breach_key: row.get(0)?,
+                breach_kind: kind,
+                direction,
+                first_triggered_at: row.get(3)?,
+                last_seen_at: row.get(4)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(breaches)
+}
+
+fn unchanged_evaluation(
+    config: &PortfolioAlertConfig,
+    status: PortfolioAlertDataStatus,
+    missing_data: Vec<MissingPortfolioAlertData>,
+    active_breaches: Vec<PortfolioAlertBreach>,
+) -> PortfolioAlertEvaluation {
+    PortfolioAlertEvaluation {
+        status,
+        snapshot: config.last_snapshot.clone(),
+        stale: true,
+        missing_data,
+        active_breaches,
+        newly_triggered: vec![],
+    }
+}
+
+fn proposed_breaches(
+    config_id: &str,
+    snapshot: &PortfolioAlertSnapshot,
+    evaluated_at: &str,
+) -> BTreeMap<String, PortfolioAlertBreach> {
+    let mut proposed = BTreeMap::new();
+    for category in &snapshot.categories {
+        let Some(direction) = &category.direction else {
+            continue;
+        };
+        let key = format!(
+            "category:{}",
+            category.category_id.as_deref().unwrap_or("uncategorized")
+        );
+        proposed.insert(
+            key.clone(),
+            PortfolioAlertBreach {
+                config_id: config_id.to_string(),
+                breach_key: key,
+                breach_kind: PortfolioAlertBreachKind::CategoryDeviation,
+                direction: match direction {
+                    AllocationDirection::Overweight => PortfolioAlertBreachDirection::Overweight,
+                    AllocationDirection::Underweight => PortfolioAlertBreachDirection::Underweight,
+                },
+                first_triggered_at: evaluated_at.to_string(),
+                last_seen_at: evaluated_at.to_string(),
+            },
+        );
+    }
+    for concentration in &snapshot.concentrations {
+        let key = format!(
+            "security:{}:{}",
+            concentration.market, concentration.normalized_symbol
+        );
+        proposed.insert(
+            key.clone(),
+            PortfolioAlertBreach {
+                config_id: config_id.to_string(),
+                breach_key: key,
+                breach_kind: PortfolioAlertBreachKind::Concentration,
+                direction: PortfolioAlertBreachDirection::AboveLimit,
+                first_triggered_at: evaluated_at.to_string(),
+                last_seen_at: evaluated_at.to_string(),
+            },
+        );
+    }
+    proposed
+}
+
+fn breach_kind_sql(kind: &PortfolioAlertBreachKind) -> &'static str {
+    match kind {
+        PortfolioAlertBreachKind::CategoryDeviation => "CATEGORY_DEVIATION",
+        PortfolioAlertBreachKind::Concentration => "CONCENTRATION",
+    }
+}
+
+fn breach_direction_sql(direction: &PortfolioAlertBreachDirection) -> &'static str {
+    match direction {
+        PortfolioAlertBreachDirection::Overweight => "OVERWEIGHT",
+        PortfolioAlertBreachDirection::Underweight => "UNDERWEIGHT",
+        PortfolioAlertBreachDirection::AboveLimit => "ABOVE_LIMIT",
+    }
+}
+
+fn persist_ready_transition(
+    db: &Database,
+    config_id: &str,
+    snapshot: &PortfolioAlertSnapshot,
+    proposed: &BTreeMap<String, PortfolioAlertBreach>,
+    evaluated_at: &str,
+) -> Result<(Vec<PortfolioAlertBreach>, Vec<PortfolioAlertBreach>), String> {
+    let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let existing = load_active_breaches(&transaction, config_id)?
+        .into_iter()
+        .map(|breach| (breach.breach_key.clone(), breach))
+        .collect::<HashMap<_, _>>();
+
+    for (key, breach) in proposed
+        .iter()
+        .filter(|(key, _)| existing.contains_key(*key))
+    {
+        transaction
+            .execute(
+                "UPDATE portfolio_alert_breaches
+                 SET breach_kind = ?1, direction = ?2, last_seen_at = ?3
+                 WHERE config_id = ?4 AND breach_key = ?5",
+                rusqlite::params![
+                    breach_kind_sql(&breach.breach_kind),
+                    breach_direction_sql(&breach.direction),
+                    evaluated_at,
+                    config_id,
+                    key,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for key in existing.keys().filter(|key| !proposed.contains_key(*key)) {
+        transaction
+            .execute(
+                "DELETE FROM portfolio_alert_breaches WHERE config_id = ?1 AND breach_key = ?2",
+                rusqlite::params![config_id, key],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
+    let mut newly_triggered = Vec::new();
+    for (key, breach) in proposed
+        .iter()
+        .filter(|(key, _)| !existing.contains_key(*key))
+    {
+        transaction
+            .execute(
+                "INSERT INTO portfolio_alert_breaches
+                 (config_id, breach_key, breach_kind, direction, first_triggered_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                rusqlite::params![
+                    config_id,
+                    key,
+                    breach_kind_sql(&breach.breach_kind),
+                    breach_direction_sql(&breach.direction),
+                    evaluated_at,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        newly_triggered.push(breach.clone());
+    }
+
+    let snapshot_json = serde_json::to_string(snapshot).map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE portfolio_alert_configs
+             SET last_snapshot_json = ?1, last_evaluated_at = ?2
+             WHERE id = ?3",
+            rusqlite::params![snapshot_json, evaluated_at, config_id],
+        )
+        .map_err(|error| error.to_string())?;
+    let active = load_active_breaches(&transaction, config_id)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok((active, newly_triggered))
+}
+
+fn persist_empty_transition(
+    db: &Database,
+    config_id: &str,
+    evaluated_at: &str,
+) -> Result<(), String> {
+    let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM portfolio_alert_breaches WHERE config_id = ?1",
+            [config_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE portfolio_alert_configs
+             SET last_snapshot_json = NULL, last_evaluated_at = ?1 WHERE id = ?2",
+            rusqlite::params![evaluated_at, config_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+pub async fn evaluate_portfolio_alert(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    exchange_rates: Option<&ExchangeRates>,
+    config_id: &str,
+    evaluated_at: &str,
+) -> Result<PortfolioAlertEvaluation, String> {
+    let (config, categories, base_currency, account_market) = {
+        let conn = db.conn.lock().map_err(|error| error.to_string())?;
+        let config = load_config_by_column(&conn, "id", config_id)?
+            .ok_or_else(|| format!("portfolio alert configuration {config_id} not found"))?;
+        let categories = load_categories(&conn)?;
+        let (base_currency, account_market) =
+            evaluation_currency_and_account_market(&conn, &config)?;
+        (config, categories, base_currency, account_market)
+    };
+    let read_model =
+        PortfolioReadModel::load(db, quote_cache, None, QuoteReadMode::CacheOnly).await?;
+    let scoped_holdings = read_model
+        .holdings()
+        .iter()
+        .filter(|holding| scope_matches_holding(&config, account_market.as_deref(), holding))
+        .collect::<Vec<_>>();
+
+    if scoped_holdings.is_empty() {
+        persist_empty_transition(db, config_id, evaluated_at)?;
+        return Ok(PortfolioAlertEvaluation {
+            status: PortfolioAlertDataStatus::Empty,
+            snapshot: None,
+            stale: false,
+            missing_data: vec![],
+            active_breaches: vec![],
+            newly_triggered: vec![],
+        });
+    }
+
+    let existing_breaches = {
+        let conn = db.conn.lock().map_err(|error| error.to_string())?;
+        load_active_breaches(&conn, config_id)?
+    };
+    let mut missing_data = Vec::new();
+    let mut reported_missing_quotes = HashSet::new();
+    for holding in &scoped_holdings {
+        if is_cash_symbol(&holding.symbol) {
+            continue;
+        }
+        let key = (
+            holding.market.trim().to_ascii_uppercase(),
+            holding.symbol.trim().to_ascii_uppercase(),
+        );
+        if read_model.missing_quote_keys().contains(&key)
+            || !holding.current_price.is_finite()
+            || holding.current_price < 0.0
+        {
+            if reported_missing_quotes.insert(key.clone()) {
+                missing_data.push(MissingPortfolioAlertData {
+                    market: Some(key.0),
+                    symbol: Some(key.1),
+                    currency: None,
+                    reason: "cached quote is unavailable".to_string(),
+                });
+            }
+        }
+    }
+
+    let required_currencies = scoped_holdings
+        .iter()
+        .map(|holding| holding.currency.trim().to_ascii_uppercase())
+        .filter(|currency| currency != &base_currency)
+        .collect::<HashSet<_>>();
+    for currency in required_currencies {
+        let valid = exchange_rates
+            .is_some_and(|rates| required_fx_is_valid(&currency, &base_currency, rates));
+        if !valid {
+            missing_data.push(MissingPortfolioAlertData {
+                market: None,
+                symbol: None,
+                currency: Some(currency.clone()),
+                reason: format!("exchange rate from {currency} to {base_currency} is unavailable"),
+            });
+        }
+    }
+    if !missing_data.is_empty() {
+        return Ok(unchanged_evaluation(
+            &config,
+            PortfolioAlertDataStatus::Incomplete,
+            missing_data,
+            existing_breaches,
+        ));
+    }
+
+    let target_total: f64 = config
+        .targets
+        .iter()
+        .map(|target| target.target_percent)
+        .sum();
+    if !target_total_is_within_tolerance(target_total) {
+        return Ok(unchanged_evaluation(
+            &config,
+            PortfolioAlertDataStatus::InvalidConfig,
+            vec![],
+            existing_breaches,
+        ));
+    }
+
+    let positions = scoped_holdings
+        .into_iter()
+        .map(|holding| {
+            let is_cash = is_cash_symbol(&holding.symbol);
+            let holding_currency = holding.currency.trim().to_ascii_uppercase();
+            let native_value = if is_cash {
+                holding.shares
+            } else {
+                holding.market_value
+            };
+            let market_value = if holding_currency == base_currency {
+                native_value
+            } else {
+                convert_currency(
+                    native_value,
+                    &holding_currency,
+                    &base_currency,
+                    exchange_rates.expect("required exchange rates were validated"),
+                )
+            };
+            PortfolioAlertPositionInput {
+                account_id: holding.account_id.clone(),
+                market: holding.market.trim().to_ascii_uppercase(),
+                symbol: normalize_stock_symbol(&holding.symbol)
+                    .unwrap_or_else(|| holding.symbol.trim().to_ascii_uppercase()),
+                name: holding.name.clone(),
+                category_id: read_model
+                    .category_id_for_holding(&holding.id)
+                    .map(str::to_string),
+                category_name: holding.category_name.clone(),
+                category_color: holding.category_color.clone(),
+                market_value,
+                is_cash,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    match calculate_portfolio_alert_snapshot(
+        &config,
+        &categories,
+        &positions,
+        &base_currency,
+        evaluated_at,
+    )? {
+        PortfolioAlertCalculation::Empty => {
+            persist_empty_transition(db, config_id, evaluated_at)?;
+            Ok(PortfolioAlertEvaluation {
+                status: PortfolioAlertDataStatus::Empty,
+                snapshot: None,
+                stale: false,
+                missing_data: vec![],
+                active_breaches: vec![],
+                newly_triggered: vec![],
+            })
+        }
+        PortfolioAlertCalculation::Ready(snapshot) => {
+            let proposed = proposed_breaches(config_id, &snapshot, evaluated_at);
+            let (active_breaches, newly_triggered) =
+                persist_ready_transition(db, config_id, &snapshot, &proposed, evaluated_at)?;
+            Ok(PortfolioAlertEvaluation {
+                status: PortfolioAlertDataStatus::Ready,
+                snapshot: Some(snapshot),
+                stale: false,
+                missing_data: vec![],
+                active_breaches,
+                newly_triggered,
+            })
+        }
+    }
+}
+
+pub async fn save_and_evaluate_portfolio_alert_config(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    exchange_rates: Option<&ExchangeRates>,
+    input: SavePortfolioAlertConfigInput,
+    evaluated_at: &str,
+) -> Result<PortfolioAlertView, String> {
+    let config = save_portfolio_alert_config(db, input)?;
+    let evaluation = if config.is_active {
+        Some(
+            evaluate_portfolio_alert(db, quote_cache, exchange_rates, &config.id, evaluated_at)
+                .await?,
+        )
+    } else {
+        None
+    };
+    Ok(PortfolioAlertView {
+        config: Some(get_portfolio_alert_config_by_id(db, &config.id)?),
+        evaluation,
+    })
+}
+
+pub async fn set_portfolio_alert_active_and_evaluate(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    exchange_rates: Option<&ExchangeRates>,
+    config_id: &str,
+    is_active: bool,
+    evaluated_at: &str,
+) -> Result<PortfolioAlertView, String> {
+    let config = set_portfolio_alert_active(db, config_id, is_active)?;
+    let evaluation = if is_active {
+        Some(
+            evaluate_portfolio_alert(db, quote_cache, exchange_rates, config_id, evaluated_at)
+                .await?,
+        )
+    } else {
+        None
+    };
+    Ok(PortfolioAlertView {
+        config: Some(get_portfolio_alert_config_by_id(db, &config.id)?),
+        evaluation,
+    })
 }
 
 fn validated_market(market: Option<&str>) -> Result<&str, String> {
@@ -951,5 +1513,760 @@ mod tests {
                 .unwrap()
                 .is_active
         );
+    }
+
+    struct EvaluationFixture {
+        db: Database,
+        quote_cache: crate::services::quote_service::QuoteCache,
+        rates: crate::models::ExchangeRates,
+        config_id: String,
+    }
+
+    fn rates() -> crate::models::ExchangeRates {
+        crate::models::ExchangeRates {
+            usd_cny: 5.0,
+            usd_hkd: 8.0,
+            cny_hkd: 1.6,
+            updated_at: "2026-09-06T09:00:00Z".to_string(),
+        }
+    }
+
+    fn quote(market: &str, symbol: &str, price: f64) -> crate::models::StockQuote {
+        crate::models::StockQuote {
+            market: market.to_string(),
+            symbol: symbol.to_string(),
+            name: symbol.to_string(),
+            current_price: price,
+            previous_close: price,
+            updated_at: "2026-09-06T09:00:00Z".to_string(),
+            ..crate::models::StockQuote::default()
+        }
+    }
+
+    fn seed_holding(
+        db: &Database,
+        id: &str,
+        account_id: &str,
+        symbol: &str,
+        market: &str,
+        category_id: Option<&str>,
+        shares: f64,
+        currency: &str,
+    ) {
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, 1, ?7, '2026-09-06', '2026-09-06')",
+                rusqlite::params![id, account_id, symbol, market, category_id, shares, currency],
+            )
+            .unwrap();
+    }
+
+    fn evaluation_fixture() -> EvaluationFixture {
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        seed_account(&db, "acct-us", "US");
+        seed_holding(
+            &db,
+            "holding-aapl",
+            "acct-us",
+            "AAPL",
+            "US",
+            Some("growth"),
+            10.0,
+            "USD",
+        );
+        seed_holding(
+            &db,
+            "holding-cash",
+            "acct-us",
+            "$CASH-USD",
+            "US",
+            Some("growth"),
+            100.0,
+            "USD",
+        );
+        let config = save_portfolio_alert_config(
+            &db,
+            input(overall_scope(), 20.0, 60.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        let quote_cache = crate::services::quote_service::QuoteCache::new();
+        quote_cache.set(quote("US", "AAPL", 100.0));
+        EvaluationFixture {
+            db,
+            quote_cache,
+            rates: rates(),
+            config_id: config.id,
+        }
+    }
+
+    fn breach_count(db: &Database) -> i64 {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM portfolio_alert_breaches", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn breach_keys(db: &Database) -> Vec<String> {
+        let conn = db.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare("SELECT breach_key FROM portfolio_alert_breaches ORDER BY breach_key")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ready_evaluation_persists_snapshot_and_notifies_only_on_new_transition() {
+        let fixture = evaluation_fixture();
+        let first = evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first.status,
+            crate::models::portfolio_alert::PortfolioAlertDataStatus::Ready
+        );
+        assert_eq!(first.newly_triggered.len(), 1);
+        assert_eq!(breach_count(&fixture.db), 1);
+        let persisted = get_portfolio_alert_config_by_id(&fixture.db, &fixture.config_id).unwrap();
+        assert_eq!(
+            persisted.last_evaluated_at.as_deref(),
+            Some("2026-09-06T10:00:00Z")
+        );
+        assert_eq!(persisted.last_snapshot, first.snapshot);
+
+        let second = evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            "2026-09-06T10:05:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(second.newly_triggered.is_empty());
+        assert_eq!(breach_count(&fixture.db), 1);
+        assert_eq!(
+            second.active_breaches[0].first_triggered_at,
+            "2026-09-06T10:00:00Z"
+        );
+        assert_eq!(
+            second.active_breaches[0].last_seen_at,
+            "2026-09-06T10:05:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_removes_active_row_and_later_breach_notifies_again() {
+        let fixture = evaluation_fixture();
+        evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        fixture.quote_cache.set(quote("US", "AAPL", 10.0));
+        let recovered = evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            "2026-09-06T10:05:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(recovered.active_breaches.is_empty());
+        assert_eq!(breach_count(&fixture.db), 0);
+
+        fixture.quote_cache.set(quote("US", "AAPL", 100.0));
+        let rebreach = evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            "2026-09-06T10:10:00Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(rebreach.newly_triggered.len(), 1);
+        assert_eq!(
+            rebreach.newly_triggered[0].first_triggered_at,
+            "2026-09-06T10:10:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_quotes_keep_last_snapshot_and_do_not_change_breaches() {
+        let fixture = evaluation_fixture();
+        let prior = evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap()
+        .snapshot
+        .unwrap();
+        let prior_breach_keys = breach_keys(&fixture.db);
+        let empty_cache = crate::services::quote_service::QuoteCache::new();
+
+        let result = evaluate_portfolio_alert(
+            &fixture.db,
+            &empty_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            "2026-09-06T10:05:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.status,
+            crate::models::portfolio_alert::PortfolioAlertDataStatus::Incomplete
+        );
+        assert!(result.stale);
+        assert_eq!(result.snapshot, Some(prior));
+        assert_eq!(breach_keys(&fixture.db), prior_breach_keys);
+        assert!(result.newly_triggered.is_empty());
+        assert_eq!(result.missing_data.len(), 1);
+        assert_eq!(result.missing_data[0].market.as_deref(), Some("US"));
+        assert_eq!(result.missing_data[0].symbol.as_deref(), Some("AAPL"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_quotes_are_checked_only_after_scope_filtering() {
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        seed_account(&db, "acct-us", "US");
+        seed_account(&db, "acct-cn", "CN");
+        seed_holding(
+            &db,
+            "us",
+            "acct-us",
+            "SAME",
+            "US",
+            Some("growth"),
+            10.0,
+            "USD",
+        );
+        seed_holding(
+            &db,
+            "cn",
+            "acct-cn",
+            "SAME",
+            "CN",
+            Some("growth"),
+            10.0,
+            "CNY",
+        );
+        let config = save_portfolio_alert_config(
+            &db,
+            input(market_scope("US"), 20.0, 100.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        let cache = crate::services::quote_service::QuoteCache::new();
+        cache.set(quote("US", "SAME", 10.0));
+
+        let result =
+            evaluate_portfolio_alert(&db, &cache, None, &config.id, "2026-09-06T10:00:00Z")
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result.status,
+            crate::models::portfolio_alert::PortfolioAlertDataStatus::Ready
+        );
+        assert_eq!(result.snapshot.unwrap().total_market_value, 100.0);
+    }
+
+    #[tokio::test]
+    async fn account_scope_isolated_native_holdings_need_no_fx_cache() {
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        seed_account(&db, "acct-us-1", "US");
+        seed_account(&db, "acct-us-2", "US");
+        seed_holding(
+            &db,
+            "one",
+            "acct-us-1",
+            "AAPL",
+            "US",
+            Some("growth"),
+            2.0,
+            "USD",
+        );
+        seed_holding(
+            &db,
+            "two",
+            "acct-us-2",
+            "MSFT",
+            "US",
+            Some("growth"),
+            9.0,
+            "USD",
+        );
+        let config = save_portfolio_alert_config(
+            &db,
+            input(account_scope("acct-us-1"), 20.0, 100.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        let cache = crate::services::quote_service::QuoteCache::new();
+        cache.set(quote("US", "AAPL", 25.0));
+
+        let result =
+            evaluate_portfolio_alert(&db, &cache, None, &config.id, "2026-09-06T10:00:00Z")
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result.status,
+            crate::models::portfolio_alert::PortfolioAlertDataStatus::Ready
+        );
+        assert_eq!(result.snapshot.unwrap().total_market_value, 50.0);
+    }
+
+    #[tokio::test]
+    async fn overall_missing_fx_keeps_state_stale_and_reports_currency_pair() {
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        seed_account(&db, "acct-cn", "CN");
+        seed_holding(
+            &db,
+            "cn",
+            "acct-cn",
+            "600000",
+            "CN",
+            Some("growth"),
+            10.0,
+            "CNY",
+        );
+        let config = save_portfolio_alert_config(
+            &db,
+            input(overall_scope(), 20.0, 100.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        let cache = crate::services::quote_service::QuoteCache::new();
+        cache.set(quote("CN", "600000", 10.0));
+
+        let result =
+            evaluate_portfolio_alert(&db, &cache, None, &config.id, "2026-09-06T10:00:00Z")
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result.status,
+            crate::models::portfolio_alert::PortfolioAlertDataStatus::Incomplete
+        );
+        assert!(result.stale);
+        assert!(result
+            .missing_data
+            .iter()
+            .any(|item| item.currency.as_deref() == Some("CNY")));
+        assert!(result.snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_finite_or_non_positive_required_fx_is_incomplete() {
+        for usd_cny in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let db = configured_db();
+            seed_categories(&db, ["growth"]);
+            seed_account(&db, "acct-cn", "CN");
+            seed_holding(
+                &db,
+                "cn",
+                "acct-cn",
+                "600000",
+                "CN",
+                Some("growth"),
+                1.0,
+                "CNY",
+            );
+            let config = save_portfolio_alert_config(
+                &db,
+                input(overall_scope(), 20.0, 100.0, [("growth", 100.0)]),
+            )
+            .unwrap();
+            let cache = crate::services::quote_service::QuoteCache::new();
+            cache.set(quote("CN", "600000", 10.0));
+            let invalid_rates = crate::models::ExchangeRates { usd_cny, ..rates() };
+
+            let result = evaluate_portfolio_alert(
+                &db,
+                &cache,
+                Some(&invalid_rates),
+                &config.id,
+                "2026-09-06T10:00:00Z",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result.status,
+                crate::models::portfolio_alert::PortfolioAlertDataStatus::Incomplete
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_and_non_positive_portfolios_return_empty_without_breaches() {
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        let config = save_portfolio_alert_config(
+            &db,
+            input(overall_scope(), 20.0, 20.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        let cache = crate::services::quote_service::QuoteCache::new();
+        let no_holdings =
+            evaluate_portfolio_alert(&db, &cache, None, &config.id, "2026-09-06T10:00:00Z")
+                .await
+                .unwrap();
+        assert_eq!(
+            no_holdings.status,
+            crate::models::portfolio_alert::PortfolioAlertDataStatus::Empty
+        );
+
+        seed_account(&db, "acct-us", "US");
+        seed_holding(
+            &db,
+            "zero",
+            "acct-us",
+            "ZERO",
+            "US",
+            Some("growth"),
+            1.0,
+            "USD",
+        );
+        cache.set(quote("US", "ZERO", 0.0));
+        let zero = evaluate_portfolio_alert(&db, &cache, None, &config.id, "2026-09-06T10:05:00Z")
+            .await
+            .unwrap();
+        assert_eq!(
+            zero.status,
+            crate::models::portfolio_alert::PortfolioAlertDataStatus::Empty
+        );
+        assert_eq!(breach_count(&db), 0);
+    }
+
+    #[tokio::test]
+    async fn deleted_target_category_returns_invalid_config_without_changing_state() {
+        let fixture = evaluation_fixture();
+        let prior = evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap()
+        .snapshot;
+        let prior_keys = breach_keys(&fixture.db);
+        fixture
+            .db
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM categories WHERE id = 'growth'", [])
+            .unwrap();
+
+        let result = evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            "2026-09-06T10:05:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.status,
+            crate::models::portfolio_alert::PortfolioAlertDataStatus::InvalidConfig
+        );
+        assert_eq!(result.snapshot, prior);
+        assert!(result.stale);
+        assert_eq!(breach_keys(&fixture.db), prior_keys);
+    }
+
+    #[tokio::test]
+    async fn cash_uses_native_value_without_quote_and_is_excluded_from_concentration() {
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        seed_account(&db, "acct-us", "US");
+        seed_holding(
+            &db,
+            "cash",
+            "acct-us",
+            "$CASH-USD",
+            "US",
+            Some("growth"),
+            250.0,
+            "USD",
+        );
+        let config = save_portfolio_alert_config(
+            &db,
+            input(market_scope("US"), 20.0, 1.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+
+        let result = evaluate_portfolio_alert(
+            &db,
+            &crate::services::quote_service::QuoteCache::new(),
+            None,
+            &config.id,
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.status,
+            crate::models::portfolio_alert::PortfolioAlertDataStatus::Ready
+        );
+        let snapshot = result.snapshot.unwrap();
+        assert_eq!(snapshot.total_market_value, 250.0);
+        assert!(snapshot.concentrations.is_empty());
+        assert!(result.missing_data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_market_symbol_is_aggregated_across_accounts_for_concentration() {
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        seed_account(&db, "one", "US");
+        seed_account(&db, "two", "US");
+        seed_holding(
+            &db,
+            "one-aapl",
+            "one",
+            "aapl",
+            "US",
+            Some("growth"),
+            2.0,
+            "USD",
+        );
+        seed_holding(
+            &db,
+            "two-aapl",
+            "two",
+            "aapl",
+            "US",
+            Some("growth"),
+            3.0,
+            "USD",
+        );
+        seed_holding(
+            &db,
+            "cash",
+            "one",
+            "$CASH-USD",
+            "US",
+            Some("growth"),
+            50.0,
+            "USD",
+        );
+        let config = save_portfolio_alert_config(
+            &db,
+            input(overall_scope(), 20.0, 40.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        let cache = crate::services::quote_service::QuoteCache::new();
+        cache.set(quote("US", "aapl", 10.0));
+
+        let result =
+            evaluate_portfolio_alert(&db, &cache, None, &config.id, "2026-09-06T10:00:00Z")
+                .await
+                .unwrap();
+        let concentrations = result.snapshot.unwrap().concentrations;
+        assert_eq!(concentrations.len(), 1);
+        assert_eq!(concentrations[0].market_value, 50.0);
+        assert_eq!(concentrations[0].normalized_symbol, "AAPL");
+    }
+
+    #[tokio::test]
+    async fn saving_changed_config_clears_old_breaches_then_immediately_evaluates() {
+        let fixture = evaluation_fixture();
+        evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap();
+        let mut changed = input(overall_scope(), 20.0, 95.0, [("growth", 100.0)]);
+        changed.id = Some(fixture.config_id.clone());
+
+        let view = save_and_evaluate_portfolio_alert_config(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            changed,
+            "2026-09-06T10:05:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert!(view.evaluation.unwrap().active_breaches.is_empty());
+        assert_eq!(breach_count(&fixture.db), 0);
+        assert_eq!(
+            view.config.unwrap().last_evaluated_at.as_deref(),
+            Some("2026-09-06T10:05:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_clears_and_skips_evaluation_then_enable_evaluates_current_data() {
+        let fixture = evaluation_fixture();
+        let disabled = set_portfolio_alert_active_and_evaluate(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            false,
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(disabled.evaluation.is_none());
+        assert_eq!(breach_count(&fixture.db), 0);
+        assert!(
+            get_portfolio_alert_config_by_id(&fixture.db, &fixture.config_id)
+                .unwrap()
+                .last_evaluated_at
+                .is_none()
+        );
+
+        let enabled = set_portfolio_alert_active_and_evaluate(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            true,
+            "2026-09-06T10:05:00Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(enabled.evaluation.unwrap().newly_triggered.len(), 1);
+        assert_eq!(breach_count(&fixture.db), 1);
+    }
+
+    #[tokio::test]
+    async fn breach_write_failure_rolls_back_snapshot_timestamp_insert_update_and_delete() {
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        seed_account(&db, "acct-us", "US");
+        seed_holding(
+            &db,
+            "persist",
+            "acct-us",
+            "PERSIST",
+            "US",
+            Some("growth"),
+            4.0,
+            "USD",
+        );
+        seed_holding(
+            &db,
+            "new",
+            "acct-us",
+            "NEW",
+            "US",
+            Some("growth"),
+            4.0,
+            "USD",
+        );
+        seed_holding(
+            &db,
+            "cash",
+            "acct-us",
+            "$CASH-USD",
+            "US",
+            Some("growth"),
+            2.0,
+            "USD",
+        );
+        let config = save_portfolio_alert_config(
+            &db,
+            input(overall_scope(), 20.0, 30.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        let previous_snapshot = crate::models::portfolio_alert::PortfolioAlertSnapshot {
+            config_id: config.id.clone(),
+            scope: overall_scope(),
+            base_currency: "USD".to_string(),
+            evaluated_at: "old".to_string(),
+            total_market_value: 1.0,
+            categories: vec![],
+            concentrations: vec![],
+        };
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE portfolio_alert_configs SET last_snapshot_json = ?1, last_evaluated_at = 'old' WHERE id = ?2",
+                rusqlite::params![serde_json::to_string(&previous_snapshot).unwrap(), config.id],
+            )
+            .unwrap();
+            for key in ["security:US:PERSIST", "security:US:RECOVER"] {
+                conn.execute(
+                    "INSERT INTO portfolio_alert_breaches
+                     (config_id, breach_key, breach_kind, direction, first_triggered_at, last_seen_at)
+                     VALUES (?1, ?2, 'CONCENTRATION', 'ABOVE_LIMIT', 'first', 'old')",
+                    rusqlite::params![config.id, key],
+                )
+                .unwrap();
+            }
+            conn.execute_batch(
+                "CREATE TRIGGER fail_new_breach BEFORE INSERT ON portfolio_alert_breaches
+                 WHEN NEW.breach_key = 'security:US:NEW'
+                 BEGIN SELECT RAISE(ABORT, 'forced breach write failure'); END;",
+            )
+            .unwrap();
+        }
+        let cache = crate::services::quote_service::QuoteCache::new();
+        cache.set(quote("US", "PERSIST", 10.0));
+        cache.set(quote("US", "NEW", 10.0));
+
+        let error = evaluate_portfolio_alert(&db, &cache, None, &config.id, "new")
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("forced breach write failure"));
+        let unchanged = get_portfolio_alert_config_by_id(&db, &config.id).unwrap();
+        assert_eq!(unchanged.last_snapshot, Some(previous_snapshot));
+        assert_eq!(unchanged.last_evaluated_at.as_deref(), Some("old"));
+        assert_eq!(
+            breach_keys(&db),
+            vec!["security:US:PERSIST", "security:US:RECOVER"]
+        );
+        let last_seen: String = db.conn.lock().unwrap().query_row(
+            "SELECT last_seen_at FROM portfolio_alert_breaches WHERE breach_key = 'security:US:PERSIST'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(last_seen, "old");
     }
 }

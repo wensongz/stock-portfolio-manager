@@ -278,6 +278,10 @@ pub fn run() {
             commands::alerts::get_alerts,
             commands::alerts::update_alert,
             commands::alerts::delete_alert,
+            commands::portfolio_alerts::get_portfolio_alert_view,
+            commands::portfolio_alerts::save_portfolio_alert_config,
+            commands::portfolio_alerts::set_portfolio_alert_active,
+            commands::portfolio_alerts::evaluate_portfolio_alert,
             // Phase 6: Review
             commands::review::get_stock_operation_review,
             // Phase 6: AI Config

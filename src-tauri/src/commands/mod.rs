@@ -13,6 +13,7 @@ pub mod ocr;
 pub mod option_review;
 pub mod options;
 pub mod performance;
+pub mod portfolio_alerts;
 pub mod quarterly;
 pub mod quote_provider;
 pub mod quotes;

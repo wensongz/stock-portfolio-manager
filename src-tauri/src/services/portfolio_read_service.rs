@@ -5,6 +5,7 @@ use crate::services::quote_provider_service;
 use crate::services::quote_service::{
     fetch_quotes_batch_cached_with_providers, QuoteCache, QuoteServiceState,
 };
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuoteReadMode {
@@ -15,8 +16,31 @@ pub enum QuoteReadMode {
 #[derive(Debug)]
 pub struct PortfolioReadModel {
     holdings: Vec<HoldingDetail>,
+    missing_quote_keys: HashSet<(String, String)>,
+    category_ids_by_holding: HashMap<String, Option<String>>,
     quote_warning: Option<String>,
     quotes_refreshed: bool,
+}
+
+fn normalized_quote_key(market: &str, symbol: &str) -> (String, String) {
+    (
+        market.trim().to_ascii_uppercase(),
+        symbol.trim().to_ascii_uppercase(),
+    )
+}
+
+fn quote_values_by_market_and_symbol(
+    quotes: &[crate::models::StockQuote],
+) -> HashMap<(String, String), (f64, f64)> {
+    quotes
+        .iter()
+        .map(|quote| {
+            (
+                normalized_quote_key(&quote.market, &quote.symbol),
+                (quote.current_price, quote.change),
+            )
+        })
+        .collect()
 }
 
 impl PortfolioReadModel {
@@ -35,6 +59,7 @@ impl PortfolioReadModel {
             market: String,
             category_name: String,
             category_color: String,
+            category_id: Option<String>,
             shares: f64,
             avg_cost: f64,
             currency: String,
@@ -48,7 +73,7 @@ impl PortfolioReadModel {
                             h.symbol, h.name, h.market,
                             COALESCE(c.name, '未分类') AS category_name,
                             COALESCE(c.color, '#8B8B8B') AS category_color,
-                            h.shares, h.avg_cost, h.currency
+                            h.category_id, h.shares, h.avg_cost, h.currency
                      FROM holdings h
                      LEFT JOIN accounts a ON h.account_id = a.id
                      LEFT JOIN categories c ON h.category_id = c.id
@@ -67,9 +92,10 @@ impl PortfolioReadModel {
                         market: row.get(5)?,
                         category_name: row.get(6)?,
                         category_color: row.get(7)?,
-                        shares: row.get(8)?,
-                        avg_cost: row.get(9)?,
-                        currency: row.get(10)?,
+                        category_id: row.get(8)?,
+                        shares: row.get(9)?,
+                        avg_cost: row.get(10)?,
+                        currency: row.get(11)?,
                     })
                 })
                 .map_err(|error| error.to_string())?
@@ -81,6 +107,8 @@ impl PortfolioReadModel {
         if rows.is_empty() {
             return Ok(Self {
                 holdings: vec![],
+                missing_quote_keys: HashSet::new(),
+                category_ids_by_holding: HashMap::new(),
                 quote_warning: None,
                 quotes_refreshed: false,
             });
@@ -107,7 +135,7 @@ impl PortfolioReadModel {
                 fetch_quotes_batch_cached_with_providers(
                     state,
                     quote_cache,
-                    symbols,
+                    symbols.clone(),
                     &config.us_provider,
                     &config.hk_provider,
                     &config.cn_provider,
@@ -116,16 +144,27 @@ impl PortfolioReadModel {
                 .await?
             }
         };
-        let quote_map: std::collections::HashMap<String, (f64, f64)> = quote_result
+        let available_quote_keys = quote_result
             .data
-            .into_iter()
-            .map(|quote| (quote.symbol.clone(), (quote.current_price, quote.change)))
+            .iter()
+            .map(|quote| normalized_quote_key(&quote.market, &quote.symbol))
+            .collect::<HashSet<_>>();
+        let missing_quote_keys = symbols
+            .iter()
+            .map(|(symbol, market)| normalized_quote_key(market, symbol))
+            .filter(|key| !available_quote_keys.contains(key))
+            .collect();
+        let quote_map = quote_values_by_market_and_symbol(&quote_result.data);
+        let category_ids_by_holding = rows
+            .iter()
+            .map(|row| (row.id.clone(), row.category_id.clone()))
             .collect();
 
         let holdings = rows
             .into_iter()
             .map(|row| {
-                let (current_price, change) = *quote_map.get(&row.symbol).unwrap_or(&(0.0, 0.0));
+                let quote_key = normalized_quote_key(&row.market, &row.symbol);
+                let (current_price, change) = *quote_map.get(&quote_key).unwrap_or(&(0.0, 0.0));
                 let market_value = row.shares * current_price;
                 let cost_value = row.shares * row.avg_cost;
                 let pnl = market_value - cost_value;
@@ -159,6 +198,8 @@ impl PortfolioReadModel {
 
         Ok(Self {
             holdings,
+            missing_quote_keys,
+            category_ids_by_holding,
             quote_warning: quote_result.warning,
             quotes_refreshed: quote_result.did_refresh,
         })
@@ -166,6 +207,16 @@ impl PortfolioReadModel {
 
     pub fn holdings(&self) -> &[HoldingDetail] {
         &self.holdings
+    }
+
+    pub fn missing_quote_keys(&self) -> &HashSet<(String, String)> {
+        &self.missing_quote_keys
+    }
+
+    pub fn category_id_for_holding(&self, holding_id: &str) -> Option<&str> {
+        self.category_ids_by_holding
+            .get(holding_id)
+            .and_then(Option::as_deref)
     }
 
     pub fn holdings_with_usd(&self, rates: &ExchangeRates) -> Vec<HoldingDetail> {
@@ -244,7 +295,12 @@ impl PortfolioReadModel {
     #[cfg(test)]
     pub(crate) fn from_holdings_for_test(holdings: Vec<HoldingDetail>) -> Self {
         Self {
+            category_ids_by_holding: holdings
+                .iter()
+                .map(|holding| (holding.id.clone(), None))
+                .collect(),
             holdings,
+            missing_quote_keys: HashSet::new(),
             quote_warning: None,
             quotes_refreshed: false,
         }
@@ -552,5 +608,36 @@ mod tests {
         assert_eq!(report.summary.daily_pnl, 10.0);
         assert_eq!(report.holdings.len(), 1);
         assert_eq!(report.holdings[0].market_value_usd, 120.0);
+    }
+
+    #[test]
+    fn quote_lookup_keeps_identical_symbols_in_different_markets_separate() {
+        let quotes = vec![
+            StockQuote {
+                symbol: "SAME".to_string(),
+                market: "US".to_string(),
+                current_price: 10.0,
+                change: 1.0,
+                ..StockQuote::default()
+            },
+            StockQuote {
+                symbol: " same ".to_string(),
+                market: "CN".to_string(),
+                current_price: 20.0,
+                change: 2.0,
+                ..StockQuote::default()
+            },
+        ];
+
+        let lookup = super::quote_values_by_market_and_symbol(&quotes);
+
+        assert_eq!(
+            lookup.get(&("US".to_string(), "SAME".to_string())),
+            Some(&(10.0, 1.0))
+        );
+        assert_eq!(
+            lookup.get(&("CN".to_string(), "SAME".to_string())),
+            Some(&(20.0, 2.0))
+        );
     }
 }

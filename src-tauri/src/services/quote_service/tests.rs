@@ -1004,84 +1004,6 @@ fn test_fetch_quotes_batch_cached_deduplicates_symbols() {
 }
 
 #[test]
-fn cached_batch_returns_requested_order_across_cache_hits_and_fetched_misses() {
-    let cache = QuoteCache::new();
-    let mut cached = sample_quote("AAPL", "US");
-    cached.current_price = 101.0;
-    cache.set(cached);
-    let requested = vec![
-        ("$CASH-USD".to_string(), "US".to_string()),
-        ("AAPL".to_string(), "US".to_string()),
-    ];
-    let state = QuoteServiceState::new();
-
-    let result = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(fetch_quotes_batch_cached_with_providers(
-            &state,
-            &cache,
-            requested,
-            "invalid-provider",
-            "invalid-provider",
-            "invalid-provider",
-            false,
-        ))
-        .unwrap();
-
-    assert_eq!(
-        result
-            .data
-            .iter()
-            .map(|quote| (
-                quote.market.as_str(),
-                quote.symbol.as_str(),
-                quote.current_price
-            ))
-            .collect::<Vec<_>>(),
-        vec![("US", "$CASH-USD", 1.0), ("US", "AAPL", 101.0)]
-    );
-}
-
-#[test]
-fn forced_cached_batch_returns_stale_fallbacks_in_requested_order() {
-    let cache = QuoteCache::new();
-    let mut stale = sample_quote("AAPL", "US");
-    stale.current_price = 101.0;
-    cache.set(stale);
-    let requested = vec![
-        ("AAPL".to_string(), "US".to_string()),
-        ("$CASH-USD".to_string(), "US".to_string()),
-    ];
-    let state = QuoteServiceState::new();
-
-    let result = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(fetch_quotes_batch_cached_with_providers(
-            &state,
-            &cache,
-            requested,
-            "invalid-provider",
-            "invalid-provider",
-            "invalid-provider",
-            true,
-        ))
-        .unwrap();
-
-    assert_eq!(
-        result
-            .data
-            .iter()
-            .map(|quote| (
-                quote.market.as_str(),
-                quote.symbol.as_str(),
-                quote.current_price
-            ))
-            .collect::<Vec<_>>(),
-        vec![("US", "AAPL", 101.0), ("US", "$CASH-USD", 1.0)]
-    );
-}
-
-#[test]
 fn test_quote_cache_update_overwrites() {
     let cache = QuoteCache::new();
     let mut quote = sample_quote("AAPL", "US");
@@ -2037,13 +1959,37 @@ fn xueqiu_realtime_planner_never_aliases_an_ambiguous_cross_market_api_symbol() 
 
     let (batches, invalid) = plan_xueqiu_realtime_batches(&symbols);
 
-    assert!(invalid.is_empty());
+    assert_eq!(
+        invalid,
+        vec![
+            ("00700".to_string(), "US".to_string()),
+            ("700".to_string(), "HK".to_string()),
+        ]
+    );
+    assert!(batches.is_empty());
+}
+
+#[test]
+fn xueqiu_realtime_planner_routes_cross_batch_api_token_collisions_to_fallback() {
+    let mut symbols = vec![("00700".to_string(), "US".to_string())];
+    symbols.extend((0..199).map(|index| (format!("T{index:03}"), "US".to_string())));
+    symbols.push(("700".to_string(), "HK".to_string()));
+
+    let (batches, fallback) = plan_xueqiu_realtime_batches(&symbols);
+
     assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].len(), 2);
-    assert_eq!(batches[0][0].market, "US");
-    assert_eq!(batches[0][1].market, "HK");
-    assert!(batches[0][0].aliases.is_empty());
-    assert!(batches[0][1].aliases.is_empty());
+    assert_eq!(batches[0].len(), 199);
+    assert!(batches
+        .iter()
+        .flatten()
+        .all(|request| request.api_symbol != "00700"));
+    assert_eq!(
+        fallback,
+        vec![
+            ("00700".to_string(), "US".to_string()),
+            ("700".to_string(), "HK".to_string()),
+        ]
+    );
 }
 
 // ---- Xueqiu response parsing tests ----

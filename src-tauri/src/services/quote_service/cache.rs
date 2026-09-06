@@ -305,4 +305,39 @@ mod tests {
             &[quote("US", "AAPL"), quote("HK", "0700")],
         ));
     }
+
+    #[test]
+    fn final_batch_order_follows_requested_market_and_symbol_for_mixed_sources() {
+        // The input represents cache, fresh-provider, and stale-fallback
+        // quotes arriving in implementation order rather than request order.
+        let requested = vec![
+            ("FRESH".to_string(), "US".to_string()),
+            ("CACHED".to_string(), "HK".to_string()),
+            ("STALE".to_string(), "CN".to_string()),
+        ];
+        let mut cached = quote("HK", "CACHED");
+        cached.current_price = 2.0;
+        let mut fresh = quote("US", "FRESH");
+        fresh.current_price = 1.0;
+        let mut stale = quote("CN", "STALE");
+        stale.current_price = 3.0;
+
+        let ordered = order_quotes_by_request(&requested, vec![cached, fresh, stale]);
+
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|quote| (
+                    quote.market.as_str(),
+                    quote.symbol.as_str(),
+                    quote.current_price
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("US", "FRESH", 1.0),
+                ("HK", "CACHED", 2.0),
+                ("CN", "STALE", 3.0)
+            ]
+        );
+    }
 }

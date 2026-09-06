@@ -683,29 +683,52 @@ pub(super) fn plan_xueqiu_realtime_batches(
 ) -> (Vec<Vec<XueqiuRealtimeRequestSymbol>>, Vec<(String, String)>) {
     let mut planned: Vec<XueqiuRealtimeRequestSymbol> = Vec::new();
     let mut index_by_api_symbol: HashMap<(String, String), usize> = HashMap::new();
+    let normalized_symbols = symbols
+        .iter()
+        .map(|(symbol, market)| to_xueqiu_realtime_symbol(symbol, market).ok())
+        .collect::<Vec<_>>();
+    let mut markets_by_api_symbol: HashMap<String, HashSet<String>> = HashMap::new();
+    for ((_, market), api_symbol) in symbols.iter().zip(&normalized_symbols) {
+        if let Some(api_symbol) = api_symbol {
+            markets_by_api_symbol
+                .entry(api_symbol.to_ascii_uppercase())
+                .or_default()
+                .insert(market.trim().to_ascii_uppercase());
+        }
+    }
+    let ambiguous_api_symbols = markets_by_api_symbol
+        .into_iter()
+        .filter_map(|(api_symbol, markets)| (markets.len() > 1).then_some(api_symbol))
+        .collect::<HashSet<_>>();
     let mut invalid = Vec::new();
-    for (symbol, market) in symbols {
-        match to_xueqiu_realtime_symbol(symbol, market) {
-            Ok(api_symbol) => {
-                let key = (
-                    market.trim().to_ascii_uppercase(),
-                    api_symbol.to_ascii_uppercase(),
-                );
-                if let Some(existing_index) = index_by_api_symbol.get(&key).copied() {
-                    planned[existing_index]
-                        .aliases
-                        .push((symbol.clone(), market.clone()));
-                } else {
-                    index_by_api_symbol.insert(key, planned.len());
-                    planned.push(XueqiuRealtimeRequestSymbol {
-                        original_symbol: symbol.clone(),
-                        market: market.clone(),
-                        api_symbol,
-                        aliases: Vec::new(),
-                    });
-                }
-            }
-            Err(_) => invalid.push((symbol.clone(), market.clone())),
+    for ((symbol, market), api_symbol) in symbols.iter().zip(normalized_symbols) {
+        let Some(api_symbol) = api_symbol else {
+            invalid.push((symbol.clone(), market.clone()));
+            continue;
+        };
+        if ambiguous_api_symbols.contains(&api_symbol.to_ascii_uppercase()) {
+            // Realtime responses have no market field, so this API token
+            // cannot safely serve more than one market. Preserve every tuple
+            // for the existing market-specific fallback path.
+            invalid.push((symbol.clone(), market.clone()));
+            continue;
+        }
+        let key = (
+            market.trim().to_ascii_uppercase(),
+            api_symbol.to_ascii_uppercase(),
+        );
+        if let Some(existing_index) = index_by_api_symbol.get(&key).copied() {
+            planned[existing_index]
+                .aliases
+                .push((symbol.clone(), market.clone()));
+        } else {
+            index_by_api_symbol.insert(key, planned.len());
+            planned.push(XueqiuRealtimeRequestSymbol {
+                original_symbol: symbol.clone(),
+                market: market.clone(),
+                api_symbol,
+                aliases: Vec::new(),
+            });
         }
     }
     let batches = planned

@@ -1133,15 +1133,15 @@ where
             holding.market.trim().to_ascii_uppercase(),
             holding.symbol.trim().to_ascii_uppercase(),
         );
-        if read_model.missing_quote_keys().contains(&key) || !holding.current_price.is_finite() {
-            if reported_missing_quotes.insert(key.clone()) {
-                missing_data.push(MissingPortfolioAlertData {
-                    market: Some(key.0),
-                    symbol: Some(key.1),
-                    currency: None,
-                    reason: "cached quote is unavailable".to_string(),
-                });
-            }
+        if (read_model.missing_quote_keys().contains(&key) || !holding.current_price.is_finite())
+            && reported_missing_quotes.insert(key.clone())
+        {
+            missing_data.push(MissingPortfolioAlertData {
+                market: Some(key.0),
+                symbol: Some(key.1),
+                currency: None,
+                reason: "cached quote is unavailable".to_string(),
+            });
         }
     }
 
@@ -1764,7 +1764,7 @@ mod tests {
         scope: PortfolioAlertScope,
     ) -> crate::models::portfolio_alert::PortfolioAlertConfig {
         save_portfolio_alert_config(
-            &db,
+            db,
             input(scope, 20.0, 20.0, [("growth", 60.0), ("bonds", 40.0)]),
         )
         .unwrap()
@@ -2192,16 +2192,17 @@ mod tests {
         }
     }
 
-    fn seed_holding(
-        db: &Database,
-        id: &str,
-        account_id: &str,
-        symbol: &str,
-        market: &str,
-        category_id: Option<&str>,
+    struct HoldingSeed<'a> {
+        id: &'a str,
+        account_id: &'a str,
+        symbol: &'a str,
+        market: &'a str,
+        category_id: Option<&'a str>,
         shares: f64,
-        currency: &str,
-    ) {
+        currency: &'a str,
+    }
+
+    fn insert_seed_holding(db: &Database, seed: HoldingSeed<'_>) {
         db.conn
             .lock()
             .unwrap()
@@ -2209,16 +2210,41 @@ mod tests {
                 "INSERT INTO holdings
                  (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, 1, ?7, '2026-09-06', '2026-09-06')",
-                rusqlite::params![id, account_id, symbol, market, category_id, shares, currency],
+                rusqlite::params![
+                    seed.id,
+                    seed.account_id,
+                    seed.symbol,
+                    seed.market,
+                    seed.category_id,
+                    seed.shares,
+                    seed.currency,
+                ],
             )
             .unwrap();
+    }
+
+    macro_rules! seed_holding {
+        ($db:expr, $id:expr, $account_id:expr, $symbol:expr, $market:expr, $category_id:expr, $shares:expr, $currency:expr $(,)?) => {
+            insert_seed_holding(
+                $db,
+                HoldingSeed {
+                    id: $id,
+                    account_id: $account_id,
+                    symbol: $symbol,
+                    market: $market,
+                    category_id: $category_id,
+                    shares: $shares,
+                    currency: $currency,
+                },
+            )
+        };
     }
 
     fn evaluation_fixture() -> EvaluationFixture {
         let db = configured_db();
         seed_categories(&db, ["growth"]);
         seed_account(&db, "acct-us", "US");
-        seed_holding(
+        seed_holding!(
             &db,
             "holding-aapl",
             "acct-us",
@@ -2228,7 +2254,7 @@ mod tests {
             10.0,
             "USD",
         );
-        seed_holding(
+        seed_holding!(
             &db,
             "holding-cash",
             "acct-us",
@@ -2324,7 +2350,10 @@ mod tests {
             last_seen_at: "persisted-last".to_string(),
             ..proposed.clone()
         };
-        assert!(intersect_preview_breaches(&[wrong_direction], &[proposed.clone()]).is_empty());
+        assert!(
+            intersect_preview_breaches(&[wrong_direction], std::slice::from_ref(&proposed),)
+                .is_empty()
+        );
         let wrong_kind = PortfolioAlertBreach {
             breach_kind: PortfolioAlertBreachKind::Concentration,
             direction: PortfolioAlertBreachDirection::AboveLimit,
@@ -2332,7 +2361,9 @@ mod tests {
             last_seen_at: "persisted-last".to_string(),
             ..proposed.clone()
         };
-        assert!(intersect_preview_breaches(&[wrong_kind], &[proposed.clone()]).is_empty());
+        assert!(
+            intersect_preview_breaches(&[wrong_kind], std::slice::from_ref(&proposed)).is_empty()
+        );
 
         let persisted = PortfolioAlertBreach {
             first_triggered_at: "persisted-first".to_string(),
@@ -2398,7 +2429,7 @@ mod tests {
         let db = configured_db();
         seed_categories(&db, ["growth"]);
         seed_account(&db, "acct-us", "US");
-        seed_holding(
+        seed_holding!(
             &db,
             "holding-aapl",
             "acct-us",
@@ -2544,7 +2575,7 @@ mod tests {
         let db = configured_db();
         seed_categories(&db, ["growth"]);
         seed_account(&db, "acct-us", "US");
-        seed_holding(
+        seed_holding!(
             &db,
             "holding-aapl",
             "acct-us",
@@ -2624,7 +2655,7 @@ mod tests {
         seed_categories(&db, ["growth"]);
         seed_account(&db, "acct-us", "US");
         seed_account(&db, "acct-hk", "HK");
-        seed_holding(
+        seed_holding!(
             &db,
             "holding-aapl",
             "acct-us",
@@ -2634,7 +2665,7 @@ mod tests {
             10.0,
             "USD",
         );
-        seed_holding(
+        seed_holding!(
             &db,
             "holding-0700",
             "acct-hk",
@@ -2704,7 +2735,7 @@ mod tests {
         let db = configured_db();
         seed_categories(&db, ["growth", "cash"]);
         seed_account(&db, "acct-us", "US");
-        seed_holding(
+        seed_holding!(
             &db,
             "holding-aapl",
             "acct-us",
@@ -2714,7 +2745,7 @@ mod tests {
             1.0,
             "USD",
         );
-        seed_holding(
+        seed_holding!(
             &db,
             "holding-cash",
             "acct-us",
@@ -2901,7 +2932,7 @@ mod tests {
         seed_categories(&db, ["growth"]);
         seed_account(&db, "acct-us", "US");
         seed_account(&db, "acct-cn", "CN");
-        seed_holding(
+        seed_holding!(
             &db,
             "us",
             "acct-us",
@@ -2911,7 +2942,7 @@ mod tests {
             10.0,
             "USD",
         );
-        seed_holding(
+        seed_holding!(
             &db,
             "cn",
             "acct-cn",
@@ -2947,7 +2978,7 @@ mod tests {
         seed_categories(&db, ["growth"]);
         seed_account(&db, "acct-us-1", "US");
         seed_account(&db, "acct-us-2", "US");
-        seed_holding(
+        seed_holding!(
             &db,
             "one",
             "acct-us-1",
@@ -2957,7 +2988,7 @@ mod tests {
             2.0,
             "USD",
         );
-        seed_holding(
+        seed_holding!(
             &db,
             "two",
             "acct-us-2",
@@ -2992,7 +3023,7 @@ mod tests {
         let db = configured_db();
         seed_categories(&db, ["growth"]);
         seed_account(&db, "acct-cn", "CN");
-        seed_holding(
+        seed_holding!(
             &db,
             "cn",
             "acct-cn",
@@ -3033,7 +3064,7 @@ mod tests {
             let db = configured_db();
             seed_categories(&db, ["growth"]);
             seed_account(&db, "acct-cn", "CN");
-            seed_holding(
+            seed_holding!(
                 &db,
                 "cn",
                 "acct-cn",
@@ -3088,7 +3119,7 @@ mod tests {
         );
 
         seed_account(&db, "acct-us", "US");
-        seed_holding(
+        seed_holding!(
             &db,
             "zero",
             "acct-us",
@@ -3155,7 +3186,7 @@ mod tests {
         let db = configured_db();
         seed_categories(&db, ["growth"]);
         seed_account(&db, "acct-us", "US");
-        seed_holding(
+        seed_holding!(
             &db,
             "cash",
             "acct-us",
@@ -3197,7 +3228,7 @@ mod tests {
         seed_categories(&db, ["growth"]);
         seed_account(&db, "one", "US");
         seed_account(&db, "two", "US");
-        seed_holding(
+        seed_holding!(
             &db,
             "one-aapl",
             "one",
@@ -3207,7 +3238,7 @@ mod tests {
             2.0,
             "USD",
         );
-        seed_holding(
+        seed_holding!(
             &db,
             "two-aapl",
             "two",
@@ -3217,7 +3248,7 @@ mod tests {
             3.0,
             "USD",
         );
-        seed_holding(
+        seed_holding!(
             &db,
             "cash",
             "one",
@@ -3319,7 +3350,7 @@ mod tests {
         let db = configured_db();
         seed_categories(&db, ["growth"]);
         seed_account(&db, "acct-us", "US");
-        seed_holding(
+        seed_holding!(
             &db,
             "persist",
             "acct-us",
@@ -3329,7 +3360,7 @@ mod tests {
             4.0,
             "USD",
         );
-        seed_holding(
+        seed_holding!(
             &db,
             "new",
             "acct-us",
@@ -3339,7 +3370,7 @@ mod tests {
             4.0,
             "USD",
         );
-        seed_holding(
+        seed_holding!(
             &db,
             "cash",
             "acct-us",
@@ -3416,7 +3447,7 @@ mod tests {
         seed_categories(&db, ["growth"]);
         seed_account(&db, "acct-us", "US");
         seed_account(&db, "acct-cn", "CN");
-        seed_holding(
+        seed_holding!(
             &db,
             "us",
             "acct-us",
@@ -3426,7 +3457,7 @@ mod tests {
             10.0,
             "USD",
         );
-        seed_holding(
+        seed_holding!(
             &db,
             "cn",
             "acct-cn",
@@ -3464,7 +3495,7 @@ mod tests {
         let db = configured_db();
         seed_categories(&db, ["growth"]);
         seed_account(&db, "acct-us", "US");
-        seed_holding(
+        seed_holding!(
             &db,
             "negative",
             "acct-us",

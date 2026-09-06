@@ -141,7 +141,7 @@ fn relative_deviation_percent(current: f64, target: f64) -> Option<f64> {
     Some((current - target).abs() / target * 100.0)
 }
 
-fn build_category_allocation(
+struct CategoryAllocationInput {
     category_id: Option<String>,
     category_name: String,
     category_color: String,
@@ -150,16 +150,18 @@ fn build_category_allocation(
     current_market_value: f64,
     total_market_value: f64,
     deviation_threshold: f64,
-) -> CategoryAllocation {
-    let current_percent = current_market_value / total_market_value * 100.0;
-    let target_market_value = total_market_value * target_percent / 100.0;
-    let rebalance_amount = target_market_value - current_market_value;
+}
+
+fn build_category_allocation(input: CategoryAllocationInput) -> CategoryAllocation {
+    let current_percent = input.current_market_value / input.total_market_value * 100.0;
+    let target_market_value = input.total_market_value * input.target_percent / 100.0;
+    let rebalance_amount = target_market_value - input.current_market_value;
     let relative_deviation_percent =
-        relative_deviation_percent(current_market_value, target_market_value);
-    let direction = if target_percent == 0.0 {
-        (current_market_value > 0.0).then_some(AllocationDirection::Overweight)
-    } else if relative_deviation_percent.is_some_and(|value| value > deviation_threshold) {
-        Some(if current_market_value > target_market_value {
+        relative_deviation_percent(input.current_market_value, target_market_value);
+    let direction = if input.target_percent == 0.0 {
+        (input.current_market_value > 0.0).then_some(AllocationDirection::Overweight)
+    } else if relative_deviation_percent.is_some_and(|value| value > input.deviation_threshold) {
+        Some(if input.current_market_value > target_market_value {
             AllocationDirection::Overweight
         } else {
             AllocationDirection::Underweight
@@ -169,14 +171,14 @@ fn build_category_allocation(
     };
 
     CategoryAllocation {
-        category_id,
-        category_name,
-        category_color,
-        category_icon,
-        target_percent,
+        category_id: input.category_id,
+        category_name: input.category_name,
+        category_color: input.category_color,
+        category_icon: input.category_icon,
+        target_percent: input.target_percent,
         current_percent,
         relative_deviation_percent,
-        current_market_value,
+        current_market_value: input.current_market_value,
         target_market_value,
         rebalance_amount,
         direction,
@@ -255,29 +257,29 @@ pub fn calculate_portfolio_alert_snapshot(
                 .get(&category.id)
                 .copied()
                 .unwrap_or(0.0);
-            build_category_allocation(
-                Some(category.id.clone()),
-                category.name.clone(),
-                category.color.clone(),
-                category.icon.clone(),
+            build_category_allocation(CategoryAllocationInput {
+                category_id: Some(category.id.clone()),
+                category_name: category.name.clone(),
+                category_color: category.color.clone(),
+                category_icon: category.icon.clone(),
                 target_percent,
                 current_market_value,
                 total_market_value,
-                config.deviation_threshold,
-            )
+                deviation_threshold: config.deviation_threshold,
+            })
         })
         .collect::<Vec<_>>();
 
-    category_allocations.push(build_category_allocation(
-        None,
-        "未分类".to_string(),
-        "#8B8B8B".to_string(),
-        String::new(),
-        0.0,
-        uncategorized_market_value,
+    category_allocations.push(build_category_allocation(CategoryAllocationInput {
+        category_id: None,
+        category_name: "未分类".to_string(),
+        category_color: "#8B8B8B".to_string(),
+        category_icon: String::new(),
+        target_percent: 0.0,
+        current_market_value: uncategorized_market_value,
         total_market_value,
-        config.deviation_threshold,
-    ));
+        deviation_threshold: config.deviation_threshold,
+    }));
 
     let mut concentration_groups = BTreeMap::<(String, String), ConcentrationAccumulator>::new();
     for position in filtered_positions
@@ -439,28 +441,46 @@ mod tests {
         ]
     }
 
-    fn position(
-        account_id: &str,
-        market: &str,
-        symbol: &str,
-        name: &str,
-        category_id: Option<&str>,
-        category_name: &str,
-        category_color: &str,
+    struct PositionFixture<'a> {
+        account_id: &'a str,
+        market: &'a str,
+        symbol: &'a str,
+        name: &'a str,
+        category_id: Option<&'a str>,
+        category_name: &'a str,
+        category_color: &'a str,
         market_value: f64,
         is_cash: bool,
-    ) -> PortfolioAlertPositionInput {
+    }
+
+    fn build_position(fixture: PositionFixture<'_>) -> PortfolioAlertPositionInput {
         PortfolioAlertPositionInput {
-            account_id: account_id.to_string(),
-            market: market.to_string(),
-            symbol: symbol.to_string(),
-            name: name.to_string(),
-            category_id: category_id.map(|value| value.to_string()),
-            category_name: category_name.to_string(),
-            category_color: category_color.to_string(),
-            market_value,
-            is_cash,
+            account_id: fixture.account_id.to_string(),
+            market: fixture.market.to_string(),
+            symbol: fixture.symbol.to_string(),
+            name: fixture.name.to_string(),
+            category_id: fixture.category_id.map(str::to_string),
+            category_name: fixture.category_name.to_string(),
+            category_color: fixture.category_color.to_string(),
+            market_value: fixture.market_value,
+            is_cash: fixture.is_cash,
         }
+    }
+
+    macro_rules! position {
+        ($account_id:expr, $market:expr, $symbol:expr, $name:expr, $category_id:expr, $category_name:expr, $category_color:expr, $market_value:expr, $is_cash:expr $(,)?) => {
+            build_position(PositionFixture {
+                account_id: $account_id,
+                market: $market,
+                symbol: $symbol,
+                name: $name,
+                category_id: $category_id,
+                category_name: $category_name,
+                category_color: $category_color,
+                market_value: $market_value,
+                is_cash: $is_cash,
+            })
+        };
     }
 
     fn positions<const N: usize>(
@@ -475,7 +495,7 @@ mod tests {
                     } else {
                         (Some("growth"), "Growth", "#00AA00")
                     };
-                position(
+                position!(
                     "acct-a",
                     "US",
                     symbol,
@@ -491,7 +511,7 @@ mod tests {
     }
 
     fn uncategorized_position(market_value: f64) -> Vec<PortfolioAlertPositionInput> {
-        vec![position(
+        vec![position!(
             "acct-a",
             "US",
             "misc",
@@ -513,7 +533,7 @@ mod tests {
     ) -> Vec<PortfolioAlertPositionInput> {
         let residual_cash = total_market_value - first_market_value - second_market_value;
         vec![
-            position(
+            position!(
                 "acct-a",
                 market,
                 symbol,
@@ -524,7 +544,7 @@ mod tests {
                 first_market_value,
                 false,
             ),
-            position(
+            position!(
                 "acct-b",
                 market,
                 &symbol.to_ascii_lowercase(),
@@ -535,7 +555,7 @@ mod tests {
                 second_market_value,
                 false,
             ),
-            position(
+            position!(
                 "acct-a",
                 market,
                 "cash",
@@ -643,7 +663,7 @@ mod tests {
             &config,
             &categories,
             &[
-                position(
+                position!(
                     "acct-a",
                     "US",
                     "cash",
@@ -654,7 +674,7 @@ mod tests {
                     60.0,
                     true,
                 ),
-                position(
+                position!(
                     "acct-a",
                     "US",
                     "growth",
@@ -693,7 +713,7 @@ mod tests {
         let config = config_with_concentration(10.0);
         let categories = default_categories();
         let positions = [
-            position(
+            position!(
                 "acct-a",
                 "US",
                 "AAPL",
@@ -704,7 +724,7 @@ mod tests {
                 30.0,
                 false,
             ),
-            position(
+            position!(
                 "acct-a",
                 "HK",
                 "AAPL",
@@ -715,7 +735,7 @@ mod tests {
                 20.0,
                 false,
             ),
-            position(
+            position!(
                 "acct-a",
                 "US",
                 "cash",
@@ -745,7 +765,7 @@ mod tests {
         let config = config_with_market_scope("us");
         let categories = default_categories();
         let positions = [
-            position(
+            position!(
                 "acct-a",
                 "US",
                 "growth",
@@ -756,7 +776,7 @@ mod tests {
                 60.0,
                 false,
             ),
-            position(
+            position!(
                 "acct-a",
                 "HK",
                 "growth",
@@ -796,7 +816,7 @@ mod tests {
         let config = config_with_targets(20.0, [("growth", 37.5), ("cash", 62.5)]);
         let categories = default_categories();
         let positions = [
-            position(
+            position!(
                 "acct-a",
                 "US",
                 "growth",
@@ -807,7 +827,7 @@ mod tests {
                 30.0,
                 false,
             ),
-            position(
+            position!(
                 "acct-a",
                 "US",
                 "cash",
@@ -838,7 +858,7 @@ mod tests {
             calculate(
                 &config,
                 &categories,
-                &[position(
+                &[position!(
                     "acct-a",
                     "US",
                     "growth",
@@ -861,7 +881,7 @@ mod tests {
         let snapshot = snapshot(
             &config,
             &categories,
-            &[position(
+            &[position!(
                 "acct-a",
                 "US",
                 "cash",
@@ -887,7 +907,7 @@ mod tests {
         let snapshot = snapshot(
             &config,
             &categories,
-            &[position(
+            &[position!(
                 "acct-a",
                 "US",
                 "cash",
@@ -913,7 +933,7 @@ mod tests {
         let negative = calculate_portfolio_alert_snapshot(
             &config,
             &categories,
-            &[position(
+            &[position!(
                 "acct-a",
                 "US",
                 "growth",
@@ -946,7 +966,7 @@ mod tests {
         let config = config_with_targets(20.0, [("growth", 50.0), ("value", 50.0)]);
         let categories = value_and_growth_categories();
         let positions = [
-            position(
+            position!(
                 "acct-a",
                 "US",
                 "value",
@@ -957,7 +977,7 @@ mod tests {
                 40.0,
                 false,
             ),
-            position(
+            position!(
                 "acct-a",
                 "US",
                 "growth",
@@ -968,7 +988,7 @@ mod tests {
                 40.0,
                 false,
             ),
-            position(
+            position!(
                 "acct-a",
                 "US",
                 "legacy",
@@ -979,7 +999,7 @@ mod tests {
                 15.0,
                 false,
             ),
-            position(
+            position!(
                 "acct-a",
                 "US",
                 "misc",
@@ -1016,7 +1036,7 @@ mod tests {
             account_id: Some("acct-a".to_string()),
         };
         let positions = [
-            position(
+            position!(
                 "acct-a",
                 "US",
                 "growth",
@@ -1027,7 +1047,7 @@ mod tests {
                 60.0,
                 false,
             ),
-            position(
+            position!(
                 "acct-a",
                 "US",
                 "cash",
@@ -1038,7 +1058,7 @@ mod tests {
                 40.0,
                 true,
             ),
-            position(
+            position!(
                 "acct-b",
                 "US",
                 "growth",
@@ -1049,7 +1069,7 @@ mod tests {
                 40.0,
                 false,
             ),
-            position(
+            position!(
                 "acct-b",
                 "US",
                 "cash",
@@ -1075,7 +1095,7 @@ mod tests {
             &config,
             &categories,
             &[
-                position(
+                position!(
                     "acct-a",
                     "US",
                     "growth",
@@ -1086,7 +1106,7 @@ mod tests {
                     20.0,
                     false,
                 ),
-                position(
+                position!(
                     "acct-a",
                     "US",
                     "cash",

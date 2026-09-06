@@ -1947,6 +1947,9 @@ mod tests {
         );
     }
 
+    type PersistedBreachState = (String, String, String);
+    type PersistedRebalanceState = (Option<String>, Option<String>, Vec<PersistedBreachState>);
+
     struct RebalanceFixture {
         db: Database,
         cache: ExchangeRateCache,
@@ -2053,13 +2056,7 @@ mod tests {
             .await
         }
 
-        fn persisted_state(
-            &self,
-        ) -> (
-            Option<String>,
-            Option<String>,
-            Vec<(String, String, String)>,
-        ) {
+        fn persisted_state(&self) -> PersistedRebalanceState {
             let conn = self.db.conn.lock().unwrap();
             let config = conn
                 .query_row(

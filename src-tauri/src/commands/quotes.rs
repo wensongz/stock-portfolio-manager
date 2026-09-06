@@ -1,5 +1,7 @@
+use crate::commands::portfolio_alerts::evaluate_and_emit_portfolio_alerts;
 use crate::db::Database;
 use crate::models::{HoldingWithQuote, StockQuote};
+use crate::services::exchange_rate_service::ExchangeRateCache;
 use crate::services::quote_provider_service;
 use crate::services::quote_service::{
     fetch_cn_quote_with_provider, fetch_hk_quote_with_provider,
@@ -8,7 +10,8 @@ use crate::services::quote_service::{
     QuoteServiceState, CASH_SYMBOL_PREFIX,
 };
 use serde::Serialize;
-use tauri::State;
+use std::future::Future;
+use tauri::{AppHandle, State};
 use tracing::warn;
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,9 +71,23 @@ pub async fn get_holding_quotes(
     db: State<'_, Database>,
     quote_cache: State<'_, QuoteCache>,
     quote_state: State<'_, QuoteServiceState>,
+    app_handle: AppHandle,
+    exchange_rate_cache: State<'_, ExchangeRateCache>,
     refresh_symbols: Option<Vec<(String, String)>>,
 ) -> Result<QuoteCommandResult<Vec<HoldingWithQuote>>, String> {
-    get_holding_quotes_inner(&db, &quote_cache, &quote_state, refresh_symbols).await
+    let (outcome, did_refresh) = get_holding_quotes_inner_with_refresh_status(
+        &db,
+        &quote_cache,
+        &quote_state,
+        refresh_symbols.clone(),
+    )
+    .await?;
+    run_alert_evaluation_after_holding_refresh(refresh_symbols.as_deref(), did_refresh, || async {
+        evaluate_and_emit_portfolio_alerts(&app_handle, &db, &quote_cache, &exchange_rate_cache)
+            .await;
+    })
+    .await;
+    Ok(outcome)
 }
 
 pub async fn get_holding_quotes_inner(
@@ -79,6 +96,17 @@ pub async fn get_holding_quotes_inner(
     quote_state: &QuoteServiceState,
     refresh_symbols: Option<Vec<(String, String)>>,
 ) -> Result<QuoteCommandResult<Vec<HoldingWithQuote>>, String> {
+    get_holding_quotes_inner_with_refresh_status(db, quote_cache, quote_state, refresh_symbols)
+        .await
+        .map(|(outcome, _)| outcome)
+}
+
+async fn get_holding_quotes_inner_with_refresh_status(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    quote_state: &QuoteServiceState,
+    refresh_symbols: Option<Vec<(String, String)>>,
+) -> Result<(QuoteCommandResult<Vec<HoldingWithQuote>>, bool), String> {
     let config = quote_provider_service::get_quote_provider_config(db)?;
     // Load holdings from DB (synchronous) and pre-compute realized PnL for cleared positions.
     // realized_pnl_map: holding_id -> (realized_pnl, total_buy_cost)
@@ -251,14 +279,29 @@ pub async fn get_holding_quotes_inner(
         })
         .collect();
 
-    finish_quote_command(
+    let did_refresh = fetch.did_refresh;
+    let outcome = finish_quote_command(
         db,
         QuoteFetchResult {
             data: result,
             warning: fetch.warning,
-            did_refresh: fetch.did_refresh,
+            did_refresh,
         },
-    )
+    )?;
+    Ok((outcome, did_refresh))
+}
+
+pub(crate) async fn run_alert_evaluation_after_holding_refresh<F, Fut>(
+    refresh_symbols: Option<&[(String, String)]>,
+    did_refresh: bool,
+    evaluate: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    if did_refresh && refresh_symbols.is_none_or(|symbols| !symbols.is_empty()) {
+        evaluate().await;
+    }
 }
 
 /// Load realized PnL for every cleared non-cash position in one grouped query.
@@ -381,6 +424,36 @@ mod tests {
 
     fn now() -> String {
         chrono::Utc::now().to_rfc3339()
+    }
+
+    #[tokio::test]
+    async fn public_empty_symbol_holding_refresh_does_not_trigger_portfolio_alert_evaluation() {
+        // This catches the public cache-only `Some(vec![])` path accidentally
+        // running portfolio-alert evaluation after serving cached quotes.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_calls = calls.clone();
+
+        run_alert_evaluation_after_holding_refresh(Some(&[]), true, move || async move {
+            observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn actual_holding_refresh_runs_the_shared_portfolio_alert_hook() {
+        // This catches a full refresh path that completes without the shared
+        // portfolio-alert follow-up.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_calls = calls.clone();
+
+        run_alert_evaluation_after_holding_refresh(None, true, move || async move {
+            observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

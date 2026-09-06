@@ -3,9 +3,9 @@ use crate::{
     models::portfolio_alert::{
         AllocationDirection, MissingPortfolioAlertData, PortfolioAlertBreach,
         PortfolioAlertBreachDirection, PortfolioAlertBreachKind, PortfolioAlertConfig,
-        PortfolioAlertDataStatus, PortfolioAlertEvaluation, PortfolioAlertScope,
-        PortfolioAlertScopeKind, PortfolioAlertSnapshot, PortfolioAlertTarget, PortfolioAlertView,
-        SavePortfolioAlertConfigInput,
+        PortfolioAlertDataStatus, PortfolioAlertEvaluation, PortfolioAlertNotification,
+        PortfolioAlertScope, PortfolioAlertScopeKind, PortfolioAlertSnapshot, PortfolioAlertTarget,
+        PortfolioAlertView, SavePortfolioAlertConfigInput,
     },
     models::ExchangeRates,
     services::{
@@ -22,6 +22,7 @@ use crate::{
 use chrono::{SecondsFormat, TimeDelta, Utc};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use tracing::warn;
 use uuid::Uuid;
 
 const TOTAL_TOLERANCE: f64 = 0.01;
@@ -641,6 +642,75 @@ pub async fn evaluate_portfolio_alert(
         || {},
     )
     .await
+}
+
+/// Evaluate each configuration that was active at the start of this batch.
+/// A malformed or incomplete scope must not prevent the remaining scopes from
+/// updating their persisted breach transitions.
+pub async fn evaluate_all_active_portfolio_alerts(
+    db: &Database,
+    quote_cache: &QuoteCache,
+    exchange_rates: Option<&ExchangeRates>,
+    evaluated_at: &str,
+) -> Result<Vec<PortfolioAlertNotification>, String> {
+    let active_ids = {
+        let conn = db.conn.lock().map_err(|error| error.to_string())?;
+        let mut statement = conn
+            .prepare("SELECT id FROM portfolio_alert_configs WHERE is_active = 1 ORDER BY id")
+            .map_err(|error| error.to_string())?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        ids
+    };
+
+    let mut notifications = Vec::new();
+    for config_id in active_ids {
+        let config = match get_portfolio_alert_config_by_id(db, &config_id) {
+            Ok(config) if config.is_active => config,
+            Ok(_) => continue,
+            Err(error) => {
+                warn!(
+                    config_id = %config_id,
+                    "Skipping portfolio alert evaluation because configuration could not be loaded: {error}"
+                );
+                continue;
+            }
+        };
+        match evaluate_portfolio_alert(db, quote_cache, exchange_rates, &config_id, evaluated_at)
+            .await
+        {
+            Ok(evaluation) => {
+                notifications.extend(evaluation.newly_triggered.into_iter().map(|breach| {
+                    PortfolioAlertNotification {
+                        config_id: config.id.clone(),
+                        scope: config.scope.clone(),
+                        message: portfolio_alert_notification_message(&breach),
+                        breach,
+                        triggered_at: evaluated_at.to_string(),
+                    }
+                }));
+            }
+            Err(error) => warn!(
+                config_id = %config_id,
+                "Portfolio alert evaluation failed after quote refresh: {error}"
+            ),
+        }
+    }
+    Ok(notifications)
+}
+
+fn portfolio_alert_notification_message(breach: &PortfolioAlertBreach) -> String {
+    match breach.breach_kind {
+        PortfolioAlertBreachKind::CategoryDeviation => {
+            format!("资产配置偏离预警：{}", breach.breach_key)
+        }
+        PortfolioAlertBreachKind::Concentration => {
+            format!("持仓集中度预警：{}", breach.breach_key)
+        }
+    }
 }
 
 async fn evaluate_portfolio_alert_inner<F>(
@@ -1800,6 +1870,166 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn evaluate_all_active_skips_disabled_configs_and_collects_only_new_breaches() {
+        // This catches a batch evaluator that includes disabled configurations
+        // or reports an already-persisted breach as new.
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        seed_account(&db, "acct-us", "US");
+        seed_holding(
+            &db,
+            "holding-aapl",
+            "acct-us",
+            "AAPL",
+            "US",
+            Some("growth"),
+            10.0,
+            "USD",
+        );
+        let active = save_portfolio_alert_config(
+            &db,
+            input_with_id(
+                "config-us".to_string(),
+                market_scope("US"),
+                20.0,
+                60.0,
+                [("growth", 100.0)],
+            ),
+        )
+        .unwrap();
+        let disabled = save_portfolio_alert_config(
+            &db,
+            input_with_id(
+                "config-hk".to_string(),
+                market_scope("HK"),
+                20.0,
+                60.0,
+                [("growth", 100.0)],
+            ),
+        )
+        .unwrap();
+        set_portfolio_alert_active(&db, &disabled.id, false).unwrap();
+        let quote_cache = crate::services::quote_service::QuoteCache::new();
+        quote_cache.set(quote("US", "AAPL", 100.0));
+
+        let first = evaluate_all_active_portfolio_alerts(
+            &db,
+            &quote_cache,
+            Some(&rates()),
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            first
+                .iter()
+                .map(|notification| notification.config_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["config-us"]
+        );
+        assert_eq!(first[0].scope, market_scope("US"));
+        assert_eq!(first[0].triggered_at, "2026-09-06T10:00:00Z");
+        assert_eq!(first[0].breach.config_id, active.id);
+        assert!(first[0].message.contains("预警"));
+        assert!(get_portfolio_alert_config_by_id(&db, &disabled.id)
+            .unwrap()
+            .last_evaluated_at
+            .is_none());
+
+        let second = evaluate_all_active_portfolio_alerts(
+            &db,
+            &quote_cache,
+            Some(&rates()),
+            "2026-09-06T10:05:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(second.is_empty());
+    }
+
+    #[tokio::test]
+    async fn evaluate_all_active_continues_after_incomplete_conversion_scope() {
+        // This catches a batch evaluator that stops when one active scope is
+        // incomplete because its currency conversion rate is unavailable.
+        let db = configured_db();
+        seed_categories(&db, ["growth"]);
+        seed_account(&db, "acct-us", "US");
+        seed_account(&db, "acct-hk", "HK");
+        seed_holding(
+            &db,
+            "holding-aapl",
+            "acct-us",
+            "AAPL",
+            "US",
+            Some("growth"),
+            10.0,
+            "USD",
+        );
+        seed_holding(
+            &db,
+            "holding-0700",
+            "acct-hk",
+            "0700",
+            "HK",
+            Some("growth"),
+            10.0,
+            "HKD",
+        );
+        let incomplete = save_portfolio_alert_config(
+            &db,
+            input_with_id(
+                "config-overall".to_string(),
+                overall_scope(),
+                20.0,
+                60.0,
+                [("growth", 100.0)],
+            ),
+        )
+        .unwrap();
+        let ready = save_portfolio_alert_config(
+            &db,
+            input_with_id(
+                "config-us".to_string(),
+                market_scope("US"),
+                20.0,
+                60.0,
+                [("growth", 100.0)],
+            ),
+        )
+        .unwrap();
+        let quote_cache = crate::services::quote_service::QuoteCache::new();
+        quote_cache.set(quote("US", "AAPL", 100.0));
+        quote_cache.set(quote("HK", "0700", 100.0));
+
+        let notifications =
+            evaluate_all_active_portfolio_alerts(&db, &quote_cache, None, "2026-09-06T10:00:00Z")
+                .await
+                .unwrap();
+
+        assert_eq!(
+            notifications
+                .iter()
+                .map(|notification| notification.config_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["config-us"]
+        );
+        assert_eq!(
+            get_portfolio_alert_config_by_id(&db, &incomplete.id)
+                .unwrap()
+                .last_evaluated_at,
+            None
+        );
+        assert_eq!(
+            get_portfolio_alert_config_by_id(&db, &ready.id)
+                .unwrap()
+                .last_evaluated_at
+                .as_deref(),
+            Some("2026-09-06T10:00:00Z")
+        );
     }
 
     #[tokio::test]

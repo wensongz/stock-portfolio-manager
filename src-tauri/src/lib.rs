@@ -114,6 +114,7 @@ pub fn run() {
                 let db = handle.state::<Database>();
                 let cache = handle.state::<QuoteCache>();
                 let quote_state = handle.state::<QuoteServiceState>();
+                let rate_cache = handle.state::<ExchangeRateCache>();
 
                 // Collect all holding symbols.
                 let symbols: Vec<(String, String)> = {
@@ -181,6 +182,20 @@ pub fn run() {
                                 warn!("Background refresh: failed to persist quotes: {}", error);
                             }
                         }
+                        commands::quotes::run_alert_evaluation_after_holding_refresh(
+                            None,
+                            fetch.did_refresh,
+                            || async {
+                                commands::portfolio_alerts::evaluate_and_emit_portfolio_alerts(
+                                    &handle,
+                                    &db,
+                                    &cache,
+                                    &rate_cache,
+                                )
+                                .await;
+                            },
+                        )
+                        .await;
                         let refreshed_at = if fetch.did_refresh {
                             services::quote_service::save_quote_refresh_time(&db)
                                 .map(Some)

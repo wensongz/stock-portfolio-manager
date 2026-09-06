@@ -7,7 +7,8 @@ use crate::services::exchange_rate_service::{load_exchange_rates_from_db, Exchan
 use crate::services::portfolio_alert_service;
 use crate::services::quote_service::QuoteCache;
 use chrono::Utc;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
+use tracing::warn;
 
 fn cached_exchange_rates(
     db: &Database,
@@ -16,6 +17,40 @@ fn cached_exchange_rates(
     match cache.get_stale() {
         Some(rates) => Ok(Some(rates)),
         None => load_exchange_rates_from_db(db),
+    }
+}
+
+/// Evaluate active portfolio alerts using only in-memory or persisted rates,
+/// then notify the frontend about each newly inserted breach. Quote refreshes
+/// must remain successful even when alert evaluation or event delivery fails.
+pub(crate) async fn evaluate_and_emit_portfolio_alerts(
+    app_handle: &AppHandle,
+    db: &Database,
+    quote_cache: &QuoteCache,
+    exchange_rate_cache: &ExchangeRateCache,
+) {
+    let rates = exchange_rate_cache.get_stale().or_else(|| {
+        load_exchange_rates_from_db(db).unwrap_or_else(|error| {
+            warn!("Unable to load persisted exchange rates for portfolio alerts: {error}");
+            None
+        })
+    });
+    match portfolio_alert_service::evaluate_all_active_portfolio_alerts(
+        db,
+        quote_cache,
+        rates.as_ref(),
+        &Utc::now().to_rfc3339(),
+    )
+    .await
+    {
+        Ok(notifications) => {
+            for notification in notifications {
+                if let Err(error) = app_handle.emit("portfolio-alert-triggered", notification) {
+                    warn!("Failed to emit portfolio-alert-triggered event: {error}");
+                }
+            }
+        }
+        Err(error) => warn!("Portfolio alert evaluation after quote refresh failed: {error}"),
     }
 }
 

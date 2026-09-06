@@ -377,3 +377,40 @@ pub(super) fn create_portfolio_query_indexes(conn: &Connection) -> Result<()> {
            ON option_records(account_id, option_symbol, traded_at);",
     )
 }
+
+pub(super) fn create_import_batch_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS import_batches (
+            id TEXT PRIMARY KEY NOT NULL,
+            request_id TEXT NOT NULL UNIQUE,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            source TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            source_content TEXT NOT NULL,
+            parser_version TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('holdings','transactions')),
+            status TEXT NOT NULL CHECK(status IN ('preview','applied','undone')),
+            created_at TEXT NOT NULL,
+            before_state TEXT,
+            after_state TEXT,
+            expected_balances TEXT NOT NULL DEFAULT '[]',
+            request_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_import_batches_account ON import_batches(account_id,created_at);
+        CREATE TABLE IF NOT EXISTS import_batch_rows (
+            batch_id TEXT NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE,
+            row_key TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            raw TEXT NOT NULL,
+            external_id TEXT,
+            data TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('ready','suspected','duplicate','failed','imported')),
+            error TEXT,
+            record_id TEXT,
+            PRIMARY KEY(batch_id,row_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_import_rows_fingerprint ON import_batch_rows(fingerprint,status);
+        CREATE INDEX IF NOT EXISTS idx_import_rows_external ON import_batch_rows(external_id,status);"
+    )
+}

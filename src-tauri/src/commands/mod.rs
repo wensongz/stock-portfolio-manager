@@ -24,3 +24,5 @@ pub mod snapshots;
 pub mod statistics;
 pub mod stock_splits;
 pub mod transactions;
+
+pub mod import_batches;

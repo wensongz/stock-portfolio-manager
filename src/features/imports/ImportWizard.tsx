@@ -1,11 +1,11 @@
-import { CheckCircleOutlined, CloseCircleOutlined, InboxOutlined } from "@ant-design/icons";
-import { Alert, Button, Modal, Space, Steps, Table, Tag, Typography, Upload, message } from "antd";
+import ImportBatchPanel from "./ImportBatchPanel.tsx";
+import { InboxOutlined } from "@ant-design/icons";
+import { Alert, Button, Modal, Space, Steps, Table, Upload, message } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import type { ImportRow } from "./types.ts";
 import { useImportWizard, type ImportAdapter } from "./useImportWizard.ts";
 
 const { Dragger } = Upload;
-const { Paragraph, Text } = Typography;
 
 interface ImportWizardProps<Row extends ImportRow> {
   open: boolean;
@@ -32,10 +32,11 @@ export default function ImportWizard<Row extends ImportRow>({
   onImported,
   width = 1100,
 }: ImportWizardProps<Row>) {
-  const wizard = useImportWizard(adapter, onImported);
+  const wizard = useImportWizard(adapter);
   const selectedCount = wizard.rows.filter((row) => row.selected).length;
 
   const close = () => {
+    if (wizard.importing) return;
     wizard.reset();
     onClose();
   };
@@ -44,34 +45,24 @@ export default function ImportWizard<Row extends ImportRow>({
     if (!(await wizard.importRows())) message.warning("请至少选择一条记录导入");
   };
 
-  const resultColumn = {
-    title: "状态",
-    key: "status",
-    width: 90,
-    fixed: "right" as const,
-    render: (_: unknown, row: Row) => row.importOk
-      ? <Tag icon={<CheckCircleOutlined />} color="success">成功</Tag>
-      : <Tag icon={<CloseCircleOutlined />} color="error">失败</Tag>,
-  };
-  const tableColumns = columns(wizard.updateRow, wizard.step);
-  const displayedColumns = wizard.step === 2 ? [...tableColumns, resultColumn] : tableColumns;
+  const tableColumns = columns(wizard.updateRow, wizard.importing ? 2 : wizard.step);
 
   const footer = wizard.step === 0
-    ? <Button onClick={close}>取消</Button>
+    ? <Button disabled={wizard.importing} onClick={close}>取消</Button>
     : wizard.step === 1
       ? <Space>
           <Button onClick={() => wizard.setStep(0)} disabled={wizard.importing}>上一步</Button>
           <Button type="primary" loading={wizard.importing} onClick={() => void startImport()}>
-            导入 {selectedCount} 条记录
+            检查 {selectedCount} 条记录
           </Button>
         </Space>
-      : <Button type="primary" onClick={close}>完成</Button>;
+      : <Button type="primary" disabled={wizard.importing} onClick={close}>完成</Button>;
 
   return (
-    <Modal open={open} title={title} width={width} onCancel={close} footer={footer} destroyOnHidden>
+    <Modal open={open} title={title} width={width} onCancel={close} footer={footer} closable={!wizard.importing} maskClosable={!wizard.importing} keyboard={!wizard.importing} destroyOnHidden>
       <Steps
         current={wizard.step}
-        items={[{ title: "上传文件" }, { title: "确认数据" }, { title: "导入结果" }]}
+        items={[{ title: "上传文件" }, { title: "确认数据" }, { title: "批次核对与导入" }]}
         style={{ marginBottom: 24 }}
       />
 
@@ -79,6 +70,7 @@ export default function ImportWizard<Row extends ImportRow>({
         <Space orientation="vertical" size="middle" style={{ width: "100%" }}>
           <Alert type="info" showIcon message={`目标账户：${accountName}`} />
           <Dragger
+            disabled={wizard.importing}
             accept=".csv,.txt"
             maxCount={1}
             fileList={wizard.fileList}
@@ -95,6 +87,7 @@ export default function ImportWizard<Row extends ImportRow>({
 
       {wizard.step === 1 && (
         <Space orientation="vertical" size="middle" style={{ width: "100%" }}>
+          {wizard.parseError && <Alert type="error" showIcon message={wizard.parseError} />}
           {wizard.warnings.map((warning) => <Alert key={warning} type="warning" showIcon message={warning} />)}
           <Alert
             type="info"
@@ -106,35 +99,15 @@ export default function ImportWizard<Row extends ImportRow>({
             size="small"
             pagination={{ pageSize: 20, showSizeChanger: true }}
             scroll={{ x: "max-content", y: 480 }}
-            columns={displayedColumns}
+            columns={tableColumns}
             dataSource={wizard.rows}
           />
         </Space>
       )}
 
-      {wizard.step === 2 && wizard.importResult && (
-        <Space orientation="vertical" size="middle" style={{ width: "100%" }}>
-          <Alert
-            type={wizard.importResult.failed === 0 ? "success" : "warning"}
-            showIcon
-            message={`导入完成：成功 ${wizard.importResult.success} 条，失败 ${wizard.importResult.failed} 条`}
-            description={wizard.importResult.errors.length > 0
-              ? wizard.importResult.errors.map((error) => (
-                  <Paragraph key={`${error.name}-${error.error}`} style={{ marginBottom: 4 }}>
-                    <Text strong>{error.name}：</Text>{error.error}
-                  </Paragraph>
-                ))
-              : undefined}
-          />
-          <Table<Row>
-            rowKey="key"
-            size="small"
-            pagination={{ pageSize: 20 }}
-            scroll={{ x: "max-content", y: 420 }}
-            columns={displayedColumns}
-            dataSource={wizard.rows.filter((row) => row.selected)}
-          />
-        </Space>
+      {wizard.step === 2 && wizard.batch && (
+        <ImportBatchPanel batch={wizard.batch} onChange={wizard.setBatch}
+          onImported={onImported} onBusyChange={wizard.setImporting} />
       )}
     </Modal>
   );

@@ -28,6 +28,7 @@ function parseDate(raw: string): string {
 function parseTradeTable(lines: string[], headerIndex: number, market: Market, structured: boolean): TransactionImportRow[] {
   const headers = splitCsvLine(lines[headerIndex]).map((field) => field.trim());
   const column = (name: string) => headers.indexOf(name);
+  const externalIndex = headers.findIndex(name => ["Trade ID", "TradeID", "Transaction ID", "Execution ID"].includes(name));
   const symbolIndex = column("Symbol");
   const dateIndex = column("Trade Date/Time") !== -1 ? column("Trade Date/Time") : column("Date/Time");
   const quantityIndex = column("Quantity");
@@ -66,8 +67,9 @@ function parseTradeTable(lines: string[], headerIndex: number, market: Market, s
       const combined = parseCsvNumber(fields[combinedFeeIndex]);
       commission = Number.isNaN(combined) ? 0 : Math.abs(combined);
     }
+    const externalId = (fields[externalIndex] ?? "").trim();
     rows.push({
-      key: String(i), selected: true, transaction_type: action, stock_name: rawSymbol,
+      key: String(i), raw: lines[i], external_id: /^0*$/.test(externalId) ? null : externalId, selected: true, transaction_type: action, stock_name: rawSymbol,
       symbol: formatSymbol(rawSymbol, market), traded_at: parseDate(fields[dateIndex] ?? ""),
       price: Math.abs(price), shares,
       total_amount: Math.abs(Number.isNaN(proceeds) ? price * shares : proceeds), commission,
@@ -109,7 +111,7 @@ function parseDividends(lines: string[], headerIndex: number, market: Market): T
     const tradedAt = parseDate(date);
     if (!symbol || Number.isNaN(amount) || !tradedAt) continue;
     rows.push({
-      key: String(i), selected: true, transaction_type: "PAY", stock_name: symbol, symbol,
+      key: String(i), raw: lines[i], selected: true, transaction_type: "PAY", stock_name: symbol, symbol,
       traded_at: tradedAt, price: 0, shares: 0, total_amount: amount, commission: 0,
       notes: dividendNotes(description),
     });

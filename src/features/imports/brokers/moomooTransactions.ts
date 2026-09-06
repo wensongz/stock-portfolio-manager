@@ -47,17 +47,30 @@ export function parseMoomooTransactions(text: string, defaultMarket: Market): Tr
   const commissionIndex = column("合计费用") !== -1 ? column("合计费用") : column("合计手续费");
   if ([codeIndex, sharesIndex, priceIndex].includes(-1)) return [];
 
-  interface Fill { shares: number; price: number; amount: number; time: string; commission: number }
+  const externalIndex = headers.findIndex(name => ["成交编号", "成交序号", "交易编号", "Execution ID"].includes(name));
+  interface Fill { raw: string; externalId: string | null; shares: number; price: number; amount: number; time: string; commission: number }
   interface Group { direction: string; code: string; name: string; market: Market; fills: Fill[] }
   const rows: TransactionImportRow[] = [];
   let group: Group | null = null;
   let key = 0;
   const finalize = () => {
     if (!group || group.fills.length === 0) return;
+    // Execution identifiers describe individual fills. Never discard them by
+    // aggregating: a later export may contain an overlapping subset of fills.
+    if (group.fills.some(fill => fill.externalId !== null)) {
+      for (const fill of group.fills) {
+        rows.push({ key: String(key++), raw: fill.raw, external_id: fill.externalId,
+          selected: true, transaction_type: group.direction, stock_name: group.name,
+          symbol: formatSymbol(group.code, group.market), traded_at: fill.time,
+          price: fill.price, shares: fill.shares, total_amount: fill.amount, commission: fill.commission });
+      }
+      return;
+    }
     const shares = group.fills.reduce((sum, fill) => sum + fill.shares, 0);
     const amount = group.fills.reduce((sum, fill) => sum + fill.amount, 0);
     rows.push({
-      key: String(key++), selected: true, transaction_type: group.direction, stock_name: group.name,
+      key: String(key++), raw: group.fills.map(fill => fill.raw),
+      external_id: group.fills.length === 1 ? group.fills[0].externalId : null, selected: true, transaction_type: group.direction, stock_name: group.name,
       symbol: formatSymbol(group.code, group.market), traded_at: group.fills[0].time,
       price: Math.round((shares > 0 ? amount / shares : group.fills[0].price) * 10_000) / 10_000,
       shares, total_amount: Math.round(amount * 100) / 100,
@@ -77,7 +90,9 @@ export function parseMoomooTransactions(text: string, defaultMarket: Market): Tr
     if (Number.isNaN(shares) || Number.isNaN(price)) continue;
     const amount = parseCsvNumber(fields[amountIndex]);
     const commission = parseCsvNumber(fields[commissionIndex]);
+    const externalId = (fields[externalIndex] ?? "").trim();
     const fill = {
+      raw: lines[i], externalId: /^0*$/.test(externalId) ? null : externalId,
       shares: Math.abs(shares), price: Math.abs(price),
       amount: Math.abs(Number.isNaN(amount) ? price * shares : amount),
       time: parseDate(fields[timeIndex] ?? ""),

@@ -4,7 +4,7 @@ use crate::services::quote_provider_service::market_adjusts_sell_pay_cost;
 use crate::services::quote_service::{cash_display_name, is_cash_symbol, CASH_SYMBOL_PREFIX};
 use rusqlite::{Connection, OptionalExtension};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CreateHoldingInput {
     pub account_id: String,
     pub symbol: String,
@@ -16,7 +16,7 @@ pub struct CreateHoldingInput {
     pub currency: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CreateTransactionInput {
     pub account_id: String,
     pub symbol: String,

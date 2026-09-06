@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Account, CreateHoldingPayload, Currency, Market } from "../../types";
-import { useHoldingStore } from "../../stores/holdingStore";
+import { holdingBatchData } from "./batchAdapters.ts";
 import { readFileAsText } from "./csv.ts";
 import { holdingColumns } from "./holdingColumns.tsx";
 import ImportWizard from "./ImportWizard.tsx";
@@ -40,15 +40,15 @@ export default function BrokerHoldingImportModal({
   resolveNames: shouldResolveNames = false,
   payloadForRow,
 }: BrokerHoldingImportModalProps) {
-  const createHolding = useHoldingStore((state) => state.createHolding);
   const accountMarket = (fixedMarket ?? account.market) as Market;
   const adapter = useMemo<ImportAdapter<HoldingImportRow>>(() => ({
+    accountId: account.id, source: brokerName, kind: "holdings",
     parseFile: async (file) => {
       const texts = await readFileAsText(file, encodings);
       let lastResult: ParseResult<HoldingImportRow> = { rows: [], warnings: [] };
       for (const text of texts) {
         lastResult = parse(text, accountMarket);
-        if (lastResult.rows.length > 0) return lastResult;
+        if (lastResult.rows.length > 0) return { ...lastResult, sourceContent: text };
       }
       return lastResult.warnings.length > 0
         ? lastResult
@@ -62,13 +62,12 @@ export default function BrokerHoldingImportModal({
         return { ...row, name: resolved && resolved !== symbol ? resolved : row.name };
       });
     } : undefined,
-    importRow: async (row) => {
+    toData: (row) => {
       if (payloadForRow) {
-        await createHolding(payloadForRow(row, account));
-        return;
+        return holdingBatchData(payloadForRow(row, account));
       }
       const market = row.market ?? accountMarket;
-      await createHolding({
+      return holdingBatchData({
         accountId: account.id,
         symbol: row.symbol,
         name: row.name || row.symbol,
@@ -78,8 +77,7 @@ export default function BrokerHoldingImportModal({
         currency: row.currency ?? defaultCurrency(market),
       });
     },
-    rowName: (row) => row.name || row.symbol,
-  }), [account, accountMarket, brokerName, createHolding, encodings, parse, payloadForRow, shouldResolveNames]);
+  }), [account, accountMarket, brokerName, encodings, parse, payloadForRow, shouldResolveNames]);
 
   return (
     <ImportWizard

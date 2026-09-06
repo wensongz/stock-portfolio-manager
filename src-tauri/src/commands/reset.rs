@@ -31,6 +31,8 @@ pub(crate) fn reset_database_state(conn: &mut Connection, now: &str) -> Result<(
         "option_records",
         "option_share_lots",
         "stock_splits",
+        "import_batch_rows",
+        "import_batches",
         "transactions",
         "holdings",
         "portfolio_alert_breaches",
@@ -244,6 +246,8 @@ mod tests {
         for table in [
             "accounts",
             "holdings",
+            "import_batch_rows",
+            "import_batches",
             "transactions",
             "cached_quotes",
             "cached_quote_refresh_time",

@@ -21,7 +21,7 @@ export function parseFirstradeHoldings(text: string): ParseResult<HoldingImportR
         || Number.isNaN(shares) || shares <= 0 || Number.isNaN(avgCost)) continue;
       const symbol = raw.toUpperCase();
       rows.push({
-        key: String(rows.length), selected: true, symbol,
+        key: String(rows.length), raw: lines[j], selected: true, symbol,
         name: (nameIndex === -1 ? "" : fields[nameIndex] ?? "").trim() || symbol,
         shares, avgCost,
       });

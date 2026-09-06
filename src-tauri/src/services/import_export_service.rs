@@ -2,9 +2,6 @@ use crate::db::Database;
 use crate::models::import_export::{
     ExportFilters, ImportError, ImportPreview, ImportResult, ImportSkipped,
 };
-use crate::services::portfolio_mutation::{
-    create_holding_in, create_transaction_in, CreateHoldingInput, CreateTransactionInput,
-};
 use csv::WriterBuilder;
 use std::collections::{HashMap, HashSet};
 
@@ -436,174 +433,158 @@ fn extract_str<'a>(row: &'a serde_json::Value, key: &str) -> &'a str {
     row.get(key).and_then(|v| v.as_str()).unwrap_or("").trim()
 }
 
-fn parse_number(row: &serde_json::Value, key: &str, row_number: usize) -> Result<f64, ImportError> {
-    let raw = extract_str(row, key);
-    raw.parse::<f64>().map_err(|_| ImportError {
-        row: row_number,
-        column: key.to_string(),
-        message: format!("第{row_number}行 {key} 必须是有效数字"),
-    })
-}
-
-fn parse_optional_number(
-    row: &serde_json::Value,
-    key: &str,
-    row_number: usize,
-) -> Result<f64, ImportError> {
-    let raw = extract_str(row, key);
-    if raw.is_empty() {
-        Ok(0.0)
-    } else {
-        parse_number(row, key, row_number)
-    }
-}
-
-/// Reparse and write every valid CSV row to the database.
+/// Compatibility entry point. All writes go through the audited batch service.
 pub fn confirm_import(
     db: &Database,
     content: &str,
     data_type: &str,
     account_id: &str,
 ) -> Result<ImportResult, String> {
-    let parsed = parse_import_rows(content, data_type)?;
-    let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let batch = preview_csv_import_batch(
+        db,
+        content,
+        data_type,
+        account_id,
+        "import.csv",
+        &uuid::Uuid::new_v4().to_string(),
+    )?;
+    let keys: Vec<String> = batch
+        .rows
+        .iter()
+        .filter(|r| r.status == "ready" || r.status == "failed")
+        .map(|r| r.key.clone())
+        .collect();
+    let batch = crate::services::import_batch::apply_import_batch(db, &batch.id, &keys, &[])?;
     let mut result = ImportResult {
         imported_count: 0,
         skipped_count: 0,
-        skipped_rows: Vec::new(),
-        errors: Vec::new(),
+        skipped_rows: vec![],
+        errors: vec![],
     };
-
-    for parsed_row in &parsed.valid_rows {
-        let row = &parsed_row.data;
-        let row_number = parsed_row.row_number;
-        let symbol = extract_str(row, "symbol").to_uppercase();
-
-        let mutation_result = if data_type == "holdings" {
-            let market = match extract_str(row, "market") {
-                "" => "US".to_string(),
-                value => value.to_string(),
-            };
-            let currency = match extract_str(row, "currency") {
-                "" if market == "CN" => "CNY".to_string(),
-                "" if market == "HK" => "HKD".to_string(),
-                "" => "USD".to_string(),
-                value => value.to_string(),
-            };
-            let values = parse_number(row, "shares", row_number).and_then(|shares| {
-                parse_number(row, "avg_cost", row_number).map(|avg_cost| (shares, avg_cost))
-            });
-            match values {
-                Ok((shares, avg_cost)) => {
-                    let input = CreateHoldingInput {
-                        account_id: account_id.to_string(),
-                        symbol: symbol.clone(),
-                        name: extract_str(row, "name").to_string(),
-                        market,
-                        category_id: None,
-                        shares,
-                        avg_cost,
-                        currency,
-                    };
-                    let mut savepoint = conn.savepoint().map_err(|error| error.to_string())?;
-                    match create_holding_in(&savepoint, &input) {
-                        Ok(_) => savepoint
-                            .commit()
-                            .map(|_| ())
-                            .map_err(|error| (String::new(), error.to_string())),
-                        Err(error) => {
-                            savepoint.rollback().map_err(|rollback_error| {
-                                format!("导入回滚失败: {rollback_error}")
-                            })?;
-                            Err((String::new(), error))
-                        }
-                    }
-                }
-                Err(error) => Err((error.column, error.message)),
-            }
+    for row in batch.rows {
+        if row.status == "imported" {
+            result.imported_count += 1;
         } else {
-            let market = match extract_str(row, "market") {
-                "" => "US".to_string(),
-                value => value.to_string(),
-            };
-            let currency = match extract_str(row, "currency") {
-                "" if market == "CN" => "CNY".to_string(),
-                "" if market == "HK" => "HKD".to_string(),
-                "" => "USD".to_string(),
-                value => value.to_string(),
-            };
-            let values = parse_number(row, "shares", row_number).and_then(|shares| {
-                parse_number(row, "price", row_number).and_then(|price| {
-                    parse_optional_number(row, "commission", row_number).and_then(|commission| {
-                        parse_optional_number(row, "total_amount", row_number)
-                            .map(|amount| (shares, price, commission, amount))
-                    })
-                })
+            result.skipped_count += 1;
+            let reason = row
+                .error
+                .unwrap_or_else(|| "记录未导入，请在导入历史中核查".into());
+            let row_number = row.key.parse().unwrap_or(0);
+            result.skipped_rows.push(ImportSkipped {
+                row: row_number,
+                symbol: row.data["symbol"].as_str().unwrap_or("").into(),
+                reason: reason.clone(),
             });
-            match values {
-                Ok((shares, price, commission, amount)) => {
-                    let input = CreateTransactionInput {
-                        account_id: account_id.to_string(),
-                        symbol: symbol.clone(),
-                        name: extract_str(row, "name").to_string(),
-                        market,
-                        transaction_type: extract_str(row, "transaction_type").to_uppercase(),
-                        shares,
-                        price,
-                        total_amount: if amount.abs() > 0.0 {
-                            amount
-                        } else {
-                            shares * price
-                        },
-                        commission,
-                        currency,
-                        traded_at: extract_str(row, "traded_at").to_string(),
-                        notes: match extract_str(row, "notes") {
-                            "" => None,
-                            notes => Some(notes.to_string()),
-                        },
-                    };
-                    let mut savepoint = conn.savepoint().map_err(|error| error.to_string())?;
-                    match create_transaction_in(&savepoint, &input) {
-                        Ok(_) => savepoint
-                            .commit()
-                            .map(|_| ())
-                            .map_err(|error| (String::new(), error.to_string())),
-                        Err(error) => {
-                            savepoint.rollback().map_err(|rollback_error| {
-                                format!("导入回滚失败: {rollback_error}")
-                            })?;
-                            Err((String::new(), error))
-                        }
-                    }
-                }
-                Err(error) => Err((error.column, error.message)),
-            }
-        };
-
-        match mutation_result {
-            Ok(()) => result.imported_count += 1,
-            Err((column, message)) => {
-                result.skipped_count += 1;
-                result.errors.push(ImportError {
-                    row: row_number,
-                    column,
-                    message: message.clone(),
-                });
-                result.skipped_rows.push(ImportSkipped {
-                    row: row_number,
-                    symbol: if symbol.is_empty() {
-                        "(空)".to_string()
-                    } else {
-                        symbol
-                    },
-                    reason: message,
-                });
-            }
+            result.errors.push(ImportError {
+                row: row_number,
+                column: ["shares", "avg_cost", "price", "commission", "total_amount"]
+                    .into_iter()
+                    .find(|field| row.data.get(*field).is_some_and(|v| v.as_f64().is_none()))
+                    .unwrap_or("")
+                    .into(),
+                message: reason,
+            });
         }
     }
-
     Ok(result)
+}
+
+/// The preview persists every valid parsed row (not just the first 20 display
+/// rows), and retains original source content for repeat-file detection.
+pub fn preview_csv_import_batch(
+    db: &Database,
+    content: &str,
+    data_type: &str,
+    account_id: &str,
+    file_name: &str,
+    request_id: &str,
+) -> Result<crate::models::import_batch::ImportBatch, String> {
+    use crate::models::import_batch::{ImportBatchRequest, ImportBatchRowInput};
+    let parsed = parse_import_rows(content, data_type)?;
+    let account_market: String = db
+        .conn
+        .lock()
+        .map_err(|e| e.to_string())?
+        .query_row(
+            "SELECT market FROM accounts WHERE id=?1",
+            [account_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    for row in parsed.valid_rows {
+        let raw = row.data.clone();
+        let mut data = row.data;
+        let market = match extract_str(&data, "market") {
+            "" => account_market.clone(),
+            value => value.to_string(),
+        };
+        let currency = match extract_str(&data, "currency") {
+            "" if market == "HK" => "HKD",
+            "" if market == "CN" => "CNY",
+            "" => "USD",
+            value => value,
+        }
+        .to_string();
+        data["market"] = serde_json::json!(market);
+        data["currency"] = serde_json::json!(currency);
+        if extract_str(&data, "name").is_empty() {
+            data["name"] = data["symbol"].clone();
+        }
+        data["category_id"] = serde_json::Value::Null;
+        if extract_str(&data, "notes").is_empty() {
+            data["notes"] = serde_json::Value::Null;
+        }
+        for field in if data_type == "holdings" {
+            vec!["shares", "avg_cost"]
+        } else {
+            vec!["shares", "price", "commission", "total_amount"]
+        } {
+            let text = extract_str(&data, field);
+            let result = if text.is_empty() && ["commission", "total_amount"].contains(&field) {
+                Ok(0.0)
+            } else {
+                text.parse::<f64>()
+            };
+            if let Ok(value) = result {
+                if value.is_finite() {
+                    data[field] = serde_json::json!(value);
+                }
+            }
+        }
+        if data_type == "transactions" && data["total_amount"].as_f64() == Some(0.0) {
+            if let (Some(shares), Some(price)) = (data["shares"].as_f64(), data["price"].as_f64()) {
+                data["total_amount"] = serde_json::json!(shares * price);
+            }
+        }
+        let external_id = ["external_id", "execution_id", "trade_id", "成交编号"]
+            .iter()
+            .find_map(|field| {
+                raw.get(*field)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(String::from)
+            });
+        rows.push(ImportBatchRowInput {
+            key: row.row_number.to_string(),
+            raw,
+            external_id,
+            data,
+        });
+    }
+    crate::services::import_batch::preview_import_batch(
+        db,
+        &ImportBatchRequest {
+            request_id: request_id.into(),
+            account_id: account_id.into(),
+            source: "generic-csv".into(),
+            file_name: file_name.into(),
+            source_content: content.into(),
+            parser_version: "2".into(),
+            kind: data_type.into(),
+            rows,
+        },
+    )
 }
 
 #[cfg(test)]

@@ -28,7 +28,7 @@ function parseTable(lines: string[], headerIndex: number, market: Market, struct
     const shares = parseCsvNumber(fields[quantityIndex]);
     const avgCost = parseCsvNumber(fields[costIndex]);
     if (Number.isNaN(shares) || shares <= 0 || Number.isNaN(avgCost)) continue;
-    rows.push({ key: String(rows.length), selected: true, symbol: formatSymbol(raw, market), name: raw, shares, avgCost });
+    rows.push({ key: String(rows.length), raw: lines[i], selected: true, symbol: formatSymbol(raw, market), name: raw, shares, avgCost });
   }
   return rows;
 }

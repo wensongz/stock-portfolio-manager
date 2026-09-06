@@ -2,6 +2,8 @@ export type ThsTransactionType = "BUY" | "SELL" | "PAY";
 
 export interface ThsCsvRow {
   key: string;
+  raw?: string;
+  external_id?: string | null;
   selected: boolean;
   transaction_type: ThsTransactionType;
   symbol: string;
@@ -101,6 +103,7 @@ export function parseThsCsv(text: string): ThsCsvRow[] {
     return -1;
   };
 
+  const iExternal = firstCol("成交编号", "成交序号", "交易编号");
   const iDate = firstCol("成交日期", "交易日期", "发生日期");
   const iTime = col("成交时间");
   const iCode = col("证券代码");
@@ -177,6 +180,8 @@ export function parseThsCsv(text: string): ThsCsvRow[] {
 
     rows.push({
       key: String(idx++),
+      raw: line,
+      external_id: /^0*$/.test(get(iExternal).trim()) ? null : get(iExternal).trim(),
       selected: true,
       transaction_type,
       symbol,

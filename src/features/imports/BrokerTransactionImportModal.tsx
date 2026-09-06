@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { Account, Currency, Market } from "../../types";
+import { transactionBatchData } from "./batchAdapters.ts";
+import type { Account, Market } from "../../types";
 import { readFileAsText } from "./csv.ts";
 import ImportWizard from "./ImportWizard.tsx";
 import { resolveStockNames, type InvokeFunction } from "./resolveStockNames.ts";
@@ -21,10 +22,6 @@ interface BrokerTransactionImportModalProps {
   allowPay?: boolean;
 }
 
-function currencyForMarket(market: Market): Currency {
-  return market === "HK" ? "HKD" : market === "CN" ? "CNY" : "USD";
-}
-
 export default function BrokerTransactionImportModal({
   open,
   account,
@@ -39,11 +36,12 @@ export default function BrokerTransactionImportModal({
 }: BrokerTransactionImportModalProps) {
   const accountMarket = (fixedMarket ?? account.market) as Market;
   const adapter = useMemo<ImportAdapter<TransactionImportRow>>(() => ({
+    accountId: account.id, source: brokerName, kind: "transactions",
     parseFile: async (file) => {
       const texts = await readFileAsText(file, encodings);
       for (const text of texts) {
         const rows = parse(text, accountMarket);
-        if (rows.length > 0) return { rows, warnings: [] };
+        if (rows.length > 0) return { rows, warnings: [], sourceContent: text };
       }
       return { rows: [], warnings: [`未从 CSV 中识别到 ${brokerName} 交易记录，请确认导出格式是否正确。`] };
     },
@@ -55,24 +53,8 @@ export default function BrokerTransactionImportModal({
         return { ...row, stock_name: resolved && resolved !== symbol ? resolved : row.stock_name };
       });
     },
-    importRow: async (row) => {
-      const market: Market = fixedMarket ?? (row.symbol.endsWith(".HK") ? "HK" : accountMarket);
-      await invoke("create_transaction", {
-        accountId: account.id,
-        symbol: row.symbol.trim(),
-        name: row.stock_name || row.symbol,
-        market,
-        transactionType: row.transaction_type,
-        shares: row.shares,
-        price: row.price,
-        totalAmount: row.total_amount,
-        commission: row.commission,
-        currency: currencyForMarket(market),
-        tradedAt: new Date(row.traded_at).toISOString(),
-        notes: row.notes ?? null,
-      });
-    },
-    rowName: (row) => row.stock_name || row.symbol,
+    toData: (row) => transactionBatchData(row,
+      fixedMarket ?? (row.symbol.endsWith(".HK") ? "HK" : accountMarket)),
     compareRows: (left, right) => left.traded_at.localeCompare(right.traded_at),
   }), [account.id, accountMarket, brokerName, encodings, fixedMarket, parse]);
 

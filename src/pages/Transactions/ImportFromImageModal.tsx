@@ -25,6 +25,9 @@ import {
 import type { UploadFile } from "antd/es/upload";
 import dayjs from "dayjs";
 import { invoke } from "@tauri-apps/api/core";
+import ImportBatchPanel from "../../features/imports/ImportBatchPanel.tsx";
+import type { ImportBatch } from "../../features/imports/batchTypes.ts";
+import { batchPreviewRequest, transactionBatchData } from "../../features/imports/batchAdapters.ts";
 import type { Account, Market, Currency } from "../../types";
 
 const { Dragger } = Upload;
@@ -46,17 +49,12 @@ interface ParsedTradeRow {
 
 interface EditableRow extends ParsedTradeRow {
   key: string;
+  raw: ParsedTradeRow;
   symbol: string;
   selected: boolean;
   lookingUp: boolean;
   importError?: string;
   importOk?: boolean;
-}
-
-interface ImportResult {
-  success: number;
-  failed: number;
-  errors: { name: string; error: string }[];
 }
 
 // ---------------------------------------------------------------------------
@@ -88,7 +86,8 @@ export default function ImportFromImageModal({
   const [parsing, setParsing] = useState(false);
   const [rows, setRows] = useState<EditableRow[]>([]);
   const [importing, setImporting] = useState(false);
-  const [importResult, setImportResult] = useState<ImportResult | null>(null);
+  const [batch, setBatch] = useState<ImportBatch | null>(null);
+  const [requestId, setRequestId] = useState(() => crypto.randomUUID());
   const [parseError, setParseError] = useState<string>("");
 
   const market: Market = account.market as Market;
@@ -133,11 +132,13 @@ export default function ImportFromImageModal({
       }
       const editableRows: EditableRow[] = parsed.map((r, idx) => ({
         ...r,
+        raw: { ...r },
         key: String(idx),
         symbol: "",
         selected: true,
         lookingUp: false,
       }));
+      setRequestId(crypto.randomUUID());
       setRows(editableRows);
       setStep(1);
     } catch (err) {
@@ -151,6 +152,7 @@ export default function ImportFromImageModal({
 
   const updateRow = useCallback(
     (key: string, patch: Partial<EditableRow>) => {
+      setRequestId(crypto.randomUUID());
       setRows((prev) =>
         prev.map((r) => (r.key === key ? { ...r, ...patch } : r))
       );
@@ -231,59 +233,31 @@ export default function ImportFromImageModal({
     }
 
     setImporting(true);
-    let success = 0;
-    const errors: { name: string; error: string }[] = [];
-
-    // Sort chronologically before importing
-    const sorted = [...selected].sort((a, b) =>
-      a.traded_at.localeCompare(b.traded_at)
-    );
-
-    for (const r of sorted) {
-      try {
-        await invoke("create_transaction", {
-          accountId: account.id,
-          symbol: r.symbol.trim(),
-          name: r.stock_name,
-          market,
-          transactionType: r.transaction_type,
-          shares: r.shares,
-          price: r.price,
-          totalAmount: r.total_amount,
-          commission: r.commission,
-          currency,
-          tradedAt: new Date(r.traded_at).toISOString(),
-        });
-        success++;
-        updateRow(r.key, { importOk: true, importError: undefined });
-      } catch (err) {
-        const msg = String(err);
-        errors.push({ name: r.stock_name, error: msg });
-        updateRow(r.key, { importError: msg, importOk: false });
-      }
-    }
-
-    setImportResult({ success, failed: errors.length, errors });
-    setImporting(false);
-    setStep(2);
-
-    if (success > 0) {
-      onImported();
-    }
-  }, [rows, account.id, market, currency, updateRow, onImported]);
+    try {
+      const request = batchPreviewRequest({ requestId, accountId: account.id,
+        source: "ths-ocr", kind: "transactions", fileName: fileList[0]?.name ?? "screenshot",
+        sourceContent: imageBase64, rows: [...rows].sort((a,b) => a.traded_at.localeCompare(b.traded_at)),
+        toData: row => transactionBatchData(row, market) });
+      setBatch(await invoke<ImportBatch>("preview_import_batch", { request }));
+      setStep(2);
+    } catch (error) { message.error(String(error)); }
+    finally { setImporting(false); }
+  }, [rows, account.id, market, requestId, fileList, imageBase64]);
 
   // ---- Reset ----------------------------------------------------------------
 
   const handleClose = useCallback(() => {
+    if (importing || parsing) return;
     setStep(0);
     setFileList([]);
     setImageBase64("");
     setPreviewUrl("");
     setRows([]);
     setParseError("");
-    setImportResult(null);
+    setBatch(null);
+    setRequestId(crypto.randomUUID());
     onClose();
-  }, [onClose]);
+  }, [onClose, importing, parsing]);
 
   // ---- Table columns (Step 1) -----------------------------------------------
 
@@ -477,7 +451,7 @@ export default function ImportFromImageModal({
   const footer = (() => {
     if (step === 0) {
       return [
-        <Button key="cancel" onClick={handleClose}>
+        <Button key="cancel" disabled={parsing} onClick={handleClose}>
           取消
         </Button>,
         <Button
@@ -493,10 +467,10 @@ export default function ImportFromImageModal({
     }
     if (step === 1) {
       return [
-        <Button key="back" onClick={() => setStep(0)}>
+        <Button key="back" disabled={importing} onClick={() => setStep(0)}>
           返回
         </Button>,
-        <Button key="lookup-all" onClick={handleLookupAll}>
+        <Button key="lookup-all" disabled={importing} onClick={handleLookupAll}>
           批量查询代码
         </Button>,
         <Button
@@ -505,12 +479,12 @@ export default function ImportFromImageModal({
           loading={importing}
           onClick={handleImport}
         >
-          导入选中记录
+          检查选中记录
         </Button>,
       ];
     }
     return [
-      <Button key="close" type="primary" onClick={handleClose}>
+      <Button key="close" disabled={importing} type="primary" onClick={handleClose}>
         完成
       </Button>,
     ];
@@ -522,7 +496,10 @@ export default function ImportFromImageModal({
       open={open}
       onCancel={handleClose}
       footer={footer}
-      width={step === 1 ? 900 : 520}
+      width={step >= 1 ? 1100 : 520}
+      closable={!importing && !parsing}
+      maskClosable={!importing && !parsing}
+      keyboard={!importing && !parsing}
       destroyOnHidden
     >
       <Steps
@@ -530,7 +507,7 @@ export default function ImportFromImageModal({
         items={[
           { title: "上传截图" },
           { title: "核对数据" },
-          { title: "导入结果" },
+          { title: "批次核对与导入" },
         ]}
         className="mb-4"
       />
@@ -539,6 +516,7 @@ export default function ImportFromImageModal({
       {step === 0 && (
         <div>
           <Dragger
+            disabled={parsing}
             fileList={fileList}
             beforeUpload={handleBeforeUpload}
             accept="image/*"
@@ -600,7 +578,7 @@ export default function ImportFromImageModal({
 
       {/* ---- Step 1: Edit ---- */}
       {step === 1 && (
-        <div>
+        <div inert={importing}>
           <Alert
             type="info"
             showIcon
@@ -625,34 +603,8 @@ export default function ImportFromImageModal({
       )}
 
       {/* ---- Step 2: Result ---- */}
-      {step === 2 && importResult && (
-        <div>
-          {importResult.success > 0 && (
-            <Alert
-              type="success"
-              showIcon
-              title={`成功导入 ${importResult.success} 条交易记录`}
-              className="mb-3"
-            />
-          )}
-          {importResult.failed > 0 && (
-            <Alert
-              type="error"
-              showIcon
-              title={`${importResult.failed} 条导入失败`}
-              description={
-                <ul className="mt-1 pl-4">
-                  {importResult.errors.map((e, i) => (
-                    <li key={i}>
-                      <strong>{e.name}</strong>: {e.error}
-                    </li>
-                  ))}
-                </ul>
-              }
-              className="mb-3"
-            />
-          )}
-        </div>
+      {step === 2 && batch && (
+        <ImportBatchPanel batch={batch} onChange={setBatch} onImported={onImported} onBusyChange={setImporting} />
       )}
     </Modal>
   );

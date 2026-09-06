@@ -9,6 +9,7 @@ function deriveSymbol(code: string, exchange: string): string {
 
 export function parseCnHoldings(text: string): ParseResult<HoldingImportRow> {
   const lines = stripBom(text).split(/\r?\n/);
+  let cashRaw = "";
   let cashAmount: number | undefined;
   let headerIndex = -1;
 
@@ -22,7 +23,7 @@ export function parseCnHoldings(text: string): ParseResult<HoldingImportRow> {
         const rmbIndex = data.indexOf("人民币");
         if (rmbIndex !== -1) {
           const value = parseCsvNumber(data[availableIndex + rmbIndex]);
-          if (!Number.isNaN(value) && value > 0) cashAmount = value;
+          if (!Number.isNaN(value) && value > 0) { cashAmount = value; cashRaw = lines[j]; }
           break;
         }
       }
@@ -82,13 +83,13 @@ export function parseCnHoldings(text: string): ParseResult<HoldingImportRow> {
     const exchange = marketIndex === -1 ? "" : (fields[marketIndex] ?? "").trim();
     const symbol = deriveSymbol(code, exchange);
     rows.push({
-      key: String(rows.length), selected: true, isCash: false, symbol,
+      key: String(rows.length), raw: lines[i], selected: true, isCash: false, symbol,
       name: (fields[nameIndex] ?? "").trim() || symbol, shares, avgCost,
     });
   }
   if (cashAmount !== undefined && cashAmount > 0) {
     rows.unshift({
-      key: `cash-${rows.length}`, selected: true, isCash: true, symbol: "$CASH-CNY",
+      key: `cash-${rows.length}`, raw: cashRaw, selected: true, isCash: true, symbol: "$CASH-CNY",
       name: "现金 (CNY)", shares: cashAmount, avgCost: 1,
     });
   }

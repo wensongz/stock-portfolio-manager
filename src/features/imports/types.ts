@@ -2,6 +2,8 @@ import type { Currency, Market } from "../../types";
 
 export interface ImportRow {
   key: string;
+  raw?: unknown;
+  external_id?: string | null;
   selected: boolean;
   lookingUp?: boolean;
   importOk?: boolean;
@@ -33,6 +35,7 @@ export interface HoldingImportRow extends ImportRow {
 export interface ParseResult<Row extends ImportRow> {
   rows: Row[];
   warnings: string[];
+  sourceContent?: string;
 }
 
 export interface ImportResult {

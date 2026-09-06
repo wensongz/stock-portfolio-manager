@@ -23,6 +23,7 @@ export function parseFirstradeTransactions(text: string): TransactionImportRow[]
 
   const headers = splitCsvLine(lines[headerIndex]).map((field) => field.trim());
   const column = (name: string) => headers.indexOf(name);
+  const externalIndex = headers.findIndex(name => ["Trade ID", "TradeID", "Transaction ID", "Execution ID"].includes(name));
   const symbolIndex = column("Symbol");
   const quantityIndex = column("Quantity");
   const priceIndex = column("Price");
@@ -47,8 +48,9 @@ export function parseFirstradeTransactions(text: string): TransactionImportRow[]
     const amount = parseCsvNumber(fields[amountIndex]);
     const commission = parseCsvNumber(fields[commissionIndex]);
     const fee = parseCsvNumber(fields[feeIndex]);
+    const externalId = (fields[externalIndex] ?? "").trim();
     rows.push({
-      key: String(i), selected: true, transaction_type: action, stock_name: symbol, symbol,
+      key: String(i), raw: lines[i], external_id: /^0*$/.test(externalId) ? null : externalId, selected: true, transaction_type: action, stock_name: symbol, symbol,
       traded_at: parseDate(fields[dateIndex] ?? ""), price: Math.abs(price), shares,
       total_amount: Math.abs(Number.isNaN(amount) ? price * shares : amount),
       commission: (Number.isNaN(commission) ? 0 : Math.abs(commission)) + (Number.isNaN(fee) ? 0 : Math.abs(fee)),

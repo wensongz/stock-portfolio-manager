@@ -284,6 +284,13 @@ pub fn run() {
             commands::import_export::get_import_template,
             commands::import_export::parse_import_csv,
             commands::import_export::confirm_import,
+            commands::import_batches::preview_import_batch,
+            commands::import_batches::get_import_batch,
+            commands::import_batches::list_import_batches,
+            commands::import_batches::apply_import_batch,
+            commands::import_batches::undo_import_batch,
+            commands::import_batches::reconcile_import_batch,
+            commands::import_batches::preview_csv_import_batch,
             // Phase 6: Price Alerts
             commands::alerts::create_alert,
             commands::alerts::get_alerts,

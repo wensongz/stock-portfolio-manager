@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   Card,
   Upload,
@@ -21,7 +21,10 @@ import {
   ImportOutlined,
 } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
-import type { ImportPreview, ImportResult, ExportFilters, ImportOptionsResult } from "../../types";
+import type { ImportPreview, ExportFilters, ImportOptionsResult } from "../../types";
+import ImportBatchPanel from "../../features/imports/ImportBatchPanel";
+import ImportBatchHistory from "../../features/imports/ImportBatchHistory";
+import type { ImportBatch } from "../../features/imports/batchTypes";
 import { useAccountStore } from "../../stores/accountStore";
 
 const { Title, Text } = Typography;
@@ -32,7 +35,11 @@ export default function ImportPage() {
   const [currentStep, setCurrentStep] = useState(0);
   const [dataType, setDataType] = useState<DataType>("holdings");
   const [preview, setPreview] = useState<ImportPreview | null>(null);
-  const [importResult, setImportResult] = useState<ImportResult | null>(null);
+  const [batch, setBatch] = useState<ImportBatch | null>(null);
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [historyRefresh, setHistoryRefresh] = useState(0);
+  const [fileName, setFileName] = useState("");
+  const previewRequest = useRef<{ fingerprint: string; id: string } | null>(null);
   const [optionsImportResult, setOptionsImportResult] = useState<ImportOptionsResult | null>(null);
   const [selectedAccountId, setSelectedAccountId] = useState("");
   const [loading, setLoading] = useState(false);
@@ -67,10 +74,13 @@ export default function ImportPage() {
   };
 
   const handleFileUpload = (file: File) => {
+    setLoading(true);
     const reader = new FileReader();
     reader.onload = async (e) => {
       const content = e.target?.result as string;
       setRawCsvContent(content);
+      setFileName(file.name);
+      previewRequest.current = null;
       setLoading(true);
       try {
         if (dataType === "options") {
@@ -91,6 +101,10 @@ export default function ImportPage() {
       } finally {
         setLoading(false);
       }
+    };
+    reader.onerror = () => {
+      setLoading(false);
+      message.error("读取文件失败，请重新选择文件");
     };
     reader.readAsText(file, "UTF-8");
     return false;
@@ -113,14 +127,20 @@ export default function ImportPage() {
         setCurrentStep(2);
         message.success(`成功导入 ${result.imported} 条记录`);
       } else {
-        const result = await invoke<ImportResult>("confirm_import", {
+        const fingerprint = JSON.stringify([rawCsvContent, dataType, selectedAccountId, fileName]);
+        if (previewRequest.current?.fingerprint !== fingerprint) {
+          previewRequest.current = { fingerprint, id: crypto.randomUUID() };
+        }
+        const result = await invoke<ImportBatch>("preview_csv_import_batch", {
           content: rawCsvContent,
           dataType,
           accountId: selectedAccountId,
+          fileName,
+          requestId: previewRequest.current.id,
         });
-        setImportResult(result);
+        setBatch(result);
         setCurrentStep(2);
-        message.success(`成功导入 ${result.imported_count} 条记录`);
+        setHistoryRefresh((value) => value + 1);
       }
     } catch (err) {
       message.error("导入失败: " + String(err));
@@ -170,7 +190,9 @@ export default function ImportPage() {
   const handleReset = () => {
     setCurrentStep(0);
     setPreview(null);
-    setImportResult(null);
+    setBatch(null);
+    setFileName("");
+    previewRequest.current = null;
     setOptionsImportResult(null);
     setRawCsvContent("");
   };
@@ -253,7 +275,7 @@ export default function ImportPage() {
           items={[
             { title: "上传文件" },
             { title: "预览确认" },
-            { title: "导入完成" },
+            { title: dataType === "options" ? "导入完成" : "批次导入与核对" },
           ]}
         />
 
@@ -263,6 +285,7 @@ export default function ImportPage() {
               <Text>数据类型：</Text>
               <Select
                 value={dataType}
+                disabled={loading}
                 onChange={(v) => setDataType(v)}
                 style={{ width: 160 }}
                 options={[
@@ -319,6 +342,7 @@ export default function ImportPage() {
                   style={{ width: 200 }}
                   value={selectedAccountId || undefined}
                   onChange={setSelectedAccountId}
+                  disabled={loading}
                   options={accounts.map((a) => ({ value: a.id, label: a.name }))}
                 />
               </Form.Item>
@@ -334,15 +358,15 @@ export default function ImportPage() {
             />
 
             <Space>
-              <Button onClick={() => setCurrentStep(0)}>返回</Button>
+              <Button disabled={loading} onClick={() => setCurrentStep(0)}>返回</Button>
               <Button
                 type="primary"
                 icon={<CheckCircleOutlined />}
                 loading={loading}
                 onClick={handleConfirmImport}
-                disabled={!selectedAccountId}
+                disabled={!selectedAccountId || preview.valid_rows === 0}
               >
-                确认导入
+                {dataType === "options" ? "确认导入" : "创建批次并选择导入行"}
               </Button>
             </Space>
           </Space>
@@ -350,22 +374,10 @@ export default function ImportPage() {
 
         {currentStep === 2 && (
           <Space orientation="vertical" style={{ width: "100%" }}>
-            {importResult && (
-              <Alert
-                type="success"
-                title="导入完成"
-                description={
-                  <ul>
-                    <li>成功导入：{importResult.imported_count} 条</li>
-                    <li>跳过：{importResult.skipped_count} 条</li>
-                    {importResult.errors.length > 0 && (
-                      <li>错误：{importResult.errors.length} 条</li>
-                    )}
-                  </ul>
-                }
-                icon={<CheckCircleOutlined />}
-              />
-            )}
+            {batch && <ImportBatchPanel batch={batch} onChange={(updated) => {
+              setBatch(updated);
+              setHistoryRefresh((value) => value + 1);
+            }} onBusyChange={setBatchBusy} />}
             {optionsImportResult && (
               <Alert
                 type="success"
@@ -383,12 +395,13 @@ export default function ImportPage() {
               />
             )}
 
-            <Button onClick={handleReset}>
+            <Button disabled={batchBusy || loading} onClick={handleReset}>
               继续导入
             </Button>
           </Space>
         )}
       </Card>
+      <ImportBatchHistory refreshKey={historyRefresh} />
     </div>
   );
 }

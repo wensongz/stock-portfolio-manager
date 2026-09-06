@@ -37,7 +37,7 @@ export function parseMoomooHoldings(text: string, accountMarket: Market): ParseR
         : currency === "CNY" ? "CN"
         : accountMarket === "HK" ? "US" : accountMarket;
       rows.push({
-        key: String(rows.length), selected: true, symbol: formatSymbol(raw, market),
+        key: String(rows.length), raw: lines[j], selected: true, symbol: formatSymbol(raw, market),
         name: (nameIndex === -1 ? "" : fields[nameIndex] ?? "").trim() || raw,
         shares, avgCost, currency, market,
       });

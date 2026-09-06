@@ -1672,7 +1672,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(reopened_definitions, definitions);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 5);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 6);
     }
 
     #[test]
@@ -1739,4 +1739,18 @@ mod tests {
         );
         assert_eq!(version, 0);
     }
+}
+
+#[test]
+fn migration_creates_import_batch_audit_tables() {
+    let db = super::Database::new(":memory:").unwrap();
+    let conn = db.conn.lock().unwrap();
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('import_batches', 'import_batch_rows')",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        count, 2,
+        "batch audit tables must be present after migration"
+    );
 }

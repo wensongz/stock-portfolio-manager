@@ -13,6 +13,8 @@ test("preserves legacy THS operation and cash-flow parsing", () => {
   assert.equal(rows.length, 2);
   assert.deepEqual(rows[0], {
     key: "0",
+    raw: csv.split("\n")[1],
+    external_id: null,
     selected: true,
     transaction_type: "SELL",
     symbol: "sh601318",
@@ -26,6 +28,8 @@ test("preserves legacy THS operation and cash-flow parsing", () => {
   });
   assert.deepEqual(rows[1], {
     key: "1",
+    raw: csv.split("\n")[2],
+    external_id: null,
     selected: true,
     transaction_type: "PAY",
     symbol: "sh600036",

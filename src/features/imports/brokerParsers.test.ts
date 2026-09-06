@@ -14,7 +14,7 @@ test("normalizes an IB structured trade and preserves fees and HK symbols", () =
 Trades,Data,U1234567,00700,"2026-08-25, 10:28:37",-100,520,-52000,SELL,-5,-1`;
 
   assert.deepEqual(parseIbTransactions(csv, "HK"), [{
-    key: "1", selected: true, transaction_type: "SELL", stock_name: "00700",
+    key: "1", raw: csv.split("\n")[1], external_id: null, selected: true, transaction_type: "SELL", stock_name: "00700",
     symbol: "700.HK", traded_at: "2026-08-25T10:28:37", price: 520,
     shares: 100, total_amount: 52000, commission: 6,
   }]);
@@ -26,7 +26,7 @@ test("merges Moomoo sub-executions into one normalized order", () => {
 ,,,,50,510,25500,2026/08/25 09:31:00,2`;
 
   assert.deepEqual(parseMoomooTransactions(csv, "US"), [{
-    key: "0", selected: true, transaction_type: "BUY", stock_name: "腾讯控股",
+    key: "0", raw: csv.split("\n").slice(1), external_id: null, selected: true, transaction_type: "BUY", stock_name: "腾讯控股",
     symbol: "700.HK", traded_at: "2026-08-25T09:30:00", price: 503.3333,
     shares: 150, total_amount: 75500, commission: 7,
   }]);
@@ -37,7 +37,7 @@ test("normalizes Firstrade trades and combines commission with fee", () => {
 AAPL,10,200,BUY,2026/8/25,-2000,-1.25,-0.5`;
 
   assert.deepEqual(parseFirstradeTransactions(csv), [{
-    key: "1", selected: true, transaction_type: "BUY", stock_name: "AAPL",
+    key: "1", raw: csv.split("\n")[1], external_id: null, selected: true, transaction_type: "BUY", stock_name: "AAPL",
     symbol: "AAPL", traded_at: "2026-08-25T10:30:00", price: 200,
     shares: 10, total_amount: 2000, commission: 1.75,
   }]);
@@ -49,7 +49,7 @@ Open Positions,Data,00121,200,84.5
 Open Positions,Data,Total,200,84.5`;
 
   assert.deepEqual(parseIbHoldings(csv, "HK"), {
-    rows: [{ key: "0", selected: true, symbol: "121.HK", name: "00121", shares: 200, avgCost: 84.5 }],
+    rows: [{ key: "0", raw: csv.split("\n")[1], selected: true, symbol: "121.HK", name: "00121", shares: 200, avgCost: 84.5 }],
     warnings: [],
   });
 });
@@ -61,8 +61,8 @@ AAPL,Apple,2,200,USD`;
 
   assert.deepEqual(parseMoomooHoldings(csv, "HK"), {
     rows: [
-      { key: "0", selected: true, symbol: "700.HK", name: "腾讯控股", shares: 100, avgCost: 500, currency: "HKD", market: "HK" },
-      { key: "1", selected: true, symbol: "AAPL", name: "Apple", shares: 2, avgCost: 200, currency: "USD", market: "US" },
+      { key: "0", raw: csv.split("\n")[1], selected: true, symbol: "700.HK", name: "腾讯控股", shares: 100, avgCost: 500, currency: "HKD", market: "HK" },
+      { key: "1", raw: csv.split("\n")[2], selected: true, symbol: "AAPL", name: "Apple", shares: 2, avgCost: 200, currency: "USD", market: "US" },
     ],
     warnings: [],
   });
@@ -74,7 +74,7 @@ msft,Microsoft,3,410.25
 Total,,3,410.25`;
 
   assert.deepEqual(parseFirstradeHoldings(csv), {
-    rows: [{ key: "0", selected: true, symbol: "MSFT", name: "Microsoft", shares: 3, avgCost: 410.25 }],
+    rows: [{ key: "0", raw: csv.split("\n")[1], selected: true, symbol: "MSFT", name: "Microsoft", shares: 3, avgCost: 410.25 }],
     warnings: [],
   });
 });
@@ -87,9 +87,31 @@ test("keeps CN holding cash detection and exchange symbol formatting", () => {
 
   assert.deepEqual(parseCnHoldings(csv), {
     rows: [
-      { key: "cash-1", selected: true, isCash: true, symbol: "$CASH-CNY", name: "现金 (CNY)", shares: 279.08, avgCost: 1 },
-      { key: "0", selected: true, isCash: false, symbol: "sh600519", name: "贵州茅台", shares: 100, avgCost: 1400 },
+      { key: "cash-1", raw: csv.split("\n")[1], selected: true, isCash: true, symbol: "$CASH-CNY", name: "现金 (CNY)", shares: 279.08, avgCost: 1 },
+      { key: "0", raw: csv.split("\n")[3], selected: true, isCash: false, symbol: "sh600519", name: "贵州茅台", shares: 100, avgCost: 1400 },
     ],
     warnings: [],
   });
+});
+
+test('Moomoo retains individual executions across overlapping grouped exports', () => {
+ const header='方向,代码,名称,市场,成交数量,成交价格,成交金额,成交时间,合计费用,成交编号';
+ const first=header+'\n买入,AAPL,Apple,美股,10,100,1000,2026/08/25 09:30:00,1,E1\n,,,,20,101,2020,2026/08/25 09:31:00,2,E2';
+ const overlap=header+'\n买入,AAPL,Apple,美股,20,101,2020,2026/08/25 09:31:00,2,E2\n,,,,30,102,3060,2026/08/25 09:32:00,3,E3';
+ const a=parseMoomooTransactions(first,'US'); const b=parseMoomooTransactions(overlap,'US');
+ assert.deepEqual(a.map(r=>r.external_id),['E1','E2']); assert.deepEqual(b.map(r=>r.external_id),['E2','E3']);
+ const business=({key,raw,...r})=>r;
+ assert.deepEqual(business(a[1]),business(b[0]));
+ assert.equal(a[1].shares,20); assert.equal(a[1].price,101); assert.equal(a[1].commission,2);
+});
+
+test('Moomoo placeholder identifiers preserve legacy no-ID aggregation', () => {
+ const rows=parseMoomooTransactions('方向,代码,成交数量,成交价格,成交编号\n买入,AAPL,1,10,0\n,,2,10,000','US');
+ assert.equal(rows.length,1); assert.equal(rows[0].external_id,null); assert.equal(rows[0].shares,3);
+});
+
+test('IB and Firstrade ignore zero execution-id placeholders', () => {
+ const ib=parseIbTransactions('Symbol,Date/Time,Quantity,Price,Trade ID\nAAPL,2026-01-01,1,10,000','US');
+ const ft=parseFirstradeTransactions('Symbol,Action,Quantity,Price,TradeDate,Execution ID\nAAPL,BUY,1,10,2026-01-01,0');
+ assert.equal(ib[0].external_id,null); assert.equal(ft[0].external_id,null);
 });

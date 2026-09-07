@@ -160,15 +160,10 @@ pub(super) fn invalidate_daily(
         );
     let start = changed
         .filter_map(|r| r["traded_at"].as_str())
-        .filter_map(|s| s.get(..10))
+        .map(|date| crate::services::snapshot_cache_service::snapshot_date(conn, date))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .min()
-        .unwrap_or("0000-01-01");
-    conn.execute(
-        "DELETE FROM daily_holding_snapshots WHERE date>=?1",
-        [start],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM daily_portfolio_values WHERE date>=?1", [start])
-        .map_err(|e| e.to_string())?;
-    Ok(())
+        .unwrap_or_else(|| "0000-01-01".into());
+    crate::services::snapshot_cache_service::invalidate_from(conn, &start)
 }

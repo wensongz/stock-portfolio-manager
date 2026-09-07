@@ -103,6 +103,7 @@ export type PerformanceInvoke = <T>(
 
 export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
   let latestRequestId = 0;
+  let successfulReportScope: string | null = null;
   let nextBenchmarkRequestId = 0;
   const latestBenchmarkRequestIds = new Map<string, number>();
 
@@ -162,7 +163,6 @@ export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
 
   fetchAll: async (forceRefresh?: boolean) => {
     const requestId = ++latestRequestId;
-    set({ loading: true, error: null });
     try {
       const state = get();
       let startDate: string;
@@ -185,19 +185,34 @@ export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
         filterParams.accountId = state.selectedAccountId;
       }
 
+      const reportScope = JSON.stringify([
+        startDate, endDate, filterParams.market ?? null, filterParams.accountId ?? null,
+      ]);
+      // Retained values are only meaningful under the filters and dates that
+      // produced them; a changed scope can also change the displayed currency.
+      set({
+        loading: true,
+        error: null,
+        ...(reportScope !== successfulReportScope ? {
+          summary: null,
+          returnSeries: [],
+          drawdown: null,
+          attribution: null,
+          monthlyReturns: [],
+          holdingPerformances: [],
+          riskMetrics: null,
+        } : {}),
+      });
+
       // Automatically backfill missing daily snapshots using historical closing prices.
       // When forceRefresh is true (user clicked "刷新"), re-create all snapshots
-      // including transaction-aware adjustments. Otherwise only fill in dates
-      // that have never been computed, so the page loads quickly from cache.
-      try {
-        await invokeFn<number>("backfill_snapshots", {
-          startDate,
-          endDate,
-          force: forceRefresh ?? false,
-        });
-      } catch (err) {
-        console.warn("backfill_snapshots error (non-fatal):", err);
-      }
+      // including transaction-aware adjustments. Otherwise fill missing or
+      // invalidated dates. A failed rebuild must not publish an outdated report.
+      await invokeFn<number>("backfill_snapshots", {
+        startDate,
+        endDate,
+        force: forceRefresh ?? false,
+      });
 
       if (requestId !== latestRequestId) return;
 
@@ -210,6 +225,7 @@ export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
 
       if (requestId !== latestRequestId) return;
 
+      successfulReportScope = reportScope;
       set({
         summary: report.summary,
         returnSeries: report.summary.return_series,

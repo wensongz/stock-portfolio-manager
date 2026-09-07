@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from "react";
-import { Button, Card, Col, Divider, Row, Select, Space, Typography } from "antd";
+import { Alert, Button, Card, Col, Divider, Row, Select, Space, Typography } from "antd";
 import { ReloadOutlined, LineChartOutlined } from "@ant-design/icons";
 import { usePerformanceStore } from "../../stores/performanceStore";
 import { useAccountStore } from "../../stores/accountStore";
@@ -45,6 +45,7 @@ export default function PerformancePage() {
     holdingPerformances,
     riskMetrics,
     loading,
+    error,
     setTimeRange,
     setBenchmarks,
     setMarket,
@@ -213,6 +214,16 @@ export default function PerformancePage() {
           </Space>
         </div>
       </div>
+
+      {error && (
+        <Alert
+          type="error"
+          title="绩效数据刷新失败"
+          description={summary ? `当前仍显示上次成功加载的数据。${error}` : error}
+          showIcon
+          className="mb-4"
+        />
+      )}
 
       {/* Summary cards */}
       <PerformanceSummaryCards summary={displaySummary} loading={loading} currency={currency} />

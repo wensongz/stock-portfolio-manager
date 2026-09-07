@@ -113,10 +113,7 @@ pub fn update_holding(
             [&id], |r| r.get::<_, Option<String>>(0),
         ).optional().map_err(|e| e.to_string())?.flatten();
         let from = opening_date.as_deref().unwrap_or("0000-01-01");
-        tx.execute("DELETE FROM daily_holding_snapshots WHERE date>=?1", [from])
-            .map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM daily_portfolio_values WHERE date>=?1", [from])
-            .map_err(|e| e.to_string())?;
+        super::snapshot_cache_service::invalidate_from(&tx, from)?;
     }
     tx.execute(
         "UPDATE holdings SET account_id=?2,symbol=?3,name=?4,market=?5,category_id=?6,

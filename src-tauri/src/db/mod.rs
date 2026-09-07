@@ -1,5 +1,6 @@
 pub(crate) mod migrations;
 mod schema;
+mod snapshot_cache_schema;
 
 use rusqlite::{Connection, Result};
 use std::sync::Mutex;

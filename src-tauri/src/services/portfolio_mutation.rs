@@ -1,6 +1,7 @@
 use crate::models::{Holding, Transaction};
 use crate::services::position_replay::{rebuild_position_group, PositionKey};
 use crate::services::quote_service::{cash_display_name, is_cash_symbol, CASH_SYMBOL_PREFIX};
+use crate::services::snapshot_cache_service::{invalidate_from, snapshot_date};
 use rusqlite::{Connection, OptionalExtension};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -412,6 +413,8 @@ pub fn create_transaction_in(
         .optional()
         .map_err(|error| error.to_string())?;
 
+    invalidate_from(conn, &input.traded_at)?;
+
     Ok(Transaction {
         id: transaction_id,
         holding_id: response_holding_id,
@@ -565,6 +568,23 @@ pub(crate) fn update_transaction_in(
         rebuild_position_group(conn, key)?;
     }
 
+    // Notes and display-name edits do not change historical valuation.
+    let valuation_changed = old_transaction.account_id != input.account_id
+        || old_transaction.symbol != input.symbol
+        || old_transaction.market != input.market
+        || old_transaction.transaction_type != input.transaction_type
+        || old_transaction.shares != input.shares
+        || old_transaction.price != input.price
+        || old_transaction.total_amount != input.total_amount
+        || old_transaction.commission != input.commission
+        || old_transaction.currency != input.currency
+        || old_transaction.traded_at != input.traded_at;
+    if valuation_changed {
+        let old_date = snapshot_date(conn, &old_transaction.traded_at)?;
+        let new_date = snapshot_date(conn, &input.traded_at)?;
+        invalidate_from(conn, &old_date.min(new_date))?;
+    }
+
     transaction_by_id(conn, id)
 }
 
@@ -602,6 +622,7 @@ pub(crate) fn delete_transaction_in(conn: &Connection, id: &str) -> Result<(), S
         )?;
     }
 
+    invalidate_from(conn, &transaction.traded_at)?;
     Ok(())
 }
 

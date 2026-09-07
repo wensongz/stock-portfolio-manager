@@ -1,7 +1,7 @@
 use super::schema;
 use rusqlite::{Connection, Error, OptionalExtension, Result};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 pub(crate) fn run_migrations(conn: &mut Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -34,6 +34,9 @@ pub(crate) fn run_migrations(conn: &mut Connection) -> Result<()> {
     }
     if version < 6 {
         schema::create_import_batch_schema(&transaction)?;
+    }
+    if version < 7 {
+        super::snapshot_cache_schema::migrate_v7(&transaction)?;
     }
     transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     transaction.commit()

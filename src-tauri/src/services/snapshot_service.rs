@@ -573,8 +573,9 @@ where
     // 1. Load all relevant holdings: current active ones PLUS any that had
     //    transactions in the backfill period (they may be sold now but were
     //    held on historical dates).
-    let holdings = {
+    let (holdings, input_revision) = {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
+        let revision = crate::services::snapshot_cache_service::current_revision(&conn)?;
         let start_str = start_date.format("%Y-%m-%d").to_string();
         let mut stmt = conn
             .prepare(
@@ -608,11 +609,33 @@ where
                 })
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
+        let holdings = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        (holdings, revision)
     };
 
     if holdings.is_empty() {
+        if force {
+            let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            if crate::services::snapshot_cache_service::current_revision(&tx)? != input_revision {
+                return Err("交易或持仓已变更，请重新刷新业绩数据".to_string());
+            }
+            let start = start_date.format("%Y-%m-%d").to_string();
+            let end = end_date.format("%Y-%m-%d").to_string();
+            tx.execute(
+                "DELETE FROM daily_holding_snapshots WHERE date BETWEEN ?1 AND ?2",
+                rusqlite::params![start, end],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "DELETE FROM daily_portfolio_values WHERE date BETWEEN ?1 AND ?2",
+                rusqlite::params![start, end],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+        }
         return Ok(0);
     }
 
@@ -738,18 +761,18 @@ where
     };
 
     let mut missing_dates: Vec<NaiveDate> = Vec::new();
-    // When `force` is true, re-create ALL snapshots if any transactions
-    // exist in the period (a transaction on date D changes the adjusted
-    // holdings for every date around D).  When `force` is false, only
-    // fill in dates that have never been calculated – this lets the UI
+    // When `force` is true, re-create all snapshots even when no transactions
+    // remain in the period. Existing positions can still need repricing, and
+    // deleting the last transaction can leave a stale cached value.
+    // When `force` is false, only fill dates that have never been calculated.
+    // This lets the UI
     // load quickly from cached data without re-fetching historical prices.
-    let has_transactions = force && transactions.iter().any(|tx| tx.trade_date <= end_date);
     let mut d = start_date;
     while d <= end_date {
         let wd = d.weekday();
         if wd != chrono::Weekday::Sat && wd != chrono::Weekday::Sun {
             let ds = d.format("%Y-%m-%d").to_string();
-            if !existing_dates.contains(&ds) || has_transactions {
+            if !existing_dates.contains(&ds) || force {
                 missing_dates.push(d);
             }
         }
@@ -825,7 +848,7 @@ where
                 history_map.insert(symbol.clone(), date_price_map);
             }
             Err(e) => {
-                warn!("failed to fetch history for {} ({}): {}", symbol, market, e);
+                return Err(format!("获取 {} ({}) 历史行情失败: {}", symbol, market, e));
             }
         }
     }
@@ -880,6 +903,7 @@ where
         snapshots: Vec<DailyHoldingSnapshot>,
     }
     let mut date_rows: Vec<DateRow> = Vec::with_capacity(missing_dates.len());
+    let mut empty_dates: Vec<String> = Vec::new();
 
     for date in &missing_dates {
         let date_str = date.format("%Y-%m-%d").to_string();
@@ -1013,6 +1037,14 @@ where
             });
         }
 
+        // A date before the portfolio's first position has no holdings to
+        // value. Remove its old cache, but preserve cached dates that still
+        // have positions and merely lack usable prices.
+        if snapshots.is_empty() {
+            empty_dates.push(date_str);
+            continue;
+        }
+
         // Skip dates where no price data is available at all (e.g. date
         // is before the earliest trading data for every holding).
         if !has_any_price {
@@ -1056,6 +1088,22 @@ where
     {
         let mut conn = db.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        // Holdings and transactions were read before asynchronous price/rate
+        // requests. Reject an obsolete calculation before it can recreate
+        // snapshots invalidated by a transaction or holding change.
+        if crate::services::snapshot_cache_service::current_revision(&tx)? != input_revision {
+            return Err("交易或持仓已变更，请重新刷新业绩数据".to_string());
+        }
+
+        for date in &empty_dates {
+            tx.execute(
+                "DELETE FROM daily_holding_snapshots WHERE date = ?1",
+                [date],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute("DELETE FROM daily_portfolio_values WHERE date = ?1", [date])
+                .map_err(|error| error.to_string())?;
+        }
 
         for row in &date_rows {
             let prev_total_value: f64 = tx
@@ -1128,6 +1176,10 @@ fn forward_fill_price(
         Err(idx) => Some(sorted_prices[idx - 1].1),
     }
 }
+
+#[cfg(test)]
+#[path = "snapshot_refresh_tests.rs"]
+mod refresh_tests;
 
 #[cfg(test)]
 mod tests {

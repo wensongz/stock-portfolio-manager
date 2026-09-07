@@ -112,6 +112,164 @@ test("a failed refresh preserves the last successful report", async () => {
   assert.equal(store.getState().loading, false);
 });
 
+test("only an explicit refresh forces snapshot rebuilding for the selected dates", async () => {
+  const backfillCalls = [];
+  const invoke = async (command, args) => {
+    if (command === "backfill_snapshots") {
+      backfillCalls.push(args);
+      return 0;
+    }
+    assert.equal(command, "get_performance_report");
+    return report("saved");
+  };
+  const store = createPerformanceStore(invoke);
+  store.getState().setTimeRange("CUSTOM", "2025-02-01", "2025-02-28");
+
+  await store.getState().fetchAll();
+  await store.getState().fetchAll(true);
+
+  assert.deepEqual(backfillCalls, [
+    { startDate: "2025-02-01", endDate: "2025-02-28", force: false },
+    { startDate: "2025-02-01", endDate: "2025-02-28", force: true },
+  ]);
+});
+
+for (const forceRefresh of [false, true]) {
+  test(`a failed ${forceRefresh ? "forced" : "automatic"} backfill preserves the report and exposes the error`, async () => {
+    let backfillAttempt = 0;
+    let reportAttempt = 0;
+    const savedReport = report("saved");
+    const invoke = async (command) => {
+      if (command === "backfill_snapshots") {
+        backfillAttempt += 1;
+        if (backfillAttempt > 1) throw new Error("history changed; retry refresh");
+        return 0;
+      }
+      assert.equal(command, "get_performance_report");
+      reportAttempt += 1;
+      return reportAttempt === 1 ? savedReport : report("outdated");
+    };
+    const store = createPerformanceStore(invoke);
+
+    await store.getState().fetchAll();
+    await store.getState().fetchAll(forceRefresh);
+
+    assert.equal(reportAttempt, 1, "a failed backfill must not query an outdated report");
+    assert.equal(store.getState().summary, savedReport.summary);
+    assert.equal(store.getState().returnSeries, savedReport.summary.return_series);
+    assert.equal(store.getState().drawdown, savedReport.drawdown);
+    assert.equal(store.getState().attribution, savedReport.attribution);
+    assert.equal(store.getState().monthlyReturns, savedReport.monthly_returns);
+    assert.equal(store.getState().holdingPerformances, savedReport.holding_performances);
+    assert.equal(store.getState().riskMetrics, savedReport.risk_metrics);
+    assert.match(store.getState().error ?? "", /history changed; retry refresh/);
+    assert.equal(store.getState().loading, false);
+  });
+}
+
+for (const { label, changeScope } of [
+  { label: "market", changeScope: (state) => state.setMarket("CN") },
+  { label: "account", changeScope: (state) => state.setAccountId("account-cn") },
+  { label: "preset range", changeScope: (state) => {
+    state.setTimeRange("1Y");
+    return state.fetchAll();
+  } },
+  { label: "custom start", changeScope: (state) => {
+    state.setTimeRange("CUSTOM", "2025-02-02", "2025-02-28");
+    return state.fetchAll();
+  } },
+  { label: "custom end", changeScope: (state) => {
+    state.setTimeRange("CUSTOM", "2025-02-01", "2025-02-27");
+    return state.fetchAll();
+  } },
+]) {
+  test(`changing the ${label} clears the previous report while loading and after failure`, async () => {
+    const changedBackfill = deferred();
+    let backfillAttempt = 0;
+    const savedReport = report("saved");
+    savedReport.monthly_returns = [{
+      year: 2025, month: 2, return_rate: 10, pnl: 10, start_value: 100, end_value: 110,
+    }];
+    savedReport.holding_performances = [{
+      symbol: "AAPL", name: "Apple", market: "US", category_name: "Technology",
+      return_rate: 10, pnl: 10, start_value: 100, end_value: 110,
+    }];
+    const invoke = async (command) => {
+      if (command === "backfill_snapshots") {
+        backfillAttempt += 1;
+        return backfillAttempt === 1 ? 0 : changedBackfill.promise;
+      }
+      assert.equal(command, "get_performance_report");
+      return savedReport;
+    };
+    const store = createPerformanceStore(invoke);
+    store.getState().setTimeRange("CUSTOM", "2025-02-01", "2025-02-28");
+    await store.getState().fetchAll();
+    assert.equal(store.getState().summary, savedReport.summary);
+
+    const refresh = changeScope(store.getState());
+    const pending = store.getState();
+    changedBackfill.reject(new Error("new scope unavailable"));
+    await refresh;
+    const failed = store.getState();
+
+    assert.equal(pending.loading, true);
+    assert.equal(pending.error, null);
+    assert.equal(failed.loading, false);
+    assert.match(failed.error ?? "", /new scope unavailable/);
+    for (const state of [pending, failed]) {
+      assert.equal(state.summary, null);
+      assert.deepEqual(state.returnSeries, []);
+      assert.equal(state.drawdown, null);
+      assert.equal(state.attribution, null);
+      assert.deepEqual(state.monthlyReturns, []);
+      assert.deepEqual(state.holdingPerformances, []);
+      assert.equal(state.riskMetrics, null);
+    }
+  });
+}
+
+for (const latestReportFinishesFirst of [false, true]) {
+  test(`a stale backfill failure cannot override the latest ${latestReportFinishesFirst ? "completed" : "pending"} request`, async () => {
+    const oldBackfill = deferred();
+    const latestReport = deferred();
+    const latestReportStarted = deferred();
+    let backfillAttempt = 0;
+    let reportAttempt = 0;
+    const invoke = async (command) => {
+      if (command === "backfill_snapshots") {
+        backfillAttempt += 1;
+        return backfillAttempt === 1 ? oldBackfill.promise : 0;
+      }
+      assert.equal(command, "get_performance_report");
+      reportAttempt += 1;
+      latestReportStarted.resolve();
+      return latestReport.promise;
+    };
+    const store = createPerformanceStore(invoke);
+    const oldFetch = store.getState().fetchAll();
+    const newFetch = store.getState().fetchAll(true);
+    await latestReportStarted.promise;
+
+    if (latestReportFinishesFirst) {
+      latestReport.resolve(report("new"));
+      await newFetch;
+    }
+    oldBackfill.reject(new Error("stale backfill failed"));
+    await oldFetch;
+
+    assert.equal(store.getState().error, null);
+    assert.equal(store.getState().loading, !latestReportFinishesFirst);
+    if (!latestReportFinishesFirst) {
+      latestReport.resolve(report("new"));
+      await newFetch;
+    }
+    assert.equal(reportAttempt, 1);
+    assert.equal(store.getState().summary?.start_date, "new");
+    assert.equal(store.getState().loading, false);
+  });
+}
+
 test("market and account selections refresh with the newly written filter", async () => {
   const reportCalls = [];
   const invoke = async (command, args) => {

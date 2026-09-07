@@ -1672,7 +1672,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(reopened_definitions, definitions);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 6);
+        assert_eq!(schema_version(&reopened), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -1753,4 +1753,274 @@ fn migration_creates_import_batch_audit_tables() {
         count, 2,
         "batch audit tables must be present after migration"
     );
+}
+
+#[cfg(test)]
+mod snapshot_cache_migration {
+    use crate::db::{migrations, schema, Database};
+    use rusqlite::{types::Value, Connection};
+
+    fn create_v6_schema(conn: &Connection) {
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        schema::create_current_schema(conn).unwrap();
+        schema::create_import_batch_schema(conn).unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+    }
+
+    fn seed_ledger(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO accounts (id, name, market, created_at, updated_at)
+               VALUES ('account', 'Portfolio', 'US', '2026-01-01', '2026-01-01');
+             INSERT INTO categories (id, name, color, icon, created_at)
+               VALUES ('growth', 'Growth', '#F97316', 'stock', '2026-01-01');
+             INSERT INTO holdings
+               (id, account_id, symbol, name, market, category_id, shares, avg_cost,
+                currency, created_at, updated_at)
+               VALUES ('holding', 'account', 'AAPL', 'Apple', 'US', 'growth', 10,
+                       100, 'USD', '2026-01-01', '2026-01-01');
+             INSERT INTO transactions
+               (id, holding_id, account_id, symbol, name, market, transaction_type,
+                shares, price, total_amount, commission, currency, traded_at, notes, created_at)
+               VALUES ('trade', 'holding', 'account', 'AAPL', 'Apple', 'US', 'BUY',
+                       10, 100, 1000, 1, 'USD', '2026-01-01', 'original note', '2026-01-01');",
+        )
+        .unwrap();
+    }
+
+    fn seed_daily_cache(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO daily_portfolio_values
+               (date, total_cost, total_value, us_cost, us_value, daily_pnl, cumulative_pnl)
+               VALUES ('2026-01-02', 1000, 1100, 1000, 1100, 100, 100),
+                      ('2026-01-03', 1000, 1200, 1000, 1200, 100, 200);
+             INSERT INTO daily_holding_snapshots
+               (date, account_id, symbol, market, category_name, shares, avg_cost,
+                close_price, market_value)
+               VALUES ('2026-01-02', 'account', 'AAPL', 'US', 'Growth', 10, 100, 110, 1100),
+                      ('2026-01-03', 'account', 'AAPL', 'US', 'Growth', 10, 100, 120, 1200);",
+        )
+        .unwrap();
+    }
+
+    fn rows(conn: &Connection, table: &str) -> Vec<Vec<Value>> {
+        let mut statement = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn revision(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT revision FROM snapshot_cache_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn v7_upgrade_clears_only_daily_caches_and_preserves_ledger_imports_and_reviews() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_v6_schema(&conn);
+        seed_ledger(&conn);
+        seed_daily_cache(&conn);
+        conn.execute_batch(
+            r#"INSERT INTO option_records
+               (id, account_id, option_symbol, underlying, expiry_date, strike_price,
+                option_type, action, code, quantity, price, amount, created_at)
+               VALUES ('option', 'account', 'AAPL 18SEP26 200 C', 'AAPL', '2026-09-18',
+                       200, 'C', 'SELL', 'OPEN', 1, 5, 500, '2026-01-01');
+             INSERT INTO import_batches
+               (id, request_id, account_id, source, file_name, source_content, parser_version,
+                kind, status, created_at, before_state, after_state, expected_balances, request_json)
+               VALUES ('batch', 'request', 'account', 'csv', 'trades.csv', 'original csv content',
+                       'v1', 'transactions', 'applied', '2026-01-01', '{"before":1}',
+                       '{"after":2}', '[{"symbol":"AAPL","shares":10}]', '{"mode":"append"}');
+             INSERT INTO import_batch_rows
+               (batch_id, row_key, ordinal, raw, external_id, data, fingerprint, status, record_id)
+               VALUES ('batch', 'row-1', 1, 'original raw row', 'broker-trade-1', '{"shares":10}',
+                       'fingerprint-1', 'imported', 'trade');
+             INSERT INTO quarterly_snapshots
+               (id, quarter, snapshot_date, total_value, total_cost, total_pnl,
+                overall_notes, created_at)
+               VALUES ('review', '2026Q1', '2026-03-31', 1300, 1000, 300,
+                       'Keep this quarterly review', '2026-03-31');
+             INSERT INTO quarterly_holding_snapshots
+               (id, quarterly_snapshot_id, account_id, account_name, symbol, name, market,
+                category_name, shares, avg_cost, close_price, market_value, cost_value,
+                pnl, pnl_percent, weight, notes, decision_quality)
+               VALUES ('review-holding', 'review', 'account', 'Portfolio', 'AAPL', 'Apple',
+                       'US', 'Growth', 10, 100, 130, 1300, 1000, 300, 30, 100,
+                       'Keep this investment rationale', 'good');
+             INSERT INTO stock_daily_prices (symbol, market, date, close, source, updated_at)
+               VALUES ('AAPL', 'US', '2026-01-02', 110, 'test', '2026-01-02');"#,
+        )
+        .unwrap();
+        let preserved_tables = [
+            "accounts",
+            "categories",
+            "holdings",
+            "transactions",
+            "option_records",
+            "import_batches",
+            "import_batch_rows",
+            "quarterly_snapshots",
+            "quarterly_holding_snapshots",
+            "stock_daily_prices",
+        ];
+        let before: Vec<_> = preserved_tables
+            .iter()
+            .map(|table| rows(&conn, table))
+            .collect();
+        assert!(before.iter().all(|table| !table.is_empty()));
+        for table in ["daily_portfolio_values", "daily_holding_snapshots"] {
+            assert_eq!(rows(&conn, table).len(), 2);
+        }
+
+        migrations::run_migrations(&mut conn).unwrap();
+
+        assert_eq!(
+            conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            migrations::CURRENT_SCHEMA_VERSION
+        );
+        for (table, expected) in preserved_tables.into_iter().zip(before) {
+            assert_eq!(rows(&conn, table), expected, "migration changed {table}");
+        }
+        for table in ["daily_portfolio_values", "daily_holding_snapshots"] {
+            assert!(rows(&conn, table).is_empty(), "stale {table} survived");
+        }
+        assert_eq!(revision(&conn), 0);
+        assert_eq!(rows(&conn, "snapshot_cache_state").len(), 1);
+        assert!(conn
+            .execute("INSERT INTO snapshot_cache_state (id) VALUES (2)", [])
+            .is_err());
+    }
+
+    #[test]
+    fn v7_rerun_and_reopen_preserve_rebuilt_caches_and_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot-migration.sqlite");
+        let expected;
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            create_v6_schema(&conn);
+            seed_ledger(&conn);
+            seed_daily_cache(&conn);
+            migrations::run_migrations(&mut conn).unwrap();
+            conn.execute("UPDATE holdings SET shares = 12 WHERE id = 'holding'", [])
+                .unwrap();
+            seed_daily_cache(&conn);
+            expected = (
+                rows(&conn, "daily_portfolio_values"),
+                rows(&conn, "daily_holding_snapshots"),
+                revision(&conn),
+            );
+            assert_eq!(expected.2, 1);
+
+            migrations::run_migrations(&mut conn).unwrap();
+
+            assert_eq!(rows(&conn, "daily_portfolio_values"), expected.0);
+            assert_eq!(rows(&conn, "daily_holding_snapshots"), expected.1);
+            assert_eq!(revision(&conn), expected.2);
+        }
+
+        let reopened = Database::new(path.to_str().unwrap()).unwrap();
+        let conn = reopened.conn.lock().unwrap();
+        assert_eq!(rows(&conn, "daily_portfolio_values"), expected.0);
+        assert_eq!(rows(&conn, "daily_holding_snapshots"), expected.1);
+        assert_eq!(revision(&conn), expected.2);
+    }
+
+    #[test]
+    fn snapshot_revision_tracks_ledger_insert_update_delete_and_category_changes() {
+        let db = Database::new(":memory:").unwrap();
+        let conn = db.conn.lock().unwrap();
+        assert_eq!(revision(&conn), 0);
+        seed_ledger(&conn);
+        assert_eq!(revision(&conn), 2);
+
+        let updates = [
+            "UPDATE transactions SET shares = 11 WHERE id = 'trade'",
+            "UPDATE transactions SET price = 101 WHERE id = 'trade'",
+            "UPDATE transactions SET total_amount = 1111 WHERE id = 'trade'",
+            "UPDATE transactions SET commission = 2 WHERE id = 'trade'",
+            "UPDATE transactions SET transaction_type = 'OPEN' WHERE id = 'trade'",
+            "UPDATE transactions SET traded_at = '2026-01-02' WHERE id = 'trade'",
+            "UPDATE transactions SET symbol = 'MSFT' WHERE id = 'trade'",
+            "UPDATE transactions SET market = 'HK' WHERE id = 'trade'",
+            "UPDATE transactions SET currency = 'HKD' WHERE id = 'trade'",
+            "UPDATE holdings SET shares = 11 WHERE id = 'holding'",
+            "UPDATE holdings SET avg_cost = 101 WHERE id = 'holding'",
+            "UPDATE holdings SET category_id = NULL WHERE id = 'holding'",
+            "UPDATE holdings SET category_id = 'growth' WHERE id = 'holding'",
+            "UPDATE holdings SET created_at = '2026-01-02' WHERE id = 'holding'",
+            "UPDATE holdings SET symbol = 'MSFT' WHERE id = 'holding'",
+            "UPDATE holdings SET market = 'HK' WHERE id = 'holding'",
+            "UPDATE holdings SET currency = 'HKD' WHERE id = 'holding'",
+            "DELETE FROM transactions WHERE id = 'trade'",
+            "DELETE FROM holdings WHERE id = 'holding'",
+        ];
+        for query in updates {
+            let before = revision(&conn);
+            assert_eq!(conn.execute(query, []).unwrap(), 1, "{query}");
+            assert_eq!(revision(&conn), before + 1, "{query}");
+        }
+    }
+
+    #[test]
+    fn snapshot_revision_ignores_metadata_only_and_noop_ledger_updates() {
+        let db = Database::new(":memory:").unwrap();
+        let conn = db.conn.lock().unwrap();
+        seed_ledger(&conn);
+        let before = revision(&conn);
+        conn.execute_batch(
+            "UPDATE transactions SET name = 'Renamed Apple', notes = 'Updated rationale',
+               holding_id = NULL, created_at = '2026-02-01' WHERE id = 'trade';
+             UPDATE holdings SET name = 'Renamed Apple', updated_at = '2026-02-01'
+               WHERE id = 'holding';
+             UPDATE transactions SET shares = shares, price = price, traded_at = traded_at;
+             UPDATE holdings SET shares = shares, avg_cost = avg_cost, category_id = category_id;",
+        )
+        .unwrap();
+
+        assert_eq!(revision(&conn), before);
+    }
+
+    #[test]
+    fn snapshot_revision_rolls_back_with_ledger_mutations() {
+        let db = Database::new(":memory:").unwrap();
+        let mut conn = db.conn.lock().unwrap();
+        seed_ledger(&conn);
+        let before = (
+            revision(&conn),
+            rows(&conn, "transactions"),
+            rows(&conn, "holdings"),
+        );
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(
+            "UPDATE holdings SET shares = 20 WHERE id = 'holding';
+             UPDATE transactions SET traded_at = '2026-02-01' WHERE id = 'trade';
+             DELETE FROM transactions WHERE id = 'trade';
+             INSERT INTO holdings
+               (id, account_id, symbol, name, market, shares, avg_cost, currency, created_at, updated_at)
+               VALUES ('new-holding', 'account', 'MSFT', 'Microsoft', 'US', 5, 200,
+                       'USD', '2026-02-01', '2026-02-01');",
+        )
+        .unwrap();
+        assert_eq!(revision(&tx), before.0 + 4);
+
+        tx.rollback().unwrap();
+
+        assert_eq!(revision(&conn), before.0);
+        assert_eq!(rows(&conn, "transactions"), before.1);
+        assert_eq!(rows(&conn, "holdings"), before.2);
+    }
 }

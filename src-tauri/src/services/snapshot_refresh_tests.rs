@@ -62,6 +62,110 @@ fn date(day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(2024, 1, day).unwrap()
 }
 
+fn insert_cash_ledger(db: &Database, current_balance: f64, events: &[(&str, f64, &str)]) {
+    let conn = db.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO holdings
+         (id, account_id, symbol, name, market, shares, avg_cost, currency, created_at, updated_at)
+         VALUES ('cash', 'account', '$CASH-USD', 'USD Cash', 'US', ?1, 1, 'USD',
+                 '2024-01-01', '2024-01-05')",
+        [current_balance],
+    )
+    .unwrap();
+    for (index, (kind, amount, traded_at)) in events.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO transactions
+             (id, holding_id, account_id, symbol, name, market, transaction_type,
+              shares, price, total_amount, commission, currency, traded_at, created_at)
+             VALUES (?1, 'cash', 'account', '$CASH-USD', 'USD Cash', 'US', ?2,
+                     ?3, 1, ?3, 0, 'USD', ?4, ?4)",
+            rusqlite::params![format!("cash-{index}"), kind, amount, traded_at],
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cash_opening_correction_starts_on_its_date_without_creating_performance() {
+    let (db, cache) = refresh_fixture();
+    insert_cash_ledger(&db, 9000.0, &[("BUY", 500.0, "2024-01-04T09:00:00Z")]);
+    db.conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE holdings SET created_at = '2024-01-03T00:00:00Z'",
+            [],
+        )
+        .unwrap();
+    let preview =
+        crate::services::cash_reconciliation_service::get_cash_balance_reconciliation(&db, "cash")
+            .unwrap();
+    crate::services::cash_reconciliation_service::correct_cash_balance(
+        &db,
+        "cash",
+        700.0,
+        preview.revision,
+        "USD Cash".into(),
+        None,
+    )
+    .unwrap();
+
+    backfill_snapshots_with_fetcher(&db, &cache, date(1), date(5), true, |_, _, _, _, _| async {
+        panic!("cash needs no market history")
+    })
+    .await
+    .unwrap();
+
+    let values = get_daily_values(&db, date(1), date(5)).unwrap();
+    assert_eq!(
+        values
+            .iter()
+            .map(|value| value.total_value)
+            .collect::<Vec<_>>(),
+        vec![0.0, 0.0, 200.0, 700.0, 700.0]
+    );
+    let summary = crate::services::performance_service::get_performance_summary(
+        &db,
+        date(2),
+        date(5),
+        &crate::services::performance_service::PerformanceFilter::default(),
+    )
+    .unwrap();
+    assert_eq!(summary.total_pnl, 0.0);
+    assert_eq!(summary.total_return, 0.0);
+}
+
+#[tokio::test]
+async fn cash_opening_replay_uses_utc_reset_order_and_keeps_negative_balances() {
+    let (db, cache) = refresh_fixture();
+    insert_cash_ledger(
+        &db,
+        -25.0,
+        &[
+            ("OPEN", 100.0, "2024-01-02T00:00:00Z"),
+            ("BUY", 50.0, "2024-01-03T09:00:00Z"),
+            // UTC Jan 3: the later OPEN replaces the previous balance.
+            ("OPEN", -40.0, "2024-01-04T00:30:00+08:00"),
+            ("BUY", 15.0, "2024-01-04T09:00:00Z"),
+        ],
+    );
+
+    backfill_snapshots_with_fetcher(&db, &cache, date(1), date(5), true, |_, _, _, _, _| async {
+        panic!("cash needs no market history")
+    })
+    .await
+    .unwrap();
+
+    let values = get_daily_values(&db, date(1), date(5)).unwrap();
+    assert_eq!(
+        values
+            .iter()
+            .map(|value| value.total_value)
+            .collect::<Vec<_>>(),
+        vec![0.0, 100.0, -40.0, -25.0, -25.0]
+    );
+}
+
 #[tokio::test]
 async fn forced_refresh_revalues_existing_holdings_without_transactions_in_range() {
     let (db, cache) = refresh_fixture();

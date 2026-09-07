@@ -4,6 +4,7 @@ pub mod ai_models_service;
 pub mod ai_tools;
 pub mod alert_service;
 pub mod backup_service;
+pub mod cash_reconciliation_service;
 pub mod exchange_rate_service;
 pub(crate) mod historical_exchange_rate_service;
 pub mod holding_edit;

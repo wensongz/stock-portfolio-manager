@@ -4,6 +4,33 @@ use crate::services::portfolio_mutation::{create_holding_in, CreateHoldingInput}
 use tauri::State;
 
 #[tauri::command(rename_all = "camelCase")]
+pub fn get_cash_balance_reconciliation(
+    db: State<Database>,
+    id: String,
+) -> Result<crate::services::cash_reconciliation_service::CashBalanceReconciliation, String> {
+    crate::services::cash_reconciliation_service::get_cash_balance_reconciliation(db.inner(), &id)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn correct_cash_balance(
+    db: State<Database>,
+    id: String,
+    balance: f64,
+    expected_revision: i64,
+    name: String,
+    category_id: Option<String>,
+) -> Result<Holding, String> {
+    crate::services::cash_reconciliation_service::correct_cash_balance(
+        db.inner(),
+        &id,
+        balance,
+        expected_revision,
+        name,
+        category_id,
+    )
+}
+
+#[tauri::command(rename_all = "camelCase")]
 #[allow(clippy::too_many_arguments)]
 pub fn create_holding(
     db: State<Database>,

@@ -1233,6 +1233,67 @@ mod tests {
     }
 
     #[test]
+    fn quarterly_cash_corrected_opening_affects_only_its_effective_quarter() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct-a", "账户 A");
+        insert_cash(&db, "acct-a", 700.0, "2025-01-01");
+        insert_transaction(
+            &db,
+            "opening",
+            "acct-a",
+            "$CASH-USD",
+            "Cash",
+            "OPEN",
+            200.0,
+            1.0,
+            200.0,
+            0.0,
+            "2025-04-01T00:00:00Z",
+        );
+        insert_transaction(
+            &db,
+            "deposit",
+            "acct-a",
+            "$CASH-USD",
+            "Cash",
+            "BUY",
+            500.0,
+            1.0,
+            500.0,
+            0.0,
+            "2025-04-01T00:00:00.001Z",
+        );
+
+        let before = NaiveDate::from_ymd_opt(2025, 3, 31).unwrap();
+        let after = NaiveDate::from_ymd_opt(2025, 6, 30).unwrap();
+        assert!(load_historical_holdings(&db, before).unwrap().is_empty());
+        let holdings = load_historical_holdings(&db, after).unwrap();
+        assert_eq!(holdings.len(), 1);
+        assert_eq!(holdings[0].shares, 700.0);
+
+        // Updating the same opening preserves its date and changes only the
+        // quarters at or after it, including a corrected debit balance.
+        let preview =
+            crate::services::cash_reconciliation_service::get_cash_balance_reconciliation(
+                &db, "acct-a",
+            )
+            .unwrap();
+        crate::services::cash_reconciliation_service::correct_cash_balance(
+            &db,
+            "acct-a",
+            -100.0,
+            preview.revision,
+            "USD Cash".into(),
+            None,
+        )
+        .unwrap();
+        assert!(load_historical_holdings(&db, before).unwrap().is_empty());
+        let holdings = load_historical_holdings(&db, after).unwrap();
+        assert_eq!(holdings.len(), 1);
+        assert_eq!((holdings[0].shares, holdings[0].avg_cost), (-100.0, 1.0));
+    }
+
+    #[test]
     fn quarterly_cash_missing_baseline_fails_instead_of_assuming_zero() {
         let db = Database::new(":memory:").unwrap();
         insert_account(&db, "acct-a", "账户 A");

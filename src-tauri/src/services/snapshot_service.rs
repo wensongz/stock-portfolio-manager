@@ -309,7 +309,7 @@ struct HoldingRow {
     market: String,
     shares: f64,
     avg_cost: f64,
-    _currency: String,
+    currency: String,
     category_name: Option<String>,
 }
 
@@ -576,7 +576,7 @@ where
     // 1. Load all relevant holdings: current active ones PLUS any that had
     //    transactions in the backfill period (they may be sold now but were
     //    held on historical dates).
-    let (holdings, input_revision) = {
+    let (holdings, cash_opening_ledgers, input_revision) = {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
         let revision = crate::services::snapshot_cache_service::current_revision(&conn)?;
         let start_str = start_date.format("%Y-%m-%d").to_string();
@@ -607,7 +607,7 @@ where
                     market: row.get(4)?,
                     shares: row.get(5)?,
                     avg_cost: row.get(6)?,
-                    _currency: row.get(7)?,
+                    currency: row.get(7)?,
                     category_name: row.get(8)?,
                 })
             })
@@ -615,7 +615,36 @@ where
         let holdings = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        (holdings, revision)
+        // An explicit cash OPEN is a dated balance reset. Replaying its ledger
+        // prevents a corrected opening from leaking into earlier valuations.
+        // Cash without an OPEN retains the existing current-balance anchor.
+        let mut cash_opening_ledgers = std::collections::HashMap::new();
+        for holding in &holdings {
+            if !crate::services::quote_service::is_cash_symbol(&holding.symbol) {
+                continue;
+            }
+            let has_opening: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM transactions
+                     WHERE account_id = ?1 AND currency = ?2
+                       AND UPPER(symbol) LIKE '$CASH-%' AND transaction_type = 'OPEN')",
+                    rusqlite::params![holding.account_id, holding.currency],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if has_opening {
+                let ledger = crate::services::cash_reconciliation_service::load_cash_ledger(
+                    &conn,
+                    &holding.account_id,
+                    &holding.currency,
+                )?;
+                cash_opening_ledgers.insert(
+                    (holding.account_id.clone(), holding.currency.clone()),
+                    ledger,
+                );
+            }
+        }
+        (holdings, cash_opening_ledgers, revision)
     };
 
     if holdings.is_empty() {
@@ -970,7 +999,15 @@ where
             let total_adj = total_unwind.get(&key).copied().unwrap_or(0.0);
             let running_adj = running_unwind.get(&key).copied().unwrap_or(0.0);
             let adjustment = total_adj - running_adj;
-            let adjusted_shares = holding.shares + adjustment;
+            let adjusted_shares = if crate::services::quote_service::is_cash_symbol(&holding.symbol)
+            {
+                cash_opening_ledgers
+                    .get(&(holding.account_id.clone(), holding.currency.clone()))
+                    .and_then(|ledger| ledger.balance_at_date(*date))
+                    .unwrap_or(holding.shares + adjustment)
+            } else {
+                holding.shares + adjustment
+            };
 
             // Skip holdings with no shares on this date
             if adjusted_shares.abs() < 1e-9
@@ -1265,7 +1302,7 @@ mod tests {
             market: "CN".to_string(),
             shares: 100.0,
             avg_cost: 10.0,
-            _currency: "CNY".to_string(),
+            currency: "CNY".to_string(),
             category_name: None,
         }];
         let transactions = vec![TxInfo {
@@ -1315,7 +1352,7 @@ mod tests {
             market: "CN".to_string(),
             shares: 100.0,
             avg_cost: 10.0,
-            _currency: "CNY".to_string(),
+            currency: "CNY".to_string(),
             category_name: None,
         }];
 
@@ -1348,7 +1385,7 @@ mod tests {
             market: "CN".to_string(),
             shares: 100.0,
             avg_cost: 10.0,
-            _currency: "CNY".to_string(),
+            currency: "CNY".to_string(),
             category_name: None,
         }];
         let transactions = vec![TxInfo {

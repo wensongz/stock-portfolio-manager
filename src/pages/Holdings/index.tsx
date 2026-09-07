@@ -42,9 +42,15 @@ import type {
   Transaction,
   TransactionType,
   QuoteCommandResult,
+  CashBalanceReconciliation,
+  CashBalanceReconciliationRow,
+  CreateHoldingPayload,
 } from "../../types";
 import dayjs from "dayjs";
 import { canEditOpening } from "./holdingEditPolicy";
+import CashBalancePreview from "./CashBalancePreview";
+import { cashBalanceEditDecision, cashBalanceSaveCommand, createEditSession, createHoldingRequest, emptyHoldingRequest, formatCashDelta, mergeHoldingQuote } from "./cashBalanceEditing";
+import { formatMoney } from "../../lib/formatMoney";
 
 const { Title, Text } = Typography;
 
@@ -67,38 +73,6 @@ function isCashSymbol(symbol: string): boolean {
 function isClearedPosition(holding: { symbol: string; shares: number }): boolean {
   return !isCashSymbol(holding.symbol) && holding.shares === 0;
 }
-
-/**
- * Compute the cash flow delta caused by a single transaction.
- * Cash-symbol BUY → deposit, positive; cash-symbol SELL → withdrawal, negative
- *   (mirrors the backend cash_delta sign flip). OPEN/PAY on cash symbols → 0.
- * Stock BUY → cash out (negative). Commission is added to the outflow because
- *   it further reduces available cash on top of the purchase cost.
- * Stock SELL → cash in (positive). Commission is subtracted from the inflow
- *   because it is deducted from the proceeds, reducing available cash.
- * PAY (dividend) → cash in (positive), net of commission.
- * Stock OPEN → 0 (initial position entry, no real cash movement).
- */
-function computeCashDelta(txn: Transaction): number {
-  if (isCashSymbol(txn.symbol)) {
-    // Cash deposit (BUY) → money in; cash withdrawal (SELL) → money out.
-    // Mirrors the backend cash_delta sign flip.
-    if (txn.transaction_type === "BUY") return txn.total_amount;
-    if (txn.transaction_type === "SELL") return -txn.total_amount;
-    return 0; // OPEN/PAY on cash symbols have no cash impact
-  }
-  switch (txn.transaction_type) {
-    case "BUY": return -(txn.total_amount + txn.commission);
-    case "SELL": return txn.total_amount - txn.commission;
-    case "PAY": return txn.total_amount - txn.commission;
-    default: return 0; // OPEN for stocks
-  }
-}
-
-type CashFlowRow = Transaction & {
-  cashDelta: number;
-  runningBalance: number;
-};
 
 /** Shared formatting options for displaying currency amounts. */
 const CURRENCY_FORMAT_OPTIONS: Intl.NumberFormatOptions = {
@@ -137,7 +111,7 @@ function PnlText({ value, percent }: { value: number | null; percent: number | n
 }
 
 export default function HoldingsPage() {
-  const { holdings, loading: holdingsLoading, fetchHoldings, createHolding, updateHolding, deleteHolding } =
+  const { holdings, loading: holdingsLoading, fetchHoldings, createHolding, updateHolding, correctCashBalance, deleteHolding } =
     useHoldingStore();
   const { accounts, fetchAccounts } = useAccountStore();
   const { categories, fetchCategories } = useCategoryStore();
@@ -159,13 +133,20 @@ export default function HoldingsPage() {
   const [holdingMoomooCsvImportModalOpen, setHoldingMoomooCsvImportModalOpen] = useState(false);
   const [holdingFirstradeCsvImportModalOpen, setHoldingFirstradeCsvImportModalOpen] = useState(false);
   const [editingHolding, setEditingHolding] = useState<Holding | null>(null);
+  const isEditingCash = !!editingHolding && isCashSymbol(editingHolding.symbol);
+  const [saving, setSaving] = useState(false);
+  const editSession = useMemo(() => createEditSession(), []);
+  const [cashPreview, setCashPreview] = useState(emptyHoldingRequest<CashBalanceReconciliation>);
+  const previewRequest = useMemo(() => createHoldingRequest<CashBalanceReconciliation>(setCashPreview), []);
+  const loadCashPreview = useCallback((holding: Holding) => previewRequest.load(holding.id,
+    () => invoke<CashBalanceReconciliation>("get_cash_balance_reconciliation", { id: holding.id })), [previewRequest]);
   const [editHistory, setEditHistory] = useState<{ id: string; editable: boolean; error?: boolean } | null>(null);
-  const financialFieldsLocked = !!editingHolding &&
+  const financialFieldsLocked = !!editingHolding && !isEditingCash &&
     (editHistory?.id !== editingHolding.id || !editHistory.editable);
   const identityFieldsLocked = financialFieldsLocked || !!editingHolding && isCashSymbol(editingHolding.symbol);
 
   useEffect(() => {
-    if (!editingHolding) { setEditHistory(null); return; }
+    if (!editingHolding || isCashSymbol(editingHolding.symbol)) { setEditHistory(null); return; }
     let cancelled = false;
     const holding = editingHolding;
     setEditHistory(null);
@@ -179,14 +160,20 @@ export default function HoldingsPage() {
     return () => { cancelled = true; };
   }, [editingHolding]);
   const [detailModalOpen, setDetailModalOpen] = useState(false);
-  const [detailHolding, setDetailHolding] = useState<HoldingWithQuote | null>(null);
-  const [detailTransactions, setDetailTransactions] = useState<Transaction[]>([]);
-  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailHolding, setDetailHolding] = useState<Holding | null>(null);
+  const [detailState, setDetailState] = useState(emptyHoldingRequest<{ cash: CashBalanceReconciliation | null; transactions: Transaction[] }>);
+  const detailRequest = useMemo(() => createHoldingRequest<{ cash: CashBalanceReconciliation | null; transactions: Transaction[] }>(setDetailState), []);
+  const detailHoldingRef = useRef<Holding | null>(null);
+  const detailLoading = detailState.status === "loading";
+  const detailTransactions = detailState.data?.transactions ?? [];
+  const detailCash = detailState.data?.cash ?? null;
   const [showRealtime, setShowRealtime] = useState(true);
   const [showCleared, setShowCleared] = useState(false);
   const [form] = Form.useForm();
   const [cashForm] = Form.useForm();
   const selectedFormMarket = Form.useWatch("market", form) as Market | undefined;
+  const draftBalance = Form.useWatch("shares", form) as number | null | undefined;
+  const cashEditDecision = isEditingCash ? cashBalanceEditDecision(editingHolding!, draftBalance, cashPreview) : null;
   const [fetchingName, setFetchingName] = useState(false);
   // Remember the last "按账户" filter selection across sessions.
   const [filterAccountId, setFilterAccountId] = useState<string | undefined>(() => {
@@ -195,6 +182,13 @@ export default function HoldingsPage() {
   const [filterMarket, setFilterMarket] = useState<Market | undefined>(undefined);
   const [symbolSearch, setSymbolSearch] = useState("");
   const displayDataRef = useRef<HoldingWithQuote[]>([]);
+
+  useEffect(() => () => {
+    previewRequest.invalidate();
+    detailRequest.invalidate();
+    detailHoldingRef.current = null;
+    editSession.close();
+  }, [previewRequest, detailRequest, editSession]);
 
   // Derive unique stock symbols from existing holdings for autocomplete
   const symbolOptions = useMemo(() => {
@@ -327,44 +321,46 @@ export default function HoldingsPage() {
     return startQuoteSync();
   }, [showRealtime]);
 
-  const handleSubmit = async (values: {
-    accountId: string;
-    symbol: string;
-    name: string;
-    market: Market;
-    categoryId?: string;
-    shares: number;
-    avgCost: number;
-    currency: Currency;
-  }) => doSubmit(values);
+  const closeEditModal = () => {
+    editSession.close();
+    previewRequest.clear();
+    setSaving(false);
+    setModalOpen(false);
+    setEditingHolding(null);
+    setSymbolSearch("");
+    form.resetFields();
+  };
 
-  const doSubmit = async (values: {
-    accountId: string;
-    symbol: string;
-    name: string;
-    market: Market;
-    categoryId?: string;
-    shares: number;
-    avgCost: number;
-    currency: Currency;
-  }) => {
+  const handleSubmit = async (values: CreateHoldingPayload) => {
+    const token = editSession.beginSave();
+    if (token === null) return;
+    setSaving(true);
     try {
       if (editingHolding) {
-        await updateHolding({ id: editingHolding.id, ...values });
-        // Reload holding quotes from DB cache (no API call) so the table
-        // immediately reflects the updated holding metadata.
-        fetchHoldingQuotes([]);
-        message.success("持仓更新成功");
+        let updated: Holding;
+        if (isCashSymbol(editingHolding.symbol)) {
+          const command = cashBalanceSaveCommand(editingHolding, values, cashPreview);
+          updated = command.kind === "correction"
+            ? await correctCashBalance(command.payload)
+            : await updateHolding(command.payload);
+          useQuoteStore.setState((state) => ({
+            holdingQuotes: state.holdingQuotes.map((quote) => quote.id === updated.id ? mergeHoldingQuote(updated, quote) : quote),
+          }));
+          if (detailHoldingRef.current?.id === updated.id) void handleShowDetail(updated);
+        } else {
+          updated = await updateHolding({ id: editingHolding.id, ...values });
+        }
+        void fetchHoldingQuotes([]);
+        if (editSession.isCurrent(token)) message.success(isCashSymbol(updated.symbol) ? "现金余额更新成功" : "持仓更新成功");
       } else {
         await createHolding(values);
-        message.success("持仓创建成功");
+        if (editSession.isCurrent(token)) message.success("持仓创建成功");
       }
-      setModalOpen(false);
-      form.resetFields();
-      setEditingHolding(null);
-      setSymbolSearch("");
+      if (editSession.isCurrent(token)) closeEditModal();
     } catch (err) {
-      message.error(`操作失败: ${err}`);
+      if (editSession.isCurrent(token)) message.error(`操作失败: ${err}`);
+    } finally {
+      if (editSession.finishSave(token)) setSaving(false);
     }
   };
 
@@ -399,7 +395,11 @@ export default function HoldingsPage() {
     }
   };
 
-  const openEditModal = (holding: Holding) => {
+  const openEditModal = (selected: Holding) => {
+    const holding = useHoldingStore.getState().holdings.find((h) => h.id === selected.id) ?? selected;
+    editSession.open();
+    setSaving(false);
+    previewRequest.clear();
     setEditingHolding(holding);
     form.setFieldsValue({
       accountId: holding.account_id,
@@ -408,10 +408,11 @@ export default function HoldingsPage() {
       market: holding.market,
       categoryId: holding.category_id,
       shares: holding.shares,
-      avgCost: holding.avg_cost,
+      avgCost: isCashSymbol(holding.symbol) ? 1 : holding.avg_cost,
       currency: holding.currency,
     });
     setModalOpen(true);
+    if (isCashSymbol(holding.symbol)) void loadCashPreview(holding);
   };
 
   const handleEdit = (holding: Holding) => {
@@ -427,76 +428,35 @@ export default function HoldingsPage() {
     }
   };
 
-  const handleShowDetail = useCallback(async (holding: HoldingWithQuote) => {
+  const handleShowDetail = useCallback(async (holding: Holding) => {
+    detailHoldingRef.current = holding;
     setDetailHolding(holding);
     setDetailModalOpen(true);
-    setDetailLoading(true);
-    try {
-      let txns: Transaction[];
+    await detailRequest.load(holding.id, async () => {
       if (isCashSymbol(holding.symbol)) {
-        // For cash holdings, fetch all account transactions so we can show the
-        // full cash flow history (deposits + stock buys/sells/dividends).
-        txns = await invoke<Transaction[]>("get_transactions", {
-          accountId: holding.account_id,
-        });
-        // Keep only transactions that match the cash currency, and exclude
-        // synthetic initial-position entries:
-        // - OPEN type records for non-cash symbols (zero cash impact)
-        // - BUY records flagged as 'backfill:initial': the DB migration in
-        //   db/mod.rs converts these to OPEN on startup, but this filter is
-        //   retained as a fallback in case the migration fails silently.
-        txns = txns.filter(
-          (t) =>
-            t.currency === holding.currency &&
-            !["STOCK_IN", "STOCK_OUT"].includes(t.transaction_type) &&
-            !(t.transaction_type === "OPEN" && !isCashSymbol(t.symbol)) &&
-            t.notes !== "backfill:initial",
-        );
-      } else {
-        txns = await invoke<Transaction[]>("get_transactions", {
-          accountId: holding.account_id,
-          symbol: holding.symbol,
-        });
+        const cash = await invoke<CashBalanceReconciliation>("get_cash_balance_reconciliation", { id: holding.id });
+        return { cash, transactions: [] };
       }
-      setDetailTransactions(txns);
-    } catch (err) {
-      message.error(`获取交易记录失败: ${err}`);
-      setDetailTransactions([]);
-    } finally {
-      setDetailLoading(false);
-    }
-  }, []);
+      const transactions = await invoke<Transaction[]>("get_transactions", {
+        accountId: holding.account_id, symbol: holding.symbol,
+      });
+      return { cash: null, transactions };
+    });
+  }, [detailRequest]);
+
+  const closeDetailModal = () => {
+    detailRequest.clear();
+    detailHoldingRef.current = null;
+    setDetailModalOpen(false);
+    setDetailHolding(null);
+  };
 
   const accountMap = Object.fromEntries(accounts.map((a) => [a.id, a.name]));
   const categoryMap = Object.fromEntries(categories.map((c) => [c.id, c]));
 
-  // Compute cash flow rows for the cash holding detail modal.
-  // Transactions are sorted chronologically (ascending) to compute the running
-  // balance, then reversed so the table shows the most recent entry first.
-  const cashFlowRows = useMemo<CashFlowRow[]>(() => {
-    if (!detailHolding || !isCashSymbol(detailHolding.symbol)) return [];
-    const sorted = [...detailTransactions].sort(
-      (a, b) => new Date(a.traded_at).getTime() - new Date(b.traded_at).getTime(),
-    );
-    let balance = 0;
-    const rows = sorted.map((txn) => {
-      const delta = computeCashDelta(txn);
-      balance += delta;
-      return { ...txn, cashDelta: delta, runningBalance: balance };
-    });
-    return rows.reverse();
-  }, [detailHolding, detailTransactions]);
-
-  // Merge holdings with realtime quotes
+  // Cash balances use the current holding, even if a cached quote predates a correction.
   const quoteMap = Object.fromEntries(holdingQuotes.map((h) => [h.id, h as HoldingWithQuote]));
-  const allDisplayData: HoldingWithQuote[] = holdings.map((h) => quoteMap[h.id] ?? {
-    ...h,
-    quote: null,
-    market_value: null,
-    total_cost: null,
-    unrealized_pnl: null,
-    unrealized_pnl_percent: null,
-  });
+  const allDisplayData = holdings.map((h) => mergeHoldingQuote(h, quoteMap[h.id]));
 
   // Apply filters
   const displayData = allDisplayData.filter((h) => {
@@ -783,6 +743,9 @@ export default function HoldingsPage() {
             type="primary"
             icon={<PlusOutlined />}
             onClick={() => {
+              editSession.open();
+              setSaving(false);
+              previewRequest.clear();
               setEditingHolding(null);
               form.resetFields();
               // Pre-populate form fields based on active filters
@@ -894,20 +857,25 @@ export default function HoldingsPage() {
       })()}
 
       <Modal
-        title={editingHolding ? "编辑持仓" : "新增持仓"}
+        title={isEditingCash ? "编辑现金余额" : editingHolding ? "编辑持仓" : "新增持仓"}
         open={modalOpen}
         onOk={() => form.submit()}
-        onCancel={() => {
-          setModalOpen(false);
-          setEditingHolding(null);
-          setSymbolSearch("");
-          form.resetFields();
-        }}
+        onCancel={closeEditModal}
+        confirmLoading={saving}
+        okButtonProps={{ disabled: saving || !!cashEditDecision && !cashEditDecision.canSubmit }}
         okText="确认"
         cancelText="取消"
         width={600}
       >
-        {editingHolding && (
+        {isEditingCash && editingHolding && <>
+          <CashBalancePreview holding={editingHolding} state={cashPreview}
+            onRetry={() => void loadCashPreview(editingHolding)}
+            onAdopt={(balance) => form.setFieldsValue({ shares: balance })}
+            onDetail={() => void handleShowDetail(editingHolding)} disabled={saving} />
+          {cashEditDecision?.data && cashEditDecision.data.current_balance !== editingHolding.shares && <Alert type="info" showIcon title="当前余额已变化，表单保留原输入。确认将按填写的余额校正；可采用推荐值或修改余额。" style={{ marginBottom: 12 }} />}
+          {cashEditDecision?.reason && <Alert type="warning" showIcon title={cashEditDecision.reason} style={{ marginBottom: 12 }} />}
+        </>}
+        {editingHolding && !isEditingCash && (
           <Alert
             showIcon
             type={editHistory?.error ? "warning" : "info"}
@@ -917,20 +885,18 @@ export default function HoldingsPage() {
               : editHistory?.id !== editingHolding.id
                 ? "正在检查交易记录…"
                 : financialFieldsLocked
-                  ? isCashSymbol(editingHolding.symbol)
-                    ? "该现金持仓已有资金流水。余额变动请在交易记录中记录存入或提取，此处仅可编辑名称和类别。"
-                    : "该持仓已有交易记录。买卖、分红请在交易记录中修正，此处仅可编辑名称和类别。"
+                  ? "该持仓已有交易记录。买卖、分红请在交易记录中修正，此处仅可编辑名称和类别。"
                   : "此处修改将同步修正期初记录，并保留原期初日期，重算后仍保持一致。"}
           />
         )}
-        <Form form={form} layout="vertical" onFinish={handleSubmit}>
+        <Form form={form} layout="vertical" onFinish={handleSubmit} disabled={saving}>
           <Form.Item
             name="accountId"
             label="所属账户"
             style={{ marginBottom: 12 }}
             rules={[{ required: true, message: "请选择账户" }]}
           >
-            <Select placeholder="选择证券账户" onChange={handleAccountChange} disabled={identityFieldsLocked}>
+            <Select placeholder="选择证券账户" onChange={handleAccountChange} disabled={saving || identityFieldsLocked}>
               {accounts.map((a) => (
                 <Select.Option key={a.id} value={a.id}>
                   [{a.market}] {a.name}
@@ -942,12 +908,12 @@ export default function HoldingsPage() {
             <Col span={12}>
               <Form.Item
                 name="symbol"
-                label="股票代码"
+                label={isEditingCash ? "现金代码" : "股票代码"}
                 style={{ marginBottom: 12 }}
                 rules={[{ required: true, message: "请输入股票代码" }]}
               >
                 <AutoComplete
-                  disabled={identityFieldsLocked}
+                  disabled={saving || identityFieldsLocked}
                   options={filteredSymbolOptions}
                   onSearch={setSymbolSearch}
                   onSelect={handleSymbolSelect}
@@ -959,7 +925,7 @@ export default function HoldingsPage() {
             <Col span={12}>
               <Form.Item
                 name="name"
-                label="股票名称"
+                label={isEditingCash ? "现金名称" : "股票名称"}
                 style={{ marginBottom: 12 }}
                 rules={[{ required: true, message: "请输入股票名称" }]}
               >
@@ -983,15 +949,15 @@ export default function HoldingsPage() {
             <Col span={12}>
               <Form.Item
                 name="shares"
-                label="持仓股数"
+                label={isEditingCash ? "现金余额" : "持仓股数"}
                 style={{ marginBottom: 12 }}
-                rules={[{ required: true, message: "请输入持仓股数" }]}
+                rules={[{ required: true, message: isEditingCash ? "请输入现金余额" : "请输入持仓股数" }, ...(isEditingCash ? [{ validator: (_: unknown, value: unknown) => typeof value === "number" && Number.isFinite(value) ? Promise.resolve() : Promise.reject(new Error("请输入有限数字，可为零或负数")) }] : [])]}
               >
                 <InputNumber
-                  {...(editingHolding && isCashSymbol(editingHolding.symbol)
-                    ? { min: 0, precision: 2, placeholder: "现金余额" }
+                  {...(isEditingCash
+                    ? { precision: 2, placeholder: "现金余额，可为零或负数" }
                     : shareInputProps(selectedFormMarket))}
-                  disabled={financialFieldsLocked}
+                  disabled={saving || financialFieldsLocked}
                   style={{ width: "100%" }}
                 />
               </Form.Item>
@@ -1003,7 +969,7 @@ export default function HoldingsPage() {
                 style={{ marginBottom: 12 }}
                 rules={[{ required: true, message: "请输入平均成本价" }]}
               >
-                <InputNumber min={0} precision={4} style={{ width: "100%" }} placeholder="买入均价" disabled={financialFieldsLocked || !!editingHolding && isCashSymbol(editingHolding.symbol)} />
+                <InputNumber min={0} precision={4} style={{ width: "100%" }} placeholder="买入均价" disabled={saving || financialFieldsLocked || isEditingCash} />
               </Form.Item>
             </Col>
           </Row>
@@ -1015,7 +981,7 @@ export default function HoldingsPage() {
                 style={{ marginBottom: 0 }}
                 rules={[{ required: true, message: "请选择市场" }]}
               >
-                <Select placeholder="选择市场" disabled={identityFieldsLocked}>
+                <Select placeholder="选择市场" disabled={saving || identityFieldsLocked}>
                   <Select.Option value="US">🇺🇸 美股</Select.Option>
                   <Select.Option value="CN">🇨🇳 A股</Select.Option>
                   <Select.Option value="HK">🇭🇰 港股</Select.Option>
@@ -1029,7 +995,7 @@ export default function HoldingsPage() {
                 style={{ marginBottom: 0 }}
                 rules={[{ required: true, message: "请选择币种" }]}
               >
-                <Select placeholder="选择币种" disabled={identityFieldsLocked}>
+                <Select placeholder="选择币种" disabled={saving || identityFieldsLocked}>
                   <Select.Option value="USD">USD 美元</Select.Option>
                   <Select.Option value="CNY">CNY 人民币</Select.Option>
                   <Select.Option value="HKD">HKD 港元</Select.Option>
@@ -1081,18 +1047,24 @@ export default function HoldingsPage() {
       <Modal
         title={detailHolding ? `交易明细 — ${detailHolding.name} (${detailHolding.symbol})` : "交易明细"}
         open={detailModalOpen}
-        onCancel={() => {
-          setDetailModalOpen(false);
-          setDetailHolding(null);
-          setDetailTransactions([]);
-        }}
+        onCancel={closeDetailModal}
         footer={null}
         width={detailHolding && isCashSymbol(detailHolding.symbol) ? 1000 : 900}
       >
+        {detailHolding && isCashSymbol(detailHolding.symbol) && <CashBalancePreview
+          holding={detailHolding}
+          state={{ ...detailState, data: detailCash }}
+          onRetry={() => void handleShowDetail(detailHolding)}
+          onEdit={() => { const holding = detailHolding; closeDetailModal(); openEditModal(holding); }}
+        />}
+        {detailHolding && !isCashSymbol(detailHolding.symbol) && detailState.status === "error" && <Alert
+          type="warning" showIcon title="获取交易记录失败" description={detailState.error}
+          action={<Button onClick={() => void handleShowDetail(detailHolding)}>重试</Button>}
+          style={{ marginBottom: 12 }}
+        />}
         {detailHolding && isCashSymbol(detailHolding.symbol) ? (
-          /* Cash flow history: shows all account transactions with cash impact */
-          <Table<CashFlowRow>
-            dataSource={cashFlowRows}
+          <Table<CashBalanceReconciliationRow>
+            dataSource={detailCash?.rows ?? []}
             rowKey="id"
             loading={detailLoading}
             pagination={false}
@@ -1110,8 +1082,9 @@ export default function HoldingsPage() {
                 dataIndex: "transaction_type",
                 key: "transaction_type",
                 width: 80,
-                render: (type: TransactionType, record: CashFlowRow) => {
-                  if (isCashSymbol(record.symbol)) {
+                render: (type: TransactionType, record: CashBalanceReconciliationRow) => {
+                  if (type === "OPEN") return <Tag color="blue">期初</Tag>;
+                  if (isCashSymbol(record.symbol) && (type === "BUY" || type === "SELL")) {
                     return record.transaction_type === "BUY"
                       ? <Tag color="blue">存入</Tag>
                       : <Tag color="red">提取</Tag>;
@@ -1129,7 +1102,7 @@ export default function HoldingsPage() {
               {
                 title: "股票",
                 key: "stock",
-                render: (_: unknown, record: CashFlowRow) => {
+                render: (_: unknown, record: CashBalanceReconciliationRow) => {
                   if (isCashSymbol(record.symbol)) {
                     return <span style={{ color: "var(--color-text-secondary)" }}>—</span>;
                   }
@@ -1146,14 +1119,12 @@ export default function HoldingsPage() {
                 key: "cashDelta",
                 width: 160,
                 align: "right" as const,
-                render: (_: unknown, record: CashFlowRow) => {
-                  const delta = record.cashDelta;
-                  const sym = currencySymbol[record.currency] ?? "";
+                render: (_: unknown, record: CashBalanceReconciliationRow) => {
+                  const delta = record.cash_delta;
                   const isPositive = delta >= 0;
                   return (
                     <span style={{ color: isPositive ? "#16a34a" : "#dc2626", fontWeight: 500 }}>
-                      {isPositive ? "+" : ""}
-                      {sym}{Math.abs(delta).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      {formatCashDelta(delta, record.currency)}
                     </span>
                   );
                 },
@@ -1163,11 +1134,10 @@ export default function HoldingsPage() {
                 key: "runningBalance",
                 width: 160,
                 align: "right" as const,
-                render: (_: unknown, record: CashFlowRow) => {
-                  const sym = currencySymbol[record.currency] ?? "";
+                render: (_: unknown, record: CashBalanceReconciliationRow) => {
                   return (
                     <span style={{ fontWeight: 500 }}>
-                      {sym}{record.runningBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      {formatMoney(record.running_balance, record.currency)}
                     </span>
                   );
                 },

@@ -243,6 +243,8 @@ pub fn run() {
             commands::holdings::create_holding,
             commands::holdings::get_holdings,
             commands::holdings::update_holding,
+            commands::holdings::get_cash_balance_reconciliation,
+            commands::holdings::correct_cash_balance,
             commands::holdings::delete_holding,
             commands::transactions::create_transaction,
             commands::transactions::get_transactions,

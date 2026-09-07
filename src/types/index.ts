@@ -55,6 +55,31 @@ export interface Transaction {
   created_at: string;
 }
 
+export interface CashBalanceReconciliationRow extends Transaction {
+  cash_delta: number;
+  running_balance: number;
+}
+
+export interface CashBalanceReconciliation {
+  holding_id: string;
+  account_id: string;
+  currency: Currency;
+  current_balance: number;
+  recommended_balance: number | null;
+  difference: number | null;
+  revision: number;
+  opening_count: number;
+  rows: CashBalanceReconciliationRow[];
+}
+
+export interface CorrectCashBalancePayload {
+  id: string;
+  balance: number;
+  expectedRevision: number;
+  name: string;
+  categoryId?: string;
+}
+
 export interface StockQuote {
   symbol: string;
   name: string;

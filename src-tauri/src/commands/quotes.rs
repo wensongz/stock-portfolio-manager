@@ -352,12 +352,10 @@ pub(crate) fn persist_holding_quote_refresh(
     }
 }
 
-/// Load realized PnL for every cleared non-cash position in one grouped query.
-///   realized_pnl = SUM(SELL total_amount - commission) - SUM((BUY|OPEN) total_amount + commission)
-///   total_buy_cost = SUM((BUY|OPEN) total_amount + commission)  [used for % calculation]
-/// OPEN transactions are position-entry records (create_holding / backfill)
-/// with no cash impact, but their total_amount is the position's cost basis
-/// and must count toward realized PnL.
+/// Load realized PnL for cleared non-cash positions. OPEN and STOCK_IN supply
+/// acquisition cost without cash impact; STOCK_OUT removes carried acquisition
+/// cost without sale proceeds. Replay only extracted positions to adjust the
+/// grouped cost totals, keeping transfers out of realized sale profits.
 fn load_realized_pnl_by_holding(
     conn: &rusqlite::Connection,
 ) -> Result<std::collections::HashMap<String, (f64, f64)>, rusqlite::Error> {
@@ -365,11 +363,11 @@ fn load_realized_pnl_by_holding(
         "SELECT h.id,
                 COALESCE(SUM(CASE
                     WHEN t.transaction_type = 'SELL' THEN t.total_amount - t.commission
-                    WHEN t.transaction_type IN ('BUY', 'OPEN') THEN -(t.total_amount + t.commission)
+                    WHEN t.transaction_type IN ('BUY', 'OPEN', 'STOCK_IN') THEN -(t.total_amount + t.commission)
                     ELSE 0
                 END), 0.0),
                 COALESCE(SUM(CASE
-                    WHEN t.transaction_type IN ('BUY', 'OPEN') THEN t.total_amount + t.commission
+                    WHEN t.transaction_type IN ('BUY', 'OPEN', 'STOCK_IN') THEN t.total_amount + t.commission
                     ELSE 0
                 END), 0.0)
            FROM holdings h
@@ -384,7 +382,53 @@ fn load_realized_pnl_by_holding(
             (row.get::<_, f64>(1)?, row.get::<_, f64>(2)?),
         ))
     })?;
-    rows.collect()
+    let mut results: std::collections::HashMap<String, (f64, f64)> =
+        rows.collect::<Result<_, _>>()?;
+    // Remove the acquisition basis carried out of the account. Track the
+    // unsold acquisition basis independently of the optional breakeven-cost
+    // display adjustment: extracting shares must not erase past sale profits.
+    let mut transfer_stmt = conn.prepare(
+        "SELECT h.id, t.transaction_type, t.shares, t.total_amount, t.commission
+         FROM holdings h JOIN transactions t ON t.holding_id = h.id
+         WHERE h.shares = 0 AND h.symbol NOT LIKE '$CASH-%'
+           AND EXISTS (SELECT 1 FROM transactions x WHERE x.holding_id = h.id
+                       AND x.transaction_type = 'STOCK_OUT')
+         ORDER BY h.id, t.traded_at, t.created_at, t.id",
+    )?;
+    let transfers = transfer_stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, f64>(2)?,
+            row.get::<_, f64>(3)?,
+            row.get::<_, f64>(4)?,
+        ))
+    })?;
+    let mut inventory: std::collections::HashMap<String, (f64, f64)> =
+        std::collections::HashMap::new();
+    for row in transfers {
+        let (id, kind, shares, amount, fee) = row?;
+        let (held, basis) = inventory.entry(id.clone()).or_default();
+        match kind.as_str() {
+            "OPEN" | "BUY" | "STOCK_IN" => {
+                *held += shares;
+                *basis += amount + fee;
+            }
+            "SELL" | "STOCK_OUT" if *held > 0.0 => {
+                let removed = *basis * (shares / *held).min(1.0);
+                *held = (*held - shares).max(0.0);
+                *basis -= removed;
+                if kind == "STOCK_OUT" {
+                    if let Some((pnl, cost)) = results.get_mut(&id) {
+                        *pnl += removed;
+                        *cost -= removed;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(results)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -657,6 +701,26 @@ mod tests {
             }
         }
         (db, holding_id)
+    }
+
+    #[test]
+    fn stock_transfers_realized_pnl_excludes_extracted_cost() {
+        let (db, holding_id) = db_with_cleared_position();
+        let conn = db.conn.lock().unwrap();
+        let original = load_realized_pnl_by_holding(&conn).unwrap()[&holding_id];
+        conn.execute(
+            "UPDATE transactions SET transaction_type='STOCK_IN' WHERE transaction_type='OPEN'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            load_realized_pnl_by_holding(&conn).unwrap()[&holding_id],
+            original
+        );
+        conn.execute("UPDATE transactions SET transaction_type='STOCK_OUT', price=0, total_amount=0, commission=0 WHERE transaction_type='SELL'", []).unwrap();
+        let result = load_realized_pnl_by_holding(&conn).unwrap()[&holding_id];
+        assert!(result.0.abs() < 1e-6, "{}", result.0);
+        assert!(result.1.abs() < 1e-6, "{}", result.1);
     }
 
     #[test]

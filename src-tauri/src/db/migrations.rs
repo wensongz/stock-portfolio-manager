@@ -1,7 +1,7 @@
 use super::schema;
 use rusqlite::{Connection, Error, OptionalExtension, Result};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 8;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 pub(crate) fn run_migrations(conn: &mut Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -43,6 +43,10 @@ pub(crate) fn run_migrations(conn: &mut Connection) -> Result<()> {
     }
     if version < 8 {
         super::quarterly_schema::migrate_currency(&transaction)?;
+    }
+    if version < 9 {
+        migrate_transactions_check_constraint(&transaction)?;
+        schema::create_portfolio_query_indexes(&transaction)?;
     }
     transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     transaction.commit()
@@ -237,7 +241,11 @@ fn migrate_transactions_check_constraint(conn: &Connection) -> Result<()> {
         [],
         |row| row.get(0),
     )?;
-    if definition.contains("'OPEN'") && definition.contains("'PAY'") {
+    if definition.contains("'OPEN'")
+        && definition.contains("'PAY'")
+        && definition.contains("'STOCK_IN'")
+        && definition.contains("'STOCK_OUT'")
+    {
         return Ok(());
     }
 
@@ -249,7 +257,7 @@ fn migrate_transactions_check_constraint(conn: &Connection) -> Result<()> {
            symbol TEXT NOT NULL,
            name TEXT NOT NULL,
            market TEXT NOT NULL CHECK(market IN ('US', 'CN', 'HK')),
-           transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'OPEN', 'PAY')),
+           transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'OPEN', 'PAY', 'STOCK_IN', 'STOCK_OUT')),
            shares REAL NOT NULL,
            price REAL NOT NULL,
            total_amount REAL NOT NULL,

@@ -231,6 +231,11 @@ pub fn get_quarterly_snapshot_detail(
             // A symbol group may contain trades settled in different currencies.
             // Convert each trade before summing; the group currency is insufficient.
             for txn in &g.transactions {
+                match txn.transaction_type.as_str() {
+                    "STOCK_IN" => entry.0 += txn.shares,
+                    "STOCK_OUT" => entry.0 -= txn.shares,
+                    _ => {}
+                }
                 let sign = match txn.transaction_type.as_str() {
                     "BUY" => 1.0,
                     "SELL" => -1.0,

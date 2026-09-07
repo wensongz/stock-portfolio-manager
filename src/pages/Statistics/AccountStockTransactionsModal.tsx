@@ -83,8 +83,8 @@ export default function AccountStockTransactionsModal({
             key: "transaction_type",
             width: 80,
             render: (type: TransactionType) => (
-              <Tag color={type === "BUY" ? "green" : type === "OPEN" ? "blue" : type === "PAY" ? "orange" : "red"}>
-                {type === "BUY" ? "买入" : type === "OPEN" ? "建仓" : type === "PAY" ? "分红" : "卖出"}
+              <Tag color={type === "STOCK_IN" ? "cyan" : type === "STOCK_OUT" ? "purple" : type === "BUY" ? "green" : type === "OPEN" ? "blue" : type === "PAY" ? "orange" : "red"}>
+                {type === "STOCK_IN" ? "存入股票" : type === "STOCK_OUT" ? "提取股票" : type === "BUY" ? "买入" : type === "OPEN" ? "建仓" : type === "PAY" ? "分红" : "卖出"}
               </Tag>
             ),
           },

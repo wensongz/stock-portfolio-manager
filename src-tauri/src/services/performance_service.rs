@@ -2,6 +2,24 @@ use crate::db::Database;
 use crate::models::performance::PerformanceReport;
 use chrono::NaiveDate;
 
+// Transfers are external asset flows valued at the latest historical close on
+// or before the transfer date, never at their acquisition cost or zero proceeds.
+// Keep this expression shared by portfolio returns, attribution and rankings.
+pub(super) const TRANSFER_VALUE_SQL: &str = "CASE
+    WHEN t.transaction_type IN ('STOCK_IN', 'STOCK_OUT') THEN t.shares * (
+        SELECT h.close_price FROM daily_holding_snapshots h
+        WHERE h.account_id = t.account_id AND UPPER(h.symbol) = UPPER(t.symbol)
+          AND h.market = t.market AND h.date <= DATE(t.traded_at)
+          AND h.close_price > 0
+        ORDER BY h.date DESC, h.id DESC LIMIT 1)
+    ELSE t.total_amount END";
+
+pub(super) fn require_flow_value(value: Option<f64>) -> Result<f64, String> {
+    value
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| "缺少股票存入或提取时的历史估值，请先补齐发生日或此前的持仓快照".to_string())
+}
+
 pub(super) const RISK_FREE_RATE: f64 = 0.045; // 4.5% US 10-year treasury default
 pub(super) const TRADING_DAYS_PER_YEAR: f64 = 252.0;
 

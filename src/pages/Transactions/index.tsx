@@ -87,6 +87,8 @@ export default function TransactionsPage() {
   const [form] = Form.useForm();
   const watchedType = Form.useWatch("transactionType", form);
   const isDividend = watchedType === "PAY";
+  const isStockTransfer = watchedType === "STOCK_IN" || watchedType === "STOCK_OUT";
+  const isStockOut = watchedType === "STOCK_OUT";
   // Cash deposit/withdraw: 存入现金 → $CASH-* BUY; 提取现金 → $CASH-* SELL
   const isCashTxn = watchedType === "CASH_IN" || watchedType === "CASH_OUT";
   const cashDirection = watchedType === "CASH_IN" ? "BUY" : "SELL";
@@ -222,7 +224,7 @@ export default function TransactionsPage() {
     symbol: string;
     name: string;
     market: Market;
-    transactionType: TransactionType;
+    transactionType: TransactionType | "CASH_IN" | "CASH_OUT";
     shares: number;
     price: number;
     totalAmount: number;
@@ -240,9 +242,14 @@ export default function TransactionsPage() {
       return;
     }
     // For cash deposit/withdraw, map to $CASH-* BUY/SELL with fixed fields
+    const stockSubmitted = values.transactionType === "STOCK_IN"
+      ? { ...submittedValues, totalAmount: values.shares * values.price, commission: 0 }
+      : values.transactionType === "STOCK_OUT"
+        ? { ...submittedValues, price: 0, totalAmount: 0, commission: 0 }
+        : submittedValues;
     const cashSubmitted = isCashTxn
       ? {
-          ...submittedValues,
+          ...stockSubmitted,
           transactionType: cashDirection as TransactionType, // BUY (deposit) or SELL (withdraw)
           symbol: `${CASH_SYMBOL_PREFIX}${values.currency}`,
           name: `现金 (${values.currency})`,
@@ -250,7 +257,7 @@ export default function TransactionsPage() {
           price: 0,
           commission: 0,
         }
-      : submittedValues;
+      : { ...stockSubmitted, transactionType: stockSubmitted.transactionType as TransactionType };
     try {
       if (editingTransaction) {
         await updateTransaction({
@@ -381,8 +388,8 @@ export default function TransactionsPage() {
           );
         }
         return (
-          <Tag color={type === "BUY" ? "green" : type === "OPEN" ? "blue" : type === "PAY" ? "orange" : "red"}>
-            {type === "BUY" ? "买入" : type === "OPEN" ? "建仓" : type === "PAY" ? "分红" : "卖出"}
+          <Tag color={type === "STOCK_IN" ? "cyan" : type === "STOCK_OUT" ? "purple" : type === "BUY" ? "green" : type === "OPEN" ? "blue" : type === "PAY" ? "orange" : "red"}>
+            {type === "STOCK_IN" ? "存入股票" : type === "STOCK_OUT" ? "提取股票" : type === "BUY" ? "买入" : type === "OPEN" ? "建仓" : type === "PAY" ? "分红" : "卖出"}
           </Tag>
         );
       },
@@ -399,13 +406,13 @@ export default function TransactionsPage() {
       dataIndex: "price",
       key: "price",
       render: (v: number, record: Transaction) =>
-        record.symbol.startsWith(CASH_SYMBOL_PREFIX) ? "—" : `${currencySymbol[record.currency]}${v.toFixed(2)}`,
+        record.symbol.startsWith(CASH_SYMBOL_PREFIX) || record.transaction_type === "STOCK_OUT" ? "—" : `${currencySymbol[record.currency]}${v.toFixed(2)}`,
     },
     {
       title: "总金额",
       dataIndex: "total_amount",
       key: "total_amount",
-      render: (v: number, record: Transaction) => `${currencySymbol[record.currency]}${v.toFixed(2)}`,
+      render: (v: number, record: Transaction) => record.transaction_type === "STOCK_OUT" ? "—" : `${currencySymbol[record.currency]}${v.toFixed(2)}`,
     },
     {
       title: "手续费",
@@ -610,26 +617,33 @@ export default function TransactionsPage() {
             <Col span={12}>
               <Form.Item name="transactionType" label="交易类型" style={{ marginBottom: 12 }}
                 rules={[{ required: true, message: "请选择交易类型" }]}>
-                <Select placeholder="买入 / 卖出 / 分红">
+                <Select placeholder="选择交易类型">
                   <Select.Option value="BUY">买入</Select.Option>
                   <Select.Option value="SELL">卖出</Select.Option>
                   <Select.Option value="PAY">分红</Select.Option>
                   <Select.Option value="CASH_IN">存入现金</Select.Option>
                   <Select.Option value="CASH_OUT">提取现金</Select.Option>
+                  <Select.Option value="STOCK_IN">存入股票</Select.Option>
+                  <Select.Option value="STOCK_OUT">提取股票</Select.Option>
                 </Select>
               </Form.Item>
             </Col>
             <Col span={12}>
-              <Form.Item name="tradedAt" label="成交时间" style={{ marginBottom: 12 }}
+              <Form.Item name="tradedAt" label={isStockTransfer ? "发生时间" : "成交时间"} style={{ marginBottom: 12 }}
                 rules={[{ required: true, message: "请选择成交时间" }]}>
                 <DatePicker showTime style={{ width: "100%" }} />
               </Form.Item>
             </Col>
           </Row>
+          {isStockTransfer && (
+            <Typography.Paragraph type="secondary">
+              {isStockOut ? "按原持仓成本提取股票，不增加现金、不计入卖出收益。提取数量不能超过发生时间的持仓。" : "按填写的每股成本存入股票并计算持仓均价，不扣除现金。"}
+            </Typography.Paragraph>
+          )}
           {!isDividend && !isCashTxn && (
             <Row gutter={12}>
               <Col span={12}>
-                <Form.Item name="shares" label="交易股数" style={{ marginBottom: 12 }}
+                <Form.Item name="shares" label={isStockTransfer ? (isStockOut ? "提取股数" : "存入股数") : "交易股数"} style={{ marginBottom: 12 }}
                   rules={[{ required: true, message: "请输入交易股数" }]}>
                   <InputNumber
                     {...shareInputProps(selectedFormMarket)}
@@ -637,16 +651,16 @@ export default function TransactionsPage() {
                     onChange={handleAmountFieldChange} />
                 </Form.Item>
               </Col>
-              <Col span={12}>
-                <Form.Item name="price" label="成交价格" style={{ marginBottom: 12 }}
-                  rules={[{ required: true, message: "请输入成交价格" }]}>
+              {!isStockOut && <Col span={12}>
+                <Form.Item name="price" label={watchedType === "STOCK_IN" ? "每股成本" : "成交价格"} style={{ marginBottom: 12 }}
+                  rules={[{ required: true, message: watchedType === "STOCK_IN" ? "请输入每股成本" : "请输入成交价格" }]}>
                   <InputNumber min={0} precision={4} style={{ width: "100%" }}
                     onChange={handleAmountFieldChange} />
                 </Form.Item>
-              </Col>
+              </Col>}
             </Row>
           )}
-          <Row gutter={12}>
+          {!isStockTransfer && <Row gutter={12}>
             <Col span={12}>
               <Form.Item name="totalAmount" label="成交总额" style={{ marginBottom: 12 }}
                 rules={[{ required: true, message: "请输入成交总额" }]}>
@@ -658,7 +672,7 @@ export default function TransactionsPage() {
                 <InputNumber min={0} precision={2} style={{ width: "100%" }} />
               </Form.Item>
             </Col>
-          </Row>
+          </Row>}
           <Row gutter={12}>
             <Col span={12}>
               <Form.Item name="market" label="市场" style={{ marginBottom: 12 }}

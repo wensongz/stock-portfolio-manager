@@ -184,7 +184,7 @@ pub(super) fn load_historical_holdings(
                 state.holding.shares = shares;
                 state.holding.avg_cost = price;
             }
-            "BUY" => {
+            "BUY" | "STOCK_IN" => {
                 let new_shares = state.holding.shares + shares;
                 if new_shares > 0.0 {
                     state.holding.avg_cost = (state.holding.shares * state.holding.avg_cost
@@ -194,7 +194,7 @@ pub(super) fn load_historical_holdings(
                 }
                 state.holding.shares = new_shares;
             }
-            "SELL" => {
+            "SELL" | "STOCK_OUT" => {
                 let remaining = state.holding.shares - shares;
                 if remaining < -1e-9 {
                     return Err(format!(
@@ -202,13 +202,16 @@ pub(super) fn load_historical_holdings(
                         state.holding.account_id, state.holding.market, state.holding.symbol
                     ));
                 }
-                if adjust_cost {
+                if adjust_cost && transaction_type == "SELL" {
                     state.holding.avg_cost = if remaining > 1e-9 {
                         (state.holding.shares * state.holding.avg_cost - total_amount + commission)
                             / remaining
                     } else {
                         0.0
                     };
+                }
+                if transaction_type == "STOCK_OUT" && remaining <= 1e-9 {
+                    state.holding.avg_cost = 0.0;
                 }
                 state.holding.shares = remaining.max(0.0);
             }
@@ -995,6 +998,66 @@ mod tests {
              VALUES (?1, ?1, '$CASH-USD', 'USD Cash', 'US', ?2, 1, 'USD', ?3, ?3)",
             rusqlite::params![account, balance, created_at],
         ).unwrap();
+    }
+
+    #[test]
+    fn stock_transfers_reconstruct_historical_holdings_and_cash() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct-a", "账户 A");
+        insert_transaction(
+            &db,
+            "cash",
+            "acct-a",
+            "$CASH-USD",
+            "Cash",
+            "OPEN",
+            1000.0,
+            1.0,
+            1000.0,
+            0.0,
+            "2025-01-01",
+        );
+        insert_transaction(
+            &db,
+            "in",
+            "acct-a",
+            "AAPL",
+            "Apple",
+            "STOCK_IN",
+            10.0,
+            20.0,
+            200.0,
+            0.0,
+            "2025-01-02",
+        );
+        insert_transaction(
+            &db,
+            "out",
+            "acct-a",
+            "AAPL",
+            "Apple",
+            "STOCK_OUT",
+            4.0,
+            0.0,
+            0.0,
+            0.0,
+            "2025-02-02",
+        );
+        for (month, shares) in [(1, 10.0), (3, 6.0)] {
+            let holdings =
+                load_historical_holdings(&db, NaiveDate::from_ymd_opt(2025, month, 28).unwrap())
+                    .unwrap();
+            let stock = holdings.iter().find(|h| h.symbol == "AAPL").unwrap();
+            assert_eq!((stock.shares, stock.avg_cost), (shares, 20.0));
+            assert_eq!(
+                holdings
+                    .iter()
+                    .find(|h| h.symbol == "$CASH-USD")
+                    .unwrap()
+                    .shares,
+                1000.0
+            );
+        }
     }
 
     #[test]

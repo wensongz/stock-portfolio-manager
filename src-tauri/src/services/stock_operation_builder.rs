@@ -70,8 +70,15 @@ pub(crate) fn build_raw_stock_operations(transactions: &[Transaction]) -> Vec<Ra
             market_key.clone(),
         );
 
-        if transaction.transaction_type == "OPEN" {
+        if matches!(transaction.transaction_type.as_str(), "OPEN" | "STOCK_IN") {
             *shares_by_position.entry(position_key.clone()).or_default() += transaction.shares;
+            latest_action_by_position.remove(&position_key);
+            continue;
+        }
+
+        if transaction.transaction_type == "STOCK_OUT" {
+            let held = shares_by_position.entry(position_key.clone()).or_default();
+            *held = (*held - transaction.shares).max(0.0);
             latest_action_by_position.remove(&position_key);
             continue;
         }
@@ -390,6 +397,27 @@ mod tests {
         assert_eq!(
             (actions[2].account_id.as_str(), actions[2].market.as_str()),
             ("account-1", "HK")
+        );
+    }
+
+    #[test]
+    fn stock_transfers_update_inventory_without_creating_trade_actions() {
+        let actions = build_raw_stock_operations(&[
+            transaction("in", "STOCK_IN", 10.0, 20.0, "2026-07-01T09:00:00Z"),
+            transaction("sell", "SELL", 5.0, 30.0, "2026-07-01T10:00:00Z"),
+            transaction("out", "STOCK_OUT", 5.0, 0.0, "2026-07-01T11:00:00Z"),
+            transaction("buy", "BUY", 3.0, 30.0, "2026-07-01T12:00:00Z"),
+        ]);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].action_type, "reduce");
+        assert_eq!(
+            (actions[0].shares_before, actions[0].shares_after),
+            (10.0, 5.0)
+        );
+        assert_eq!(actions[1].action_type, "open");
+        assert_eq!(
+            (actions[1].shares_before, actions[1].shares_after),
+            (0.0, 3.0)
         );
     }
 

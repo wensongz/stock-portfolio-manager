@@ -470,6 +470,42 @@ mod tests {
     }
 
     #[test]
+    fn stock_transfers_appear_in_quarterly_holding_changes() {
+        let db = mixed_currency_quarters();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM quarterly_holding_snapshots WHERE id IN ('q1-cn', 'q2-us')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO accounts (id,name,market,created_at,updated_at) VALUES ('acct','Account','US','2025-01-01','2025-01-01')", []).unwrap();
+            for (kind, symbol, market, currency) in [
+                ("STOCK_IN", "600000", "CN", "CNY"),
+                ("STOCK_OUT", "AAPL", "US", "USD"),
+            ] {
+                conn.execute("INSERT INTO transactions (id,account_id,symbol,name,market,transaction_type,shares,price,total_amount,currency,traded_at,created_at) VALUES (?1,'acct',?2,?2,?3,?1,1,0,0,?4,'2025-04-01','2025-04-01')", rusqlite::params![kind,symbol,market,currency]).unwrap();
+            }
+        }
+        let changes = get_quarterly_snapshot_detail(&db, "q2")
+            .unwrap()
+            .holding_changes
+            .unwrap();
+        let added = changes
+            .new_holdings
+            .iter()
+            .find(|h| h.symbol == "600000")
+            .unwrap();
+        assert_eq!(added.q2_shares, Some(1.0));
+        let removed = changes
+            .closed_holdings
+            .iter()
+            .find(|h| h.symbol == "AAPL")
+            .unwrap();
+        assert_eq!(removed.shares_change, -1.0);
+    }
+
+    #[test]
     fn detail_holding_change_fallback_converts_each_transaction_to_market_currency() {
         let db = mixed_currency_quarters();
         let conn = db.conn.lock().unwrap();

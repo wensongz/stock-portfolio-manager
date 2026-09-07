@@ -374,7 +374,7 @@ fn accumulate_transaction_unwind(
         ),
     );
     match transaction_type {
-        "OPEN" => {
+        "OPEN" | "STOCK_IN" => {
             *unwind.entry(key).or_insert(0.0) -= shares;
         }
         "BUY" => {
@@ -384,6 +384,9 @@ fn accumulate_transaction_unwind(
         "SELL" => {
             *unwind.entry(key).or_insert(0.0) += shares;
             *unwind.entry(cash_key).or_insert(0.0) -= total_amount - commission;
+        }
+        "STOCK_OUT" => {
+            *unwind.entry(key).or_insert(0.0) += shares;
         }
         "PAY" => {
             *unwind.entry(cash_key).or_insert(0.0) -= total_amount - commission;
@@ -701,7 +704,7 @@ where
                 "SELECT account_id, symbol, price
                  FROM transactions
                  WHERE DATE(traded_at) < ?1
-                   AND UPPER(transaction_type) IN ('BUY', 'OPEN')
+                   AND UPPER(transaction_type) IN ('BUY', 'OPEN', 'STOCK_IN')
                    AND price > 0
                  ORDER BY traded_at ASC",
             )
@@ -911,7 +914,7 @@ where
         // Advance running_unwind past transactions on or before this date.
         while txn_idx < transactions.len() && transactions[txn_idx].trade_date <= *date {
             let tx = &transactions[txn_idx];
-            if matches!(tx.transaction_type.as_str(), "BUY" | "OPEN")
+            if matches!(tx.transaction_type.as_str(), "BUY" | "OPEN" | "STOCK_IN")
                 && tx.price > 0.0
                 && !crate::services::quote_service::is_cash_symbol(&tx.symbol)
             {
@@ -1706,6 +1709,24 @@ mod tests {
             .unwrap()
         };
         assert!((pre_listing_price_after_late_start - 10.11).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stock_transfers_unwind_shares_without_cash() {
+        let mut unwind = std::collections::HashMap::new();
+        accumulate_transaction_unwind(
+            &mut unwind,
+            "a",
+            "AAPL",
+            "STOCK_IN",
+            10.0,
+            200.0,
+            0.0,
+            "USD",
+        );
+        accumulate_transaction_unwind(&mut unwind, "a", "AAPL", "STOCK_OUT", 4.0, 0.0, 0.0, "USD");
+        assert_eq!(unwind[&("a".into(), "AAPL".into())], -6.0);
+        assert!(!unwind.contains_key(&("a".into(), "$CASH-USD".into())));
     }
 
     #[test]

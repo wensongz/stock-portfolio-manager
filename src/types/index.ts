@@ -1,6 +1,6 @@
 export type Market = "US" | "CN" | "HK";
 export type Currency = "USD" | "CNY" | "HKD";
-export type TransactionType = "BUY" | "SELL" | "OPEN" | "PAY";
+export type TransactionType = "BUY" | "SELL" | "OPEN" | "PAY" | "STOCK_IN" | "STOCK_OUT";
 
 export * from "./portfolioAlert";
 

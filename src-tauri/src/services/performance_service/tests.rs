@@ -1069,3 +1069,29 @@ fn test_max_drawdown_includes_loss_from_baseline_to_first_visible_day() {
     assert_eq!(drawdown.drawdown_duration, 1);
     assert_eq!(drawdown.recovery_date, None);
 }
+
+#[test]
+fn stock_transfers_do_not_become_performance_gains_or_losses() {
+    for (kind, value) in [("STOCK_IN", 185.0), ("STOCK_OUT", 145.0)] {
+        let db = cash_flow_performance_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("UPDATE daily_portfolio_values SET total_value=?1, us_value=?1 WHERE date='2024-01-03'", [value]).unwrap();
+            conn.execute("INSERT INTO daily_holding_snapshots (date,account_id,symbol,market,shares,avg_cost,close_price,market_value) VALUES ('2024-01-03','acct-us','SPY','US',1,10,20,20)", []).unwrap();
+            conn.execute("INSERT INTO transactions (id,account_id,symbol,name,market,transaction_type,shares,price,total_amount,commission,currency,traded_at,created_at) VALUES ('transfer','acct-us','SPY','SPY','US',?1,1,0,0,0,'USD','2024-01-03','2024-01-03')", [kind]).unwrap();
+        }
+        let summary = get_performance_summary(
+            &db,
+            parse_date("2024-01-02").unwrap(),
+            parse_date("2024-01-03").unwrap(),
+            &PerformanceFilter::default(),
+        )
+        .unwrap();
+        assert!(
+            (summary.total_pnl - 15.0).abs() < 1e-9,
+            "{kind}: {}",
+            summary.total_pnl
+        );
+        assert!((summary.total_return - 15.0).abs() < 1e-9);
+    }
+}

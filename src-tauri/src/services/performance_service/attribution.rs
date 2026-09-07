@@ -219,6 +219,10 @@ pub(super) fn return_attribution_from(
             sql.push_str(&format!(" AND t.market = ?{}", params.len() + 1));
             params.push(Box::new(market.clone()));
         }
+        sql = sql.replace(
+            "t.total_amount,",
+            &format!("{},", super::TRANSFER_VALUE_SQL),
+        );
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -229,7 +233,7 @@ pub(super) fn return_attribution_from(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, f64>(4)?,
+                    row.get::<_, Option<f64>>(4)?,
                     row.get::<_, f64>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
@@ -240,10 +244,12 @@ pub(super) fn return_attribution_from(
             .map_err(|e| e.to_string())?;
         for (account_id, symbol, market, tx_type, amount, commission, currency, rates_json) in rows
         {
+            let amount = super::require_flow_value(amount)?;
             let native_flow = match tx_type.as_str() {
                 "BUY" => amount + commission,
                 "SELL" | "PAY" => -(amount - commission),
-                "OPEN" => amount + commission,
+                "OPEN" | "STOCK_IN" => amount + commission,
+                "STOCK_OUT" => -amount,
                 _ => continue,
             };
             let flow = if normalize_to_usd && currency != "USD" {

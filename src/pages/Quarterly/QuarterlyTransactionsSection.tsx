@@ -38,6 +38,8 @@ function TransactionDetailTable({ transactions }: { transactions: Transaction[] 
       key: "transaction_type",
       render: (t: string) => {
         switch (t) {
+          case "STOCK_IN": return <Tag color="cyan">存入股票</Tag>;
+          case "STOCK_OUT": return <Tag color="purple">提取股票</Tag>;
           case "BUY": return <Tag color="green">买入</Tag>;
           case "SELL": return <Tag color="red">卖出</Tag>;
           case "PAY": return <Tag color="orange">分红</Tag>;

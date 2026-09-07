@@ -75,7 +75,7 @@ pub(crate) fn replay_transactions(
                 projection.shares = transaction.shares;
                 projection.avg_cost = transaction.price;
             }
-            "BUY" => {
+            "BUY" | "STOCK_IN" => {
                 let new_shares = projection.shares + transaction.shares;
                 if new_shares <= 0.0 {
                     return Err("BUY must leave a positive historical position".to_string());
@@ -86,7 +86,7 @@ pub(crate) fn replay_transactions(
                     / new_shares;
                 projection.shares = new_shares;
             }
-            "SELL" => {
+            "SELL" | "STOCK_OUT" => {
                 let remaining = projection.shares - transaction.shares;
                 // Allow a few floating-point ulps for sums such as 0.1 + 0.7,
                 // not an absolute epsilon that erases real tiny positions.
@@ -96,8 +96,8 @@ pub(crate) fn replay_transactions(
                         .min(POSITION_EPSILON);
                 if remaining < -tolerance {
                     return Err(format!(
-                        "SELL of {} exceeds historical position of {}",
-                        transaction.shares, projection.shares
+                        "{} of {} exceeds historical position of {}",
+                        transaction.transaction_type, transaction.shares, projection.shares
                     ));
                 }
                 let remaining = if remaining.abs() <= tolerance {
@@ -105,7 +105,7 @@ pub(crate) fn replay_transactions(
                 } else {
                     remaining
                 };
-                if adjust_sell_pay_cost {
+                if adjust_sell_pay_cost && transaction.transaction_type == "SELL" {
                     projection.avg_cost = if remaining > 0.0 {
                         (projection.shares * projection.avg_cost - transaction.total_amount
                             + transaction.commission)
@@ -113,6 +113,9 @@ pub(crate) fn replay_transactions(
                     } else {
                         0.0
                     };
+                }
+                if transaction.transaction_type == "STOCK_OUT" && remaining == 0.0 {
+                    projection.avg_cost = 0.0;
                 }
                 projection.shares = remaining;
             }
@@ -212,9 +215,12 @@ fn apply_group_projection(
         .collect();
     let projection = replay_transactions(&replay_rows, market_adjusts_sell_pay_cost(conn, market))?;
 
-    let produces_position = transactions
-        .iter()
-        .any(|transaction| matches!(transaction.replay.transaction_type.as_str(), "OPEN" | "BUY"));
+    let produces_position = transactions.iter().any(|transaction| {
+        matches!(
+            transaction.replay.transaction_type.as_str(),
+            "OPEN" | "BUY" | "STOCK_IN"
+        )
+    });
     let now = chrono::Utc::now().to_rfc3339();
     let primary_id = if let Some(primary) = holdings.first() {
         conn.execute(
@@ -409,6 +415,32 @@ mod tests {
                 .unwrap();
         }
         database
+    }
+
+    #[test]
+    fn stock_transfers_preserve_cost_without_sale_proceeds() {
+        for adjust in [false, true] {
+            let projection = replay_transactions(
+                &[
+                    transaction("STOCK_IN", 10.0, 20.0, 200.0, 0.0),
+                    transaction("STOCK_IN", 10.0, 40.0, 400.0, 0.0),
+                    transaction("STOCK_OUT", 5.0, 0.0, 0.0, 0.0),
+                ],
+                adjust,
+            )
+            .unwrap();
+            assert_eq!(projection.shares, 15.0);
+            assert_eq!(projection.avg_cost, 30.0);
+            assert!(replay_transactions(
+                &[
+                    transaction("STOCK_IN", 1.0, 20.0, 20.0, 0.0),
+                    transaction("STOCK_OUT", 2.0, 0.0, 0.0, 0.0),
+                ],
+                adjust
+            )
+            .unwrap_err()
+            .contains("exceeds"));
+        }
     }
 
     #[test]

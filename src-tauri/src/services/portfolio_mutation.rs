@@ -91,12 +91,22 @@ pub(crate) fn validate_transaction_values(input: &CreateTransactionInput) -> Res
     validate_market_and_currency(&input.market, &input.currency)?;
     if !matches!(
         input.transaction_type.as_str(),
-        "BUY" | "SELL" | "OPEN" | "PAY"
+        "BUY" | "SELL" | "OPEN" | "PAY" | "STOCK_IN" | "STOCK_OUT"
     ) {
         return Err(format!(
             "Unsupported transaction type: {}",
             input.transaction_type
         ));
+    }
+    if matches!(input.transaction_type.as_str(), "STOCK_IN" | "STOCK_OUT") {
+        if is_cash_symbol(&input.symbol) || input.commission != 0.0 {
+            return Err("股票存入和提取仅适用于股票，手续费必须为零".into());
+        }
+        if input.transaction_type == "STOCK_OUT"
+            && (input.price != 0.0 || input.total_amount != 0.0)
+        {
+            return Err("提取股票不产生现金成交额，价格和总额必须为零".into());
+        }
     }
     validate_transaction_shares(
         &input.market,
@@ -120,7 +130,7 @@ pub(crate) fn validate_transaction_values(input: &CreateTransactionInput) -> Res
     if input.transaction_type != "OPEN" && input.total_amount < 0.0 {
         return Err("Transaction total_amount must be non-negative".to_string());
     }
-    if matches!(input.transaction_type.as_str(), "BUY" | "SELL") && input.price < 0.0 {
+    if matches!(input.transaction_type.as_str(), "BUY" | "SELL" | "STOCK_IN") && input.price < 0.0 {
         return Err("Transaction price must be non-negative".to_string());
     }
     Ok(())
@@ -142,7 +152,7 @@ pub(crate) fn cash_delta(
     match transaction_type {
         "BUY" => -(total_amount + commission),
         "SELL" | "PAY" => total_amount - commission,
-        "OPEN" => 0.0,
+        "OPEN" | "STOCK_IN" | "STOCK_OUT" => 0.0,
         other => panic!("Unexpected transaction_type for cash_delta: {other}"),
     }
 }
@@ -708,6 +718,122 @@ mod tests {
             )
             .unwrap();
         (transaction_count, stock_shares, cash_shares)
+    }
+
+    #[test]
+    fn stock_transfers_invalid_history_rolls_back_atomically() {
+        let db = database_with_account();
+        let (incoming, outgoing) = {
+            let mut conn = db.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            let incoming = create_transaction_in(
+                &tx,
+                &stock_transaction("STOCK_IN", 10.0, 20.0, 200.0, "2026-01-02"),
+            )
+            .unwrap();
+            let outgoing = create_transaction_in(
+                &tx,
+                &stock_transaction("STOCK_OUT", 4.0, 0.0, 0.0, "2026-01-03"),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            (incoming, outgoing)
+        };
+        let baseline = portfolio_counts(&db);
+        for action in 0..4 {
+            {
+                let mut conn = db.conn.lock().unwrap();
+                let tx = conn.transaction().unwrap();
+                let result = match action {
+                    0 => create_transaction_in(
+                        &tx,
+                        &stock_transaction("STOCK_OUT", 7.0, 0.0, 0.0, "2026-01-04"),
+                    )
+                    .map(|_| ()),
+                    1 => super::update_transaction_in(
+                        &tx,
+                        &outgoing.id,
+                        &stock_transaction("STOCK_OUT", 4.0, 0.0, 0.0, "2026-01-01"),
+                    )
+                    .map(|_| ()),
+                    2 => super::delete_transaction_in(&tx, &incoming.id),
+                    _ => super::update_transaction_in(
+                        &tx,
+                        &incoming.id,
+                        &stock_transaction("STOCK_IN", 3.0, 20.0, 60.0, "2026-01-02"),
+                    )
+                    .map(|_| ()),
+                };
+                assert!(result.unwrap_err().contains("historical position"));
+            }
+            assert_eq!(portfolio_counts(&db), baseline);
+        }
+    }
+
+    #[test]
+    fn stock_transfers_validate_quantity_cost_and_hidden_cash_fields() {
+        let mut input = stock_transaction("STOCK_IN", 0.125, 0.0, 0.0, "2026-01-01");
+        assert!(super::validate_transaction_values(&input).is_ok());
+        input.market = "HK".into();
+        assert!(super::validate_transaction_values(&input).is_err());
+        input.market = "US".into();
+        input.price = -1.0;
+        assert!(super::validate_transaction_values(&input).is_err());
+        input.price = 0.0;
+        input.commission = 1.0;
+        assert!(super::validate_transaction_values(&input).is_err());
+        input.commission = 0.0;
+        input.transaction_type = "STOCK_OUT".into();
+        input.total_amount = 1.0;
+        assert!(super::validate_transaction_values(&input).is_err());
+        input.total_amount = 0.0;
+        input.symbol = "$CASH-USD".into();
+        assert!(super::validate_transaction_values(&input).is_err());
+    }
+
+    #[test]
+    fn stock_transfers_create_edit_delete_without_cash_flow() {
+        let db = database_with_account();
+        let mut conn = db.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        let incoming = create_transaction_in(
+            &tx,
+            &stock_transaction("STOCK_IN", 10.0, 20.0, 200.0, "2026-01-01"),
+        )
+        .unwrap();
+        let outgoing = create_transaction_in(
+            &tx,
+            &stock_transaction("STOCK_OUT", 4.0, 0.0, 0.0, "2026-01-02"),
+        )
+        .unwrap();
+        let position = |conn: &rusqlite::Connection| -> (f64, f64) {
+            conn.query_row(
+                "SELECT shares, avg_cost FROM holdings WHERE symbol='AAPL'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(position(&tx), (6.0, 20.0));
+        super::update_transaction_in(
+            &tx,
+            &incoming.id,
+            &stock_transaction("STOCK_IN", 12.0, 30.0, 360.0, "2026-01-01"),
+        )
+        .unwrap();
+        assert_eq!(position(&tx), (8.0, 30.0));
+        super::delete_transaction_in(&tx, &outgoing.id).unwrap();
+        assert_eq!(position(&tx), (12.0, 30.0));
+        super::delete_transaction_in(&tx, &incoming.id).unwrap();
+        assert_eq!(position(&tx).0, 0.0);
+        let cash: f64 = tx
+            .query_row(
+                "SELECT COALESCE(SUM(shares),0) FROM holdings WHERE symbol='$CASH-USD'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cash, 0.0);
     }
 
     #[test]

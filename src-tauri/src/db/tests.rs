@@ -7,6 +7,44 @@ mod tests {
     };
     use rusqlite::Connection;
 
+    #[test]
+    fn stock_transfers_migration_preserves_legacy_records_and_indexes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE transactions (
+            id TEXT PRIMARY KEY NOT NULL, holding_id TEXT REFERENCES holdings(id) ON DELETE SET NULL,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            symbol TEXT NOT NULL, name TEXT NOT NULL, market TEXT NOT NULL,
+            transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY','SELL','OPEN','PAY')),
+            shares REAL NOT NULL, price REAL NOT NULL, total_amount REAL NOT NULL,
+            commission REAL NOT NULL DEFAULT 0, currency TEXT NOT NULL,
+            traded_at TEXT NOT NULL, notes TEXT, created_at TEXT NOT NULL);").unwrap();
+        schema::create_current_schema(&conn).unwrap();
+        conn.execute_batch("INSERT INTO accounts (id,name,market,created_at,updated_at) VALUES ('a','A','US','2026-01-01','2026-01-01');
+            INSERT INTO transactions (id,account_id,symbol,name,market,transaction_type,shares,price,total_amount,currency,traded_at,created_at) VALUES ('old','a','AAPL','Apple','US','BUY',10,20,200,'USD','2026-01-02','2026-01-02');
+            PRAGMA user_version=8;").unwrap();
+        run_migrations(&mut conn).unwrap();
+        run_migrations(&mut conn).unwrap();
+        let original: (String, f64) = conn
+            .query_row(
+                "SELECT transaction_type,total_amount FROM transactions WHERE id='old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(original, ("BUY".into(), 200.0));
+        for kind in ["STOCK_IN", "STOCK_OUT"] {
+            conn.execute("INSERT INTO transactions SELECT ?1,holding_id,account_id,symbol,name,market,?1,shares,price,total_amount,commission,currency,traded_at,notes,created_at FROM transactions WHERE id='old'", [kind]).unwrap();
+        }
+        let indexes: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_transactions_%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexes, 3);
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
+
     fn create_test_db() -> Database {
         Database::new(":memory:").expect("failed to create in-memory database")
     }

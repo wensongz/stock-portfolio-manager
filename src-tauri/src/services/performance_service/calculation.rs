@@ -194,7 +194,11 @@ fn fetch_external_cash_flows(
           WHERE DATE(t.traded_at) > ?1 AND DATE(t.traded_at) <= ?2
             AND ((UPPER(t.symbol) LIKE '$CASH-%'
                   AND t.transaction_type IN ('BUY', 'SELL'))
-                 OR t.transaction_type = 'OPEN')",
+                 OR t.transaction_type IN ('OPEN', 'STOCK_IN', 'STOCK_OUT'))",
+    );
+    sql = sql.replace(
+        "t.total_amount,",
+        &format!("{},", super::TRANSFER_VALUE_SQL),
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
         vec![Box::new(start_str), Box::new(end_str)];
@@ -216,7 +220,7 @@ fn fetch_external_cash_flows(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, f64>(2)?,
+                row.get::<_, Option<f64>>(2)?,
                 row.get::<_, f64>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
@@ -230,10 +234,12 @@ fn fetch_external_cash_flows(
     for (date_str, transaction_type, total_amount, commission, currency, rates_json) in rows {
         let date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
             .map_err(|e| format!("bad cash-flow date '{}': {}", date_str, e))?;
+        let total_amount = super::require_flow_value(total_amount)?;
         let signed_amount = match transaction_type.as_str() {
             "BUY" => total_amount + commission,
             "SELL" => -(total_amount + commission),
-            "OPEN" => total_amount + commission,
+            "OPEN" | "STOCK_IN" => total_amount + commission,
+            "STOCK_OUT" => -total_amount,
             _ => continue,
         };
         let amount = if filter.is_active() || currency == "USD" {

@@ -10,7 +10,6 @@ import {
   Typography,
 } from "antd";
 import PieChart from "../../components/charts/PieChart";
-import type { PieSlice } from "../../types";
 import { ArrowLeftOutlined, EditOutlined, ReloadOutlined } from "@ant-design/icons";
 import { useNavigate, useParams } from "react-router-dom";
 import { useQuarterlyStore } from "../../stores/quarterlyStore";
@@ -20,6 +19,8 @@ import QuarterlyNotesEditor from "./QuarterlyNotesEditor";
 import HoldingChangesTable from "./HoldingChangesTable";
 import QuarterlyTransactionsSection from "./QuarterlyTransactionsSection";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { buildSnapshotComposition, parseSnapshotExchangeRates } from "./aggregateSnapshotHoldings";
+import { formatQuarterlyMoney } from "./formatMoney";
 
 const { Title, Text } = Typography;
 
@@ -38,26 +39,6 @@ export default function SnapshotDetail() {
   const loading = detailLoading || mutationLoading;
 
   const { pnlColorDark } = usePnlColor();
-
-  /** Build category distribution pie data for a subset of holdings */
-  function categorySlices(hdgs: { market: string; category_name: string; category_color: string; market_value: number }[], market?: string): PieSlice[] {
-    const subset = market ? hdgs.filter((h) => h.market === market) : hdgs;
-    const map = new Map<string, { value: number; color: string }>();
-    subset.forEach((h) => {
-      const key = h.category_name || "未分类";
-      const color = h.category_color || "#999";
-      const prev = map.get(key);
-      map.set(key, { value: (prev?.value ?? 0) + h.market_value, color });
-    });
-    const CATEGORY_ORDER = ["现金类", "分红股", "成长股", "套利"];
-    return [...map.entries()]
-      .map(([name, { value, color }]) => ({ name, value, color }))
-      .sort((a, b) => {
-        const ai = CATEGORY_ORDER.indexOf(a.name);
-        const bi = CATEGORY_ORDER.indexOf(b.name);
-        return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
-      });
-  }
 
   const holdings = detail?.holdings ?? [];
 
@@ -83,6 +64,8 @@ export default function SnapshotDetail() {
   }
 
   const snap = detail?.snapshot;
+  const snapshotRates = parseSnapshotExchangeRates(snap?.exchange_rates);
+  const categoryLegend = [...new Map(holdings.map((holding) => [holding.category_name || "未分类", { name: holding.category_name || "未分类", color: holding.category_color }])).values()];
   const pnlColor = pnlColorDark(snap?.total_pnl ?? 0);
 
   return (
@@ -118,8 +101,7 @@ export default function SnapshotDetail() {
             <Statistic
               title="总市值 (USD)"
               value={snap?.total_value ?? 0}
-              precision={2}
-              prefix="$"
+              formatter={(value) => formatQuarterlyMoney(Number(value), "USD")}
             />
           </Card>
         </Col>
@@ -128,18 +110,16 @@ export default function SnapshotDetail() {
             <Statistic
               title="总成本 (USD)"
               value={snap?.total_cost ?? 0}
-              precision={2}
-              prefix="$"
+              formatter={(value) => formatQuarterlyMoney(Number(value), "USD")}
             />
           </Card>
         </Col>
         <Col xs={12} sm={6}>
           <Card size="small">
             <Statistic
-              title="总盈亏 (USD)"
+              title="持仓盈亏 (USD)"
               value={snap?.total_pnl ?? 0}
-              precision={2}
-              prefix="$"
+              formatter={(value) => formatQuarterlyMoney(Number(value), "USD")}
               styles={{ content: {  color: pnlColor  } }}
             />
           </Card>
@@ -163,13 +143,11 @@ export default function SnapshotDetail() {
               <Text type="secondary">{label}</Text>
               <br />
               <Text strong style={{ fontSize: 16 }}>
-                {currency === "CNY" ? "¥" : currency === "HKD" ? "HK$" : "$"}
-                {value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                {formatQuarterlyMoney(value, currency)}
               </Text>
               <br />
               <Text type="secondary" style={{ fontSize: 12 }}>
-                成本 {currency === "CNY" ? "¥" : currency === "HKD" ? "HK$" : "$"}
-                {cost.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                成本 {formatQuarterlyMoney(cost, currency)}
               </Text>
             </Col>
           ))}
@@ -186,18 +164,26 @@ export default function SnapshotDetail() {
               { label: "🇭🇰 港股", market: "HK", currency: "HKD" },
               { label: "🇺🇸 美股", market: "US", currency: "USD" },
             ].map(({ label, market, currency }) => {
-              const slices = categorySlices(holdings, market);
-              if (slices.length === 0) return null;
+              if (!holdings.some((holding) => !market || holding.market === market)) return null;
+              const composition = buildSnapshotComposition(holdings, snapshotRates, market);
               return (
                 <Col key={label} xs={24} sm={12} lg={6}>
-                  <PieChart data={slices} title={label} height={200} currencyCode={currency} hideLegend />
+                  {composition.pieSlices.length > 0 ? (
+                    <PieChart data={composition.pieSlices} title={`${label} (${currency})`} height={200} currencyCode={currency} formatValue={(value) => formatQuarterlyMoney(value, currency)} hideLegend />
+                  ) : (
+                    <div style={{ minHeight: 200, display: "flex", flexDirection: "column", justifyContent: "center", textAlign: "center", gap: 8 }}>
+                      <Text strong>{label} ({currency})</Text>
+                      <Text type="secondary">{composition.hasMissingRates ? "缺少有效快照汇率，无法折算分布" : composition.hasNegativeValues ? "含负余额，不展示饼图；金额见持仓明细" : "暂无正余额可展示"}</Text>
+                      {composition.total !== null && <Text>净市值 {formatQuarterlyMoney(composition.total, currency)}</Text>}
+                    </div>
+                  )}
                 </Col>
               );
             })}
           </Row>
           {/* Shared legend — built from all holdings so every category appears */}
           <div className="flex flex-wrap justify-start gap-x-4 gap-y-1 mt-2">
-            {categorySlices(holdings).map(({ name, color }) => (
+            {categoryLegend.map(({ name, color }) => (
               <span key={name} className="flex items-center gap-1 text-sm">
                 <span
                   style={{ display: "inline-block", width: 12, height: 12, borderRadius: 2, background: color ?? "var(--color-text-tertiary)", flexShrink: 0 }}

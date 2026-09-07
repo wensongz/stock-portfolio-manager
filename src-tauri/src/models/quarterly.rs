@@ -33,6 +33,8 @@ pub struct QuarterlyHoldingSnapshot {
     pub market: String,
     pub category_name: String,
     pub category_color: String,
+    /// Actual denomination of prices and monetary values in this holding row.
+    pub currency: String,
     pub shares: f64,
     pub avg_cost: f64,
     pub close_price: f64,

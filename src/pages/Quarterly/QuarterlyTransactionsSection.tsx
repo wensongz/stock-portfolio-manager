@@ -4,6 +4,7 @@ import dayjs from "dayjs";
 import type { StockTransactionGroup, Transaction } from "../../types";
 import { useAccountStore } from "../../stores/accountStore";
 import type { Market } from "../../types";
+import { formatQuarterlyMoney } from "./formatMoney";
 
 const { Text } = Typography;
 
@@ -12,13 +13,6 @@ const MARKET_COLORS: Record<string, string> = {
   CN: "red",
   HK: "green",
 };
-
-function fmt(v: number, decimals = 2) {
-  return v.toLocaleString("en-US", {
-    minimumFractionDigits: decimals,
-    maximumFractionDigits: decimals,
-  });
-}
 
 /** Expanded view: individual transactions for one stock within the quarter. */
 function TransactionDetailTable({ transactions }: { transactions: Transaction[] }) {
@@ -62,19 +56,19 @@ function TransactionDetailTable({ transactions }: { transactions: Transaction[] 
       title: "价格",
       dataIndex: "price",
       key: "price",
-      render: (v: number, r: Transaction) => `${r.currency} ${fmt(v, 4)}`,
+      render: (v: number, r: Transaction) => formatQuarterlyMoney(v, r.currency, 4),
     },
     {
       title: "成交总额",
       dataIndex: "total_amount",
       key: "total_amount",
-      render: (v: number, r: Transaction) => `${r.currency} ${fmt(v)}`,
+      render: (v: number, r: Transaction) => formatQuarterlyMoney(v, r.currency),
     },
     {
       title: "手续费",
       dataIndex: "commission",
       key: "commission",
-      render: (v: number, r: Transaction) => (v > 0 ? `${r.currency} ${fmt(v)}` : "—"),
+      render: (v: number, r: Transaction) => (v > 0 ? formatQuarterlyMoney(v, r.currency) : "—"),
     },
     {
       title: "备注",
@@ -124,7 +118,7 @@ function buildColumns() {
           <Text>
             {r.buy_count}笔 · {r.total_buy_shares.toLocaleString()}股 ·{" "}
             <Text type="success">
-              {r.currency} {fmt(r.total_buy_amount)}
+              {formatQuarterlyMoney(r.total_buy_amount, r.currency)}
             </Text>
           </Text>
         ) : (
@@ -139,7 +133,7 @@ function buildColumns() {
           <Text>
             {r.sell_count}笔 · {r.total_sell_shares.toLocaleString()}股 ·{" "}
             <Text type="danger">
-              {r.currency} {fmt(r.total_sell_amount)}
+              {formatQuarterlyMoney(r.total_sell_amount, r.currency)}
             </Text>
           </Text>
         ) : (
@@ -215,7 +209,7 @@ function MarketTable({
                   buyEntries.map(([cur, t]) => (
                     <div key={cur}>
                       <Text type="success" strong>
-                        {cur} {fmt(t.buy)}
+                        {formatQuarterlyMoney(t.buy, cur)}
                       </Text>
                     </div>
                   ))
@@ -229,7 +223,7 @@ function MarketTable({
                   sellEntries.map(([cur, t]) => (
                     <div key={cur}>
                       <Text type="danger" strong>
-                        {cur} {fmt(t.sell)}
+                        {formatQuarterlyMoney(t.sell, cur)}
                       </Text>
                     </div>
                   ))

@@ -1,3 +1,4 @@
+import { getCurrencySymbol } from "../../lib/formatMoney";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
@@ -781,7 +782,7 @@ export default function PortfolioAlertsTab() {
                       <Tag color={row.statusColor}>{row.statusLabel}</Tag>
                       <Text>{row.icon} {row.name}</Text>
                       <Text type={row.rebalanceAmount < 0 ? "danger" : "success"}>
-                        {row.rebalanceAmount < 0 ? "建议减配" : "建议增配"} {row.rebalanceAmountLabel.replace("-", "")} {displayModel.currency}
+                        {row.rebalanceAmount < 0 ? "建议减配" : "建议增配"} {getCurrencySymbol(displayModel.currency)}{row.rebalanceAmountLabel.replace("-", "")}
                       </Text>
                     </Space>
                   </List.Item>

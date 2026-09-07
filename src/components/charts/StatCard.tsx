@@ -1,6 +1,7 @@
 import { Card, Statistic } from "antd";
 import { ArrowUpOutlined, ArrowDownOutlined } from "@ant-design/icons";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { getCurrencySymbol } from "../../lib/formatMoney";
 
 interface StatCardProps {
   title: string;
@@ -26,15 +27,19 @@ export default function StatCard({
   const { pnlColor } = usePnlColor();
   const changeColor =
     change === undefined ? undefined : pnlColor(change);
+  const currencyPrefix = typeof prefix === "string"
+    && ["USD", "CNY", "HKD", "$", "¥", "HK$"].includes(prefix)
+    ? getCurrencySymbol(prefix)
+    : null;
 
   return (
     <Card loading={loading} styles={{ body: { padding: "16px 20px" } }}>
       <Statistic
         title={title}
         value={value}
-        prefix={prefix}
+        prefix={currencyPrefix ?? prefix}
         suffix={suffix}
-        styles={{ content: valueStyle }}
+        styles={{ content: valueStyle, prefix: currencyPrefix ? { marginInlineEnd: 0 } : undefined }}
       />
       {change !== undefined && (
         <div style={{ marginTop: 4, color: changeColor, fontSize: 13 }}>

@@ -14,6 +14,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{date_to_quarter, parse_quarter, quarter_end_date};
 
+#[path = "cash.rs"]
+mod cash;
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct PositionKey {
     account_id: String,
@@ -42,11 +45,13 @@ pub(super) struct WorkingHolding {
     pub(super) symbol: String,
     pub(super) name: String,
     pub(super) market: String,
+    pub(super) currency: String,
     pub(super) category_name: String,
     pub(super) category_color: String,
     pub(super) shares: f64,
     pub(super) avg_cost: f64,
     pub(super) notes: Option<String>,
+    pub(super) decision_quality: Option<String>,
 }
 
 #[derive(Debug)]
@@ -94,12 +99,13 @@ pub(super) fn load_historical_holdings(
                           AND h.market = t.market
                         LIMIT 1
                     ), '#8B8B8B'),
-                    t.transaction_type, t.shares, t.price, t.total_amount, t.commission
+                    t.transaction_type, t.shares, t.price, t.total_amount, t.commission,
+                    t.currency
              FROM transactions t
              LEFT JOIN accounts a ON a.id = t.account_id
              WHERE DATE(t.traded_at) <= ?1
                AND UPPER(t.symbol) NOT LIKE '$CASH-%'
-             ORDER BY t.traded_at ASC, t.created_at ASC, t.id ASC",
+             ORDER BY JULIANDAY(t.traded_at) ASC, JULIANDAY(t.created_at) ASC, t.id ASC",
         )
         .map_err(|error| error.to_string())?;
     let rows = stmt
@@ -119,6 +125,7 @@ pub(super) fn load_historical_holdings(
                     row.get::<_, f64>(9)?,
                     row.get::<_, f64>(10)?,
                     row.get::<_, f64>(11)?,
+                    row.get::<_, String>(12)?,
                 ))
             },
         )
@@ -139,6 +146,7 @@ pub(super) fn load_historical_holdings(
             price,
             total_amount,
             commission,
+            currency,
         ) = row.map_err(|error| error.to_string())?;
         if [shares, price, total_amount, commission]
             .iter()
@@ -160,11 +168,13 @@ pub(super) fn load_historical_holdings(
                 symbol,
                 name: name.clone(),
                 market: market.clone(),
+                currency,
                 category_name,
                 category_color,
                 shares: 0.0,
                 avg_cost: 0.0,
                 notes: None,
+                decision_quality: None,
             },
         });
         state.holding.name = name;
@@ -217,11 +227,13 @@ pub(super) fn load_historical_holdings(
         }
     }
 
-    Ok(states
+    let mut holdings: Vec<_> = states
         .into_values()
         .map(|state| state.holding)
         .filter(|holding| holding.shares > 1e-9)
-        .collect())
+        .collect();
+    holdings.extend(cash::load_cash_holdings(&conn, end_date)?);
+    Ok(holdings)
 }
 
 fn load_historical_prices_from_db(
@@ -298,37 +310,20 @@ fn validate_rates(rates: ExchangeRates, label: &str) -> Result<ExchangeRates, St
     }
 }
 
+#[cfg(test)]
 fn load_historical_rates(db: &Database, end_date: NaiveDate) -> Result<ExchangeRates, String> {
-    let conn = db.conn.lock().map_err(|error| error.to_string())?;
-    let json = conn
-        .query_row(
-            "SELECT exchange_rates
-             FROM daily_portfolio_values
-             WHERE date <= ?1
-             ORDER BY date DESC
-             LIMIT 1",
-            rusqlite::params![end_date.format("%Y-%m-%d").to_string()],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| {
-            format!(
-                "missing historical exchange rates on or before {}",
-                end_date.format("%Y-%m-%d")
-            )
-        })?;
-    let rates = serde_json::from_str::<ExchangeRates>(&json)
-        .map_err(|error| format!("invalid historical exchange rates: {error}"))?;
-    validate_rates(rates, "historical")
+    crate::services::historical_exchange_rate_service::load_for_snapshot(db, end_date, None)
 }
+
+type SnapshotNotes = BTreeMap<PositionKey, (Option<String>, Option<String>)>;
 
 #[derive(Debug)]
 struct ExistingSnapshot {
     id: String,
     created_at: String,
     overall_notes: Option<String>,
-    notes: BTreeMap<PositionKey, Option<String>>,
+    exchange_rates: String,
+    notes: SnapshotNotes,
 }
 
 fn load_existing_snapshot(
@@ -339,7 +334,7 @@ fn load_existing_snapshot(
     let conn = db.conn.lock().map_err(|error| error.to_string())?;
     let header = if let Some(snapshot_id) = requested_id {
         conn.query_row(
-            "SELECT id, created_at, overall_notes
+            "SELECT id, created_at, overall_notes, exchange_rates
              FROM quarterly_snapshots
              WHERE id = ?1 AND quarter = ?2",
             rusqlite::params![snapshot_id, quarter],
@@ -348,6 +343,7 @@ fn load_existing_snapshot(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
@@ -357,7 +353,7 @@ fn load_existing_snapshot(
         .into()
     } else {
         conn.query_row(
-            "SELECT id, created_at, overall_notes
+            "SELECT id, created_at, overall_notes, exchange_rates
              FROM quarterly_snapshots
              WHERE quarter = ?1",
             rusqlite::params![quarter],
@@ -366,18 +362,30 @@ fn load_existing_snapshot(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| error.to_string())?
     };
-    let Some((id, created_at, overall_notes)) = header else {
+    let Some((id, created_at, overall_notes, exchange_rates)) = header else {
         return Ok(None);
     };
+    let notes = load_snapshot_notes(&conn, &id)?;
+    Ok(Some(ExistingSnapshot {
+        id,
+        created_at,
+        overall_notes,
+        exchange_rates,
+        notes,
+    }))
+}
+
+fn load_snapshot_notes(conn: &rusqlite::Connection, id: &str) -> Result<SnapshotNotes, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT account_id, symbol, market, notes
+            "SELECT account_id, symbol, market, notes, decision_quality
              FROM quarterly_holding_snapshots
              WHERE quarterly_snapshot_id = ?1",
         )
@@ -389,18 +397,16 @@ fn load_existing_snapshot(
             let market = row.get::<_, String>(2)?;
             Ok((
                 PositionKey::new(&account_id, &symbol, &market),
-                row.get::<_, Option<String>>(3)?,
+                (
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ),
             ))
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<BTreeMap<_, _>, _>>()
         .map_err(|error| error.to_string())?;
-    Ok(Some(ExistingSnapshot {
-        id,
-        created_at,
-        overall_notes,
-        notes,
-    }))
+    Ok(notes)
 }
 
 fn load_current_holdings(db: &Database) -> Result<Vec<WorkingHolding>, String> {
@@ -409,11 +415,12 @@ fn load_current_holdings(db: &Database) -> Result<Vec<WorkingHolding>, String> {
         .prepare(
             "SELECT h.account_id, COALESCE(a.name, ''), h.symbol, h.name, h.market,
                     COALESCE(c.name, '未分类'), COALESCE(c.color, '#8B8B8B'),
-                    h.shares, h.avg_cost
+                    h.shares, CASE WHEN UPPER(h.symbol) LIKE '$CASH-%' THEN 1.0 ELSE h.avg_cost END,
+                    h.currency
              FROM holdings h
              LEFT JOIN accounts a ON a.id = h.account_id
              LEFT JOIN categories c ON c.id = h.category_id
-             WHERE h.shares > 0
+             WHERE h.shares > 0 OR UPPER(h.symbol) LIKE '$CASH-%'
              ORDER BY h.market, UPPER(h.symbol), h.account_id",
         )
         .map_err(|error| error.to_string())?;
@@ -429,7 +436,9 @@ fn load_current_holdings(db: &Database) -> Result<Vec<WorkingHolding>, String> {
                 category_color: row.get(6)?,
                 shares: row.get(7)?,
                 avg_cost: row.get(8)?,
+                currency: row.get(9)?,
                 notes: None,
+                decision_quality: None,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -566,8 +575,13 @@ fn compute_snapshot(
         let market_value = holding.shares * close_price;
         let cost_value = holding.shares * holding.avg_cost;
         let totals = market_totals.entry(holding.market.clone()).or_default();
-        totals.0 += market_value;
-        totals.1 += cost_value;
+        let market_currency = match holding.market.as_str() {
+            "CN" => "CNY",
+            "HK" => "HKD",
+            _ => "USD",
+        };
+        totals.0 += convert_currency(market_value, &holding.currency, market_currency, rates);
+        totals.1 += convert_currency(cost_value, &holding.currency, market_currency, rates);
         let pnl = market_value - cost_value;
         rows.push(ComputedHolding {
             holding,
@@ -593,11 +607,7 @@ fn compute_snapshot(
         + convert_currency(cn_cost, "CNY", "USD", rates)
         + convert_currency(hk_cost, "HKD", "USD", rates);
     for row in &mut rows {
-        let value_usd = match row.holding.market.as_str() {
-            "CN" => convert_currency(row.market_value, "CNY", "USD", rates),
-            "HK" => convert_currency(row.market_value, "HKD", "USD", rates),
-            _ => row.market_value,
-        };
+        let value_usd = convert_currency(row.market_value, &row.holding.currency, "USD", rates);
         row.weight = if total_value != 0.0 {
             value_usd / total_value * 100.0
         } else {
@@ -629,10 +639,34 @@ fn persist_snapshot(
     rates: &ExchangeRates,
     computed: &ComputedSnapshot,
     exists: bool,
-) -> Result<(), String> {
+    input_revision: i64,
+) -> Result<Option<String>, String> {
     let rates_json = serde_json::to_string(rates).map_err(|error| error.to_string())?;
     let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
     let tx = conn.transaction().map_err(|error| error.to_string())?;
+    if crate::services::snapshot_cache_service::current_revision(&tx)? != input_revision {
+        return Err("ledger changed while rebuilding quarterly snapshot; please retry".into());
+    }
+    // Notes can autosave while quotes are being fetched without changing the
+    // ledger revision. Read their latest values under the final write lock,
+    // including explicit clears, before replacing any snapshot rows.
+    let (overall_notes, latest_notes) = if exists {
+        let overall_notes = tx
+            .query_row(
+                "SELECT overall_notes FROM quarterly_snapshots WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        (overall_notes, load_snapshot_notes(&tx, id)?)
+    } else {
+        (overall_notes.map(str::to_owned), SnapshotNotes::new())
+    };
+    crate::services::historical_exchange_rate_service::record_snapshot_rates_in(
+        &tx,
+        &snapshot_date.format("%Y-%m-%d").to_string(),
+        rates,
+    )?;
     if exists {
         tx.execute(
             "DELETE FROM quarterly_holding_snapshots WHERE quarterly_snapshot_id = ?1",
@@ -691,13 +725,20 @@ fn persist_snapshot(
         .map_err(|error| error.to_string())?;
     }
     for row in &computed.holdings {
+        let (notes, decision_quality) = latest_notes
+            .get(&PositionKey::from_holding(&row.holding))
+            .map(|(notes, quality)| (notes.as_deref(), quality.as_deref()))
+            .unwrap_or((
+                row.holding.notes.as_deref(),
+                row.holding.decision_quality.as_deref(),
+            ));
         tx.execute(
             "INSERT INTO quarterly_holding_snapshots
              (id, quarterly_snapshot_id, account_id, account_name, symbol, name, market,
               category_name, category_color, shares, avg_cost, close_price, market_value,
-              cost_value, pnl, pnl_percent, weight, notes)
+              cost_value, pnl, pnl_percent, weight, notes, decision_quality, currency)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18)",
+                     ?15, ?16, ?17, ?18, ?19, ?20)",
             rusqlite::params![
                 uuid::Uuid::new_v4().to_string(),
                 id,
@@ -716,12 +757,15 @@ fn persist_snapshot(
                 row.pnl,
                 row.pnl_percent,
                 row.weight,
-                row.holding.notes,
+                notes,
+                decision_quality,
+                row.holding.currency,
             ],
         )
         .map_err(|error| error.to_string())?;
     }
-    tx.commit().map_err(|error| error.to_string())
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(overall_notes)
 }
 
 pub(super) async fn rebuild_quarterly_snapshot(
@@ -760,6 +804,10 @@ where
     FetchFuture: std::future::Future<Output = Result<Vec<(NaiveDate, f64)>, String>>,
 {
     let today = Utc::now().date_naive();
+    let input_revision = {
+        let conn = db.conn.lock().map_err(|error| error.to_string())?;
+        crate::services::snapshot_cache_service::current_revision(&conn)?
+    };
     let (year, quarter_number) = parse_quarter(quarter)?;
     let end_date = quarter_end_date(year, quarter_number);
     let is_current = date_to_quarter(today) == quarter;
@@ -779,11 +827,12 @@ where
     }
     if let Some(existing) = &existing {
         for holding in &mut holdings {
-            holding.notes = existing
-                .notes
-                .get(&PositionKey::from_holding(holding))
-                .cloned()
-                .flatten();
+            if let Some((notes, decision_quality)) =
+                existing.notes.get(&PositionKey::from_holding(holding))
+            {
+                holding.notes = notes.clone();
+                holding.decision_quality = decision_quality.clone();
+            }
         }
     }
     let prices = if is_current {
@@ -794,7 +843,13 @@ where
     let rates = if is_current {
         validate_rates(get_cached_rates(cache, db).await?, "current")?
     } else {
-        load_historical_rates(db, end_date)?
+        crate::services::historical_exchange_rate_service::load_for_snapshot(
+            db,
+            end_date,
+            existing
+                .as_ref()
+                .map(|snapshot| snapshot.exchange_rates.as_str()),
+        )?
     };
     let computed = compute_snapshot(holdings, &prices, &rates);
     let id = existing
@@ -808,7 +863,7 @@ where
     let overall_notes = existing
         .as_ref()
         .and_then(|snapshot| snapshot.overall_notes.clone());
-    persist_snapshot(
+    let overall_notes = persist_snapshot(
         db,
         &id,
         quarter,
@@ -818,11 +873,18 @@ where
         &rates,
         &computed,
         existing.is_some(),
+        input_revision,
     )?;
     let holding_count = computed
         .holdings
         .iter()
-        .map(|row| row.holding.symbol.to_uppercase())
+        .filter(|row| !crate::services::quote_service::is_cash_symbol(&row.holding.symbol))
+        .map(|row| {
+            (
+                row.holding.market.clone(),
+                row.holding.symbol.to_uppercase(),
+            )
+        })
         .collect::<BTreeSet<_>>()
         .len();
     Ok(QuarterlySnapshot {
@@ -911,18 +973,386 @@ mod tests {
             symbol: symbol.to_string(),
             name: symbol.to_string(),
             market: market.to_string(),
+            currency: match market {
+                "CN" => "CNY",
+                "HK" => "HKD",
+                _ => "USD",
+            }
+            .to_string(),
             category_name: "未分类".to_string(),
             category_color: "#8B8B8B".to_string(),
             shares: 1.0,
             avg_cost: 1.0,
             notes: None,
+            decision_quality: None,
         }
+    }
+
+    fn insert_cash(db: &Database, account: &str, balance: f64, created_at: &str) {
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO holdings
+             (id, account_id, symbol, name, market, shares, avg_cost, currency, created_at, updated_at)
+             VALUES (?1, ?1, '$CASH-USD', 'USD Cash', 'US', ?2, 1, 'USD', ?3, ?3)",
+            rusqlite::params![account, balance, created_at],
+        ).unwrap();
+    }
+
+    #[test]
+    fn quarterly_cash_replays_opening_and_every_cash_flow_through_cutoff() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct-a", "账户 A");
+        for (id, symbol, kind, shares, price, amount, fee, date) in [
+            (
+                "cash-open",
+                "$CASH-USD",
+                "OPEN",
+                1000.0,
+                1.0,
+                1000.0,
+                0.0,
+                "2025-01-01",
+            ),
+            (
+                "stock-open",
+                "AAPL",
+                "OPEN",
+                10.0,
+                10.0,
+                100.0,
+                0.0,
+                "2025-01-02",
+            ),
+            ("buy", "AAPL", "BUY", 10.0, 10.0, 100.0, 5.0, "2025-01-10"),
+            ("sell", "AAPL", "SELL", 4.0, 10.0, 40.0, 2.0, "2025-01-20"),
+            ("pay", "AAPL", "PAY", 0.0, 0.0, 10.0, 1.0, "2025-02-01"),
+            (
+                "deposit",
+                "$CASH-USD",
+                "BUY",
+                50.0,
+                1.0,
+                50.0,
+                2.0,
+                "2025-02-02",
+            ),
+            (
+                "withdraw",
+                "$CASH-USD",
+                "SELL",
+                30.0,
+                1.0,
+                30.0,
+                1.0,
+                "2025-03-31T23:59:59Z",
+            ),
+            (
+                "later-buy",
+                "AAPL",
+                "BUY",
+                30.0,
+                10.0,
+                300.0,
+                0.0,
+                "2025-04-01",
+            ),
+        ] {
+            insert_transaction(
+                &db, id, "acct-a", symbol, symbol, kind, shares, price, amount, fee, date,
+            );
+        }
+        let positions =
+            load_historical_holdings(&db, NaiveDate::from_ymd_opt(2025, 3, 31).unwrap()).unwrap();
+        let cash = positions
+            .iter()
+            .find(|h| h.symbol == "$CASH-USD")
+            .expect("cash must be included");
+        assert_eq!(cash.shares, 963.0);
+        assert_eq!(cash.avg_cost, 1.0);
+    }
+
+    #[test]
+    fn quarterly_cash_infers_baseline_from_all_flows_despite_late_cash_row() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct-a", "账户 A");
+        insert_cash(&db, "acct-a", 50.0, "2025-04-01");
+        insert_transaction(
+            &db,
+            "buy",
+            "acct-a",
+            "AAPL",
+            "Apple",
+            "BUY",
+            10.0,
+            10.0,
+            100.0,
+            2.0,
+            "2025-01-01",
+        );
+        insert_transaction(
+            &db,
+            "deposit",
+            "acct-a",
+            "$CASH-USD",
+            "Cash",
+            "BUY",
+            200.0,
+            1.0,
+            200.0,
+            1.0,
+            "2025-04-01",
+        );
+        let positions =
+            load_historical_holdings(&db, NaiveDate::from_ymd_opt(2025, 3, 31).unwrap()).unwrap();
+        let cash = positions
+            .iter()
+            .find(|h| h.symbol == "$CASH-USD")
+            .expect("cash must be included");
+        assert_eq!(cash.shares, -151.0);
+    }
+
+    #[test]
+    fn quarterly_cash_only_and_current_negative_and_zero_balances_are_retained() {
+        let db = Database::new(":memory:").unwrap();
+        for (id, balance) in [("positive", 50.0), ("negative", -25.0), ("zero", 0.0)] {
+            insert_account(&db, id, id);
+            insert_cash(&db, id, balance, "2025-01-01");
+        }
+        let historical =
+            load_historical_holdings(&db, NaiveDate::from_ymd_opt(2025, 3, 31).unwrap()).unwrap();
+        assert_eq!(historical.len(), 3);
+        let current = super::load_current_holdings(&db).unwrap();
+        assert_eq!(current.len(), 3);
+        assert_eq!(current.iter().map(|h| h.shares).sum::<f64>(), 25.0);
+    }
+
+    #[test]
+    fn quarterly_cash_current_cost_is_one_even_for_legacy_nonunit_cost() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct-a", "账户 A");
+        insert_cash(&db, "acct-a", 100.0, "2025-01-01");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE holdings SET avg_cost = 2", [])
+            .unwrap();
+        let current = super::load_current_holdings(&db).unwrap();
+        let historical =
+            load_historical_holdings(&db, NaiveDate::from_ymd_opt(2025, 3, 31).unwrap()).unwrap();
+        let prices =
+            std::collections::BTreeMap::from([(PositionKey::from_holding(&current[0]), 1.0)]);
+        let rates = crate::models::quote::ExchangeRates {
+            usd_cny: 7.1,
+            usd_hkd: 7.8,
+            cny_hkd: 7.8 / 7.1,
+            updated_at: "2025-03-31".into(),
+        };
+        let computed = super::compute_snapshot(current, &prices, &rates);
+        assert_eq!(computed.total_cost, 100.0);
+        assert_eq!(computed.total_pnl, 0.0);
+        assert_eq!(historical[0].avg_cost, 1.0);
+    }
+
+    #[test]
+    fn quarterly_cash_does_not_project_later_account_balances_into_old_quarters() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "future", "Future");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE accounts SET created_at = '2025-04-01'", [])
+            .unwrap();
+        insert_cash(&db, "future", 500.0, "2025-04-01");
+        assert!(
+            load_historical_holdings(&db, NaiveDate::from_ymd_opt(2025, 3, 31).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn quarterly_cash_missing_baseline_fails_instead_of_assuming_zero() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct-a", "账户 A");
+        insert_transaction(
+            &db,
+            "buy",
+            "acct-a",
+            "AAPL",
+            "Apple",
+            "BUY",
+            10.0,
+            10.0,
+            100.0,
+            0.0,
+            "2025-01-01",
+        );
+        let error = load_historical_holdings(&db, NaiveDate::from_ymd_opt(2025, 3, 31).unwrap())
+            .unwrap_err();
+        assert!(error.contains("missing historical cash baseline"));
+    }
+
+    #[test]
+    fn quarterly_valuation_converts_actual_currency_to_market_and_overall_totals() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct-a", "账户 A");
+        insert_cash(&db, "acct-a", 70.0, "2025-01-01");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE holdings SET market = 'CN'", [])
+            .unwrap();
+        let holdings = super::load_current_holdings(&db).unwrap();
+        let prices =
+            std::collections::BTreeMap::from([(PositionKey::from_holding(&holdings[0]), 1.0)]);
+        let rates = crate::models::quote::ExchangeRates {
+            usd_cny: 7.0,
+            usd_hkd: 7.8,
+            cny_hkd: 7.8 / 7.0,
+            updated_at: "2025-03-31".into(),
+        };
+        let computed = super::compute_snapshot(holdings, &prices, &rates);
+        assert_eq!(computed.cn_value, 490.0);
+        assert_eq!(computed.cn_cost, 490.0);
+        assert_eq!(computed.total_value, 70.0);
+        assert_eq!(computed.holdings[0].market_value, 70.0);
+        assert_eq!(computed.holdings[0].weight, 100.0);
+    }
+
+    #[test]
+    fn quarterly_valuation_uses_one_usd_basis_when_cross_rate_was_rounded() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct-a", "账户 A");
+        insert_cash(&db, "acct-a", 71.0, "2025-01-01");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE holdings SET symbol = '$CASH-CNY', currency = 'CNY', market = 'HK'",
+                [],
+            )
+            .unwrap();
+        let holdings = super::load_current_holdings(&db).unwrap();
+        let prices =
+            std::collections::BTreeMap::from([(PositionKey::from_holding(&holdings[0]), 1.0)]);
+        let rates = crate::models::quote::ExchangeRates {
+            usd_cny: 7.1,
+            usd_hkd: 7.8,
+            cny_hkd: 1.1,
+            updated_at: "2025-03-31".into(),
+        };
+        let computed = super::compute_snapshot(holdings, &prices, &rates);
+        assert_eq!(computed.hk_value, 78.0);
+        assert_eq!(computed.total_value, 10.0);
+        assert_eq!(computed.holdings[0].weight, 100.0);
+    }
+
+    #[test]
+    fn quarterly_cash_and_stock_share_utc_cutoff_for_offset_timestamps() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct-a", "账户 A");
+        insert_transaction(
+            &db,
+            "cash-open",
+            "acct-a",
+            "$CASH-USD",
+            "Cash",
+            "OPEN",
+            1000.0,
+            1.0,
+            1000.0,
+            0.0,
+            "2025-03-30",
+        );
+        insert_transaction(
+            &db,
+            "buy",
+            "acct-a",
+            "AAPL",
+            "Apple",
+            "BUY",
+            10.0,
+            10.0,
+            100.0,
+            0.0,
+            "2025-04-01T00:30:00+08:00",
+        );
+        let positions =
+            load_historical_holdings(&db, NaiveDate::from_ymd_opt(2025, 3, 31).unwrap()).unwrap();
+        assert_eq!(
+            positions
+                .iter()
+                .find(|h| h.symbol == "AAPL")
+                .unwrap()
+                .shares,
+            10.0
+        );
+        assert_eq!(
+            positions
+                .iter()
+                .find(|h| h.symbol == "$CASH-USD")
+                .unwrap()
+                .shares,
+            900.0
+        );
+    }
+
+    #[test]
+    fn quarterly_cash_creation_uses_utc_cutoff_and_openings_use_instant_order() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "created", "Created");
+        insert_cash(&db, "created", 5.0, "2025-04-01T00:30:00+08:00");
+        insert_account(&db, "openings", "Openings");
+        insert_transaction(
+            &db,
+            "first",
+            "openings",
+            "$CASH-USD",
+            "Cash",
+            "OPEN",
+            100.0,
+            1.0,
+            100.0,
+            0.0,
+            "2025-03-31T23:30:00+08:00",
+        );
+        insert_transaction(
+            &db,
+            "last",
+            "openings",
+            "$CASH-USD",
+            "Cash",
+            "OPEN",
+            200.0,
+            1.0,
+            200.0,
+            0.0,
+            "2025-03-31T20:00:00Z",
+        );
+        let positions =
+            load_historical_holdings(&db, NaiveDate::from_ymd_opt(2025, 3, 31).unwrap()).unwrap();
+        assert_eq!(
+            positions
+                .iter()
+                .find(|h| h.account_id == "openings")
+                .unwrap()
+                .shares,
+            200.0
+        );
+        assert_eq!(
+            positions
+                .iter()
+                .find(|h| h.account_id == "created")
+                .expect("cash creation was in Q1 UTC")
+                .shares,
+            5.0
+        );
     }
 
     #[test]
     fn historical_replay_uses_only_transactions_through_quarter_end() {
         let db = Database::new(":memory:").unwrap();
         insert_account(&db, "acct-a", "账户 A");
+        insert_cash(&db, "acct-a", 470.0, "2025-01-01");
         insert_transaction(
             &db,
             "open",
@@ -979,7 +1409,7 @@ mod tests {
         let positions =
             load_historical_holdings(&db, NaiveDate::from_ymd_opt(2025, 3, 31).unwrap()).unwrap();
 
-        assert_eq!(positions.len(), 1);
+        assert_eq!(positions.len(), 2);
         assert_eq!(positions[0].account_id, "acct-a");
         assert_eq!(positions[0].symbol, "AAPL");
         assert_eq!(positions[0].shares, 12.0);
@@ -1219,6 +1649,7 @@ mod tests {
         insert_existing_snapshot(&db, "snapshot-q1", 10.0);
         {
             let conn = db.conn.lock().unwrap();
+            conn.execute("UPDATE quarterly_holding_snapshots SET decision_quality = 'good' WHERE id = 'old-row'", []).unwrap();
             conn.execute(
                 "INSERT INTO quarterly_holding_snapshots
                  (id, quarterly_snapshot_id, account_id, account_name, symbol, name, market,
@@ -1251,6 +1682,7 @@ mod tests {
         assert_eq!(rebuilt.overall_notes.as_deref(), Some("季度总评"));
         assert_eq!(rebuilt.total_value, 500.0);
         let conn = db.conn.lock().unwrap();
+        assert_eq!(conn.query_row("SELECT decision_quality FROM quarterly_holding_snapshots WHERE account_id = 'acct-a'", [], |row| row.get::<_, Option<String>>(0)).unwrap().as_deref(), Some("good"));
         let rows = conn
             .prepare(
                 "SELECT account_id, shares, notes
@@ -1332,5 +1764,264 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, (777.0, "账户 A 笔记".to_string()));
+    }
+
+    #[tokio::test]
+    async fn quarterly_rebuild_preserves_notes_saved_or_cleared_during_price_fetch() {
+        for (overall_notes, notes, quality) in [
+            (
+                Some("new quarter note"),
+                Some("new holding note"),
+                Some("good"),
+            ),
+            (None, None, None),
+        ] {
+            let db = Database::new(":memory:").unwrap();
+            insert_account(&db, "acct-a", "账户 A");
+            insert_transaction(
+                &db,
+                "open",
+                "acct-a",
+                "AAPL",
+                "Apple",
+                "OPEN",
+                2.0,
+                10.0,
+                20.0,
+                0.0,
+                "2025-01-02",
+            );
+            insert_historical_price_and_rates(&db, "OTHER", 1.0);
+            insert_existing_snapshot(&db, "snapshot-q1", 777.0);
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE quarterly_holding_snapshots SET decision_quality = 'old'",
+                    [],
+                )
+                .unwrap();
+            let rebuilt = rebuild_quarterly_snapshot_with_history_fetcher(
+                &db, &ExchangeRateCache::new(), &QuoteCache::new(), &QuoteServiceState::new(),
+                "2025-Q1", Some("snapshot-q1"), |_, _, _, _, _| {
+                    let conn = db.conn.lock().unwrap();
+                    conn.execute("UPDATE quarterly_snapshots SET overall_notes = ?1 WHERE id = 'snapshot-q1'", rusqlite::params![overall_notes]).unwrap();
+                    conn.execute("UPDATE quarterly_holding_snapshots SET notes = ?1, decision_quality = ?2 WHERE quarterly_snapshot_id = 'snapshot-q1'", rusqlite::params![notes, quality]).unwrap();
+                    async { Ok(vec![(NaiveDate::from_ymd_opt(2025, 3, 31).unwrap(), 100.0)]) }
+                },
+            ).await.unwrap();
+            assert_eq!(rebuilt.overall_notes.as_deref(), overall_notes);
+            assert_eq!(rebuilt.total_value, 200.0);
+            let saved = db.conn.lock().unwrap().query_row(
+                "SELECT qs.overall_notes, h.notes, h.decision_quality FROM quarterly_snapshots qs
+                 JOIN quarterly_holding_snapshots h ON h.quarterly_snapshot_id = qs.id
+                 WHERE qs.id = 'snapshot-q1' AND h.account_id = 'acct-a'",
+                [], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)),
+            ).unwrap();
+            assert_eq!(
+                (saved.0.as_deref(), saved.1.as_deref(), saved.2.as_deref()),
+                (overall_notes, notes, quality)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quarterly_rebuild_rejects_ledger_changes_during_price_fetch() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct-a", "账户 A");
+        insert_transaction(
+            &db,
+            "open",
+            "acct-a",
+            "AAPL",
+            "Apple",
+            "OPEN",
+            2.0,
+            10.0,
+            20.0,
+            0.0,
+            "2025-01-02",
+        );
+        insert_historical_price_and_rates(&db, "OTHER", 1.0);
+        insert_existing_snapshot(&db, "snapshot-q1", 777.0);
+        let error = rebuild_quarterly_snapshot_with_history_fetcher(
+            &db,
+            &ExchangeRateCache::new(),
+            &QuoteCache::new(),
+            &QuoteServiceState::new(),
+            "2025-Q1",
+            Some("snapshot-q1"),
+            |_, _, _, _, _| {
+                db.conn
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE transactions SET shares = 3 WHERE id = 'open'", [])
+                    .unwrap();
+                async { Ok(vec![(NaiveDate::from_ymd_opt(2025, 3, 31).unwrap(), 100.0)]) }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("ledger changed"));
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT total_value FROM quarterly_snapshots WHERE id = 'snapshot-q1'",
+                    [],
+                    |row| row.get::<_, f64>(0)
+                )
+                .unwrap(),
+            777.0
+        );
+    }
+
+    #[tokio::test]
+    async fn quarterly_created_snapshot_count_distinguishes_same_symbol_across_markets() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct-a", "账户 A");
+        for (id, shares) in [("us-open", 2.0), ("hk-open", 3.0)] {
+            insert_transaction(
+                &db,
+                id,
+                "acct-a",
+                "700",
+                "700",
+                "OPEN",
+                shares,
+                10.0,
+                shares * 10.0,
+                0.0,
+                "2025-01-01",
+            );
+        }
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE transactions SET market = 'HK', currency = 'HKD' WHERE id = 'hk-open'",
+                [],
+            )
+            .unwrap();
+        insert_historical_price_and_rates(&db, "700", 100.0);
+        let result = rebuild_quarterly_snapshot_with_history_fetcher(
+            &db,
+            &ExchangeRateCache::new(),
+            &QuoteCache::new(),
+            &QuoteServiceState::new(),
+            "2025-Q1",
+            None,
+            |_, _, _, _, _| async {
+                Ok(vec![(NaiveDate::from_ymd_opt(2025, 3, 31).unwrap(), 78.0)])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.holding_count, 2);
+        assert_eq!(result.total_value, 230.0);
+    }
+
+    #[tokio::test]
+    async fn quarterly_cash_only_create_refresh_and_current_share_currency_and_notes() {
+        let db = Database::new(":memory:").unwrap();
+        insert_account(&db, "acct-a", "账户 A");
+        insert_cash(&db, "acct-a", -70.0, "2025-01-01");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE holdings SET market = 'CN'", [])
+            .unwrap();
+        insert_historical_price_and_rates(&db, "unused", 1.0);
+        let cache = ExchangeRateCache::new();
+        let quotes = QuoteCache::new();
+        let quote_state = QuoteServiceState::new();
+        let original = rebuild_quarterly_snapshot_with_history_fetcher(
+            &db,
+            &cache,
+            &quotes,
+            &quote_state,
+            "2025-Q1",
+            None,
+            |_, _, _, _, _| async { Err("cash needs no network quote".into()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(original.total_value, -70.0);
+        assert_eq!(original.cn_value, -497.0);
+        assert_eq!(original.total_pnl, 0.0);
+        assert_eq!(original.holding_count, 0);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("UPDATE quarterly_holding_snapshots SET notes = 'keep cash note', decision_quality = 'good'", []).unwrap();
+            conn.execute("DELETE FROM daily_portfolio_values", [])
+                .unwrap();
+            conn.execute("DELETE FROM daily_holding_snapshots", [])
+                .unwrap();
+        }
+        let refreshed = rebuild_quarterly_snapshot_with_history_fetcher(
+            &db,
+            &cache,
+            &quotes,
+            &quote_state,
+            "2025-Q1",
+            Some(&original.id),
+            |_, _, _, _, _| async { Err("cash needs no network quote".into()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.id, original.id);
+        assert_eq!(refreshed.exchange_rates, original.exchange_rates);
+        assert_eq!(refreshed.total_value, original.total_value);
+        let today = chrono::Utc::now().date_naive();
+        cache.set(crate::models::quote::ExchangeRates {
+            usd_cny: 7.1,
+            usd_hkd: 7.8,
+            cny_hkd: 7.8 / 7.1,
+            updated_at: today.to_string(),
+        });
+        let current = rebuild_quarterly_snapshot_with_history_fetcher(
+            &db,
+            &cache,
+            &quotes,
+            &quote_state,
+            &super::date_to_quarter(today),
+            None,
+            |_, _, _, _, _| async { Err("cash needs no network quote".into()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(current.total_value, refreshed.total_value);
+        assert_eq!(current.cn_value, refreshed.cn_value);
+        assert_eq!(current.holding_count, 0);
+        let row = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT currency, shares, avg_cost, notes, decision_quality
+             FROM quarterly_holding_snapshots WHERE quarterly_snapshot_id = ?1",
+                rusqlite::params![original.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "USD".into(),
+                -70.0,
+                1.0,
+                "keep cash note".into(),
+                "good".into()
+            )
+        );
     }
 }

@@ -436,7 +436,7 @@ test("overweight, underweight, and concentration rows expose actionable labels",
   assert.deepEqual(model.rows.map((row) => row.statusLabel), ["超配", "欠配"]);
   assert.equal(model.concentrationRows[0].marketValue, 260.456);
   assert.match(model.concentrationRows[0].warning, /26.05%/);
-  assert.match(model.concentrationRows[0].marketValueLabel, /260.46 USD/);
+  assert.match(model.concentrationRows[0].marketValueLabel, /\$260\.46/);
 });
 
 test("AI is enabled only for a ready evaluation with a currently active breach", () => {

@@ -41,6 +41,7 @@ pub(crate) fn reset_database_state(conn: &mut Connection, now: &str) -> Result<(
         "accounts",
         "cached_quotes",
         "cached_exchange_rates",
+        "historical_exchange_rates",
         "cached_quote_refresh_time",
         "categories",
     ] {

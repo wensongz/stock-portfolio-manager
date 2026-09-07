@@ -2,6 +2,7 @@ import { Card, Col, Row, Statistic, Tooltip } from "antd";
 import { ArrowUpOutlined, ArrowDownOutlined, InfoCircleOutlined } from "@ant-design/icons";
 import type { PerformanceSummary } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { formatMoney } from "../../lib/formatMoney";
 
 interface Props {
   summary: PerformanceSummary | null;
@@ -61,7 +62,7 @@ export default function PerformanceSummaryCards({ summary, loading, currency = "
             precision={2}
             styles={{ content: {  color: pnlColorDark(summary?.total_pnl ?? 0)  } }}
             prefix={(summary?.total_pnl ?? 0) >= 0 ? <ArrowUpOutlined /> : <ArrowDownOutlined />}
-            suffix={currency}
+            formatter={(value) => formatMoney(Number(value), currency)}
           />
         </Card>
       </Col>

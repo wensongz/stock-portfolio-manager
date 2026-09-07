@@ -28,6 +28,7 @@ export default function QuickCharts({ summary }: Props) {
           <PieChart
             data={marketData}
             height={280}
+            currencyCode={currency}
             centerText={`${currencySymbol[currency] ?? ""}${Number(total).toLocaleString()}`}
           />
         </Card>

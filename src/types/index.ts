@@ -422,6 +422,7 @@ export interface QuarterlyHoldingSnapshot {
   symbol: string;
   name: string;
   market: string;
+  currency: string;
   category_name: string;
   category_color: string;
   shares: number;

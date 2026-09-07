@@ -1891,7 +1891,13 @@ mod snapshot_cache_migration {
                 .unwrap(),
             migrations::CURRENT_SCHEMA_VERSION
         );
-        for (table, expected) in preserved_tables.into_iter().zip(before) {
+        for (table, mut expected) in preserved_tables.into_iter().zip(before) {
+            // v8 adds the legacy row's actual currency; every prior field stays intact.
+            if table == "quarterly_holding_snapshots" {
+                for row in &mut expected {
+                    row.push(Value::Text("USD".into()));
+                }
+            }
             assert_eq!(rows(&conn, table), expected, "migration changed {table}");
         }
         for table in ["daily_portfolio_values", "daily_holding_snapshots"] {

@@ -52,6 +52,7 @@ import {
   resolveActiveUnderlyingSelection,
 } from "./activeOptionsViewModel";
 import type { ActiveUnderlyingSummary } from "./activeOptionsViewModel";
+import { formatMoney } from "../../lib/formatMoney";
 
 const { Title, Text } = Typography;
 
@@ -633,12 +634,7 @@ export default function OptionsPage() {
     ? optionReviewReport!.currency
     : selectedAccountCurrency || "USD";
   const formatOptionReviewCurrency = (value: number) =>
-    new Intl.NumberFormat("zh-CN", {
-      style: "currency",
-      currency: optionReviewCurrency,
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }).format(value);
+    formatMoney(value, optionReviewCurrency);
 
   const activeSummaryColumns: ColumnsType<ActiveUnderlyingSummary> = [
     {
@@ -923,6 +919,7 @@ export default function OptionsPage() {
                     <InputNumber
                       placeholder="输入价格"
                       prefix="$"
+                      styles={{ prefix: { marginInlineEnd: 0 } }}
                       min={0}
                       step={1}
                       value={stockPrices[symbol] ?? null}

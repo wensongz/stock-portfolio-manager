@@ -2,6 +2,7 @@ import EChart from "../../components/charts/EChart";
 import { Tabs, Typography } from "antd";
 import type { ReturnAttribution, AttributionItem } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { formatMoney } from "../../lib/formatMoney";
 
 const { Text } = Typography;
 
@@ -16,6 +17,8 @@ function makeWaterfallOption(items: AttributionItem[], title: string, colorFn: (
   const names = sorted.map((i) => i.name);
   const values = sorted.map((i) => parseFloat(i.pnl.toFixed(2)));
   const colors = values.map((v) => colorFn(v));
+  const formatSignedMoney = (value: number, precision: number) =>
+    `${value >= 0 ? "+" : "-"}${formatMoney(Math.abs(value), currency, precision)}`;
 
   return {
     title: { text: title, textStyle: { fontSize: 13 } },
@@ -26,7 +29,7 @@ function makeWaterfallOption(items: AttributionItem[], title: string, colorFn: (
         const item = sorted[p.dataIndex];
         return (
           `${p.name}<br/>` +
-          `盈亏: <b>${p.value >= 0 ? "+" : ""}${p.value.toFixed(2)} ${currency}</b><br/>` +
+          `盈亏: <b>${formatSignedMoney(p.value, 2)}</b><br/>` +
           `贡献: ${item.contribution_percent.toFixed(1)}%`
         );
       },

@@ -1,5 +1,6 @@
 import PieEChart from "./PieEChart";
 import type { PieSlice } from "../../types";
+import { formatMoney } from "../../lib/formatMoney";
 
 interface PieChartProps {
   data: PieSlice[];
@@ -7,6 +8,7 @@ interface PieChartProps {
   centerText?: string;
   height?: number;
   currencyCode?: string;
+  formatValue?: (value: number) => string;
   hideLegend?: boolean;
 }
 
@@ -15,7 +17,7 @@ const DEFAULT_COLORS = [
   "#3ba272", "#fc8452", "#9a60b4", "#ea7ccc", "#48b8d0",
 ];
 
-export default function PieChart({ data, title, centerText, height = 300, currencyCode = "USD", hideLegend = false }: PieChartProps) {
+export default function PieChart({ data, title, centerText, height = 300, currencyCode = "USD", formatValue, hideLegend = false }: PieChartProps) {
   const seriesData = data.map((item, i) => ({
     name: item.name,
     value: item.value,
@@ -31,7 +33,7 @@ export default function PieChart({ data, title, centerText, height = 300, curren
     tooltip: {
       trigger: "item",
       formatter: (params: { name: string; value: number; percent: number }) =>
-        `${params.name}<br/>${currencyCode} ${params.value.toFixed(2)} (${params.percent}%)`,
+        `${params.name}<br/>${formatValue ? formatValue(params.value) : formatMoney(params.value, currencyCode)} (${params.percent}%)`,
     },
     legend: hideLegend
       ? { show: false }

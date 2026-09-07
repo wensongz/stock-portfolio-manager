@@ -8,10 +8,13 @@ use crate::models::transaction::Transaction;
 use crate::services::exchange_rate_service::ExchangeRateCache;
 use crate::services::quote_service::{QuoteCache, QuoteServiceState};
 use chrono::{Datelike, NaiveDate, Utc};
+use rusqlite::OptionalExtension;
 use std::collections::{HashMap, HashSet};
 
 #[path = "quarterly/comparison.rs"]
 mod comparison;
+#[path = "quarterly/currency.rs"]
+pub(crate) mod currency;
 #[path = "quarterly/dates.rs"]
 mod dates;
 #[path = "quarterly/notes.rs"]
@@ -24,7 +27,7 @@ mod transactions;
 mod trends;
 
 pub use comparison::compare_quarters;
-use comparison::load_holdings_for_quarter_from_snapshot;
+use comparison::load_snapshot_for_quarter;
 pub use dates::{
     date_to_quarter, parse_quarter, previous_quarter, quarter_end_date, quarter_start_date,
 };
@@ -56,7 +59,7 @@ pub fn get_quarterly_snapshots(db: &Database) -> Result<Vec<QuarterlySnapshot>, 
             "SELECT qs.id, qs.quarter, qs.snapshot_date, qs.total_value, qs.total_cost, qs.total_pnl,
                     qs.us_value, qs.us_cost, qs.cn_value, qs.cn_cost, qs.hk_value, qs.hk_cost,
                     qs.exchange_rates, qs.overall_notes, qs.created_at,
-                    COUNT(DISTINCT qhs.symbol) AS holding_count
+                    COUNT(DISTINCT CASE WHEN qhs.symbol NOT LIKE '$CASH-%' THEN qhs.market || ':' || qhs.symbol END) AS holding_count
              FROM quarterly_snapshots qs
              LEFT JOIN quarterly_holding_snapshots qhs ON qhs.quarterly_snapshot_id = qs.id
              GROUP BY qs.id
@@ -106,7 +109,7 @@ pub fn get_quarterly_snapshot_detail(
                 "SELECT qs.id, qs.quarter, qs.snapshot_date, qs.total_value, qs.total_cost, qs.total_pnl,
                         qs.us_value, qs.us_cost, qs.cn_value, qs.cn_cost, qs.hk_value, qs.hk_cost,
                         qs.exchange_rates, qs.overall_notes, qs.created_at,
-                        COUNT(DISTINCT qhs.symbol) AS holding_count
+                        COUNT(DISTINCT CASE WHEN qhs.symbol NOT LIKE '$CASH-%' THEN qhs.market || ':' || qhs.symbol END) AS holding_count
                  FROM quarterly_snapshots qs
                  LEFT JOIN quarterly_holding_snapshots qhs ON qhs.quarterly_snapshot_id = qs.id
                  WHERE qs.id = ?1
@@ -140,14 +143,14 @@ pub fn get_quarterly_snapshot_detail(
             .prepare(
                 "SELECT id, quarterly_snapshot_id, account_id, account_name, symbol, name, market,
                         category_name, category_color, shares, avg_cost, close_price,
-                        market_value, cost_value, pnl, pnl_percent, weight, notes
+                        market_value, cost_value, pnl, pnl_percent, weight, notes, currency
                  FROM quarterly_holding_snapshots
                  WHERE quarterly_snapshot_id = ?1
                  ORDER BY market, symbol",
             )
             .map_err(|e| e.to_string())?;
 
-        let holdings = stmt
+        let mut holdings = stmt
             .query_map(rusqlite::params![snapshot_id], |row| {
                 Ok(QuarterlyHoldingSnapshot {
                     id: row.get(0)?,
@@ -168,25 +171,43 @@ pub fn get_quarterly_snapshot_detail(
                     pnl_percent: row.get(15)?,
                     weight: row.get(16)?,
                     notes: row.get(17)?,
+                    currency: row.get(18)?,
                 })
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
 
+        currency::resolve_holding_currencies(&mut holdings)?;
+        currency::holdings_in_usd(&snapshot, &holdings)?;
         (snapshot, holdings)
     }; // conn lock released here
 
     // Compute holding changes: compare Q1 snapshot with (Q1 snapshot + Q2 transactions).
     // This avoids fragile full-history recalculation that depends on accurate backfill data.
-    let prev_q = previous_quarter(&snapshot.quarter).ok();
-    let holding_changes = prev_q.as_ref().and_then(|pq| {
-        let prev_holdings = load_holdings_for_quarter_from_snapshot(db, pq).ok()?;
-        let q_txns = get_quarterly_transactions(db, snapshot_id).ok()?;
+    let prev_q = previous_quarter(&snapshot.quarter)?;
+    let holding_changes = (|| -> Result<Option<HoldingChanges>, String> {
+        let previous_exists = {
+            let conn = db.conn.lock().map_err(|error| error.to_string())?;
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM quarterly_snapshots WHERE quarter = ?1)",
+                [&prev_q],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())?
+        };
+        if !previous_exists {
+            return Ok(None);
+        }
+        let (prev_snapshot, prev_holdings) = load_snapshot_for_quarter(db, &prev_q)?;
+        let prev_holdings = currency::holdings_in_market_currency(&prev_snapshot, &prev_holdings)?;
+        let current_holdings = currency::holdings_in_market_currency(&snapshot, &holdings)?;
+        let rates = currency::SnapshotRates::from_json(&snapshot.exchange_rates)?;
+        let q_txns = get_quarterly_transactions(db, snapshot_id)?;
 
         // Aggregate Q2 snapshot holdings by uppercase symbol for market values
         let mut q2_agg: HashMap<String, (f64, f64)> = HashMap::new();
-        for h in &holdings {
+        for h in &current_holdings {
             if h.symbol.starts_with("$CASH-") {
                 continue;
             }
@@ -206,8 +227,22 @@ pub fn get_quarterly_snapshot_detail(
         for g in &q_txns {
             let key = g.symbol.to_uppercase();
             let entry = txn_net.entry(key).or_default();
-            entry.0 += g.total_buy_shares - g.total_sell_shares; // net shares change
-            entry.1 += g.total_buy_amount - g.total_sell_amount; // net value change
+            entry.0 += g.total_buy_shares - g.total_sell_shares;
+            // A symbol group may contain trades settled in different currencies.
+            // Convert each trade before summing; the group currency is insufficient.
+            for txn in &g.transactions {
+                let sign = match txn.transaction_type.as_str() {
+                    "BUY" => 1.0,
+                    "SELL" => -1.0,
+                    _ => continue,
+                };
+                let from = currency::currency_for_holding(&txn.symbol, &txn.market, &txn.currency)?;
+                let to = currency::currency_for_holding("", &txn.market, "")?;
+                entry.1 += sign
+                    * rates
+                        .convert(txn.total_amount, &from, &to)
+                        .map_err(|error| format!("Quarter {}: {error}", snapshot.quarter))?;
+            }
         }
 
         // Aggregate Q1 holdings by uppercase symbol
@@ -237,14 +272,15 @@ pub fn get_quarterly_snapshot_detail(
         // Q2 = Q1 + txn_net
         // Look up market + category for symbols not in Q1 snapshot
         let new_sym_info: HashMap<String, (String, String, String, String)> = {
-            let conn = db.conn.lock().ok()?;
+            let conn = db.conn.lock().map_err(|error| error.to_string())?;
             let mut map: HashMap<String, (String, String, String, String)> = HashMap::new();
             for sym_upper in txn_net.keys() {
                 if q1_agg.contains_key(sym_upper) {
                     continue;
                 }
-                if let Ok((name, market, cat_name, cat_color)) = conn.query_row(
-                    "SELECT h.name, h.market,
+                if let Some((name, market, cat_name, cat_color)) = conn
+                    .query_row(
+                        "SELECT h.name, h.market,
                             COALESCE(c.name, '未分类'),
                             COALESCE(c.color, '#8B8B8B')
                      FROM holdings h
@@ -252,16 +288,19 @@ pub fn get_quarterly_snapshot_detail(
                      WHERE UPPER(h.symbol) = ?1
                      ORDER BY h.shares DESC
                      LIMIT 1",
-                    rusqlite::params![sym_upper],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                        ))
-                    },
-                ) {
+                        rusqlite::params![sym_upper],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?
+                {
                     map.insert(sym_upper.clone(), (name, market, cat_name, cat_color));
                 }
             }
@@ -376,16 +415,16 @@ pub fn get_quarterly_snapshot_detail(
         sort_list(&mut decreased);
         sort_list(&mut unchanged);
 
-        Some(HoldingChanges {
+        Ok(Some(HoldingChanges {
             new_holdings,
             closed_holdings,
             increased,
             decreased,
             unchanged,
-        })
-    });
+        }))
+    })()?;
     let previous_quarter = if holding_changes.is_some() {
-        prev_q
+        Some(prev_q)
     } else {
         None
     };

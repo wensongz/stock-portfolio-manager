@@ -2,6 +2,7 @@ import dayjs from "dayjs";
 import type { Market } from "../../../types";
 import { parseCsvNumber, splitCsvLine } from "../csv.ts";
 import type { TransactionImportRow } from "../types.ts";
+import { getCurrencySymbol } from "../../../lib/formatMoney.ts";
 
 function validAccountId(value: string): boolean {
   return /^[A-Z]{1,3}\d+$/.test(value.trim());
@@ -86,7 +87,9 @@ function dividendNotes(description: string): string {
   if (!amountMatch) return "";
   const amount = Number.parseFloat(amountMatch[1]);
   if (Number.isNaN(amount)) return "";
-  let notes = `每股分红 ${currency} ${amount.toFixed(8).replace(/\.?0+$/, "")}`;
+  const displayCurrency = ["RMB", "人民币"].includes(currency) ? "CNY"
+    : ["港元", "港币"].includes(currency) ? "HKD" : currency;
+  let notes = `每股分红 ${getCurrencySymbol(displayCurrency)}${amount.toFixed(8).replace(/\.?0+$/, "")}`;
   if (/(bonus\s+dividend|奖励分红|奖励股息|红股|送股)/i.test(description)) notes += "（奖励分红）";
   return notes;
 }

@@ -1,4 +1,5 @@
 pub(crate) mod migrations;
+mod quarterly_schema;
 mod schema;
 mod snapshot_cache_schema;
 
@@ -23,5 +24,7 @@ impl Database {
     }
 }
 
+#[cfg(test)]
+mod quarterly_schema_tests;
 #[cfg(test)]
 mod tests;

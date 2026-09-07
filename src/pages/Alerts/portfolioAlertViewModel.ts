@@ -1,3 +1,4 @@
+import { formatMoney } from "../../lib/formatMoney.ts";
 import type {
   Account,
   AllocationDirection,
@@ -328,7 +329,7 @@ function formatPercent(value: number): string {
 }
 
 function formatAmount(value: number, currency: PortfolioAlertCurrency): string {
-  return `${formatNumber(value)} ${currency}`;
+  return formatMoney(value, currency);
 }
 
 function rowStatus(

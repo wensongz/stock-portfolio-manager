@@ -109,7 +109,7 @@ export default function QuarterlyPage() {
       render: (v: number) => <Text strong>${fmt(v)}</Text>,
     },
     {
-      title: "总盈亏 (USD)",
+      title: "持仓盈亏 (USD)",
       dataIndex: "total_pnl",
       key: "total_pnl",
       render: (v: number) => (

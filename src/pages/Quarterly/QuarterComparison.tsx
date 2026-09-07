@@ -19,6 +19,7 @@ import { useQuarterlyStore } from "../../stores/quarterlyStore";
 import ComparisonCharts from "./ComparisonCharts";
 import HoldingChangesTable from "./HoldingChangesTable";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { formatQuarterlyMoney } from "./formatMoney";
 
 const { Title, Text } = Typography;
 
@@ -117,30 +118,30 @@ export default function QuarterComparisonPage() {
             <Col xs={12} sm={6}>
               <Card size="small">
                 <Statistic
-                  title={`${comparison.quarter1} 市值`}
+                  title={`${comparison.quarter1} 市值 (USD)`}
                   value={ov?.q1_total_value ?? 0}
                   precision={2}
-                  prefix="$"
+                  formatter={(value) => formatQuarterlyMoney(Number(value), "USD")}
                 />
               </Card>
             </Col>
             <Col xs={12} sm={6}>
               <Card size="small">
                 <Statistic
-                  title={`${comparison.quarter2} 市值`}
+                  title={`${comparison.quarter2} 市值 (USD)`}
                   value={ov?.q2_total_value ?? 0}
                   precision={2}
-                  prefix="$"
+                  formatter={(value) => formatQuarterlyMoney(Number(value), "USD")}
                 />
               </Card>
             </Col>
             <Col xs={12} sm={6}>
               <Card size="small">
                 <Statistic
-                  title="市值变化"
+                  title="市值变化 (USD)"
                   value={ov?.value_change ?? 0}
                   precision={2}
-                  prefix={`${(ov?.value_change ?? 0) >= 0 ? "+" : ""}$`}
+                  formatter={(value) => `${Number(value) >= 0 ? "+" : ""}${formatQuarterlyMoney(Number(value), "USD")}`}
                   styles={{
                     content: {
                       color: pnlColorDark(ov?.value_change ?? 0),
@@ -188,10 +189,10 @@ export default function QuarterComparisonPage() {
                     return <Tag>{labels[m] ?? m}</Tag>;
                   },
                 },
-                { title: `${comparison.quarter1} 市值`, dataIndex: "q1_value", render: fmt },
-                { title: `${comparison.quarter2} 市值`, dataIndex: "q2_value", render: fmt },
+                { title: `${comparison.quarter1} 市值 (USD)`, dataIndex: "q1_value", render: fmt },
+                { title: `${comparison.quarter2} 市值 (USD)`, dataIndex: "q2_value", render: fmt },
                 {
-                  title: "变化",
+                  title: "变化 (USD)",
                   dataIndex: "value_change",
                   render: (v: number) => (
                     <Text style={{ color: pnlColorDark(v) }}>
@@ -199,8 +200,8 @@ export default function QuarterComparisonPage() {
                     </Text>
                   ),
                 },
-                { title: `${comparison.quarter1} 盈亏`, dataIndex: "q1_pnl", render: fmt },
-                { title: `${comparison.quarter2} 盈亏`, dataIndex: "q2_pnl", render: fmt },
+                { title: `${comparison.quarter1} 持仓盈亏 (USD)`, dataIndex: "q1_pnl", render: fmt },
+                { title: `${comparison.quarter2} 持仓盈亏 (USD)`, dataIndex: "q2_pnl", render: fmt },
               ]}
             />
           </Card>
@@ -220,10 +221,10 @@ export default function QuarterComparisonPage() {
                     <Tag color={record.category_color}>{name}</Tag>
                   ),
                 },
-                { title: `${comparison.quarter1} 市值`, dataIndex: "q1_value", render: fmt },
-                { title: `${comparison.quarter2} 市值`, dataIndex: "q2_value", render: fmt },
+                { title: `${comparison.quarter1} 市值 (USD)`, dataIndex: "q1_value", render: fmt },
+                { title: `${comparison.quarter2} 市值 (USD)`, dataIndex: "q2_value", render: fmt },
                 {
-                  title: "变化",
+                  title: "变化 (USD)",
                   dataIndex: "value_change",
                   render: (v: number) => (
                     <Text style={{ color: pnlColorDark(v) }}>

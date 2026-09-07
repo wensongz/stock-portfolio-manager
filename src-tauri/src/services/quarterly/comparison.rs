@@ -9,6 +9,9 @@ pub fn compare_quarters(
     let (snap1, h1) = load_snapshot_for_quarter(db, quarter1)?;
     let (snap2, h2) = load_snapshot_for_quarter(db, quarter2)?;
 
+    let usd1 = currency::holdings_in_usd(&snap1, &h1)?;
+    let usd2 = currency::holdings_in_usd(&snap2, &h2)?;
+
     // Overview
     let value_change = snap2.total_value - snap1.total_value;
     let value_change_percent = if snap1.total_value != 0.0 {
@@ -27,24 +30,28 @@ pub fn compare_quarters(
         q2_pnl: snap2.total_pnl,
         q1_holding_count: h1
             .iter()
-            .map(|h| h.symbol.as_str())
+            .filter(|h| !h.symbol.starts_with("$CASH-"))
+            .map(|h| (h.market.as_str(), h.symbol.as_str()))
             .collect::<std::collections::HashSet<_>>()
             .len(),
         q2_holding_count: h2
             .iter()
-            .map(|h| h.symbol.as_str())
+            .filter(|h| !h.symbol.starts_with("$CASH-"))
+            .map(|h| (h.market.as_str(), h.symbol.as_str()))
             .collect::<std::collections::HashSet<_>>()
             .len(),
     };
 
     // By market
-    let by_market = compute_market_comparison(&h1, &h2);
+    let by_market = compute_market_comparison(&usd1, &usd2);
 
     // By category
-    let by_category = compute_category_comparison(&h1, &h2);
+    let by_category = compute_category_comparison(&usd1, &usd2);
 
     // Holding changes
-    let holding_changes = compute_holding_changes(&h1, &h2);
+    let native1 = currency::holdings_in_market_currency(&snap1, &h1)?;
+    let native2 = currency::holdings_in_market_currency(&snap2, &h2)?;
+    let holding_changes = compute_holding_changes(&native1, &native2);
 
     Ok(QuarterComparison {
         quarter1: quarter1.to_string(),
@@ -56,7 +63,7 @@ pub fn compare_quarters(
     })
 }
 
-fn load_snapshot_for_quarter(
+pub(super) fn load_snapshot_for_quarter(
     db: &Database,
     quarter: &str,
 ) -> Result<(QuarterlySnapshot, Vec<QuarterlyHoldingSnapshot>), String> {
@@ -68,7 +75,12 @@ fn load_snapshot_for_quarter(
             rusqlite::params![quarter],
             |row| row.get(0),
         )
-        .map_err(|_| format!("No snapshot found for quarter '{}'", quarter))?;
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => {
+                format!("No snapshot found for quarter '{quarter}'")
+            }
+            _ => format!("Failed to load snapshot for quarter '{quarter}': {error}"),
+        })?;
 
     let snapshot = conn
         .query_row(
@@ -104,13 +116,13 @@ fn load_snapshot_for_quarter(
         .prepare(
             "SELECT id, quarterly_snapshot_id, account_id, account_name, symbol, name, market,
                     category_name, category_color, shares, avg_cost, close_price,
-                    market_value, cost_value, pnl, pnl_percent, weight, notes
+                    market_value, cost_value, pnl, pnl_percent, weight, notes, currency
              FROM quarterly_holding_snapshots
              WHERE quarterly_snapshot_id = ?1",
         )
         .map_err(|e| e.to_string())?;
 
-    let holdings = stmt
+    let mut holdings = stmt
         .query_map(rusqlite::params![snapshot_id], |row| {
             Ok(QuarterlyHoldingSnapshot {
                 id: row.get(0)?,
@@ -131,76 +143,27 @@ fn load_snapshot_for_quarter(
                 pnl_percent: row.get(15)?,
                 weight: row.get(16)?,
                 notes: row.get(17)?,
+                currency: row.get(18)?,
             })
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
 
+    currency::resolve_holding_currencies(&mut holdings)?;
     Ok((snapshot, holdings))
-}
-
-/// Load only the holdings for a given quarter. Used for computing holding changes.
-/// Read holdings from a quarterly snapshot (fast, no recalculation).
-pub(super) fn load_holdings_for_quarter_from_snapshot(
-    db: &Database,
-    quarter: &str,
-) -> Result<Vec<QuarterlyHoldingSnapshot>, String> {
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
-
-    let snapshot_id: String = conn
-        .query_row(
-            "SELECT id FROM quarterly_snapshots WHERE quarter = ?1",
-            rusqlite::params![quarter],
-            |row| row.get(0),
-        )
-        .map_err(|_| format!("No snapshot found for quarter '{}'", quarter))?;
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, quarterly_snapshot_id, account_id, account_name, symbol, name, market,
-                    category_name, category_color, shares, avg_cost, close_price,
-                    market_value, cost_value, pnl, pnl_percent, weight, notes
-             FROM quarterly_holding_snapshots
-             WHERE quarterly_snapshot_id = ?1",
-        )
-        .map_err(|e| e.to_string())?;
-
-    let holdings = stmt
-        .query_map(rusqlite::params![snapshot_id], |row| {
-            Ok(QuarterlyHoldingSnapshot {
-                id: row.get(0)?,
-                quarterly_snapshot_id: row.get(1)?,
-                account_id: row.get(2)?,
-                account_name: row.get(3)?,
-                symbol: row.get(4)?,
-                name: row.get(5)?,
-                market: row.get(6)?,
-                category_name: row.get(7)?,
-                category_color: row.get(8)?,
-                shares: row.get(9)?,
-                avg_cost: row.get(10)?,
-                close_price: row.get(11)?,
-                market_value: row.get(12)?,
-                cost_value: row.get(13)?,
-                pnl: row.get(14)?,
-                pnl_percent: row.get(15)?,
-                weight: row.get(16)?,
-                notes: row.get(17)?,
-            })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-
-    Ok(holdings)
 }
 
 fn compute_market_comparison(
     h1: &[QuarterlyHoldingSnapshot],
     h2: &[QuarterlyHoldingSnapshot],
 ) -> Vec<MarketComparison> {
-    let markets = ["US", "CN", "HK"];
+    let mut markets = vec!["US", "CN", "HK"];
+    for holding in h1.iter().chain(h2) {
+        if !markets.contains(&holding.market.as_str()) {
+            markets.push(&holding.market);
+        }
+    }
     markets
         .iter()
         .map(|m| {

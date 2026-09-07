@@ -16,6 +16,7 @@ import {
 import type { ColumnsType } from "antd/es/table";
 import { useNavigate } from "react-router-dom";
 import StatCard from "../../components/charts/StatCard";
+import { formatMoney } from "../../lib/formatMoney";
 import { usePnlColor } from "../../hooks/usePnlColor";
 import { useAccountStore } from "../../stores/accountStore";
 import { useChatStore } from "../../stores/chatStore";
@@ -45,12 +46,7 @@ const { Text } = Typography;
 const attentionFlags = new Set(["净亏损", "低留存", "单次损失较大", "样本不足"]);
 
 function formatCurrency(value: number, currency: Currency) {
-  return new Intl.NumberFormat("zh-CN", {
-    style: "currency",
-    currency,
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(value);
+  return formatMoney(value, currency);
 }
 
 function describeDataQuality(dataQuality: OptionReviewDataQuality) {

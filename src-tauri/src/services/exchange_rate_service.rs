@@ -117,8 +117,10 @@ pub async fn fetch_exchange_rates() -> Result<ExchangeRates, String> {
 
 /// Persist exchange rates to the database (single-row upsert, id=1).
 pub fn save_exchange_rates_to_db(db: &Database, rates: &ExchangeRates) -> Result<(), String> {
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
-    conn.execute(
+    let mut conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    crate::services::historical_exchange_rate_service::record_rates_in(&tx, rates, "observed")?;
+    tx.execute(
         "INSERT OR REPLACE INTO cached_exchange_rates (id, usd_cny, usd_hkd, cny_hkd, updated_at)
          VALUES (1, ?1, ?2, ?3, ?4)",
         rusqlite::params![
@@ -129,7 +131,7 @@ pub fn save_exchange_rates_to_db(db: &Database, rates: &ExchangeRates) -> Result
         ],
     )
     .map_err(|e| e.to_string())?;
-    Ok(())
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// Load persisted exchange rates from the database (returns None if none saved yet).

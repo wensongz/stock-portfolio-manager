@@ -5,6 +5,7 @@ import { useNavigate } from "react-router-dom";
 import { useQuarterlyStore } from "../../stores/quarterlyStore";
 import TrendCharts from "./TrendCharts";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { formatQuarterlyMoney } from "./formatMoney";
 
 const { Title, Text } = Typography;
 
@@ -58,20 +59,20 @@ export default function TrendsPage() {
                 <Col xs={12} sm={6}>
                   <Card size="small">
                     <Statistic
-                      title="最新总市值"
+                      title="最新总市值 (USD)"
                       value={latestValue}
                       precision={2}
-                      prefix="$"
+                      formatter={(value) => formatQuarterlyMoney(Number(value), "USD")}
                     />
                   </Card>
                 </Col>
                 <Col xs={12} sm={6}>
                   <Card size="small">
                     <Statistic
-                      title="最新总盈亏"
+                      title="最新持仓盈亏 (USD)"
                       value={latestPnl}
                       precision={2}
-                      prefix="$"
+                      formatter={(value) => formatQuarterlyMoney(Number(value), "USD")}
                       styles={{ content: {  color: pnlColorDark(latestPnl)  } }}
                     />
                   </Card>

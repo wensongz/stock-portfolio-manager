@@ -129,14 +129,24 @@ pub struct QuarterComparison {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct HoldingNoteHistory {
+pub struct QuarterlyHoldingHistory {
+    pub holding_snapshot_id: String,
+    pub snapshot_id: String,
+    pub account_id: String,
+    pub symbol: String,
+    pub currency: String,
     pub quarter: String,
-    pub snapshot_date: String,
-    pub shares: f64,
-    pub avg_cost: f64,
-    pub close_price: f64,
-    pub pnl_percent: Option<f64>,
-    pub notes: String,
+    pub start_date: String,
+    pub end_date: String,
+    pub rows: Vec<QuarterlyHoldingHistoryRow>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct QuarterlyHoldingHistoryRow {
+    #[serde(flatten)]
+    pub transaction: Transaction,
+    pub cash_delta: Option<f64>,
+    pub running_balance: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

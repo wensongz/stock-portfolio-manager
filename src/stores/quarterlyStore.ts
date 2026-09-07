@@ -42,7 +42,7 @@ export interface QuarterlyState {
   ensureCurrentQuarterSnapshot: () => Promise<QuarterlySnapshot | null>;
   compareQuarters: (quarter1: string, quarter2: string) => Promise<void>;
   fetchTrends: () => Promise<void>;
-  updateHoldingNotes: (snapshotId: string, symbol: string, notes: string) => Promise<void>;
+  updateHoldingNotes: (snapshotId: string, holdingSnapshotId: string, notes: string) => Promise<void>;
   updateQuarterlyNotes: (snapshotId: string, notes: string) => Promise<void>;
   clearDetail: () => void;
   clearComparison: () => void;
@@ -257,16 +257,26 @@ export const createQuarterlyStore = (invokeFn: QuarterlyInvoke = invoke) => {
         }
       },
 
-      updateHoldingNotes: async (snapshotId, symbol, notes) => {
+      updateHoldingNotes: async (snapshotId, holdingSnapshotId, notes) => {
         const generation = startMutation();
         try {
-          await invokeFn<boolean>("update_holding_notes", { snapshotId, symbol, notes });
-          if (get().detailSnapshotId === snapshotId) {
-            await get().fetchDetail(snapshotId);
+          const saved = await invokeFn<boolean>("update_holding_notes", { snapshotId, holdingSnapshotId, notes });
+          if (!saved) throw new Error("持仓思考未保存，请刷新后重试。");
+          if (get().detailSnapshotId === snapshotId && get().detail?.snapshot.id === snapshotId) {
+            // A detail request begun before the save must not restore older notes.
+            detailGeneration += 1;
+            set((state) => ({
+              detailLoading: false,
+              detail: state.detail ? {
+                ...state.detail,
+                holdings: state.detail.holdings.map((holding) => holding.id === holdingSnapshotId ? { ...holding, notes } : holding),
+              } : null,
+            }));
           }
           finishMutation(generation);
         } catch (err) {
           finishMutation(generation, err);
+          throw err;
         }
       },
 

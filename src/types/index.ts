@@ -536,14 +536,21 @@ export interface QuarterComparison {
   holding_changes: HoldingChanges;
 }
 
-export interface HoldingNoteHistory {
+export interface QuarterlyHoldingHistoryRow extends Transaction {
+  cash_delta: number | null;
+  running_balance: number | null;
+}
+
+export interface QuarterlyHoldingHistory {
+  holding_snapshot_id: string;
+  snapshot_id: string;
+  account_id: string;
+  symbol: string;
+  currency: string;
   quarter: string;
-  snapshot_date: string;
-  shares: number;
-  avg_cost: number;
-  close_price: number;
-  pnl_percent: number | null;
-  notes: string;
+  start_date: string;
+  end_date: string;
+  rows: QuarterlyHoldingHistoryRow[];
 }
 
 export interface QuarterlyTrends {

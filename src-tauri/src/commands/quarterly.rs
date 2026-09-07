@@ -1,6 +1,6 @@
 use crate::db::Database;
 use crate::models::quarterly::{
-    HoldingNoteHistory, QuarterComparison, QuarterlySnapshot, QuarterlySnapshotDetail,
+    QuarterComparison, QuarterlyHoldingHistory, QuarterlySnapshot, QuarterlySnapshotDetail,
     QuarterlyTrends, StockTransactionGroup,
 };
 use crate::services::exchange_rate_service::ExchangeRateCache;
@@ -79,18 +79,19 @@ pub async fn compare_quarters(
 pub async fn update_holding_notes(
     db: State<'_, Database>,
     snapshot_id: String,
-    symbol: String,
+    holding_snapshot_id: String,
     notes: String,
 ) -> Result<bool, String> {
-    quarterly_service::update_holding_notes(&db, &snapshot_id, &symbol, &notes)
+    quarterly_service::update_holding_notes(&db, &snapshot_id, &holding_snapshot_id, &notes)
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub async fn get_holding_notes_history(
+pub async fn get_quarterly_holding_history(
     db: State<'_, Database>,
-    symbol: String,
-) -> Result<Vec<HoldingNoteHistory>, String> {
-    quarterly_service::get_holding_notes_history(&db, &symbol)
+    snapshot_id: String,
+    holding_snapshot_id: String,
+) -> Result<QuarterlyHoldingHistory, String> {
+    quarterly_service::get_quarterly_holding_history(&db, &snapshot_id, &holding_snapshot_id)
 }
 
 #[tauri::command(rename_all = "camelCase")]

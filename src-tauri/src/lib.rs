@@ -276,7 +276,7 @@ pub fn run() {
             commands::quarterly::ensure_current_quarter_snapshot,
             commands::quarterly::compare_quarters,
             commands::quarterly::update_holding_notes,
-            commands::quarterly::get_holding_notes_history,
+            commands::quarterly::get_quarterly_holding_history,
             commands::quarterly::update_quarterly_notes,
             commands::quarterly::get_quarterly_trends,
             commands::quarterly::get_quarterly_transactions,

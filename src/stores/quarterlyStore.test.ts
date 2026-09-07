@@ -167,3 +167,11 @@ test("a late notes save never replaces the newly selected quarter", async () => 
   await saving;
   assert.equal(store.getState().detail, next);
 });
+
+test("loading another snapshot clears the previous snapshot mutation error", async () => {
+  const store = createQuarterlyStore(async (command) => command === "get_quarterly_transactions" ? [] : detail("B"));
+  store.setState({ detailSnapshotId: "A", detail: detail("A"), mutationError: "old failure" });
+  await store.getState().fetchDetail("B");
+  assert.equal(store.getState().detail.snapshot.id, "B");
+  assert.equal(store.getState().mutationError, null);
+});

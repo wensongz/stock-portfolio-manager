@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 struct CashEvent {
     date: NaiveDate,
     opening: Option<f64>,
+    is_deposit: bool,
     delta: f64,
 }
 
@@ -129,6 +130,7 @@ pub(super) fn load_cash_holdings(
             ));
         }
         let cash_symbol = format!("$CASH-{currency}");
+        let is_deposit = symbol == cash_symbol && kind == "BUY" && amount > 0.0;
         let account = accounts
             .entry((account_id.clone(), currency.clone()))
             .or_insert_with(|| CashAccount {
@@ -153,6 +155,7 @@ pub(super) fn load_cash_holdings(
         account.events.push(CashEvent {
             date: parse_date(&traded_at)?,
             opening: (is_cash_symbol(&symbol) && kind == "OPEN").then_some(shares),
+            is_deposit,
             delta: cash_delta(&kind, &symbol, amount, fee),
         });
     }
@@ -205,6 +208,20 @@ pub(super) fn load_cash_holdings(
                     .filter(|event| event.date > cutoff)
                     .map(|event| event.delta)
                     .sum::<f64>()
+        } else if account
+            .events
+            .iter()
+            .any(|event| event.date <= cutoff && event.is_deposit)
+        {
+            // A removed current cash row must not hide an account with explicit
+            // cash deposits. Replay that account/currency from zero, retaining
+            // the existing OPEN and current-balance precedence above.
+            account
+                .events
+                .iter()
+                .filter(|event| event.date <= cutoff)
+                .map(|event| event.delta)
+                .sum::<f64>()
         } else {
             if account
                 .events

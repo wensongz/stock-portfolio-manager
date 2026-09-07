@@ -68,6 +68,7 @@ export const createQuarterlyStore = (invokeFn: QuarterlyInvoke = invoke) => {
         detailSnapshotId: snapshotId,
         detailLoading: true,
         detailError: null,
+        mutationError: null,
         ...(changedSnapshot ? { detail: null, quarterlyTransactions: [] } : {}),
       });
 

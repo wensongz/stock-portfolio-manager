@@ -491,6 +491,36 @@ async fn resolve_current_prices(
     Ok(prices)
 }
 
+fn load_historical_transaction_price(
+    db: &Database,
+    holding: &WorkingHolding,
+    end_date: NaiveDate,
+) -> Result<Option<f64>, String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    conn.query_row(
+        "SELECT price FROM transactions
+         WHERE account_id = ?1
+           AND UPPER(symbol) = UPPER(?2)
+           AND market = ?3 AND currency = ?4
+           AND DATE(traded_at) <= ?5
+           AND UPPER(transaction_type) IN ('BUY', 'OPEN', 'STOCK_IN')
+           AND price > 0 AND price <= ?6
+         ORDER BY JULIANDAY(traded_at) DESC, JULIANDAY(created_at) DESC, id DESC
+         LIMIT 1",
+        rusqlite::params![
+            holding.account_id,
+            holding.symbol,
+            holding.market,
+            holding.currency,
+            end_date.format("%Y-%m-%d").to_string(),
+            f64::MAX,
+        ],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
 async fn resolve_historical_prices<Fetch, FetchFuture>(
     db: &Database,
     holdings: &[WorkingHolding],
@@ -525,14 +555,23 @@ where
             )
             .await;
             if let Ok(history) = history {
-                if let Some((_, price)) = history
+                let closing_price = history
                     .into_iter()
                     .filter(|(date, price)| *date <= end_date && price.is_finite() && *price > 0.0)
                     .max_by_key(|(date, _)| *date)
-                {
-                    for holding in holdings.iter().filter(|holding| {
-                        holding.symbol.eq_ignore_ascii_case(&symbol) && holding.market == market
-                    }) {
+                    .map(|(_, price)| price);
+                for holding in holdings.iter().filter(|holding| {
+                    holding.symbol.eq_ignore_ascii_case(&symbol) && holding.market == market
+                }) {
+                    // Before an allotted stock starts trading, value it at its
+                    // acquisition price, as daily snapshots do. A provider
+                    // failure never enters this branch, and future prices or
+                    // transactions must not change the quarter-end valuation.
+                    let price = match closing_price {
+                        Some(price) => Some(price),
+                        None => load_historical_transaction_price(db, holding, end_date)?,
+                    };
+                    if let Some(price) = price {
                         prices.insert(PositionKey::from_holding(holding), price);
                     }
                 }
@@ -909,6 +948,14 @@ where
         holding_count,
     })
 }
+
+#[cfg(test)]
+#[path = "cash_refresh_tests.rs"]
+mod cash_refresh_tests;
+
+#[cfg(test)]
+#[path = "price_fallback_tests.rs"]
+mod price_fallback_tests;
 
 #[cfg(test)]
 mod tests {

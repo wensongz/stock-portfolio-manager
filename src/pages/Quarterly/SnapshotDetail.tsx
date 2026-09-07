@@ -1,11 +1,13 @@
 import { useEffect } from "react";
 import {
+  Alert,
   Button,
   Card,
   Col,
   Divider,
   Row,
   Space,
+  Spin,
   Statistic,
   Typography,
 } from "antd";
@@ -30,7 +32,9 @@ export default function SnapshotDetail() {
   const {
     detail,
     detailLoading,
+    detailError,
     mutationLoading,
+    mutationError,
     quarterlyTransactions,
     fetchDetail,
     refreshSnapshot,
@@ -52,13 +56,31 @@ export default function SnapshotDetail() {
     return () => clearDetail();
   }, [snapshotId]);
 
-  if (!detail && !loading) {
+  const errors = [...new Set([detailError, mutationError].filter((error): error is string => !!error))];
+  const retry = () => {
+    if (snapshotId) return detail ? refreshSnapshot(snapshotId) : fetchDetail(snapshotId);
+  };
+  const errorFeedback = errors.length > 0 && (
+    <Alert
+      type="error"
+      showIcon
+      className="mb-4"
+      title={!detail ? "季度快照加载失败" : detailError ? "刷新未完成，当前仍显示上次加载的快照" : "快照操作未完成"}
+      description={errors.map((error) => <div key={error}>{error}</div>)}
+      action={<Button size="small" loading={loading} onClick={() => void retry()}>{detail ? "重试刷新" : "重新加载"}</Button>}
+    />
+  );
+
+  if (!detail) {
     return (
       <div>
         <Button icon={<ArrowLeftOutlined />} onClick={() => navigate("/quarterly")}>
           返回
         </Button>
-        <div className="mt-4">快照不存在或已删除</div>
+        <div className="mt-4">
+          {errorFeedback}
+          {loading ? <Space><Spin /><Text>正在加载季度快照…</Text></Space> : errors.length === 0 && <Space><Text>暂无季度快照数据</Text><Button onClick={() => void retry()}>重新加载</Button></Space>}
+        </div>
       </div>
     );
   }
@@ -93,6 +115,8 @@ export default function SnapshotDetail() {
           刷新
         </Button>
       </div>
+
+      {errorFeedback}
 
       {/* Overview Cards */}
       <Row gutter={[16, 16]} className="mb-4">

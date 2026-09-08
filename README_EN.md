@@ -54,7 +54,7 @@ The application is built with **Tauri 2 + React 19 + TypeScript + Rust + SQLite*
 - Manual SQLite backups and optional startup backups based on database changes and the backup interval
 - A factory-reset option that clears the database and locally stored UI preferences
 
-### AI assistant (experimental)
+### AI assistant
 
 - Streaming responses, multiple conversations, persisted chat history, automatic titles, and token-usage display
 - OpenAI, Anthropic Claude, Ollama, OpenRouter, Kimi, GLM, MiMo, and DeepSeek providers

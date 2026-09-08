@@ -1,4 +1,4 @@
-import { Tabs, Typography, Space, Tag } from "antd";
+import { Tabs, Typography } from "antd";
 import { SettingOutlined } from "@ant-design/icons";
 import AIPage from "../AI";
 import GeneralSettings from "./GeneralSettings";
@@ -32,12 +32,7 @@ export default function SettingsPage() {
     },
     {
       key: "ai",
-      label: (
-        <Space>
-          🤖 AI 配置
-          <Tag color="orange" style={{ fontSize: 10 }}>实验性</Tag>
-        </Space>
-      ),
+      label: "🤖 AI 配置",
       children: <AIPage />,
     },
   ];

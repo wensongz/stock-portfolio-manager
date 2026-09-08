@@ -386,7 +386,7 @@ function ApiSettingsCard() {
             }
             extra={
               <Text type="secondary" style={{ fontSize: 12 }}>
-                定义 AI 的角色、职责与回答风格。AI 会自动收到一份当前持仓与绩效的快照作为上下文，无需在此重复填写。
+                定义 AI 的角色、职责与回答风格。开启对话中的「注入数据」后，会附带使用缓存行情的持仓、近期交易与绩效快照；从复盘或组合提醒入口进入时，会提供对应范围的数据。技能会补充分析步骤与输出格式。已有提示词不会自动覆盖，可点击「恢复默认」载入最新版，再保存生效。
               </Text>
             }
           >
@@ -410,14 +410,19 @@ function ApiSettingsCard() {
       </Card>
 
       <Card title="功能说明">
-        <Paragraph>配置完成后，AI 分析功能可以帮助你：</Paragraph>
+        <Paragraph>配置完成后，可在「AI 助手」中对话，或从复盘、组合提醒页面发起分析：</Paragraph>
         <ul className="list-disc list-inside space-y-1">
-          <li>分析持仓集中度和风险分布</li>
-          <li>基于持仓历史生成季度回顾总结</li>
-          <li>提供个性化的投资建议</li>
-          <li>分析操作决策的质量和改进方向</li>
+          <li>查询大盘与个股行情、历史价格、估值和技术指标，以及 A 股财报</li>
+          <li>分析组合集中度、市场与账户分布、收益归因、月度收益和回撤风险</li>
+          <li>查询交易、分红和期权持仓，基于系统计算的股票与期权复盘报告分析操作效果</li>
+          <li>从组合提醒发起再平衡分析，按目标配置生成不追加资金的调整建议</li>
+          <li>使用内置或自定义技能进行风险体检、季度回顾和专项分析；支持关键词触发及输入 / 选择技能</li>
+          <li>管理多个会话、编辑问题重发、重新生成回答，并查看工具查询详情与 token 用量</li>
         </ul>
         <Divider />
+        <Paragraph type="secondary">
+          数据查询需要所选模型支持工具调用，行情与财报的覆盖范围、时效以数据源返回为准。关闭「注入数据」只停止自动附带组合快照，工具仍可按需查询数据。AI 工具用于查询和分析，不会修改持仓、交易记录或自动下单。
+        </Paragraph>
         <Text type="secondary">
           注意：AI 分析仅供参考，不构成投资建议。投资有风险，入市需谨慎。
         </Text>
@@ -427,7 +432,7 @@ function ApiSettingsCard() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Page shell — renders the experimental-feature banner and the API / Skills tabs.
+// Page shell — renders connection/data guidance and the API / Skills tabs.
 // (No page title here: AIPage is itself the content of the "🤖 AI 配置" tab on
 // the Settings page, which already shows the page title and tab label.)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -437,8 +442,8 @@ export default function AIPage() {
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
       <Alert
         type="info"
-        title="实验性功能"
-        description="支持 OpenAI、Ollama、OpenRouter 以及 Kimi、GLM（智谱）、MiMo（小米）、DeepSeek 等主流服务。填写 API Key 后可自动获取可用模型列表，获取失败时也可手动输入。API Key 仅本地存储，不会上传。使用前请确保 API Key 有效，并了解相关费用。"
+        title="连接与数据说明"
+        description="支持 OpenAI、Anthropic（Claude）、Ollama、OpenRouter、Kimi、GLM（智谱）、MiMo（小米）和 DeepSeek。可获取模型列表或手动输入模型名称，本地 Ollama 无需 API Key。API Key 保存在本地，并用于向你配置的 API 端点鉴权；对话、启用的技能及随请求附带的组合数据和工具结果会发送至该端点。请按所选服务了解数据使用政策与费用。"
         showIcon
       />
 

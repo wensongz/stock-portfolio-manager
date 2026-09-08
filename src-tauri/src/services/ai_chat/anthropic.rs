@@ -55,7 +55,7 @@ pub(super) async fn chat_stream_anthropic(
     if params.include_context && params.portfolio_scope.is_none() {
         match build_portfolio_context(db, cache, quote_cache, None).await {
             Ok(ctx) => system_parts.push(format!(
-                "以下是用户的实时投资组合数据，请在回答时参考（金额单位均为 USD，数据可能略有延迟）：\n\n{ctx}"
+                "以下是用户的投资组合快照，使用缓存行情，可能存在延迟。账户汇总、绩效金额与标注 USD 的市值为美元，持仓均价、现价及交易价格、金额为证券原币。近期交易表未逐条展示币种，无法确认时需先核实，不能直接跨币种汇总：\n\n{ctx}"
             )),
             Err(e) => warn!(target: "ai_chat", "failed to build portfolio context: {e}"),
         }

@@ -59,7 +59,7 @@
 - SQLite 手动备份；可在应用启动时按数据库变更和时间间隔自动备份
 - 设置页提供恢复出厂设置，可清空数据库与本地界面偏好
 
-### AI 助手（实验性）
+### AI 助手
 
 - 流式对话、多会话管理、会话持久化、自动标题和 token 用量展示
 - 支持 OpenAI、Anthropic Claude、Ollama、OpenRouter、Kimi、GLM、MiMo 和 DeepSeek

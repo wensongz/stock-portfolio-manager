@@ -608,7 +608,7 @@ export default function OptionsPage() {
       title: "交易时间",
       dataIndex: "traded_at",
       key: "traded_at",
-      width: 110,
+      width: 115,
       render: (v: string | null) => v ? v.substring(0, 10) : "-",
     },
   ];
@@ -620,7 +620,7 @@ export default function OptionsPage() {
       title: "结果",
       dataIndex: "status",
       key: "result",
-      width: 80,
+      width: 75,
       render: (v: string) => {
         if (v === "assigned") return <Tag color="red">被执行</Tag>;
         if (v === "expired") return <Tag color="green">已到期</Tag>;
@@ -754,7 +754,7 @@ export default function OptionsPage() {
       dataIndex: "assignmentRatio",
       key: "assignmentRatio",
       align: "right",
-      width: 90,
+      width: 85,
       render: (value: number) => `${(value * 100).toFixed(1)}%`,
     },
     {
@@ -779,7 +779,7 @@ export default function OptionsPage() {
       title: "最近完成日",
       dataIndex: "latestCompletedAt",
       key: "latestCompletedAt",
-      width: 110,
+      width: 115,
       render: (value: string | null) => value?.substring(0, 10) ?? "—",
     },
   ];
@@ -882,7 +882,6 @@ export default function OptionsPage() {
             rowKey={getOptionContractRowKey}
             size="small"
             pagination={false}
-            scroll={{ x: "max-content" }}
             expandable={{
               childrenColumnName: "children",
               expandIcon: ({ expanded, onExpand, record }) =>

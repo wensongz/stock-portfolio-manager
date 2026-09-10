@@ -553,7 +553,7 @@ export default function OptionsPage() {
       title: "行权价",
       dataIndex: "strike_price",
       key: "strike_price",
-      width: 90,
+      width: 85,
       render: (v: number) => `$${v.toFixed(2)}`,
     },
     {
@@ -571,19 +571,19 @@ export default function OptionsPage() {
       title: "开仓合约数",
       dataIndex: "contracts",
       key: "contracts",
-      width: 110,
+      width: 105,
     },
     {
       title: "未平仓合约数",
       dataIndex: "remaining_contracts",
       key: "remaining_contracts",
-      width: 110,
+      width: 105,
     },
     {
       title: "开仓价",
       dataIndex: "open_price",
       key: "open_price",
-      width: 80,
+      width: 75,
       render: (v: number) => `$${v.toFixed(2)}`,
     },
     {

@@ -5,6 +5,7 @@ import { EditOutlined, HistoryOutlined } from "@ant-design/icons";
 import type { QuarterlyHoldingSnapshot, QuarterlySnapshot } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
 import { useTablePageSize } from "../../hooks/tablePageSize";
+import { formatHoldingShares } from "../../lib/formatMoney";
 import HoldingNotesEditor from "./HoldingNotesEditor";
 import { formatQuarterlyMoney } from "./formatMoney";
 import { aggregateSnapshotHoldings, parseSnapshotExchangeRates, snapshotHoldingCurrency, type AggregatedSnapshotHolding } from "./aggregateSnapshotHoldings";
@@ -38,7 +39,7 @@ export default function SnapshotHoldingsTable({ holdings, snapshotId, loading, s
     { title: "代码", dataIndex: "symbol", key: "symbol", fixed: "left", width: 110, sorter: (a, b) => a.symbol.localeCompare(b.symbol), render: (v: string) => <Text strong>{v}</Text> },
     { title: "名称", dataIndex: "name", key: "name", width: 140, ellipsis: true },
     { title: "类别", dataIndex: "category_name", key: "category_name", width: 60, render: (v: string, row) => <Tag color={row.category_color}>{v}</Tag> },
-    { title: "持仓数量", dataIndex: "shares", key: "shares", width: 100, align: "right", sorter: (a, b) => a.shares - b.shares, render: (v: number) => v.toLocaleString() },
+    { title: "持仓数量", dataIndex: "shares", key: "shares", width: 100, align: "right", sorter: (a, b) => a.shares - b.shares, render: (v: number, row) => formatHoldingShares(v, row.symbol) },
     { title: "均价", dataIndex: "avg_cost", key: "avg_cost", width: 110, align: "right", render: (v: number, row) => formatQuarterlyMoney(v, snapshotHoldingCurrency(row), 3) },
     { title: "收盘价", dataIndex: "close_price", key: "close_price", width: 100, align: "right", render: (v: number, row) => formatQuarterlyMoney(v, snapshotHoldingCurrency(row)) },
     { title: "市值", dataIndex: "market_value", key: "market_value", width: 140, align: "right", defaultSortOrder: "descend", sorter: (a, b) => (a.market_value_base ?? 0) - (b.market_value_base ?? 0), render: (v: number, row) => formatQuarterlyMoney(v, snapshotHoldingCurrency(row)) },
@@ -49,7 +50,7 @@ export default function SnapshotHoldingsTable({ holdings, snapshotId, loading, s
 
   const accountColumns: ColumnsType<QuarterlyHoldingSnapshot> = [
     { title: "账户", dataIndex: "account_name", key: "account_name", width: 160 },
-    { title: "持仓数量", dataIndex: "shares", key: "shares", width: 90, align: "right", render: (v: number) => v.toLocaleString() },
+    { title: "持仓数量", dataIndex: "shares", key: "shares", width: 90, align: "right", render: (v: number, row) => formatHoldingShares(v, row.symbol) },
     { title: "均价", dataIndex: "avg_cost", key: "avg_cost", width: 90, align: "right", render: (v: number, row) => formatQuarterlyMoney(v, snapshotHoldingCurrency(row), 3) },
     { title: "市值", dataIndex: "market_value", key: "market_value", width: 140, align: "right", render: (v: number, row) => formatQuarterlyMoney(v, snapshotHoldingCurrency(row)) },
     { title: "仓位", dataIndex: "weight", key: "weight", width: 70, align: "right", render: (v: number) => `${v.toFixed(2)}%` },

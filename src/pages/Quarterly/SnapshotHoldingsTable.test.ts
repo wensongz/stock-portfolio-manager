@@ -83,3 +83,34 @@ test("quarterly holdings renders actual cash currency and signed totals, includi
   assert.match(zero, /\$CASH-USD/);
   assert.match(zero, /合计市值 \(USD\)：\$0\.00/);
 });
+
+test("quarterly holdings renders USD, CNY, and HKD cash quantities as integers while preserving fractional stock quantities", () => {
+  const probe = String.raw`
+    globalThis.localStorage = { getItem: () => null, setItem: () => {} };
+    const React = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const { default: SnapshotHoldingsTable } = await import("./src/pages/Quarterly/SnapshotHoldingsTable.tsx");
+    const holding = (id, symbol, shares) => ({
+      id, quarterly_snapshot_id: "quarter", account_id: "account-" + id, account_name: "Account " + id,
+      symbol, name: symbol, market: "US", currency: symbol.startsWith("$CASH-") ? symbol.slice(6) : "USD",
+      category_name: "现金类", category_color: "#999", shares, avg_cost: 1, close_price: 1,
+      market_value: shares, cost_value: shares, pnl: 0, pnl_percent: null, weight: 0, notes: null,
+    });
+    const holdings = [
+      holding("usd", "$CASH-USD", 1234.56),
+      holding("cny", "$CASH-CNY", 2345.67),
+      holding("hkd", "$CASH-HKD", 3456.78),
+      holding("stock", "AAPL", 12.345),
+    ];
+    const html = renderToStaticMarkup(React.createElement(SnapshotHoldingsTable, {
+      holdings, snapshotId: "quarter", snap: { exchange_rates: JSON.stringify({ usd_cny: 7, usd_hkd: 7.8, cny_hkd: 7.8 / 7 }) },
+    })).replace(/<[^>]*>/g, "");
+    process.stdout.write(html);
+  `;
+
+  const html = execFileSync("bun", ["--eval", probe], { cwd: projectRoot, encoding: "utf8" });
+  assert.match(html, /\$CASH-USD\$CASH-USD现金类1,235\$1\.000/);
+  assert.match(html, /\$CASH-CNY\$CASH-CNY现金类2,346¥1\.000/);
+  assert.match(html, /\$CASH-HKD\$CASH-HKD现金类3,457HK\$1\.000/);
+  assert.match(html, /AAPLAAPL现金类12\.345\$1\.000/);
+});

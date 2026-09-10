@@ -58,3 +58,44 @@ test("snapshot errors remain visible and successful refresh immediately renders 
   assert.match(result.successText, /合计市值 \(USD\)：\$1,300\.00/);
   assert.doesNotMatch(result.successText, /仍显示上次加载的快照|读取失败/);
 });
+
+test("category distribution headings render above and centered with their pie charts", () => {
+  const probe = String.raw`
+    globalThis.localStorage = { getItem: () => null, setItem: () => {} };
+    const React = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const { MemoryRouter, Routes, Route } = await import("react-router-dom");
+    const { createQuarterlyStore } = await import("./src/stores/quarterlyStore.ts");
+    const { mock } = await import("bun:test");
+    let activeState;
+    mock.module("./src/stores/quarterlyStore.ts", () => ({ createQuarterlyStore, useQuarterlyStore: () => activeState }));
+    const { default: SnapshotDetail } = await import("./src/pages/Quarterly/SnapshotDetail.tsx");
+    const holding = (id, symbol, market, currency, amount) => ({
+      id, quarterly_snapshot_id: "quarter-test", account_id: "account-" + id, account_name: "Account " + id,
+      symbol, name: symbol, market, currency, category_name: "现金", category_color: "#22c55e",
+      shares: amount, avg_cost: 1, close_price: 1, market_value: amount, cost_value: amount,
+      pnl: 0, pnl_percent: 0, weight: 25, notes: null,
+    });
+    const holdings = [
+      holding("us", "$CASH-USD", "US", "USD", 100),
+      holding("cn", "$CASH-CNY", "CN", "CNY", 700),
+      holding("hk", "$CASH-HKD", "HK", "HKD", 780),
+    ];
+    const detail = {
+      snapshot: { id: "quarter-test", quarter: "2026Q2", total_value: 300, total_cost: 300, total_pnl: 0, us_value: 100, us_cost: 100, cn_value: 700, cn_cost: 700, hk_value: 780, hk_cost: 780, holding_count: 3, exchange_rates: JSON.stringify({ usd_cny: 7, usd_hkd: 7.8 }), overall_notes: null },
+      holdings,
+    };
+    activeState = { detailSnapshotId: "quarter-test", detail, detailLoading: false, mutationLoading: false, detailError: null, mutationError: null, quarterlyTransactions: [], fetchDetail: () => {}, refreshSnapshot: () => {}, clearDetail: () => {} };
+    const html = renderToStaticMarkup(React.createElement(MemoryRouter, { initialEntries: ["/quarterly/quarter-test"] },
+      React.createElement(Routes, null, React.createElement(Route, { path: "/quarterly/:snapshotId", element: React.createElement(SnapshotDetail) }))
+    ));
+    process.stdout.write(html);
+  `;
+
+  const html = execFileSync("bun", ["--eval", probe], { cwd: projectRoot, encoding: "utf8" });
+  assert.equal(html.match(/<figure style="position:relative;margin:0">/g)?.length, 4);
+  assert.equal(html.match(/<figcaption style="position:absolute;top:0;right:0;left:0;text-align:center;line-height:22px;font-weight:600">/g)?.length, 4);
+  for (const title of ["整体 (USD)", "🇨🇳 A股 (CNY)", "🇭🇰 港股 (HKD)", "🇺🇸 美股 (USD)"]) {
+    assert.ok(html.includes(`>${title}</figcaption>`), `missing external chart heading: ${title}`);
+  }
+});

@@ -193,7 +193,12 @@ export default function SnapshotDetail() {
               return (
                 <Col key={label} xs={24} sm={12} lg={6}>
                   {composition.pieSlices.length > 0 ? (
-                    <PieChart data={composition.pieSlices} title={`${label} (${currency})`} height={200} currencyCode={currency} formatValue={(value) => formatQuarterlyMoney(value, currency)} hideLegend />
+                    <figure style={{ position: "relative", margin: 0 }}>
+                      <figcaption style={{ position: "absolute", top: 0, right: 0, left: 0, textAlign: "center", lineHeight: "22px", fontWeight: 600 }}>
+                        {label} ({currency})
+                      </figcaption>
+                      <PieChart data={composition.pieSlices} height={200} currencyCode={currency} formatValue={(value) => formatQuarterlyMoney(value, currency)} hideLegend />
+                    </figure>
                   ) : (
                     <div style={{ minHeight: 200, display: "flex", flexDirection: "column", justifyContent: "center", textAlign: "center", gap: 8 }}>
                       <Text strong>{label} ({currency})</Text>

@@ -4,6 +4,7 @@ import type { ColumnsType, TableProps } from "antd/es/table";
 import type { HoldingDetail } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
 import { useTablePageSize } from "../../hooks/tablePageSize";
+import { formatHoldingShares } from "../../lib/formatMoney";
 
 const { Text } = Typography;
 
@@ -11,6 +12,7 @@ interface Props {
   holdings: HoldingDetail[];
   loading: boolean;
   hideAccountMarket?: boolean;
+  formatCashSharesAsInteger?: boolean;
 }
 
 const marketLabel: Record<string, string> = {
@@ -28,7 +30,7 @@ function fmtMoney(value: number, currency: string) {
   })}`;
 }
 
-export default function HoldingsTable({ holdings, loading, hideAccountMarket = false }: Props) {
+export default function HoldingsTable({ holdings, loading, hideAccountMarket = false, formatCashSharesAsInteger = false }: Props) {
   const { pnlColor } = usePnlColor();
   const { pageSize, onShowSizeChange } = useTablePageSize();
 
@@ -119,7 +121,10 @@ export default function HoldingsTable({ holdings, loading, hideAccountMarket = f
       dataIndex: "shares",
       key: "shares",
       sorter: (a, b) => a.shares - b.shares,
-      render: (shares: number) => shares.toLocaleString(),
+      render: (shares: number, record: HoldingDetail) =>
+        formatCashSharesAsInteger
+          ? formatHoldingShares(shares, record.symbol)
+          : shares.toLocaleString(),
       align: "right",
       width: 90,
     },
@@ -202,7 +207,7 @@ export default function HoldingsTable({ holdings, loading, hideAccountMarket = f
     return hideAccountMarket
       ? allColumns.filter((c) => c.key !== "account_name" && c.key !== "market")
       : allColumns;
-  }, [accountFilters, filteredTotalMvUsd, pnlColor, hideAccountMarket]);
+  }, [accountFilters, filteredTotalMvUsd, pnlColor, hideAccountMarket, formatCashSharesAsInteger]);
 
   return (
     <Table<HoldingDetail>

@@ -3,7 +3,7 @@ use crate::models::{DashboardReport, DashboardSummary, ExchangeRates, HoldingDet
 use crate::services::exchange_rate_service::convert_currency;
 use crate::services::quote_provider_service;
 use crate::services::quote_service::{
-    fetch_quotes_batch_cached_with_providers, QuoteCache, QuoteServiceState,
+    fetch_quotes_batch_cached_with_providers, is_cash_symbol, QuoteCache, QuoteServiceState,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -165,7 +165,11 @@ impl PortfolioReadModel {
             .into_iter()
             .map(|row| {
                 let quote_key = normalized_quote_key(&row.market, &row.symbol);
-                let (current_price, change) = *quote_map.get(&quote_key).unwrap_or(&(0.0, 0.0));
+                let (current_price, change) = if is_cash_symbol(&row.symbol) {
+                    (1.0, 0.0)
+                } else {
+                    *quote_map.get(&quote_key).unwrap_or(&(0.0, 0.0))
+                };
                 let market_value = row.shares * current_price;
                 let cost_value = row.shares * row.avg_cost;
                 let pnl = market_value - cost_value;
@@ -301,6 +305,25 @@ impl PortfolioReadModel {
                 .map(|holding| (holding.id.clone(), None))
                 .collect(),
             holdings,
+            missing_quote_keys: HashSet::new(),
+            quote_warning: None,
+            quotes_refreshed: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_holdings_with_category_ids_for_test(
+        holdings: Vec<(HoldingDetail, Option<String>)>,
+    ) -> Self {
+        Self {
+            category_ids_by_holding: holdings
+                .iter()
+                .map(|(holding, category_id)| (holding.id.clone(), category_id.clone()))
+                .collect(),
+            holdings: holdings
+                .into_iter()
+                .map(|(holding, _category_id)| holding)
+                .collect(),
             missing_quote_keys: HashSet::new(),
             quote_warning: None,
             quotes_refreshed: false,
@@ -465,13 +488,43 @@ mod tests {
             .iter()
             .find(|holding| holding.symbol == "$CASH-CNY")
             .unwrap();
-        assert_eq!(cached_cash.current_price, 7.0);
-        assert_eq!(cached_cash.market_value, 14.0);
+        assert_eq!(cached_cash.current_price, 1.0);
+        assert_eq!(cached_cash.market_value, 2.0);
         assert_eq!(fetched_cash.current_price, 1.0);
         assert_eq!(fetched_cash.market_value, 3.0);
         assert_eq!(cache.get("US", "$CASH-USD").unwrap().current_price, 7.0);
         assert_eq!(cache.get("CN", "$CASH-CNY").unwrap().current_price, 1.0);
         assert_eq!(cache.get("US", "AAPL").unwrap().current_price, 12.0);
+    }
+
+    #[tokio::test]
+    async fn cache_only_keeps_cash_at_unit_price_without_a_cached_quote() {
+        let db = seeded_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
+                 VALUES ('holding-cash-usd', 'acct-us', '$CASH-USD', 'USD Cash', 'US', NULL, 100, 1, 'USD', '2026-01-01', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let model =
+            PortfolioReadModel::load(&db, &QuoteCache::new(), None, QuoteReadMode::CacheOnly)
+                .await
+                .unwrap();
+        let cash = model
+            .holdings()
+            .iter()
+            .find(|holding| holding.symbol == "$CASH-USD")
+            .unwrap();
+
+        assert_eq!(cash.current_price, 1.0);
+        assert_eq!(cash.market_value, 100.0);
+        assert_eq!(cash.cost_value, 100.0);
+        assert_eq!(cash.pnl, 0.0);
     }
 
     #[tokio::test]

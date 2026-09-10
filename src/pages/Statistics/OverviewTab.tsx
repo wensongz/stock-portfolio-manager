@@ -10,6 +10,8 @@ import { useTablePageSize } from "../../hooks/tablePageSize";
 import { statisticsViewKey, useStatisticsStore } from "../../stores/statisticsStore";
 import AccountStockTransactionsModal from "./AccountStockTransactionsModal";
 import StatisticsAiReviewButton from "./StatisticsAiReviewButton";
+import { formatHoldingShares } from "../../lib/formatMoney";
+import { filterActiveOverviewHoldings } from "./categoryHoldings";
 
 const { Text } = Typography;
 
@@ -95,13 +97,7 @@ export default function OverviewTab({ baseCurrency }: Props) {
         currency: string;
       }>;
     }>();
-    for (const holding of overview?.holdings ?? []) {
-      if (holding.symbol.startsWith("$CASH-")) continue;
-      // Skip cleared positions (shares == 0): they have no market value and
-      // belong only in the holdings page's "已清仓股票" view, not in the
-      // per-stock detail table (consistent with market statistics, which
-      // filter WHERE h.shares > 0).
-      if (holding.shares <= 0) continue;
+    for (const holding of filterActiveOverviewHoldings(overview?.holdings ?? [])) {
       const key = holding.symbol;
       const existing = map.get(key);
       const mvNative = holding.market_value;
@@ -254,7 +250,8 @@ export default function OverviewTab({ baseCurrency }: Props) {
       dataIndex: "shares",
       key: "shares",
       sorter: (a, b) => a.shares - b.shares,
-      render: (shares: number) => shares.toLocaleString(),
+      render: (shares: number, record: AggregatedStock) =>
+        formatHoldingShares(shares, record.symbol),
       align: "right" as const,
       width: 90,
     },
@@ -372,7 +369,8 @@ export default function OverviewTab({ baseCurrency }: Props) {
         key: "shares",
         align: "right" as const,
         width: 90,
-        render: (shares: number) => shares.toLocaleString(),
+        render: (shares: number, record: AccountHoldingRow) =>
+          formatHoldingShares(shares, record.symbol),
       },
       {
         title: "均价",

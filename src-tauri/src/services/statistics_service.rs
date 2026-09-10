@@ -347,12 +347,26 @@ pub fn by_category(
     category_id: &str,
     category_name: &str,
     category_color: &str,
+    is_cash_category: bool,
 ) -> CategoryStatistics {
-    let details: Vec<_> = model
+    let mut details: Vec<_> = model
         .holdings_with_usd(rates)
         .into_iter()
-        .filter(|detail| detail.category_name == category_name)
+        .filter(|detail| {
+            if is_cash_category {
+                detail.symbol.starts_with("$CASH-")
+                    || model.category_id_for_holding(&detail.id) == Some(category_id)
+            } else {
+                detail.category_name == category_name && !detail.symbol.starts_with("$CASH-")
+            }
+        })
         .collect();
+    if is_cash_category {
+        for detail in &mut details {
+            detail.category_name = category_name.to_string();
+            detail.category_color = category_color.to_string();
+        }
+    }
     let mut market_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     let mut total_market_value = 0.0;
     let mut total_cost = 0.0;
@@ -397,6 +411,7 @@ pub fn by_category(
         category_id: category_id.to_string(),
         category_name: category_name.to_string(),
         category_color: category_color.to_string(),
+        is_cash_category,
         total_market_value,
         total_cost,
         total_pnl,
@@ -574,7 +589,7 @@ mod tests {
     #[test]
     fn category_statistics_use_base_currency_and_usd_holdings() {
         let (model, rates) = fixture();
-        let result = by_category(&model, &rates, "USD", "growth", "成长", "#1677ff");
+        let result = by_category(&model, &rates, "USD", "growth", "成长", "#1677ff", false);
 
         assert_eq!(result.category_id, "growth");
         assert_eq!(result.category_name, "成长");
@@ -592,6 +607,132 @@ mod tests {
             .find(|item| item.market == "CN")
             .unwrap();
         assert_close(cn.market_value_usd, 200.0);
+    }
+
+    #[test]
+    fn cash_category_collects_all_three_cash_currencies_even_when_historically_unclassified() {
+        let model = PortfolioReadModel::from_holdings_with_category_ids_for_test(vec![
+            (
+                with_category(
+                    holding(
+                        "cash-usd",
+                        "acct-us",
+                        "US Broker",
+                        "$CASH-USD",
+                        "US",
+                        100.0,
+                        1.0,
+                        1.0,
+                        "USD",
+                    ),
+                    "未分类",
+                    "#8B8B8B",
+                ),
+                None,
+            ),
+            (
+                with_category(
+                    holding(
+                        "cash-cny",
+                        "acct-cn",
+                        "CN Broker",
+                        "$CASH-CNY",
+                        "CN",
+                        700.0,
+                        1.0,
+                        1.0,
+                        "CNY",
+                    ),
+                    "未分类",
+                    "#8B8B8B",
+                ),
+                None,
+            ),
+            (
+                with_category(
+                    holding(
+                        "cash-hkd",
+                        "acct-hk",
+                        "HK Broker",
+                        "$CASH-HKD",
+                        "HK",
+                        780.0,
+                        1.0,
+                        1.0,
+                        "HKD",
+                    ),
+                    "未分类",
+                    "#8B8B8B",
+                ),
+                None,
+            ),
+            (
+                with_category(
+                    holding(
+                        "cash-category-stock",
+                        "acct-us",
+                        "US Broker",
+                        "BIL",
+                        "US",
+                        10.0,
+                        90.0,
+                        100.0,
+                        "USD",
+                    ),
+                    "现金类",
+                    "#22C55E",
+                ),
+                Some("cash-category".to_string()),
+            ),
+            (
+                with_category(
+                    holding(
+                        "custom-cash-category-stock",
+                        "acct-us",
+                        "US Broker",
+                        "SHY",
+                        "US",
+                        10.0,
+                        80.0,
+                        100.0,
+                        "USD",
+                    ),
+                    "现金类",
+                    "#000000",
+                ),
+                Some("custom-cash".to_string()),
+            ),
+        ]);
+        let rates = ExchangeRates {
+            usd_cny: 7.0,
+            usd_hkd: 7.8,
+            cny_hkd: 7.8 / 7.0,
+            updated_at: "2026-09-10T00:00:00Z".to_string(),
+        };
+
+        let result = by_category(
+            &model,
+            &rates,
+            "USD",
+            "cash-category",
+            "现金类",
+            "#22C55E",
+            true,
+        );
+
+        assert_eq!(
+            result
+                .holdings
+                .iter()
+                .map(|holding| holding.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["$CASH-USD", "$CASH-CNY", "$CASH-HKD", "BIL"]
+        );
+        assert!(result.holdings.iter().all(
+            |holding| holding.category_name == "现金类" && holding.category_color == "#22C55E"
+        ));
+        assert_close(result.total_market_value, 1_300.0);
+        assert_close(result.total_cost, 1_200.0);
     }
 
     #[test]
@@ -709,7 +850,7 @@ mod tests {
         assert_eq!(us.account_distribution[0].name, "US Growth");
         assert_close(us.account_distribution[0].value, 20.0);
 
-        let growth = by_category(&model, &rates, "USD", "growth", "成长", "#1677ff");
+        let growth = by_category(&model, &rates, "USD", "growth", "成长", "#1677ff", false);
         assert_close(growth.total_market_value, 30.0);
         assert_close(growth.total_cost, 15.0);
         assert_eq!(growth.holdings.len(), 2);

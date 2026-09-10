@@ -9,6 +9,7 @@ import { usePnlColor } from "../../hooks/usePnlColor";
 import { useTablePageSize } from "../../hooks/tablePageSize";
 import AccountStockTransactionsModal from "./AccountStockTransactionsModal";
 import StatisticsAiReviewButton from "./StatisticsAiReviewButton";
+import { formatHoldingShares } from "../../lib/formatMoney";
 
 const { Text } = Typography;
 
@@ -230,7 +231,8 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
       dataIndex: "shares",
       key: "shares",
       sorter: (a, b) => a.shares - b.shares,
-      render: (shares: number) => shares.toLocaleString(),
+      render: (shares: number, record: AggregatedStock) =>
+        formatHoldingShares(shares, record.symbol),
       align: "right" as const,
       width: 90,
     },
@@ -340,7 +342,8 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
         key: "shares",
         align: "right" as const,
         width: 90,
-        render: (shares: number) => shares.toLocaleString(),
+        render: (shares: number, record: AccountHoldingRow) =>
+          formatHoldingShares(shares, record.symbol),
       },
       {
         title: "均价",

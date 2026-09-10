@@ -9,9 +9,20 @@ export interface ActiveHoldingLike {
   shares: number;
 }
 
-export function filterActiveStockHoldings<T extends ActiveHoldingLike>(holdings: readonly T[]): T[] {
+export function filterActiveOverviewHoldings<T extends ActiveHoldingLike>(
+  holdings: readonly T[],
+): T[] {
+  return holdings.filter((holding) => holding.shares > 0);
+}
+
+export function filterActiveStockHoldings<T extends ActiveHoldingLike>(
+  holdings: readonly T[],
+  isCashCategory = false,
+): T[] {
   return holdings.filter(
-    (holding) => holding.shares > 0 && !holding.symbol.startsWith("$CASH-"),
+    (holding) =>
+      holding.shares > 0 &&
+      (isCashCategory || !holding.symbol.startsWith("$CASH-")),
   );
 }
 

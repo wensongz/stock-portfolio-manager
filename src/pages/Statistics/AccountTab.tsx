@@ -111,7 +111,12 @@ export default function AccountTab({ selectedAccountId, onAccountChange }: Props
               />
             )}
           >
-            <HoldingsTable holdings={stats.holdings} loading={loading} hideAccountMarket />
+            <HoldingsTable
+              holdings={stats.holdings}
+              loading={loading}
+              hideAccountMarket
+              formatCashSharesAsInteger
+            />
           </Card>
         </>
       )}

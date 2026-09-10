@@ -63,6 +63,7 @@ pub struct CategoryStatistics {
     pub category_id: String,
     pub category_name: String,
     pub category_color: String,
+    pub is_cash_category: bool,
     pub total_market_value: f64,
     pub total_cost: f64,
     pub total_pnl: f64,

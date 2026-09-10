@@ -11,6 +11,7 @@ import { usePnlColor } from "../../hooks/usePnlColor";
 import { useTablePageSize } from "../../hooks/tablePageSize";
 import AccountStockTransactionsModal from "./AccountStockTransactionsModal";
 import { filterActiveStockHoldings } from "./categoryHoldings";
+import { formatHoldingShares } from "../../lib/formatMoney";
 
 const { Text } = Typography;
 
@@ -58,7 +59,7 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
 
   const aggregatedStocks = useMemo((): AggregatedStock[] => {
     if (!stats) return [];
-    const activeHoldings = filterActiveStockHoldings(stats.holdings);
+    const activeHoldings = filterActiveStockHoldings(stats.holdings, stats.is_cash_category);
     const totalValueUsd = activeHoldings.reduce((sum, h) => sum + h.market_value_usd, 0);
     const groups = new Map<string, HoldingDetail[]>();
     for (const holding of activeHoldings) {
@@ -111,7 +112,7 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
 
   const accountDetailColumns: ColumnsType<AccountHoldingRow> = useMemo(() => [
     { title: "账户", dataIndex: "account_name", key: "account_name", width: 160 },
-    { title: "持仓数量", dataIndex: "shares", key: "shares", align: "right", width: 90, render: (v: number) => v.toLocaleString() },
+    { title: "持仓数量", dataIndex: "shares", key: "shares", align: "right", width: 90, render: (v: number, r) => formatHoldingShares(v, r.symbol) },
     { title: "均价", dataIndex: "avg_cost", key: "avg_cost", align: "right", width: 90, render: (v: number) => v.toLocaleString("en-US", { minimumFractionDigits: 3, maximumFractionDigits: 3 }) },
     { title: "市值", dataIndex: "market_value", key: "market_value", align: "right", width: 140, render: (v: number, r) => formatMoney(v, r.currency) },
     { title: "仓位", dataIndex: "position_pct", key: "position_pct", align: "right", width: 70, render: (v: number) => `${v.toFixed(2)}%` },
@@ -124,7 +125,7 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
     { title: "代码", dataIndex: "symbol", key: "symbol", fixed: "left", width: 100, sorter: (a, b) => a.symbol.localeCompare(b.symbol), render: (v: string) => <Text strong>{v}</Text> },
     { title: "名称", dataIndex: "name", key: "name", ellipsis: true, width: 140 },
     { title: "类别", dataIndex: "category_name", key: "category_name", width: 60, render: (v: string, r) => <Tag color={r.category_color}>{v}</Tag> },
-    { title: "持仓数量", dataIndex: "shares", key: "shares", align: "right", width: 90, sorter: (a, b) => a.shares - b.shares, render: (v: number) => v.toLocaleString() },
+    { title: "持仓数量", dataIndex: "shares", key: "shares", align: "right", width: 90, sorter: (a, b) => a.shares - b.shares, render: (v: number, r) => formatHoldingShares(v, r.symbol) },
     { title: "均价", dataIndex: "avg_cost", key: "avg_cost", align: "right", width: 90, sorter: (a, b) => a.avg_cost - b.avg_cost, render: (v: number) => v.toLocaleString("en-US", { minimumFractionDigits: 3, maximumFractionDigits: 3 }) },
     { title: "现价", dataIndex: "current_price", key: "current_price", align: "right", width: 90, sorter: (a, b) => a.current_price - b.current_price, render: (v: number, r) => formatMoney(v, r.currency) },
     { title: "市值", dataIndex: "market_value", key: "market_value", align: "right", width: 140, defaultSortOrder: "descend", sorter: (a, b) => a.market_value_usd - b.market_value_usd, render: (v: number, r) => formatMoney(v, r.currency) },

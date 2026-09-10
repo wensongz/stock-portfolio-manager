@@ -10,3 +10,12 @@ export function formatMoney(value: number, currency: string, precision = 2): str
     maximumFractionDigits: precision,
   })}`;
 }
+
+const INTEGER_SHARE_SYMBOLS = new Set(["$CASH-USD", "$CASH-CNY", "$CASH-HKD"]);
+
+export function formatHoldingShares(value: number, symbol: string): string {
+  if (INTEGER_SHARE_SYMBOLS.has(symbol)) {
+    return value.toLocaleString("en-US", { maximumFractionDigits: 0 });
+  }
+  return value.toLocaleString();
+}

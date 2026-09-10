@@ -238,6 +238,7 @@ export interface CategoryStatistics {
   category_id: string;
   category_name: string;
   category_color: string;
+  is_cash_category: boolean;
   total_market_value: number;
   total_cost: number;
   total_pnl: number;

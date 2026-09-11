@@ -874,6 +874,9 @@ export type AiProvider =
   | "glm"
   | "mimo"
   | "deepseek"
+  | "qwen"
+  | "gemini"
+  | "grok"
   | "anthropic";
 
 export interface AiModelInfo {

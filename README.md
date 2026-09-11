@@ -62,7 +62,7 @@
 ### AI 助手
 
 - 流式对话、多会话管理、会话持久化、自动标题和 token 用量展示
-- 支持 OpenAI、Anthropic Claude、Ollama、OpenRouter、Kimi、GLM、MiMo 和 DeepSeek
+- 支持 Anthropic Claude、DeepSeek、Gemini、GLM、Grok、Kimi、MiMo、Ollama、OpenAI、OpenRouter 和 Qwen
 - 可选择是否注入当前组合快照，并通过内置工具查询行情、持仓、交易、绩效、分红和期权数据
 - 展示推理内容与工具调用卡片，支持 Markdown、GFM 表格和代码高亮
 - Markdown 技能支持关键词自动激活、`/` 手动激活、创建、编辑、克隆、导入/导出和恢复内置版本

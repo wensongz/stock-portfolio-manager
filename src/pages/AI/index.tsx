@@ -59,8 +59,7 @@ interface ProviderOption {
   key_placeholder?: string;
 }
 
-/** The providers we support. All expose an OpenAI-compatible `/models`
- *  endpoint, so models are always fetched dynamically from the API. */
+/** Supported providers. Models are fetched dynamically from each API. */
 const PROVIDERS: ProviderOption[] = [
   {
     value: "openai",
@@ -125,7 +124,35 @@ const PROVIDERS: ProviderOption[] = [
     needs_key: true,
     key_placeholder: "sk-ant-...",
   },
+  {
+    value: "qwen",
+    label: "Qwen（通义千问）",
+    hint: "阿里云百炼，默认北京端点；其他地域或工作空间请填写对应 API 端点",
+    default_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    needs_key: true,
+    key_placeholder: "sk-...",
+  },
+  {
+    value: "gemini",
+    label: "Gemini（Google）",
+    hint: "Google AI Studio 的 Gemini API，使用 OpenAI 兼容端点",
+    default_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+    needs_key: true,
+    key_placeholder: "AIza...",
+  },
+  {
+    value: "grok",
+    label: "Grok（xAI）",
+    hint: "xAI 官方 Grok API，OpenAI 兼容",
+    default_base_url: "https://api.x.ai/v1",
+    needs_key: true,
+    key_placeholder: "xai-...",
+  },
 ];
+
+const SORTED_PROVIDERS = [...PROVIDERS].sort((a, b) =>
+  a.label.localeCompare(b.label, "en", { sensitivity: "base" }),
+);
 
 function providerOf(value: string): ProviderOption | undefined {
   return PROVIDERS.find((p) => p.value === value);
@@ -263,7 +290,7 @@ function ApiSettingsCard() {
         <Form form={form} layout="vertical" style={{ maxWidth: 600 }}>
           <Form.Item name="provider" label="AI 提供商" rules={[{ required: true }]}>
             <Select
-              options={PROVIDERS.map((p) => ({
+              options={SORTED_PROVIDERS.map((p) => ({
                 value: p.value,
                 label: (
                   <Space>
@@ -443,7 +470,7 @@ export default function AIPage() {
       <Alert
         type="info"
         title="连接与数据说明"
-        description="支持 OpenAI、Anthropic（Claude）、Ollama、OpenRouter、Kimi、GLM（智谱）、MiMo（小米）和 DeepSeek。可获取模型列表或手动输入模型名称，本地 Ollama 无需 API Key。API Key 保存在本地，并用于向你配置的 API 端点鉴权；对话、启用的技能及随请求附带的组合数据和工具结果会发送至该端点。请按所选服务了解数据使用政策与费用。"
+        description={`支持 ${SORTED_PROVIDERS.map((p) => p.label).join("、")}。可获取模型列表或手动输入模型名称，本地 Ollama 无需 API Key。API Key 保存在本地，并用于向你配置的 API 端点鉴权；对话、启用的技能及随请求附带的组合数据和工具结果会发送至该端点。请按所选服务了解数据使用政策与费用。`}
         showIcon
       />
 

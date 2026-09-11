@@ -57,7 +57,7 @@ The application is built with **Tauri 2 + React 19 + TypeScript + Rust + SQLite*
 ### AI assistant
 
 - Streaming responses, multiple conversations, persisted chat history, automatic titles, and token-usage display
-- OpenAI, Anthropic Claude, Ollama, OpenRouter, Kimi, GLM, MiMo, and DeepSeek providers
+- Anthropic Claude, DeepSeek, Gemini, GLM, Grok, Kimi, MiMo, Ollama, OpenAI, OpenRouter, and Qwen providers
 - Optional portfolio-context injection and built-in tools for quotes, holdings, transactions, performance, dividends, and options data
 - Reasoning and tool-call cards, Markdown and GFM tables, and syntax-highlighted code blocks
 - Markdown skills with keyword-based automatic activation, `/` manual activation, creation, editing, cloning, import/export, and built-in skill restoration

@@ -14,7 +14,7 @@
 
 ## 工作原理
 
-工具通过模型提供商的函数调用能力实现。OpenAI、Ollama、OpenRouter、Kimi、GLM、MiMo 和 DeepSeek 使用 OpenAI 兼容协议；Anthropic Claude 使用原生 Messages 协议，应用会把同一份工具定义转换为 Anthropic 的 `tool_use` / `tool_result` 格式。
+工具通过模型提供商的函数调用能力实现。DeepSeek、Gemini、GLM、Grok、Kimi、MiMo、Ollama、OpenAI、OpenRouter 和 Qwen 使用 OpenAI 兼容协议；Anthropic Claude 使用原生 Messages 协议，应用会把同一份工具定义转换为 Anthropic 的 `tool_use` / `tool_result` 格式。
 
 1. 每次对话，后端把可用工具的清单（名字、描述、参数 schema）随请求发给大模型。
 2. 当模型判断需要数据时，它返回工具调用（OpenAI 兼容协议中的 `tool_calls`，或 Anthropic 协议中的 `tool_use`）。
@@ -23,7 +23,9 @@
 
 界面会在回答中展示每次工具调用的结果卡片，包括参数、状态、结果或错误和耗时。卡片会随消息写入本地会话，重新打开会话后仍可回看。
 
-应用支持 8 个提供商：OpenAI、Anthropic Claude、Ollama、OpenRouter、Kimi、GLM、MiMo 和 DeepSeek。是否能使用工具取决于所选的具体模型；同一提供商内也可能有不支持函数调用的模型。需要工具查询时，请选择支持函数调用的模型。
+应用支持 11 个提供商：Anthropic Claude、DeepSeek、Gemini、GLM、Grok、Kimi、MiMo、Ollama、OpenAI、OpenRouter 和 Qwen。是否能使用工具取决于所选的具体模型；同一提供商内也可能有不支持函数调用的模型。需要工具查询时，请选择支持函数调用的模型。
+
+Qwen 默认使用阿里云百炼北京端点；其他地域或工作空间请在 AI 配置中填写对应 API 端点。Gemini 使用 Google AI Studio 的 API Key，Grok 使用 xAI 的 API Key。接口说明：[Qwen](https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope)、[Gemini](https://ai.google.dev/gemini-api/docs/openai)、[Grok](https://docs.x.ai/overview)。
 
 ## 内置工具清单
 

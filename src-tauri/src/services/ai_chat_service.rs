@@ -640,6 +640,9 @@ struct ToolCallDelta {
     id: Option<String>,
     #[serde(default)]
     function: Option<ToolCallFunctionDelta>,
+    /// Opaque provider metadata, including Gemini's required thought signature.
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -737,6 +740,36 @@ struct AssembledToolCall {
     id: String,
     function_name: String,
     arguments: String,
+    extra_content: Option<serde_json::Value>,
+}
+
+fn tool_call_message(call: &AssembledToolCall) -> serde_json::Value {
+    let mut message = json!({
+        "id": call.id,
+        "type": "function",
+        "function": { "name": call.function_name, "arguments": call.arguments },
+    });
+    if let Some(extra_content) = &call.extra_content {
+        message["extra_content"] = extra_content.clone();
+    }
+    message
+}
+
+fn prefilled_tool_call_message(provider: &str, name: &str, arguments: &str) -> serde_json::Value {
+    let mut message = json!({
+        "id": HOST_PREFILLED_TOOL_CALL_ID,
+        "type": "function",
+        "function": { "name": name, "arguments": arguments },
+    });
+    // This call was executed by the host, so no model signature exists.
+    // Gemini documents this sentinel for client-generated function history:
+    // https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures
+    if provider.eq_ignore_ascii_case("gemini") {
+        message["extra_content"] = json!({
+            "google": { "thought_signature": "skip_thought_signature_validator" }
+        });
+    }
+    message
 }
 
 /// Lifecycle event for a single tool invocation, sent to the frontend via the
@@ -875,9 +908,13 @@ fn merge_tool_calls(deltas: &[ToolCallDelta]) -> Vec<AssembledToolCall> {
             id: String::new(),
             function_name: String::new(),
             arguments: String::new(),
+            extra_content: None,
         });
         if let Some(id) = &d.id {
             entry.id = id.clone();
+        }
+        if let Some(extra_content) = &d.extra_content {
+            entry.extra_content = Some(extra_content.clone());
         }
         if let Some(f) = &d.function {
             if let Some(name) = &f.name {
@@ -1263,11 +1300,7 @@ pub async fn chat_stream(
             })?;
         messages.push(json!({
             "role": "assistant",
-            "tool_calls": [{
-                "id": HOST_PREFILLED_TOOL_CALL_ID,
-                "type": "function",
-                "function": { "name": context.name, "arguments": arguments },
-            }],
+            "tool_calls": [prefilled_tool_call_message(&cfg.provider, &context.name, &arguments)],
         }));
         messages.push(json!({
             "role": "tool",
@@ -1531,20 +1564,8 @@ pub async fn chat_stream(
         // ── Model wants to call tools → execute and continue ────────────────
         // Record the assistant message with tool_calls (required by the API
         // so the next round can reference them by id).
-        let tool_calls_json: Vec<serde_json::Value> = outcome
-            .tool_calls
-            .iter()
-            .map(|tc| {
-                json!({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function_name,
-                        "arguments": tc.arguments,
-                    }
-                })
-            })
-            .collect();
+        let tool_calls_json: Vec<serde_json::Value> =
+            outcome.tool_calls.iter().map(tool_call_message).collect();
         messages.push(json!({
             "role": "assistant",
             "tool_calls": tool_calls_json,
@@ -1907,6 +1928,46 @@ mod tests {
         assert_eq!(usage.usage.as_ref().unwrap().output_tokens, 42);
     }
 
+    #[test]
+    fn gemini_tool_signature_survives_stream_assembly_and_replay() {
+        // A signature may arrive separately from the function and its arguments.
+        // Parallel calls must retain their own metadata without copying it to peers.
+        let deltas: Vec<ToolCallDelta> = serde_json::from_value(json!([
+            { "index": 0, "id": "call_1", "function": {
+                "name": "get_stock_quote", "arguments": "{\"symbol\":"
+            }},
+            { "index": 1, "id": "call_2", "function": {
+                "name": "get_portfolio_summary", "arguments": "{}"
+            }},
+            { "index": 0, "extra_content": { "google": { "thought_signature": "opaque-signature==" }}},
+            { "index": 0, "function": { "arguments": "\"AAPL\"}" }}
+        ])).unwrap();
+        let calls = merge_tool_calls(&deltas);
+        let first = tool_call_message(&calls[0]);
+        assert_eq!(
+            first["extra_content"]["google"]["thought_signature"],
+            "opaque-signature=="
+        );
+        assert_eq!(first["function"]["arguments"], "{\"symbol\":\"AAPL\"}");
+        assert_eq!(first["id"], "call_1");
+        assert!(tool_call_message(&calls[1]).get("extra_content").is_none());
+    }
+
+    #[test]
+    fn gemini_prefilled_tools_include_a_client_generated_signature() {
+        let call = prefilled_tool_call_message("gemini", "get_portfolio_summary", "{}");
+        assert_eq!(
+            call["extra_content"]["google"]["thought_signature"],
+            "skip_thought_signature_validator"
+        );
+        assert_eq!(call["id"], HOST_PREFILLED_TOOL_CALL_ID);
+        assert!(
+            prefilled_tool_call_message("openai", "get_portfolio_summary", "{}")
+                .get("extra_content")
+                .is_none()
+        );
+    }
+
     fn delta(
         index: u32,
         id: Option<&str>,
@@ -1916,6 +1977,7 @@ mod tests {
         ToolCallDelta {
             index,
             id: id.map(String::from),
+            extra_content: None,
             function: Some(ToolCallFunctionDelta {
                 name: name.map(String::from),
                 arguments: args.map(String::from),

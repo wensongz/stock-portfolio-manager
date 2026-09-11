@@ -46,6 +46,9 @@ pub(crate) fn resolve_base_url(provider: &str, user_base: Option<&str>) -> Resul
         "glm" | "zhipu" => Ok("https://open.bigmodel.cn/api/paas/v4".to_string()),
         "mimo" | "xiaomi" => Ok("https://api.xiaomimimo.com/v1".to_string()),
         "deepseek" => Ok("https://api.deepseek.com".to_string()),
+        "qwen" => Ok("https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()),
+        "gemini" => Ok("https://generativelanguage.googleapis.com/v1beta/openai".to_string()),
+        "grok" => Ok("https://api.x.ai/v1".to_string()),
         "anthropic" => Ok("https://api.anthropic.com".to_string()),
         other => Err(format!("未知的服务商：{other}，请填写 Base URL")),
     }

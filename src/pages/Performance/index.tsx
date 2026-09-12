@@ -232,7 +232,7 @@ export default function PerformancePage() {
 
       {/* Return chart + Drawdown chart */}
       <Row gutter={[16, 16]}>
-        <Col xs={24} lg={16}>
+        <Col xs={24} lg={15}>
           <Card size="small">
             <ReturnChart
               returnSeries={returnSeries}
@@ -242,7 +242,7 @@ export default function PerformancePage() {
             />
           </Card>
         </Col>
-        <Col xs={24} lg={8}>
+        <Col xs={24} lg={9}>
           <Card size="small">
             <DrawdownChart drawdown={drawdown} height={320} />
           </Card>
@@ -259,21 +259,15 @@ export default function PerformancePage() {
       <Divider />
 
       {/* Monthly returns + Risk metrics */}
-      <Row gutter={[16, 16]}>
-        <Col xs={24} xl={16}>
-          <Card size="small">
-            <MonthlyReturnsTable data={monthlyReturns} />
-          </Card>
-        </Col>
-        <Col xs={24} xl={8}>
-          <Card size="small">
-            <Typography.Text strong>⚠️ 风险指标</Typography.Text>
-            <div className="mt-2">
-              <RiskMetricsPanel metrics={riskMetrics} loading={loading} />
-            </div>
-          </Card>
-        </Col>
-      </Row>
+      <Card size="small">
+        <MonthlyReturnsTable data={monthlyReturns} />
+      </Card>
+      <Card size="small">
+        <Typography.Text strong>⚠️ 风险指标</Typography.Text>
+        <div className="mt-2">
+          <RiskMetricsPanel metrics={riskMetrics} loading={loading} />
+        </div>
+      </Card>
 
       <Divider />
 

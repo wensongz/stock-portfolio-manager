@@ -75,7 +75,7 @@ export default function DrawdownChart({ drawdown, height = 280 }: Props) {
         style={{ height, width: "100%" }}
         opts={{ renderer: "canvas" }}
       />
-      <Descriptions size="small" column={3} className="mt-2">
+      <Descriptions size="small" column={2} className="mt-2">
         <Descriptions.Item label="最大回撤">
           <Text type="danger">{drawdown.max_drawdown.toFixed(2)}%</Text>
         </Descriptions.Item>

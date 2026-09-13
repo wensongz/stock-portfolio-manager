@@ -7,35 +7,43 @@ import {
   Modal,
   Form,
   Input,
+  InputNumber,
+  ColorPicker,
   Tag,
   Popconfirm,
   message,
   Badge,
 } from "antd";
+import type { ColorPickerProps } from "antd";
 import { PlusOutlined } from "@ant-design/icons";
 import { useCategoryStore } from "../../stores/categoryStore";
-import type { Category } from "../../types";
+import type { Category, CreateCategoryPayload } from "../../types";
 
 const { Title } = Typography;
+
+type CategoryFormValues = Omit<CreateCategoryPayload, "sortOrder"> & {
+  sortOrder?: number | null;
+};
 
 export default function CategoriesPage() {
   const { categories, loading, fetchCategories, createCategory, updateCategory, deleteCategory } =
     useCategoryStore();
   const [modalOpen, setModalOpen] = useState(false);
   const [editingCategory, setEditingCategory] = useState<Category | null>(null);
-  const [form] = Form.useForm();
+  const [form] = Form.useForm<CategoryFormValues>();
 
   useEffect(() => {
     fetchCategories();
   }, [fetchCategories]);
 
-  const handleSubmit = async (values: { name: string; color: string; icon: string; sortOrder?: number }) => {
+  const handleSubmit = async (values: CategoryFormValues) => {
+    const payload: CreateCategoryPayload = { ...values, sortOrder: values.sortOrder ?? undefined };
     try {
       if (editingCategory) {
-        await updateCategory({ id: editingCategory.id, ...values });
+        await updateCategory({ id: editingCategory.id, ...payload });
         message.success("类别更新成功");
       } else {
-        await createCategory(values);
+        await createCategory(payload);
         message.success("类别创建成功");
       }
       setModalOpen(false);
@@ -170,7 +178,8 @@ export default function CategoriesPage() {
         okText="确认"
         cancelText="取消"
       >
-        <Form form={form} layout="vertical" onFinish={handleSubmit}>
+        <Form form={form} layout="vertical" onFinish={handleSubmit}
+          initialValues={{ color: "#F97316" }}>
           <Form.Item name="icon" label="图标（emoji）"
             rules={[{ required: true, message: "请输入图标" }]}>
             <Input placeholder="如：💰 🚀 🔄" maxLength={2} />
@@ -179,12 +188,33 @@ export default function CategoriesPage() {
             rules={[{ required: true, message: "请输入类别名称" }]}>
             <Input placeholder="如：成长股、分红股" />
           </Form.Item>
-          <Form.Item name="color" label="颜色（Hex）"
-            rules={[{ required: true, message: "请输入颜色" }]}>
-            <Input placeholder="#F97316" maxLength={7} />
+          <Form.Item name="color" label="颜色"
+            rules={[{ required: true, message: "请选择颜色" }]}
+            getValueFromEvent={(color: Parameters<NonNullable<ColorPickerProps["onChange"]>>[0]) => color.toHexString()}>
+            <ColorPicker
+              format="hex"
+              placement="right"
+              disabledAlpha
+              showText={() => "点击选择颜色"}
+              presets={[{
+                label: "常用颜色",
+                colors: [
+                  "#F97316", "#FF8844", "#EF4444", "#F59E0B",
+                  "#EAB308", "#22C55E", "#14B8A6", "#06B6D4",
+                  "#3B82F6", "#8B5CF6", "#EC4899", "#64748B",
+                ],
+              }]}
+            />
           </Form.Item>
-          <Form.Item name="sortOrder" label="排序顺序">
-            <Input type="number" placeholder="数字越小越靠前" />
+          <Form.Item name="sortOrder" label="排序顺序"
+            extra="数字越小越靠前，留空默认 100"
+            rules={[{
+              type: "integer",
+              min: -2147483648,
+              max: 2147483647,
+              message: "请输入 -2147483648 到 2147483647 之间的整数",
+            }]}>
+            <InputNumber precision={0} step={1} style={{ width: "100%" }} placeholder="例如：6" />
           </Form.Item>
         </Form>
       </Modal>

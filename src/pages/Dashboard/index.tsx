@@ -119,7 +119,7 @@ export default function DashboardPage() {
       <Divider>持仓概览</Divider>
 
       {/* Holdings Detail Table */}
-      <HoldingsTable holdings={holdingDetails} loading={loading} />
+      <HoldingsTable holdings={holdingDetails} loading={loading} formatCashSharesAsInteger />
     </div>
   );
 }

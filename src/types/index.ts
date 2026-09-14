@@ -165,6 +165,8 @@ export interface HoldingDetail {
   shares: number;
   avg_cost: number;
   current_price: number;
+  /** Daily quote change in percent; unavailable for cash or missing/invalid quotes. */
+  daily_change_percent?: number | null;
   market_value: number;
   cost_value: number;
   pnl: number;

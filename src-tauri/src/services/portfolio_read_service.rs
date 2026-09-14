@@ -31,13 +31,19 @@ fn normalized_quote_key(market: &str, symbol: &str) -> (String, String) {
 
 fn quote_values_by_market_and_symbol(
     quotes: &[crate::models::StockQuote],
-) -> HashMap<(String, String), (f64, f64)> {
+) -> HashMap<(String, String), (f64, f64, Option<f64>)> {
     quotes
         .iter()
         .map(|quote| {
+            let daily_change_percent = (quote.current_price.is_finite()
+                && quote.current_price > 0.0
+                && quote.previous_close.is_finite()
+                && quote.previous_close > 0.0
+                && quote.change_percent.is_finite())
+            .then_some(quote.change_percent);
             (
                 normalized_quote_key(&quote.market, &quote.symbol),
-                (quote.current_price, quote.change),
+                (quote.current_price, quote.change, daily_change_percent),
             )
         })
         .collect()
@@ -165,10 +171,10 @@ impl PortfolioReadModel {
             .into_iter()
             .map(|row| {
                 let quote_key = normalized_quote_key(&row.market, &row.symbol);
-                let (current_price, change) = if is_cash_symbol(&row.symbol) {
-                    (1.0, 0.0)
+                let (current_price, change, daily_change_percent) = if is_cash_symbol(&row.symbol) {
+                    (1.0, 0.0, None)
                 } else {
-                    *quote_map.get(&quote_key).unwrap_or(&(0.0, 0.0))
+                    *quote_map.get(&quote_key).unwrap_or(&(0.0, 0.0, None))
                 };
                 let market_value = row.shares * current_price;
                 let cost_value = row.shares * row.avg_cost;
@@ -190,6 +196,7 @@ impl PortfolioReadModel {
                     shares: row.shares,
                     avg_cost: row.avg_cost,
                     current_price,
+                    daily_change_percent,
                     market_value,
                     cost_value,
                     pnl,
@@ -408,6 +415,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daily_change_percent_preserves_quote_values_and_unavailable_states() {
+        let cases = [
+            (12.0, 11.0, 9.1, serde_json::json!(9.1)),
+            (11.0, 11.0, 0.0, serde_json::json!(0.0)),
+            (0.0, 11.0, -100.0, serde_json::Value::Null),
+            (-11.0, 11.0, -200.0, serde_json::Value::Null),
+            (12.0, 0.0, 0.0, serde_json::Value::Null),
+            (12.0, f64::INFINITY, 0.0, serde_json::Value::Null),
+            (12.0, 11.0, f64::NAN, serde_json::Value::Null),
+            (f64::NAN, 11.0, 0.0, serde_json::Value::Null),
+        ];
+
+        for (current_price, previous_close, change_percent, expected) in cases {
+            let db = seeded_db();
+            let cache = QuoteCache::new();
+            cache.set(StockQuote {
+                current_price,
+                previous_close,
+                change_percent,
+                ..cached_aapl()
+            });
+            let model = PortfolioReadModel::load(&db, &cache, None, QuoteReadMode::CacheOnly)
+                .await
+                .unwrap();
+            let holding = serde_json::to_value(&model.holdings()[0]).unwrap();
+
+            assert_eq!(
+                holding.get("daily_change_percent"),
+                Some(&expected),
+                "price={current_price}, previous close={previous_close}, quote percent={change_percent}",
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn refresh_missing_requires_quote_state() {
         let db = seeded_db();
         let cache = QuoteCache::new();
@@ -465,6 +507,8 @@ mod tests {
             name: "cached USD cash".to_string(),
             market: "US".to_string(),
             current_price: 7.0,
+            previous_close: 6.0,
+            change_percent: 100.0 / 6.0,
             ..StockQuote::default()
         });
         let quote_state = QuoteServiceState::new();
@@ -490,8 +534,20 @@ mod tests {
             .unwrap();
         assert_eq!(cached_cash.current_price, 1.0);
         assert_eq!(cached_cash.market_value, 2.0);
+        assert_eq!(
+            serde_json::to_value(cached_cash)
+                .unwrap()
+                .get("daily_change_percent"),
+            Some(&serde_json::Value::Null),
+        );
         assert_eq!(fetched_cash.current_price, 1.0);
         assert_eq!(fetched_cash.market_value, 3.0);
+        assert_eq!(
+            serde_json::to_value(fetched_cash)
+                .unwrap()
+                .get("daily_change_percent"),
+            Some(&serde_json::Value::Null),
+        );
         assert_eq!(cache.get("US", "$CASH-USD").unwrap().current_price, 7.0);
         assert_eq!(cache.get("CN", "$CASH-CNY").unwrap().current_price, 1.0);
         assert_eq!(cache.get("US", "AAPL").unwrap().current_price, 12.0);
@@ -584,6 +640,12 @@ mod tests {
         assert_eq!(missing.pnl, -80.0);
         assert_eq!(missing.pnl_percent, Some(-100.0));
         assert_eq!(missing.daily_pnl, 0.0);
+        assert_eq!(
+            serde_json::to_value(missing)
+                .unwrap()
+                .get("daily_change_percent"),
+            Some(&serde_json::Value::Null),
+        );
 
         let free = &holdings[2];
         assert_eq!(free.cost_value, 0.0);
@@ -687,11 +749,11 @@ mod tests {
 
         assert_eq!(
             lookup.get(&("US".to_string(), "SAME".to_string())),
-            Some(&(10.0, 1.0))
+            Some(&(10.0, 1.0, None))
         );
         assert_eq!(
             lookup.get(&("CN".to_string(), "SAME".to_string())),
-            Some(&(20.0, 2.0))
+            Some(&(20.0, 2.0, None))
         );
     }
 
@@ -719,12 +781,16 @@ mod tests {
             symbol: " aapl ".to_string(),
             market: " us ".to_string(),
             current_price: 12.0,
+            previous_close: 10.0,
+            change_percent: 20.0,
             ..StockQuote::default()
         });
         cache.set(StockQuote {
             symbol: "AAPL".to_string(),
             market: "CN".to_string(),
             current_price: 20.0,
+            previous_close: 25.0,
+            change_percent: -20.0,
             ..StockQuote::default()
         });
 
@@ -751,5 +817,18 @@ mod tests {
                 .current_price,
             20.0
         );
+        for (market, expected) in [("US", 20.0), ("CN", -20.0)] {
+            let holding = model
+                .holdings()
+                .iter()
+                .find(|holding| holding.market == market)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(holding)
+                    .unwrap()
+                    .get("daily_change_percent"),
+                Some(&serde_json::json!(expected)),
+            );
+        }
     }
 }

@@ -34,6 +34,9 @@ pub struct HoldingDetail {
     pub shares: f64,
     pub avg_cost: f64,
     pub current_price: f64,
+    /// Daily quote change in percent; unavailable for cash or missing/invalid quotes.
+    #[serde(default)]
+    pub daily_change_percent: Option<f64>,
     pub market_value: f64,
     pub cost_value: f64,
     pub pnl: f64,

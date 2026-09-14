@@ -454,6 +454,7 @@ mod tests {
             shares,
             avg_cost,
             current_price,
+            daily_change_percent: None,
             market_value,
             cost_value,
             pnl,

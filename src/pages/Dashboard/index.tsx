@@ -1,12 +1,12 @@
 import { useCallback, useEffect } from "react";
-import { Typography, Select, Divider, Card, Row, Col, Statistic, Spin, Button, Tooltip } from "antd";
+import { Typography, Select, Card, Row, Col, Statistic, Spin, Button, Tooltip } from "antd";
 import { ReloadOutlined, SyncOutlined, DashboardOutlined } from "@ant-design/icons";
 import { useDashboardStore } from "../../stores/dashboardStore";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
 import { useQuoteStore } from "../../stores/quoteStore";
 import type { Currency } from "../../types";
 import SummaryCards from "./SummaryCards";
-import HoldingsTable from "./HoldingsTable";
+import DashboardHoldingsTable from "./DashboardHoldingsTable";
 import QuickCharts from "./QuickCharts";
 import { refreshDashboardQuotes } from "./dashboardRefresh";
 import dayjs from "dayjs";
@@ -116,10 +116,8 @@ export default function DashboardPage() {
         </Col>
       </Row>
 
-      <Divider>持仓概览</Divider>
-
       {/* Holdings Detail Table */}
-      <HoldingsTable holdings={holdingDetails} loading={loading} formatCashSharesAsInteger />
+      <DashboardHoldingsTable holdings={holdingDetails} loading={loading} />
     </div>
   );
 }

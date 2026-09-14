@@ -16,9 +16,9 @@ export function toRecords(
     cached_tokens: m.usage?.cachedTokens ?? 0,
     // Persist reasoning (chain-of-thought) and tool-call details so they
     // survive a reload / session switch — assistant turns only. Tool calls are
-    // serialised to a JSON string (the column is TEXT). Empty values are
-    // omitted (undefined → NULL on the backend, skipped by serde).
-    ...(m.reasoning && m.reasoning.trim().length > 0
+    // serialised to a JSON string (the column is TEXT). Reasoning preserves
+    // explicit empty/whitespace values; only absent reasoning is omitted.
+    ...(m.role === "assistant" && typeof m.reasoning === "string"
       ? { reasoning: m.reasoning }
       : {}),
     ...(m.toolCalls && m.toolCalls.length > 0

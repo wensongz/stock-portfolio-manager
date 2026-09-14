@@ -74,17 +74,27 @@ export function buildHistory(messages: ChatMessageWithMeta[]): ChatMessage[] {
   // above) so we only deal with user/assistant.
   const collapsed: ChatMessage[] = [];
   for (const m of cleaned) {
+    const outgoing: ChatMessage = {
+      role: m.role,
+      content: m.content,
+      // Preserve provider reasoning exactly, including an explicitly empty
+      // string. Tool-round replay is handled by the backend within each turn.
+      ...(m.role === "assistant" && typeof m.reasoning === "string"
+        ? { reasoning_content: m.reasoning }
+        : {}),
+    };
     const last = collapsed[collapsed.length - 1];
     if (last && last.role === m.role) {
       if (m.role === "user") {
         // Preserve both inputs — join with a blank line for readability.
         last.content = `${last.content}\n\n${m.content}`;
       } else {
-        // Assistant: the newer reply supersedes the older one.
-        last.content = m.content;
+        // Replace the whole reply so old reasoning cannot survive a newer
+        // assistant message that has different or no reasoning.
+        collapsed[collapsed.length - 1] = outgoing;
       }
     } else {
-      collapsed.push({ role: m.role, content: m.content });
+      collapsed.push(outgoing);
     }
   }
 

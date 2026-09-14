@@ -275,6 +275,107 @@ function persistedMessage(id, sessionId, content) {
   };
 }
 
+for (const { name, chunks, reasoning } of [
+  { name: "non-ASCII and whitespace", chunks: [" \n核对", "持仓 🧮\t\n"], reasoning: " \n核对持仓 🧮\t\n" },
+  { name: "empty", chunks: [""], reasoning: "" },
+  { name: "whitespace only", chunks: [" \n", "\t\n"], reasoning: " \n\t\n" },
+]) {
+  test(`streamed reasoning survives persistence and reload into a follow-up request: ${name}`, async () => {
+    let records = [];
+    const requests = [];
+    invokeImpl = async (command, args) => {
+      if (command === "plugin:event|listen") {
+        eventHandlers.set(args.event, callbacks.get(args.handler));
+        return args.handler;
+      }
+      if (command === "get_chat_messages") return records;
+      if (command === "save_chat_messages") {
+        records = args.messages;
+        return;
+      }
+      if (command === "touch_chat_session") return;
+      if (command === "chat_with_ai") {
+        requests.push(args.req);
+        return;
+      }
+      throw new Error(`unexpected command ${command}`);
+    };
+    useChatStore.getState().init();
+    await Promise.resolve();
+
+    await useChatStore.getState().sendMessage("核对组合", "reasoning-session");
+    for (const payload of chunks) {
+      eventHandlers.get("ai-chat-reasoning")({ payload });
+    }
+    eventHandlers.get("ai-chat-delta")({ payload: "已核对" });
+    eventHandlers.get("ai-chat-done")({ payload: null });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(records[1].reasoning, reasoning);
+
+    await useChatStore.getState().resetForSessionSwitch();
+    await useChatStore.getState().loadSessionMessages("reasoning-session");
+    assert.equal(useChatStore.getState().messages[1].reasoning, reasoning);
+    await useChatStore.getState().sendMessage("继续", "reasoning-session");
+    eventHandlers.get("ai-chat-done")({ payload: null });
+
+    assert.deepEqual(requests[1].messages, [
+      { role: "user", content: "核对组合" },
+      { role: "assistant", content: "已核对", reasoning_content: reasoning },
+      { role: "user", content: "继续" },
+    ]);
+  });
+}
+
+test("retry clears failed-attempt metadata while retaining the trusted rebalance scope", async () => {
+  const requests = [];
+  invokeImpl = async (command, args) => {
+    if (command === "save_chat_messages" || command === "touch_chat_session") return;
+    if (command === "chat_with_ai") {
+      requests.push(args.req);
+      if (requests.length === 1) throw new Error("retry failed before a tool ran");
+      return;
+    }
+    throw new Error(`unexpected command ${command}`);
+  };
+  useChatStore.setState({
+    messages: [
+      { id: "u", role: "user", content: "rebalance", createdAt: 0 },
+      {
+        id: "failed", role: "assistant", content: "partial", createdAt: 1,
+        error: "HTTP 400", stopped: true, reasoning: "stale reasoning",
+        usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 },
+        activatedSkills: ["old skill"], usedTools: ["get_rebalance_context"],
+        toolCalls: [{
+          id: "prefilled-stock-review", origin: "host_prefill",
+          name: "get_rebalance_context", arguments: '{"config_id":"config-us"}',
+          status: "success", result: "stale result",
+        }],
+      },
+    ],
+  });
+
+  await useChatStore.getState().retryLastTurn("rebalance-session");
+  const firstRetry = useChatStore.getState().messages[1];
+  for (const field of ["reasoning", "toolCalls", "usage", "usedTools", "activatedSkills", "stopped"]) {
+    assert.equal(firstRetry[field], undefined, `${field} belongs to the failed attempt`);
+  }
+  assert.equal(firstRetry.content, "");
+
+  await useChatStore.getState().retryLastTurn("rebalance-session");
+  eventHandlers.get("ai-chat-reasoning")({ payload: "fresh reasoning" });
+  eventHandlers.get("ai-chat-delta")({ payload: "fresh answer" });
+  eventHandlers.get("ai-chat-done")({ payload: null });
+  assert.equal(useChatStore.getState().messages[1].reasoning, "fresh reasoning");
+  assert.equal(requests.length, 2);
+  for (const request of requests) {
+    assert.deepEqual(request.messages, [{ role: "user", content: "rebalance" }]);
+    assert.deepEqual(request.activeSkills, ["portfolio-rebalance"]);
+    assert.deepEqual(request.toolContext, {
+      name: "get_rebalance_context", arguments: { config_id: "config-us" },
+    });
+  }
+});
+
 test("reopening a rebalance turn restores its exact tool scope and skill", async () => {
   const user = persistedMessage("rebalance-user", "session-rebalance", "rebalance now");
   const assistant = {

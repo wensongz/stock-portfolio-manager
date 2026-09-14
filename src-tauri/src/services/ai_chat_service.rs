@@ -37,11 +37,14 @@ use tracing::{debug, info, warn};
 mod anthropic;
 #[path = "ai_chat/context.rs"]
 mod context;
+#[path = "ai_chat/messages.rs"]
+mod messages;
 #[path = "ai_chat/title.rs"]
 mod title;
 
 use anthropic::chat_stream_anthropic;
 pub use context::build_portfolio_context;
+use messages::{assistant_message, build_request_body, history_message};
 pub use title::generate_title;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -615,11 +618,8 @@ struct ChatChoice {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
-    /// Reasoning-model chain-of-thought (DeepSeek-R1 `reasoning_content`,
-    /// GLM-4.5 `reasoning_content`, OpenAI o-series would be separate). We do
-    /// NOT stream this to the user (it's internal scratch), but we track whether
-    /// any arrived so we can distinguish "model produced nothing" (real error)
-    /// from "model only produced reasoning, no final answer" (a different fix).
+    /// Provider-returned reasoning, streamed separately for display and
+    /// preserved verbatim for the next tool-call request.
     #[serde(default)]
     reasoning_content: Option<String>,
     /// Tool-call deltas. These arrive across multiple chunks; the model streams
@@ -956,9 +956,9 @@ struct RoundOutcome {
     /// only — helps distinguish "model reasoned briefly then stalled" from
     /// "model produced a huge chain-of-thought that exhausted the token budget".
     reasoning_chars: usize,
-    /// The full reasoning_content text (chain-of-thought), used as a fallback
-    /// answer when the model produces reasoning but no final `content`.
-    reasoning_text: String,
+    /// Exact reasoning for this round. `Some("")` differs from a provider
+    /// that never returned the field; neither whitespace nor fragments are lost.
+    reasoning_content: Option<String>,
     /// Total SSE data chunks processed this round. Very low counts (1-2)
     /// indicate the stream ended almost immediately — a provider/model issue.
     chunk_count: usize,
@@ -996,10 +996,28 @@ async fn stream_one_round(
         return Err(format!("AI 服务返回错误 (HTTP {status})：{body}"));
     }
 
-    // Parse the SSE stream. Each chunk is a slice of bytes; we buffer into a
-    // string and split on `\n`, processing one SSE `data:` line at a time.
+    read_stream_response(resp, |event, text| {
+        let _ = app.emit(event, text);
+    })
+    .await
+}
+
+fn pop_sse_line(buffer: &mut Vec<u8>) -> Option<String> {
+    let newline = buffer.iter().position(|byte| *byte == b'\n')?;
+    let line = String::from_utf8_lossy(&buffer[..newline])
+        .trim_end_matches('\r')
+        .to_string();
+    buffer.drain(..=newline);
+    Some(line)
+}
+
+async fn read_stream_response(
+    resp: reqwest::Response,
+    emit: impl Fn(&str, &str),
+) -> Result<RoundOutcome, String> {
+    // Buffer raw bytes until a complete SSE line arrives, then decode UTF-8.
     let mut stream = resp;
-    let mut buf = String::new();
+    let mut buf = Vec::<u8>::new();
     let mut last_usage: Option<ChatUsage> = None;
     let mut pending_deltas: Vec<ToolCallDelta> = Vec::new();
     let mut finish_reason: Option<String> = None;
@@ -1008,7 +1026,7 @@ async fn stream_one_round(
     let mut emitted_text = String::new();
     let mut had_reasoning = false;
     let mut reasoning_char_count: usize = 0;
-    let mut reasoning_text = String::new();
+    let mut reasoning_content: Option<String> = None;
     let mut chunk_count: usize = 0;
     // Track whether we received the explicit `[DONE]` SSE marker. This is the
     // authoritative signal that the model finished generating. `Ok(None)` from
@@ -1026,16 +1044,10 @@ async fn stream_one_round(
 
         match stream.chunk().await {
             Ok(Some(chunk)) => {
-                buf.push_str(&String::from_utf8_lossy(&chunk));
-                let mut newline_idx;
-                while {
-                    newline_idx = buf.find('\n');
-                    newline_idx.is_some()
-                } {
-                    let newline_idx = newline_idx.unwrap();
-                    let line = buf[..newline_idx].trim_end_matches('\r').to_string();
-                    buf.drain(..=newline_idx);
-
+                // Decode only complete SSE lines: a network chunk can split
+                // a multi-byte character inside content or reasoning_content.
+                buf.extend_from_slice(&chunk);
+                while let Some(line) = pop_sse_line(&mut buf) {
                     let Some(payload) = line.strip_prefix("data:") else {
                         continue;
                     };
@@ -1079,19 +1091,20 @@ async fn stream_one_round(
                                     if !content.is_empty() {
                                         emitted_any_content = true;
                                         emitted_text.push_str(&content);
-                                        let _ = app.emit("ai-chat-delta", content);
+                                        emit("ai-chat-delta", &content);
                                     }
                                 }
                                 if let Some(rc) = choice.delta.reasoning_content {
+                                    reasoning_content
+                                        .get_or_insert_with(String::new)
+                                        .push_str(&rc);
                                     if !rc.is_empty() {
                                         had_reasoning = true;
                                         reasoning_char_count += rc.chars().count();
-                                        reasoning_text.push_str(&rc);
-                                        // Stream the chain-of-thought to the frontend so the
-                                        // UI can render a collapsible "思考过程" block live,
-                                        // matching the Claude/ZCode reasoning experience.
-                                        let _ = app.emit("ai-chat-reasoning", rc);
                                     }
+                                    // Emit even an empty fragment so persistence can
+                                    // distinguish a returned empty field from absence.
+                                    emit("ai-chat-reasoning", &rc);
                                 }
                                 if !choice.delta.tool_calls.is_empty() {
                                     pending_deltas.extend(choice.delta.tool_calls);
@@ -1151,7 +1164,7 @@ async fn stream_one_round(
         emitted_text,
         had_reasoning_only: had_reasoning && !emitted_any_content,
         reasoning_chars: reasoning_char_count,
-        reasoning_text,
+        reasoning_content,
         chunk_count,
         stream_completed,
     })
@@ -1267,12 +1280,12 @@ pub async fn chat_stream(
         }
     }
     for m in &params.messages {
-        messages.push(json!({ "role": m.role, "content": m.content }));
+        messages.push(history_message(m, &cfg));
     }
 
     // The tools we advertise to the model on every round. Built once.
     // Only included when the user has enabled tools in settings — some models
-    // (DeepSeek-v4-flash, local Ollama) don't support function calling and
+    // (some local Ollama models) don't support function calling and
     // return empty replies when `tools` is present.
     let tools = if cfg.tools_enabled {
         crate::services::ai_tools::tool_definitions_for_scope(params.portfolio_scope.as_ref())
@@ -1298,10 +1311,15 @@ pub async fn chat_stream(
             .inspect_err(|error| {
                 emit_error(&app, error.clone());
             })?;
-        messages.push(json!({
-            "role": "assistant",
-            "tool_calls": [prefilled_tool_call_message(&cfg.provider, &context.name, &arguments)],
-        }));
+        messages.push(assistant_message(
+            "",
+            None,
+            vec![prefilled_tool_call_message(
+                &cfg.provider,
+                &context.name,
+                &arguments,
+            )],
+        ));
         messages.push(json!({
             "role": "tool",
             "tool_call_id": HOST_PREFILLED_TOOL_CALL_ID,
@@ -1339,58 +1357,6 @@ pub async fn chat_stream(
 
     let mut last_usage: Option<ChatUsage> = None;
 
-    // Build the request body. `with_tools` controls whether the `tools` /
-    // `tool_choice` fields are included. The first round always respects the
-    // user's config; a fallback round (after an empty reply from a model that
-    // likely doesn't support function calling) passes `with_tools=false`.
-    //
-    // When `with_tools=false` we ALSO strip the "# 你可用的工具" section from
-    // the base system prompt — otherwise the model is told it has tools but
-    // isn't given any, which is exactly the confusion that causes empty
-    // replies. The first system message is the base prompt (added before the
-    // skill block and context); we transform a copy, not the originals.
-    //
-    // This is a free function (not a closure) so it borrows `messages` only
-    // for the duration of the call — the loop can then mutate `messages`
-    // (e.g. append tool results) without a borrow conflict.
-    let build_body = |msgs: &Vec<serde_json::Value>, with_tools: bool| -> serde_json::Value {
-        if with_tools && cfg.tools_enabled {
-            json!({
-                "model": cfg.model,
-                "messages": msgs,
-                "stream": true,
-                "tools": tools,
-                "tool_choice": "auto",
-                "stream_options": { "include_usage": true },
-            })
-        } else {
-            // Strip the tools section from the base system prompt so the model
-            // isn't told about tools it won't receive. Only the first system
-            // message (the base persona prompt) is transformed; skill/context
-            // messages pass through unchanged.
-            let messages_for_body: Vec<serde_json::Value> = msgs
-                .iter()
-                .enumerate()
-                .map(|(i, m)| {
-                    if i == 0 && m.get("role").and_then(|r| r.as_str()) == Some("system") {
-                        if let Some(content) = m.get("content").and_then(|c| c.as_str()) {
-                            let mut copy = m.clone();
-                            copy["content"] = json!(strip_tools_from_prompt(content));
-                            return copy;
-                        }
-                    }
-                    m.clone()
-                })
-                .collect();
-            json!({
-                "model": cfg.model,
-                "messages": messages_for_body,
-                "stream": true,
-                "stream_options": { "include_usage": true },
-            })
-        }
-    };
-
     // Tracks whether we've already attempted the tools-stripped fallback this
     // turn. We retry at most once: if the model still returns empty without
     // tools, the issue is elsewhere (model choice, content filter) and a hard
@@ -1398,7 +1364,7 @@ pub async fn chat_stream(
     let mut tried_without_tools = false;
 
     for round in 0..crate::services::ai_tools::MAX_TOOL_ROUNDS {
-        let body = build_body(&messages, !tried_without_tools);
+        let body = build_request_body(&cfg, &messages, &tools, !tried_without_tools);
 
         // ── Stream with retry on truncation ────────────────────────────────
         // If the stream is truncated (no `[DONE]`, no clean EOF), we retry
@@ -1494,11 +1460,15 @@ pub async fn chat_stream(
             if !outcome.emitted_any_content {
                 // Reasoning-only fallback: the model produced chain-of-thought
                 // but no final answer. Show the reasoning with a note.
-                if outcome.had_reasoning_only && !outcome.reasoning_text.is_empty() {
+                if outcome.had_reasoning_only {
                     let note = "\n\n---\n\n> ⚠️ 本次模型只输出了思考过程，未生成最终回答（可能因输出长度限制）。如需完整回答，请重试或切换到非推理模型。";
                     let fallback = format!(
                         "**思考过程：**\n\n{}{}",
-                        outcome.reasoning_text.trim(),
+                        outcome
+                            .reasoning_content
+                            .as_deref()
+                            .unwrap_or_default()
+                            .trim(),
                         note
                     );
                     let _ = app.emit("ai-chat-delta", fallback);
@@ -1566,10 +1536,11 @@ pub async fn chat_stream(
         // so the next round can reference them by id).
         let tool_calls_json: Vec<serde_json::Value> =
             outcome.tool_calls.iter().map(tool_call_message).collect();
-        messages.push(json!({
-            "role": "assistant",
-            "tool_calls": tool_calls_json,
-        }));
+        messages.push(assistant_message(
+            &outcome.emitted_text,
+            outcome.reasoning_content.as_deref(),
+            tool_calls_json,
+        ));
 
         // Tell the UI which tools are running.
         let tool_names: Vec<String> = outcome
@@ -1852,6 +1823,147 @@ struct AnthropicToolUse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_content_survives_message_deserialization_and_serialization() {
+        let input = json!({
+            "role": "assistant",
+            "content": "建议如下",
+            "reasoning_content": "先检查持仓。\n 再检查偏离。 "
+        });
+        let message: ChatMessage = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(serde_json::to_value(message).unwrap(), input);
+    }
+
+    #[test]
+    fn reasoning_sse_lines_preserve_utf8_split_at_every_byte() {
+        let input =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"先检查中文 🧮\\n \"}}]}\r\n";
+        let mut buffer = Vec::new();
+        let mut lines = Vec::new();
+        for byte in input.bytes() {
+            buffer.push(byte);
+            while let Some(line) = pop_sse_line(&mut buffer) {
+                lines.push(line);
+            }
+        }
+        assert!(buffer.is_empty());
+        assert_eq!(lines.len(), 1);
+        let chunk: ChatStreamChunk =
+            serde_json::from_str(lines[0].strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("先检查中文 🧮\n ")
+        );
+    }
+
+    async fn reasoning_test_stream(deltas: Vec<serde_json::Value>) -> RoundOutcome {
+        let body = deltas
+            .into_iter()
+            .map(|delta| format!("data: {}\n\n", json!({"choices": [{"delta": delta}]})))
+            .collect::<String>()
+            + "data: [DONE]\n\n";
+        let response = reqwest::Response::from(tauri::http::Response::new(body));
+        read_stream_response(response, |_, _| {}).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn reasoning_stream_tool_rounds_replay_exact_content_without_cross_round_leaks() {
+        let cfg = crate::models::ai_config::AiConfig {
+            provider: "deepseek".into(),
+            model: "deepseek-flash".into(),
+            ..Default::default()
+        };
+        let first = reasoning_test_stream(vec![
+            json!({"reasoning_content": ""}),
+            json!({"reasoning_content": " 先检查"}),
+            json!({"content": "读取", "reasoning_content": "持仓。\n"}),
+            json!({"content": "数据", "tool_calls": [{"index": 0, "id": "call1", "function": {"name": "get_holdings_detail", "arguments": "{"}}]}),
+            json!({"tool_calls": [{"index": 0, "function": {"arguments": "}"}}]}),
+        ]).await;
+        assert!(first.stream_completed);
+        assert_eq!(first.reasoning_chars, 8);
+        let mut messages = vec![assistant_message(
+            &first.emitted_text,
+            first.reasoning_content.as_deref(),
+            first.tool_calls.iter().map(tool_call_message).collect(),
+        )];
+        messages.push(json!({"role": "tool", "tool_call_id": "call1", "content": "持仓数据"}));
+        let second = reasoning_test_stream(vec![
+            json!({"reasoning_content": "再查", "content": ""}),
+            json!({"reasoning_content": "行情。 ", "tool_calls": [{"index": 0, "id": "call2", "function": {"name": "get_stock_quote", "arguments": "{\"symbol\":\"AAPL\"}"}}]}),
+        ]).await;
+        messages.push(assistant_message(
+            &second.emitted_text,
+            second.reasoning_content.as_deref(),
+            second.tool_calls.iter().map(tool_call_message).collect(),
+        ));
+        messages.push(json!({"role": "tool", "tool_call_id": "call2", "content": "行情数据"}));
+        let body = build_request_body(&cfg, &messages, &[], true);
+        let wire: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        assert_eq!(wire["messages"][0]["reasoning_content"], " 先检查持仓。\n");
+        assert_eq!(wire["messages"][0]["content"], "读取数据");
+        assert_eq!(
+            wire["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            "{}"
+        );
+        assert_eq!(wire["messages"][2]["reasoning_content"], "再查行情。 ");
+        assert_eq!(wire["messages"][2]["content"], "");
+        assert_eq!(wire["messages"][2]["tool_calls"][0]["id"], "call2");
+    }
+
+    #[tokio::test]
+    async fn reasoning_stream_keeps_absent_and_empty_fields_distinct() {
+        for (delta, expected) in [
+            (json!({"content": "回答"}), None),
+            (json!({"content": "回答", "reasoning_content": null}), None),
+            (
+                json!({"content": "回答", "reasoning_content": ""}),
+                Some(""),
+            ),
+            (
+                json!({"content": "回答", "reasoning_content": " \n"}),
+                Some(" \n"),
+            ),
+        ] {
+            let outcome = reasoning_test_stream(vec![delta]).await;
+            assert_eq!(outcome.reasoning_content.as_deref(), expected);
+            let replay = assistant_message(
+                &outcome.emitted_text,
+                outcome.reasoning_content.as_deref(),
+                vec![],
+            );
+            assert_eq!(
+                replay
+                    .get("reasoning_content")
+                    .and_then(|value| value.as_str()),
+                expected
+            );
+            assert_eq!(replay["content"], "回答");
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_stream_emits_explicit_empty_field_for_persistence() {
+        let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\",\"content\":\"回答\"}}]}\n\ndata: [DONE]\n\n";
+        let response = reqwest::Response::from(tauri::http::Response::new(body));
+        let events = std::cell::RefCell::new(Vec::new());
+        read_stream_response(response, |event, value| {
+            events
+                .borrow_mut()
+                .push((event.to_string(), value.to_string()));
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                ("ai-chat-delta".to_string(), "回答".to_string()),
+                ("ai-chat-reasoning".to_string(), "".to_string())
+            ]
+        );
+    }
 
     #[test]
     fn anthropic_tool_definitions_converts_shape() {

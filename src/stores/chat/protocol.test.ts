@@ -32,6 +32,49 @@ test("outbound protocol removes invalid rows and restores role alternation", () 
   assert.deepEqual(history, [{ role: "user", content: "first\n\nsecond" }]);
 });
 
+test("outbound history preserves assistant reasoning verbatim and excludes other roles", () => {
+  const history = buildHistory([
+    message("system", "system", "system", { reasoning: "not model reasoning" }),
+    message("u1", "user", "question", { reasoning: "not model reasoning" }),
+    message("a1", "assistant", "answer", { reasoning: " \n核对持仓 🧮\t\n" }),
+    message("u2", "user", "follow-up"),
+    message("a2", "assistant", "empty reasoning answer", { reasoning: "" }),
+    message("u3", "user", "next"),
+    message("a3", "assistant", "ordinary answer"),
+    message("u4", "user", "continue"),
+  ]);
+
+  assert.deepEqual(history, [
+    { role: "user", content: "question" },
+    { role: "assistant", content: "answer", reasoning_content: " \n核对持仓 🧮\t\n" },
+    { role: "user", content: "follow-up" },
+    { role: "assistant", content: "empty reasoning answer", reasoning_content: "" },
+    { role: "user", content: "next" },
+    { role: "assistant", content: "ordinary answer" },
+    { role: "user", content: "continue" },
+  ]);
+});
+
+test("collapsed assistant history uses only the surviving reply's reasoning", () => {
+  const history = buildHistory([
+    message("u1", "user", "question"),
+    message("old", "assistant", "old answer", { reasoning: "old reasoning" }),
+    message("new", "assistant", "new answer", { reasoning: "new reasoning" }),
+    message("u2", "user", "follow-up"),
+    message("thought", "assistant", "thinking answer", { reasoning: "stale reasoning" }),
+    message("plain", "assistant", "ordinary answer"),
+    message("u3", "user", "continue"),
+  ]);
+
+  assert.deepEqual(history, [
+    { role: "user", content: "question" },
+    { role: "assistant", content: "new answer", reasoning_content: "new reasoning" },
+    { role: "user", content: "follow-up" },
+    { role: "assistant", content: "ordinary answer" },
+    { role: "user", content: "continue" },
+  ]);
+});
+
 test("model tool calls cannot collide with the reserved host-prefill id", () => {
   assert.deepEqual(
     normalizeToolCallEvent({

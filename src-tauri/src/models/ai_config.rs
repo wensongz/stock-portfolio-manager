@@ -8,7 +8,7 @@ pub struct AiConfig {
     pub base_url: Option<String>,
     pub system_prompt: String,
     /// Whether to send `tools` (function calling) to the model. Some models
-    /// (e.g. DeepSeek-v4-flash, local Ollama models) don't support function
+    /// (e.g. some local Ollama models) don't support function
     /// calling — sending `tools` causes them to return empty replies. Users
     /// can disable this in Settings → AI Config.
     #[serde(default = "default_tools_enabled")]
@@ -36,6 +36,9 @@ pub struct AiModelInfo {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Provider-returned reasoning, retained separately from visible content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// A persisted chat session (one named conversation).

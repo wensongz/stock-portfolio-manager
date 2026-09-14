@@ -23,6 +23,8 @@
 
 界面会在回答中展示每次工具调用的结果卡片，包括参数、状态、结果或错误和耗时。卡片会随消息写入本地会话，重新打开会话后仍可回看。
 
+模型返回的 `reasoning_content` 会单独累积并随会话原样保存，包括空字符串和空白。当前工具调用循环会回传每轮完整的正文、思考内容和工具调用；历史续聊按目标接口的支持情况回传思考字段。DeepSeek、Kimi、GLM、MiMo、Qwen、OpenRouter 使用该扩展，切换到其他原生接口时保留本地记录但不发送此字段。DeepSeek 的预填工具及缺失该字段的旧消息会使用空值补位，已经丢失的历史思考无法恢复。参见 [DeepSeek 思考模式](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode/)。这不代表已支持所有提供商的其他思考格式（例如 `reasoning_details` 或带签名的 thinking 内容块）。
+
 应用支持 11 个提供商：Anthropic Claude、DeepSeek、Gemini、GLM、Grok、Kimi、MiMo、Ollama、OpenAI、OpenRouter 和 Qwen。是否能使用工具取决于所选的具体模型；同一提供商内也可能有不支持函数调用的模型。需要工具查询时，请选择支持函数调用的模型。
 
 Qwen 默认使用阿里云百炼北京端点；其他地域或工作空间请在 AI 配置中填写对应 API 端点。Gemini 使用 Google AI Studio 的 API Key，Grok 使用 xAI 的 API Key。接口说明：[Qwen](https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope)、[Gemini](https://ai.google.dev/gemini-api/docs/openai)、[Grok](https://docs.x.ai/overview)。

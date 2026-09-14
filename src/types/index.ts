@@ -889,6 +889,8 @@ export interface AiModelInfo {
 export interface ChatMessage {
   role: "user" | "assistant" | "system";
   content: string;
+  /** Original assistant reasoning; supported provider adapters replay it. */
+  reasoning_content?: string;
 }
 
 /** Token-usage accounting for a single chat turn (from the final SSE chunk). */
@@ -921,7 +923,7 @@ export interface ChatMessageWithMeta {
   error?: string;
   /**
    * Chain-of-thought text streamed from `reasoning_content` (DeepSeek-R1 /
-   * GLM-4.5+ thinking models). In-memory only — not persisted. Rendered as a
+   * GLM-4.5+ thinking models). Persisted with the reply. Rendered as a
    * collapsible "思考过程" block above the answer.
    */
   reasoning?: string;
@@ -944,7 +946,7 @@ export interface ChatMessageWithMeta {
   /**
    * Detailed per-tool-call progress for this turn (Claude-style expandable
    * cards). Populated from the `ai-chat-tool-call` event and upserted by id
-   * across rounds. In-memory only — not persisted. When present, the UI
+   * across rounds. Persisted for display, not as a wire transcript. The UI
    * renders `ToolCallCard`s instead of the legacy `usedTools` name badges.
    */
   toolCalls?: ToolCallInfo[];

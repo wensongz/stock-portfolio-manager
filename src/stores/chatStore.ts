@@ -445,7 +445,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // ai-chat-delta: append to the in-flight message (foreground or background).
     listen<string>("ai-chat-reasoning", (event) => {
       const token = event.payload;
-      if (!token || !streamingId) return;
+      if (typeof token !== "string" || !streamingId) return;
       applyStreamUpdate(set, (m) => ({
         ...m,
         reasoning: (m.reasoning ?? "") + token,
@@ -524,7 +524,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
               : undefined,
           // Restore persisted reasoning + tool calls so they're visible on
           // re-open. tool_calls is a JSON string in the DB → parse to array.
-          ...(r.reasoning && r.reasoning.trim().length > 0
+          ...(r.role === "assistant" && typeof r.reasoning === "string"
             ? { reasoning: r.reasoning }
             : {}),
           ...(r.tool_calls
@@ -804,8 +804,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       : failedMsg.explicitSkillIds ?? [];
     const toolContext = sessionBinding.toolContext ?? failedMsg.explicitToolContext ?? null;
 
-    // Reset the placeholder: clear error, wipe any partial content, and mark
-    // it as the active streaming target so delta/usage/done listeners fill it.
+    // Reset all output from the failed attempt before new events arrive.
+    // Retain the resolved trusted scope even if it came from the tool cards
+    // being cleared, so another early failure can still be retried safely.
     streamingId = failedMsg.id;
     streamingSessionId = sessionId;
     set((s) => ({
@@ -814,7 +815,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
       streamingSessionIdState: sessionId,
       messages: s.messages.map((m) =>
         m.id === failedMsg.id
-          ? { ...m, error: undefined, content: "", stopped: undefined }
+          ? {
+              ...m,
+              error: undefined,
+              content: "",
+              stopped: undefined,
+              reasoning: undefined,
+              toolCalls: undefined,
+              usage: undefined,
+              usedTools: undefined,
+              activatedSkills: undefined,
+              explicitSkillIds: activeSkills.length > 0 ? activeSkills : undefined,
+              explicitToolContext: toolContext ?? undefined,
+            }
           : m,
       ),
     }));

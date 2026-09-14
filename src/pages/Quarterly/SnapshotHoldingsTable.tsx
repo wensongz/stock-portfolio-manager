@@ -51,9 +51,9 @@ export default function SnapshotHoldingsTable({ holdings, snapshotId, loading, s
   const accountColumns: ColumnsType<QuarterlyHoldingSnapshot> = [
     { title: "账户", dataIndex: "account_name", key: "account_name", width: 160 },
     { title: "持仓数量", dataIndex: "shares", key: "shares", width: 90, align: "right", render: (v: number, row) => formatHoldingShares(v, row.symbol) },
-    { title: "均价", dataIndex: "avg_cost", key: "avg_cost", width: 90, align: "right", render: (v: number, row) => formatQuarterlyMoney(v, snapshotHoldingCurrency(row), 3) },
     { title: "市值", dataIndex: "market_value", key: "market_value", width: 140, align: "right", render: (v: number, row) => formatQuarterlyMoney(v, snapshotHoldingCurrency(row)) },
     { title: "仓位", dataIndex: "weight", key: "weight", width: 70, align: "right", render: (v: number) => `${v.toFixed(2)}%` },
+    { title: "均价", dataIndex: "avg_cost", key: "avg_cost", width: 90, align: "right", render: (v: number, row) => formatQuarterlyMoney(v, snapshotHoldingCurrency(row), 3) },
     { title: "盈亏金额", dataIndex: "pnl", key: "pnl", width: 150, align: "right", render: (v: number, row) => <Text style={{ color: pnlColorDark(v) }}>{v >= 0 ? "+" : "-"}{formatQuarterlyMoney(Math.abs(v), snapshotHoldingCurrency(row))}</Text> },
     { title: "盈亏比例", dataIndex: "pnl_percent", key: "pnl_percent", width: 90, align: "right", render: (v: number | null) => <Text style={{ color: v == null ? undefined : pnlColorDark(v) }}>{fmtPct(v)}</Text> },
     { title: "操作思考", key: "notes", width: 190, align: "center", render: (_, row) => <Space size={0}><Button type="link" size="small" icon={<EditOutlined />} style={{ paddingInline: 4 }} onClick={() => setEditorTarget({ snapshotId, holding: row, showHistory: false })}>{row.notes ? "编辑" : "记录"}</Button><Button type="link" size="small" icon={<HistoryOutlined />} style={{ paddingInline: 4 }} onClick={() => setEditorTarget({ snapshotId, holding: row, showHistory: true })}>本季度操作</Button></Space> },

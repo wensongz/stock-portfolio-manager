@@ -26,7 +26,7 @@ const marketOptions = [
   { label: "🇭🇰 港股", value: "HK" },
 ];
 
-const accountValueColumnOrder = ["shares", "avg_cost", "market_value", "position_pct", "pnl", "pnl_percent"];
+const accountValueColumnOrder = ["shares", "market_value", "position_pct", "avg_cost", "pnl", "pnl_percent"];
 
 function valueColumns<T extends DashboardAccountHolding | DashboardStockHolding>(
   pnlColor: (value: number) => string,
@@ -106,7 +106,7 @@ export default function DashboardHoldingsTable({ holdings, loading }: Props) {
       render: (name: string, record: DashboardStockHolding) => <Tag color={record.category_color}>{name}</Tag>,
     },
     {
-      title: "现价", dataIndex: "current_price", key: "current_price", width: 90, align: "right",
+      title: "现价", dataIndex: "current_price", key: "current_price", width: 100, align: "right",
       sorter: (a, b) => a.current_price - b.current_price,
       render: (value: number, record: DashboardStockHolding) => formatMoney(value, record.currency),
     },

@@ -149,7 +149,7 @@ export default function HoldingsTable({ holdings, loading, hideAccountMarket = f
       render: (price: number, record: HoldingDetail) =>
         fmtMoney(price, record.currency),
       align: "right",
-      width: 90,
+      width: 100,
     },
     {
       title: "市值",

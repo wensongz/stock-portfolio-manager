@@ -254,7 +254,7 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
       render: (price: number) =>
         `${currencySymbol}${price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
       align: "right" as const,
-      width: 90,
+      width: 100,
     },
     {
       title: "市值",
@@ -346,15 +346,6 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
           formatHoldingShares(shares, record.symbol),
       },
       {
-        title: "均价",
-        dataIndex: "avg_cost",
-        key: "avg_cost",
-        align: "right" as const,
-        width: 90,
-        render: (price: number) =>
-          price.toLocaleString("en-US", { minimumFractionDigits: 3, maximumFractionDigits: 3 }),
-      },
-      {
         title: "市值",
         dataIndex: "market_value",
         key: "market_value",
@@ -370,6 +361,15 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
         align: "right" as const,
         width: 70,
         render: (pct: number) => `${pct.toFixed(2)}%`,
+      },
+      {
+        title: "均价",
+        dataIndex: "avg_cost",
+        key: "avg_cost",
+        align: "right" as const,
+        width: 90,
+        render: (price: number) =>
+          price.toLocaleString("en-US", { minimumFractionDigits: 3, maximumFractionDigits: 3 }),
       },
       {
         title: "盈亏金额",

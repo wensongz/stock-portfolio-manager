@@ -38,7 +38,7 @@ function valueColumns<T extends DashboardAccountHolding | DashboardStockHolding>
       render: (shares: number, record: T) => formatHoldingShares(shares, record.symbol),
     },
     {
-      title: "市值", dataIndex: "market_value", key: "market_value", width: 140, align: "right",
+      title: "市值", dataIndex: "market_value", key: "market_value", width: 145, align: "right",
       sorter: (a, b) => a.market_value_usd - b.market_value_usd,
       defaultSortOrder: "descend",
       render: (value: number, record: T) => formatMoney(value, record.currency),
@@ -57,7 +57,7 @@ function valueColumns<T extends DashboardAccountHolding | DashboardStockHolding>
       }),
     },
     {
-      title: "盈亏金额", dataIndex: "pnl", key: "pnl", width: 140, align: "right",
+      title: "盈亏金额", dataIndex: "pnl", key: "pnl", width: 145, align: "right",
       sorter: (a, b) => a.pnl - b.pnl,
       render: (value: number, record: T) => (
         <span style={{ color: pnlColor(value) }}>
@@ -66,7 +66,7 @@ function valueColumns<T extends DashboardAccountHolding | DashboardStockHolding>
       ),
     },
     {
-      title: "盈亏比例", dataIndex: "pnl_percent", key: "pnl_percent", width: 90, align: "right",
+      title: "盈亏比例", dataIndex: "pnl_percent", key: "pnl_percent", width: 95, align: "right",
       render: (value: number | null) => value == null ? <Text type="secondary">—</Text> : (
         <span style={{ color: pnlColor(value) }}>
           {value >= 0 ? "+" : ""}{value.toFixed(2)}%
@@ -112,7 +112,7 @@ export default function DashboardHoldingsTable({ holdings, loading }: Props) {
     },
     {
       title: <Tooltip title="行情相对上一交易日收盘价的涨跌幅">涨跌幅</Tooltip>,
-      dataIndex: "daily_change_percent", key: "daily_change_percent", width: 110, align: "right",
+      dataIndex: "daily_change_percent", key: "daily_change_percent", width: 90, align: "right",
       sorter: (a, b) => (a.daily_change_percent ?? -Infinity) - (b.daily_change_percent ?? -Infinity),
       render: (value: number | null) => value == null ? <Text type="secondary">—</Text> : (
         <Text strong style={{ color: value === 0 ? undefined : pnlColor(value) }}>
@@ -145,7 +145,7 @@ export default function DashboardHoldingsTable({ holdings, loading }: Props) {
   return (
     <Card
       title="持仓概览"
-      className="mt-4"
+      style={{ marginTop: 16 }}
       extra={(
         <div className="flex flex-wrap items-center justify-end gap-2">
           <Select

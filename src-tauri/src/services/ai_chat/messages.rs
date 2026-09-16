@@ -101,6 +101,24 @@ pub(super) fn build_request_body(
         body["tools"] = json!(tools);
         body["tool_choice"] = json!("auto");
     }
+    // Sol defaults to medium reasoning, but Chat Completions only accepts
+    // its function tools with reasoning_effort=none. Keep tool access and
+    // apply the same compatibility setting to tool-result/prefill rounds,
+    // even when no new tools are advertised. Plain chat keeps its default.
+    let model = cfg.model.strip_prefix("openai/").unwrap_or(&cfg.model);
+    if matches!(model, "gpt-5.6-sol" | "gpt-5.6") {
+        let has_functions = (with_tools && tools.iter().any(|tool| tool["type"] == "function"))
+            || messages.iter().any(|message| {
+                message["role"] == "tool"
+                    || (message["role"] == "assistant"
+                        && message["tool_calls"]
+                            .as_array()
+                            .is_some_and(|calls| !calls.is_empty()))
+            });
+        if has_functions {
+            body["reasoning_effort"] = json!("none");
+        }
+    }
     body
 }
 
@@ -113,6 +131,109 @@ mod tests {
             provider: provider.into(),
             model: "test-model".into(),
             ..AiConfig::default()
+        }
+    }
+
+    fn portfolio_tool() -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "get_portfolio_overview",
+                "description": "Read the portfolio overview",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })
+    }
+
+    #[test]
+    fn sol_function_requests_disable_incompatible_default_reasoning() {
+        let messages = vec![json!({"role": "user", "content": "我的持仓里哪些占比过高？"})];
+        let tools = vec![portfolio_tool()];
+        for (provider, model, base_url) in [
+            ("openai", "gpt-5.6-sol", None),
+            ("openai", "gpt-5.6", None),
+            ("openai", "gpt-5.6-sol", Some("https://proxy.example/v1")),
+            ("openrouter", "openai/gpt-5.6-sol", None),
+            ("openrouter", "openai/gpt-5.6", None),
+        ] {
+            let cfg = AiConfig {
+                model: model.into(),
+                base_url: base_url.map(str::to_string),
+                ..config(provider)
+            };
+            let body = build_request_body(&cfg, &messages, &tools, true);
+            assert_eq!(body["reasoning_effort"], "none", "{provider}/{model}");
+            assert_eq!(body["tools"], json!(tools));
+            assert_eq!(body["tool_choice"], "auto");
+            assert_eq!(body["messages"], json!(messages));
+            assert_eq!(body["model"], model);
+        }
+    }
+
+    #[test]
+    fn sol_tool_results_remain_compatible_without_advertised_tools() {
+        let messages = vec![
+            json!({"role": "user", "content": "检查持仓"}),
+            assistant_message(
+                "",
+                None,
+                vec![super::super::prefilled_tool_call_message(
+                    "openai",
+                    "get_portfolio_overview",
+                    "{}",
+                )],
+            ),
+            json!({"role": "tool", "tool_call_id": HOST_PREFILLED_TOOL_CALL_ID, "content": "持仓数据"}),
+        ];
+        // Covers the regular tool loop, tools-stripped fallback, and host
+        // prefill when the user has disabled model-initiated tool calls.
+        for (tools_enabled, with_tools) in [(true, true), (true, false), (false, true)] {
+            let cfg = AiConfig {
+                model: "gpt-5.6-sol".into(),
+                tools_enabled,
+                ..config("openai")
+            };
+            let body = build_request_body(&cfg, &messages, &[portfolio_tool()], with_tools);
+            assert_eq!(body["reasoning_effort"], "none");
+            assert_eq!(body["messages"], json!(messages));
+            assert_eq!(body.get("tools").is_some(), tools_enabled && with_tools);
+        }
+    }
+
+    #[test]
+    fn plain_sol_chat_and_other_models_keep_their_reasoning_defaults() {
+        let messages = vec![json!({"role": "user", "content": "你好"})];
+        let tools = vec![portfolio_tool()];
+        let mut cfg = AiConfig {
+            model: "gpt-5.6-sol".into(),
+            ..config("openai")
+        };
+        assert!(build_request_body(&cfg, &messages, &[], true)
+            .get("reasoning_effort")
+            .is_none());
+        assert!(build_request_body(&cfg, &messages, &tools, false)
+            .get("reasoning_effort")
+            .is_none());
+        cfg.tools_enabled = false;
+        assert!(build_request_body(&cfg, &messages, &tools, true)
+            .get("reasoning_effort")
+            .is_none());
+
+        for (provider, model) in [
+            ("openai", "gpt-4o"),
+            ("openai", "gpt-5.1"),
+            ("openai", "gpt-5.6-terra"),
+            ("openai", "gpt-6-astra"),
+            ("deepseek", "deepseek-reasoner"),
+            ("openrouter", "deepseek/deepseek-v4-flash"),
+        ] {
+            let cfg = AiConfig {
+                model: model.into(),
+                ..config(provider)
+            };
+            let body = build_request_body(&cfg, &messages, &tools, true);
+            assert!(body.get("reasoning_effort").is_none(), "{provider}/{model}");
+            assert_eq!(body["tools"], json!(tools));
         }
     }
 

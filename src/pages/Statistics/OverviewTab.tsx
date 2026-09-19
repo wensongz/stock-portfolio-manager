@@ -604,6 +604,9 @@ export default function OverviewTab({ baseCurrency }: Props) {
           symbol={txnModal.symbol}
           stockName={txnModal.stockName}
           onClose={() => setTxnModal(null)}
+          onUpdated={() => {
+            return useStatisticsStore.getState().fetchView({ kind: "overview", baseCurrency }, "reload-after-in-flight");
+          }}
         />
       )}
     </div>

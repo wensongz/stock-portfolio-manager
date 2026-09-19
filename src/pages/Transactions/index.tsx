@@ -4,33 +4,20 @@ import {
   Button,
   Table,
   Space,
-  Modal,
-  Form,
-  Input,
   Select,
-  InputNumber,
   Tag,
   Popconfirm,
   message,
-  DatePicker,
-  AutoComplete,
-  Row,
-  Col,
   Tooltip,
 } from "antd";
 import { PlusOutlined, EditOutlined, FilterOutlined, CameraOutlined, FileTextOutlined, SwapOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
-import { invoke } from "@tauri-apps/api/core";
 import { useTransactionStore } from "../../stores/transactionStore";
 import { useAccountStore } from "../../stores/accountStore";
 import type {
   Transaction,
   Market,
-  Currency,
   TransactionType,
-  Holding,
-  StockQuote,
-  QuoteCommandResult,
 } from "../../types";
 import ImportFromImageModal from "./ImportFromImageModal";
 import ImportFromIbCsvModal from "./ImportFromIbCsvModal";
@@ -38,7 +25,7 @@ import ImportFromMoomooCsvModal from "./ImportFromMoomooCsvModal";
 import ImportFromThsCsvModal from "./ImportFromThsCsvModal";
 import ImportFromFirstradeCsvModal from "./ImportFromFirstradeCsvModal";
 import { useTablePageSize } from "../../hooks/tablePageSize";
-import { useQuoteStore } from "../../stores/quoteStore";
+import TransactionFormModal from "./TransactionFormModal";
 
 const { Title, Text } = Typography;
 
@@ -48,54 +35,16 @@ const marketColors: Record<Market, string> = {
   HK: "green",
 };
 
-const marketCurrencyMap: Record<Market, Currency> = {
-  US: "USD",
-  CN: "CNY",
-  HK: "HKD",
-};
-
 const currencySymbol: Record<string, string> = { USD: "$", CNY: "¥", HKD: "HK$" };
 
-function shareInputProps(market?: Market) {
-  return market === "US"
-    ? { min: 0.000001, precision: 6, placeholder: "交易股数" }
-    : { min: 1, precision: 0, placeholder: "交易股数" };
-}
-
-// Default traded time: 1 hour after market open
-// US: 9:30 ET → 10:30 ET (use local hour 10, min 30)
-// CN: 9:30 CST → 10:30 CST (use local hour 10, min 30)
-// HK: 9:30 HKT → 10:30 HKT (use local hour 10, min 30)
-const marketDefaultTime: Record<Market, { hour: number; minute: number }> = {
-  US: { hour: 10, minute: 30 },
-  CN: { hour: 10, minute: 30 },
-  HK: { hour: 10, minute: 30 },
-};
-
-function getDefaultTradedAt(market?: Market): dayjs.Dayjs {
-  const time = market ? marketDefaultTime[market] : { hour: 10, minute: 30 };
-  return dayjs().hour(time.hour).minute(time.minute).second(0);
-}
-
 export default function TransactionsPage() {
-  const { transactions, loading, fetchTransactions, createTransaction, updateTransaction, deleteTransaction } =
+  const { transactions, loading, fetchTransactions, deleteTransaction } =
     useTransactionStore();
   const { accounts, fetchAccounts } = useAccountStore();
   const { pageSize, onShowSizeChange } = useTablePageSize();
   const [modalOpen, setModalOpen] = useState(false);
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
-  const [form] = Form.useForm();
-  const watchedType = Form.useWatch("transactionType", form);
-  const isDividend = watchedType === "PAY";
-  const isStockTransfer = watchedType === "STOCK_IN" || watchedType === "STOCK_OUT";
-  const isStockOut = watchedType === "STOCK_OUT";
-  // Cash deposit/withdraw: 存入现金 → $CASH-* BUY; 提取现金 → $CASH-* SELL
-  const isCashTxn = watchedType === "CASH_IN" || watchedType === "CASH_OUT";
-  const cashDirection = watchedType === "CASH_IN" ? "BUY" : "SELL";
   const CASH_SYMBOL_PREFIX = "$CASH-";
-  const selectedFormMarket = Form.useWatch("market", form) as Market | undefined;
-  const [accountHoldings, setAccountHoldings] = useState<Holding[]>([]);
-  const [symbolSearching, setSymbolSearching] = useState(false);
   // Remember the last "按账户" filter selection across sessions.
   const [filterAccountId, setFilterAccountId] = useState<string | undefined>(() => {
     return localStorage.getItem("transactions_filter_account_id") || undefined;
@@ -133,182 +82,8 @@ export default function TransactionsPage() {
     }
   }, []);
 
-  // When account changes, set default market/currency/time and load holdings
-  const handleAccountChange = useCallback(async (accountId: string) => {
-    const account = accounts.find((a) => a.id === accountId);
-    if (account) {
-      form.setFieldsValue({
-        market: account.market,
-        currency: marketCurrencyMap[account.market],
-        tradedAt: getDefaultTradedAt(account.market),
-      });
-      try {
-        const holdings = await invoke<Holding[]>("get_holdings", { accountId });
-        setAccountHoldings(holdings);
-      } catch {
-        setAccountHoldings([]);
-      }
-    }
-  }, [accounts, form]);
-
-  // Build AutoComplete options from holdings
-  const symbolOptions = useMemo(() => {
-    return accountHoldings
-      .filter((h) => h.shares > 0)
-      .map((h) => ({
-        value: h.symbol,
-        label: `${h.symbol} - ${h.name} (持仓: ${h.shares})`,
-      }));
-  }, [accountHoldings]);
-
-  // When a symbol is selected from dropdown, auto-fill name/market/currency
-  const handleSymbolSelect = useCallback((value: string) => {
-    const holding = accountHoldings.find((h) => h.symbol === value);
-    if (holding) {
-      form.setFieldsValue({
-        name: holding.name,
-        market: holding.market,
-        currency: holding.currency,
-      });
-    }
-  }, [accountHoldings, form]);
-
-  // When user finishes typing a symbol (on blur), try to look up the stock name
-  const handleSymbolBlur = useCallback(async () => {
-    const symbol = form.getFieldValue("symbol");
-    const name = form.getFieldValue("name");
-    const market = form.getFieldValue("market") as Market | undefined;
-    if (!symbol || name || !market) return;
-
-    // Check holdings first
-    const holding = accountHoldings.find(
-      (h) => h.symbol.toUpperCase() === symbol.toUpperCase()
-    );
-    if (holding) {
-      form.setFieldsValue({ name: holding.name });
-      return;
-    }
-
-    // Try to fetch quote from backend
-    setSymbolSearching(true);
-    try {
-      const outcome = await invoke<QuoteCommandResult<StockQuote[]>>("get_real_time_quotes", {
-        symbols: [[symbol, market]],
-        forceRefresh: false,
-      });
-      useQuoteStore.getState().applyQuoteMetadata(outcome);
-      const quotes = outcome.data;
-      if (quotes.length > 0 && quotes[0].name) {
-        form.setFieldsValue({ name: quotes[0].name });
-      }
-    } catch {
-      // silently ignore - user can enter name manually
-    } finally {
-      setSymbolSearching(false);
-    }
-  }, [accountHoldings, form]);
-
-  // Auto-calculate total amount when shares or price changes
-  const handleAmountFieldChange = useCallback(() => {
-    const shares = form.getFieldValue("shares");
-    const price = form.getFieldValue("price");
-    if (typeof shares === "number" && typeof price === "number" && shares > 0 && price > 0) {
-      form.setFieldsValue({
-        totalAmount: Math.round(shares * price * 100) / 100,
-      });
-    }
-  }, [form]);
-
-  const handleSubmit = async (values: {
-    accountId: string;
-    symbol: string;
-    name: string;
-    market: Market;
-    transactionType: TransactionType | "CASH_IN" | "CASH_OUT";
-    shares: number;
-    price: number;
-    totalAmount: number;
-    commission: number;
-    currency: Currency;
-    tradedAt: dayjs.Dayjs;
-    notes?: string;
-  }) => {
-    // For dividend (PAY) transactions, shares and price are not meaningful
-    const submittedValues = values.transactionType === "PAY"
-      ? { ...values, shares: 0, price: 0 }
-      : values;
-    if (isCashTxn && !values.currency) {
-      message.error("请先选择币种");
-      return;
-    }
-    // For cash deposit/withdraw, map to $CASH-* BUY/SELL with fixed fields
-    const stockSubmitted = values.transactionType === "STOCK_IN"
-      ? { ...submittedValues, totalAmount: values.shares * values.price, commission: 0 }
-      : values.transactionType === "STOCK_OUT"
-        ? { ...submittedValues, price: 0, totalAmount: 0, commission: 0 }
-        : submittedValues;
-    const cashSubmitted = isCashTxn
-      ? {
-          ...stockSubmitted,
-          transactionType: cashDirection as TransactionType, // BUY (deposit) or SELL (withdraw)
-          symbol: `${CASH_SYMBOL_PREFIX}${values.currency}`,
-          name: `现金 (${values.currency})`,
-          shares: 0,
-          price: 0,
-          commission: 0,
-        }
-      : { ...stockSubmitted, transactionType: stockSubmitted.transactionType as TransactionType };
-    try {
-      if (editingTransaction) {
-        await updateTransaction({
-          id: editingTransaction.id,
-          ...cashSubmitted,
-          tradedAt: cashSubmitted.tradedAt.toISOString(),
-        });
-        message.success("交易记录更新成功");
-      } else {
-        await createTransaction({
-          ...cashSubmitted,
-          tradedAt: cashSubmitted.tradedAt.toISOString(),
-        });
-        message.success("交易记录添加成功");
-      }
-      setModalOpen(false);
-      setEditingTransaction(null);
-      form.resetFields();
-    } catch (err) {
-      message.error(`操作失败: ${err}`);
-    }
-  };
-
-  const handleEdit = async (record: Transaction) => {
+  const handleEdit = (record: Transaction) => {
     setEditingTransaction(record);
-    // Load holdings for the account
-    try {
-      const holdings = await invoke<Holding[]>("get_holdings", { accountId: record.account_id });
-      setAccountHoldings(holdings);
-    } catch {
-      setAccountHoldings([]);
-    }
-    // If editing a cash record, show the cash-specific type
-    const isCashRecord = record.symbol.startsWith(CASH_SYMBOL_PREFIX);
-    const cashType = isCashRecord
-      ? record.transaction_type === "BUY" ? "CASH_IN" : "CASH_OUT"
-      : record.transaction_type;
-    form.setFieldsValue({
-      accountId: record.account_id,
-      symbol: record.symbol,
-      name: record.name,
-      market: record.market,
-      transactionType: cashType,
-      shares: record.shares,
-      price: record.price,
-      totalAmount: record.total_amount,
-      commission: record.commission,
-      currency: record.currency,
-      tradedAt: dayjs(record.traded_at),
-      notes: record.notes,
-    });
     setModalOpen(true);
   };
 
@@ -513,12 +288,6 @@ export default function TransactionsPage() {
             icon={<PlusOutlined />}
             onClick={() => {
               setEditingTransaction(null);
-              form.resetFields();
-              setAccountHoldings([]);
-              if (filterAccountId) {
-                form.setFieldsValue({ accountId: filterAccountId });
-                handleAccountChange(filterAccountId);
-              }
               setModalOpen(true);
             }}
           >
@@ -562,144 +331,15 @@ export default function TransactionsPage() {
         }}
       />
 
-      <Modal
-        title={editingTransaction ? "编辑交易记录" : "录入交易记录"}
+      <TransactionFormModal
         open={modalOpen}
-        onOk={() => form.submit()}
-        onCancel={() => {
+        transaction={editingTransaction}
+        initialAccountId={filterAccountId}
+        onClose={() => {
           setModalOpen(false);
           setEditingTransaction(null);
-          form.resetFields();
-          setAccountHoldings([]);
         }}
-        okText="确认"
-        cancelText="取消"
-        width={640}
-      >
-        <Form form={form} layout="vertical" onFinish={handleSubmit}
-          initialValues={{ tradedAt: getDefaultTradedAt(), commission: 0 }}>
-          <Form.Item name="accountId" label="证券账户" style={{ marginBottom: 12 }}
-            rules={[{ required: true, message: "请选择账户" }]}>
-            <Select placeholder="选择证券账户" onChange={handleAccountChange}>
-              {accounts.map((a) => (
-                <Select.Option key={a.id} value={a.id}>
-                  [{a.market}] {a.name}
-                </Select.Option>
-              ))}
-            </Select>
-          </Form.Item>
-          {!isCashTxn && (
-            <Row gutter={12}>
-              <Col span={12}>
-                <Form.Item name="symbol" label="股票代码" style={{ marginBottom: 12 }}
-                  rules={[{ required: true, message: "请输入股票代码" }]}>
-                  <AutoComplete
-                    options={symbolOptions}
-                    placeholder="输入或选择股票代码"
-                    onSelect={handleSymbolSelect}
-                    onBlur={handleSymbolBlur}
-                    filterOption={(inputValue, option) =>
-                      (option?.value?.toString().toUpperCase().indexOf(inputValue.toUpperCase()) ?? -1) >= 0 ||
-                      (option?.label?.toString().toUpperCase().indexOf(inputValue.toUpperCase()) ?? -1) >= 0
-                    }
-                  />
-                </Form.Item>
-              </Col>
-              <Col span={12}>
-                <Form.Item name="name" label="股票名称" style={{ marginBottom: 12 }}
-                  rules={[{ required: true, message: "请输入股票名称" }]}>
-                  <Input placeholder="如：苹果" disabled={symbolSearching} />
-                </Form.Item>
-              </Col>
-            </Row>
-          )}
-          <Row gutter={12}>
-            <Col span={12}>
-              <Form.Item name="transactionType" label="交易类型" style={{ marginBottom: 12 }}
-                rules={[{ required: true, message: "请选择交易类型" }]}>
-                <Select placeholder="选择交易类型">
-                  <Select.Option value="BUY">买入</Select.Option>
-                  <Select.Option value="SELL">卖出</Select.Option>
-                  <Select.Option value="PAY">分红</Select.Option>
-                  <Select.Option value="CASH_IN">存入现金</Select.Option>
-                  <Select.Option value="CASH_OUT">提取现金</Select.Option>
-                  <Select.Option value="STOCK_IN">存入股票</Select.Option>
-                  <Select.Option value="STOCK_OUT">提取股票</Select.Option>
-                </Select>
-              </Form.Item>
-            </Col>
-            <Col span={12}>
-              <Form.Item name="tradedAt" label={isStockTransfer ? "发生时间" : "成交时间"} style={{ marginBottom: 12 }}
-                rules={[{ required: true, message: "请选择成交时间" }]}>
-                <DatePicker showTime style={{ width: "100%" }} />
-              </Form.Item>
-            </Col>
-          </Row>
-          {isStockTransfer && (
-            <Typography.Paragraph type="secondary">
-              {isStockOut ? "按原持仓成本提取股票，不增加现金、不计入卖出收益。提取数量不能超过发生时间的持仓。" : "按填写的每股成本存入股票并计算持仓均价，不扣除现金。"}
-            </Typography.Paragraph>
-          )}
-          {!isDividend && !isCashTxn && (
-            <Row gutter={12}>
-              <Col span={12}>
-                <Form.Item name="shares" label={isStockTransfer ? (isStockOut ? "提取股数" : "存入股数") : "交易股数"} style={{ marginBottom: 12 }}
-                  rules={[{ required: true, message: "请输入交易股数" }]}>
-                  <InputNumber
-                    {...shareInputProps(selectedFormMarket)}
-                    style={{ width: "100%" }}
-                    onChange={handleAmountFieldChange} />
-                </Form.Item>
-              </Col>
-              {!isStockOut && <Col span={12}>
-                <Form.Item name="price" label={watchedType === "STOCK_IN" ? "每股成本" : "成交价格"} style={{ marginBottom: 12 }}
-                  rules={[{ required: true, message: watchedType === "STOCK_IN" ? "请输入每股成本" : "请输入成交价格" }]}>
-                  <InputNumber min={0} precision={4} style={{ width: "100%" }}
-                    onChange={handleAmountFieldChange} />
-                </Form.Item>
-              </Col>}
-            </Row>
-          )}
-          {!isStockTransfer && <Row gutter={12}>
-            <Col span={12}>
-              <Form.Item name="totalAmount" label="成交总额" style={{ marginBottom: 12 }}
-                rules={[{ required: true, message: "请输入成交总额" }]}>
-                <InputNumber min={0} precision={2} style={{ width: "100%" }} />
-              </Form.Item>
-            </Col>
-            <Col span={12}>
-              <Form.Item name="commission" label="手续费" style={{ marginBottom: 12 }}>
-                <InputNumber min={0} precision={2} style={{ width: "100%" }} />
-              </Form.Item>
-            </Col>
-          </Row>}
-          <Row gutter={12}>
-            <Col span={12}>
-              <Form.Item name="market" label="市场" style={{ marginBottom: 12 }}
-                rules={[{ required: true, message: "请选择市场" }]}>
-                <Select placeholder="选择市场">
-                  <Select.Option value="US">🇺🇸 美股</Select.Option>
-                  <Select.Option value="CN">🇨🇳 A股</Select.Option>
-                  <Select.Option value="HK">🇭🇰 港股</Select.Option>
-                </Select>
-              </Form.Item>
-            </Col>
-            <Col span={12}>
-              <Form.Item name="currency" label="币种" style={{ marginBottom: 12 }}
-                rules={[{ required: true, message: "请选择币种" }]}>
-                <Select placeholder="选择币种">
-                  <Select.Option value="USD">USD 美元</Select.Option>
-                  <Select.Option value="CNY">CNY 人民币</Select.Option>
-                  <Select.Option value="HKD">HKD 港元</Select.Option>
-                </Select>
-              </Form.Item>
-            </Col>
-          </Row>
-          <Form.Item name="notes" label="备注（可选）" style={{ marginBottom: 0 }}>
-            <Input.TextArea rows={2} placeholder="交易备注" />
-          </Form.Item>
-        </Form>
-      </Modal>
+      />
 
       {/* Import from screenshot modal – only for CN accounts */}
       {filterAccountId && (() => {

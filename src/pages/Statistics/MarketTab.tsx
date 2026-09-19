@@ -537,6 +537,9 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
           symbol={txnModal.symbol}
           stockName={txnModal.stockName}
           onClose={() => setTxnModal(null)}
+          onUpdated={() => {
+            return useStatisticsStore.getState().fetchView({ kind: "market", market: selectedMarket }, "reload-after-in-flight");
+          }}
         />
       )}
     </div>

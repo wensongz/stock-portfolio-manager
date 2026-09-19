@@ -237,6 +237,9 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
           symbol={txnModal.symbol}
           stockName={txnModal.stockName}
           onClose={() => setTxnModal(null)}
+          onUpdated={() => {
+            return useStatisticsStore.getState().fetchView({ kind: "category", categoryId: selectedCategoryId, baseCurrency }, "reload-after-in-flight");
+          }}
         />
       )}
     </div>

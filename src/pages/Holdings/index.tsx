@@ -51,6 +51,7 @@ import { canEditOpening } from "./holdingEditPolicy";
 import CashBalancePreview from "./CashBalancePreview";
 import { cashBalanceEditDecision, cashBalanceSaveCommand, createEditSession, createHoldingRequest, emptyHoldingRequest, formatCashDelta, mergeHoldingQuote } from "./cashBalanceEditing";
 import { formatMoney } from "../../lib/formatMoney";
+import TransactionFormModal from "../Transactions/TransactionFormModal";
 
 const { Title, Text } = Typography;
 
@@ -161,6 +162,7 @@ export default function HoldingsPage() {
   }, [editingHolding]);
   const [detailModalOpen, setDetailModalOpen] = useState(false);
   const [detailHolding, setDetailHolding] = useState<Holding | null>(null);
+  const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
   const [detailState, setDetailState] = useState(emptyHoldingRequest<{ cash: CashBalanceReconciliation | null; transactions: Transaction[] }>);
   const detailRequest = useMemo(() => createHoldingRequest<{ cash: CashBalanceReconciliation | null; transactions: Transaction[] }>(setDetailState), []);
   const detailHoldingRef = useRef<Holding | null>(null);
@@ -447,8 +449,55 @@ export default function HoldingsPage() {
   const closeDetailModal = () => {
     detailRequest.clear();
     detailHoldingRef.current = null;
+    setEditingTransaction(null);
     setDetailModalOpen(false);
     setDetailHolding(null);
+  };
+
+  const handleTransactionSaved = async (saved: Transaction) => {
+    const holding = detailHoldingRef.current;
+    await Promise.all([
+      holding ? handleShowDetail(holding) : Promise.resolve(),
+      fetchHoldingQuotes([]),
+      fetchHoldings(),
+    ]);
+    if (!holding || detailHoldingRef.current?.id !== holding.id) return;
+    setDetailState((state) => {
+      if (state.holdingId !== holding.id || !state.data) return state;
+      return {
+        ...state,
+        data: {
+          transactions: state.data.transactions.map((row) => row.id === saved.id ? { ...row, notes: saved.notes } : row),
+          cash: state.data.cash ? {
+            ...state.data.cash,
+            rows: state.data.cash.rows.map((row) => row.id === saved.id ? { ...row, notes: saved.notes } : row),
+          } : null,
+        },
+      };
+    });
+    const updated = useHoldingStore.getState().holdings.find((item) => item.id === holding.id);
+    if (updated) {
+      detailHoldingRef.current = updated;
+      setDetailHolding(updated);
+    }
+  };
+
+  const transactionActionColumn = {
+    title: "操作",
+    key: "action",
+    width: 70,
+    fixed: "right" as const,
+    align: "right" as const,
+    render: (_: unknown, record: Transaction) => (
+      <Button
+        type="link"
+        size="small"
+        disabled={record.transaction_type === "OPEN"}
+        onClick={() => setEditingTransaction(record)}
+      >
+        编辑
+      </Button>
+    ),
   };
 
   const accountMap = Object.fromEntries(accounts.map((a) => [a.id, a.name]));
@@ -1049,7 +1098,7 @@ export default function HoldingsPage() {
         open={detailModalOpen}
         onCancel={closeDetailModal}
         footer={null}
-        width={detailHolding && isCashSymbol(detailHolding.symbol) ? 1000 : 900}
+        width={detailHolding && isCashSymbol(detailHolding.symbol) ? 1060 : 960}
       >
         {detailHolding && isCashSymbol(detailHolding.symbol) && <CashBalancePreview
           holding={detailHolding}
@@ -1068,7 +1117,7 @@ export default function HoldingsPage() {
             rowKey="id"
             loading={detailLoading}
             pagination={false}
-            scroll={{ y: 400 }}
+            scroll={{ x: "max-content", y: 400 }}
             columns={[
               {
                 title: "日期",
@@ -1149,6 +1198,7 @@ export default function HoldingsPage() {
                 ellipsis: true,
                 render: (v: string | null) => v || "—",
               },
+              transactionActionColumn,
             ]}
           />
         ) : (
@@ -1182,7 +1232,7 @@ export default function HoldingsPage() {
                 title: "股数",
                 dataIndex: "shares",
                 key: "shares",
-                width: 100,
+                width: 90,
                 render: (v: number) => v.toLocaleString(),
               },
               {
@@ -1202,7 +1252,7 @@ export default function HoldingsPage() {
                 title: "手续费",
                 dataIndex: "commission",
                 key: "commission",
-                width: 100,
+                width: 90,
                 render: (v: number, record: Transaction) => `${currencySymbol[record.currency]}${v.toFixed(2)}`,
               },
               {
@@ -1212,10 +1262,18 @@ export default function HoldingsPage() {
                 ellipsis: true,
                 render: (v: string | null) => v || "—",
               },
+              transactionActionColumn,
             ]}
           />
         )}
       </Modal>
+
+      <TransactionFormModal
+        open={editingTransaction !== null}
+        transaction={editingTransaction}
+        onClose={() => setEditingTransaction(null)}
+        onSaved={handleTransactionSaved}
+      />
 
       {/* Import Holdings from CSV Modal (CN) */}
       {selectedAccount && (

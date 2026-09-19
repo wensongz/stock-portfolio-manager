@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod ai;
+pub mod alert_history;
 pub mod alerts;
 pub mod backup;
 pub mod categories;

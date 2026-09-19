@@ -135,6 +135,8 @@ pub struct MissingPortfolioAlertData {
 pub struct PortfolioAlertBreach {
     pub config_id: String,
     pub breach_key: String,
+    #[serde(default)]
+    pub category_name: Option<String>,
     pub breach_kind: PortfolioAlertBreachKind,
     pub direction: PortfolioAlertBreachDirection,
     pub first_triggered_at: String,

@@ -491,6 +491,43 @@ test("command and event breaches can share one notification presentation", () =>
   assert.match(presentation.description, /AAPL/);
 });
 
+test("category notifications show the category name instead of its opaque ID", () => {
+  const categoryId = "3b0afc82-dc36-4127-b852-8fa9ecd76e51";
+  for (const direction of ["UNDERWEIGHT", "OVERWEIGHT"]) {
+    const presentation = buildPortfolioAlertNotificationPresentation({
+      configId: "config-overall",
+      breachKey: `category:${categoryId}`,
+      categoryName: "成长股",
+      breachKind: "CATEGORY_DEVIATION",
+      direction,
+      firstTriggeredAt: "2026-09-19T05:20:36Z",
+      lastSeenAt: "2026-09-19T05:20:36Z",
+    });
+    assert.match(presentation.description, /投资类别 成长股/);
+    assert.match(presentation.description, direction === "UNDERWEIGHT" ? /欠配/ : /超配/);
+    assert.ok(!presentation.description.includes(categoryId));
+  }
+});
+
+test("missing category names never fall back to IDs, and uncategorized has a readable label", () => {
+  const breach = {
+    configId: "config-overall",
+    breachKey: "category:3b0afc82-dc36-4127-b852-8fa9ecd76e51",
+    breachKind: "CATEGORY_DEVIATION",
+    direction: "OVERWEIGHT",
+    firstTriggeredAt: "2026-09-19T05:20:36Z",
+    lastSeenAt: "2026-09-19T05:20:36Z",
+  };
+  for (const categoryName of [undefined, null, "", "   "]) {
+    const presentation = buildPortfolioAlertNotificationPresentation({ ...breach, categoryName });
+    assert.equal(presentation.description, "投资类别：类别配置超配");
+  }
+  const uncategorized = buildPortfolioAlertNotificationPresentation({
+    ...breach, breachKey: "category:uncategorized",
+  });
+  assert.equal(uncategorized.description, "投资类别 未分类：类别配置超配");
+});
+
 test("fresh categories join display rows in Settings order without making uncategorized editable", () => {
   const categories = [
     category("new", "新类别", 30, "#333333", "🆕"),

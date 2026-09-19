@@ -207,6 +207,15 @@ pub fn check_alerts(
                 )
                 .map_err(|e| e.to_string())?;
 
+            let history = super::alert_history_snapshot::price_alert_history(
+                &transaction,
+                &alert,
+                current_value,
+                (price, change_pct, pnl_pct),
+                &now,
+            )?;
+            super::alert_history_service::append_alert_history(&transaction, &history)?;
+
             triggered.push(TriggeredAlert {
                 alert: PriceAlert {
                     is_triggered: true,
@@ -227,6 +236,83 @@ pub fn check_alerts(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn triggered_price_history_preserves_account_name_values_and_survives_rule_deletion() {
+        let db = Database::new(":memory:").unwrap();
+        db.conn.lock().unwrap().execute_batch(
+            "INSERT INTO accounts (id,name,market,created_at,updated_at)
+             VALUES ('876543210','长期投资账户','US','old','old');
+             INSERT INTO holdings (id,account_id,symbol,name,market,shares,avg_cost,currency,created_at,updated_at)
+             VALUES ('holding','876543210','AAPL','苹果','US',10,80,'USD','old','old');"
+        ).unwrap();
+        let alert = create_alert(
+            &db,
+            Some("holding".into()),
+            "AAPL".into(),
+            "苹果".into(),
+            "US".into(),
+            "PRICE_ABOVE".into(),
+            120.0,
+        )
+        .unwrap();
+        let quotes = HashMap::from([(("US".into(), "AAPL".into()), (123.45, 2.5, 54.3125))]);
+        assert_eq!(check_alerts(&db, &quotes).unwrap().len(), 1);
+        assert!(check_alerts(&db, &quotes).unwrap().is_empty());
+        delete_alert(&db, &alert.id).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE accounts SET name='新名称'", [])
+            .unwrap();
+        let history =
+            crate::services::alert_history_service::get_alert_history(&db, Default::default())
+                .unwrap();
+        assert_eq!(history.total, 1);
+        let saved = &history.items[0];
+        assert_eq!(saved.account_name.as_deref(), Some("长期投资账户"));
+        assert_eq!(saved.kind, "PRICE");
+        let text = serde_json::to_string(&saved.details).unwrap();
+        assert!(text.contains("123.45"), "{text}");
+        assert!(text.contains("120.00"), "{text}");
+        assert!(text.contains("USD"), "{text}");
+        assert!(!text.contains("876543210"), "{text}");
+        assert!(!saved.scope_name.contains("876543210"));
+    }
+
+    #[test]
+    fn failed_history_insert_rolls_back_price_trigger_for_retry() {
+        let db = Database::new(":memory:").unwrap();
+        create_alert(
+            &db,
+            None,
+            "AAPL".into(),
+            "苹果".into(),
+            "US".into(),
+            "PRICE_ABOVE".into(),
+            120.0,
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_history BEFORE INSERT ON alert_history
+             BEGIN SELECT RAISE(ABORT, 'history unavailable'); END;",
+            )
+            .unwrap();
+        let quotes = HashMap::from([(("US".into(), "AAPL".into()), (123.45, 2.5, 0.0))]);
+        assert!(check_alerts(&db, &quotes)
+            .unwrap_err()
+            .contains("history unavailable"));
+        assert!(!get_alerts(&db).unwrap()[0].is_triggered);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_history")
+            .unwrap();
+        assert_eq!(check_alerts(&db, &quotes).unwrap().len(), 1);
+    }
 
     fn seeded_alert_db() -> Database {
         let db = Database::new(":memory:").unwrap();
@@ -272,5 +358,9 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(statuses, vec![0, 0]);
+        let history_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM alert_history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(history_count, 0);
     }
 }

@@ -298,6 +298,8 @@ pub fn run() {
             commands::alerts::get_alerts,
             commands::alerts::update_alert,
             commands::alerts::delete_alert,
+            commands::alert_history::get_alert_history,
+            commands::alert_history::delete_alert_history,
             commands::portfolio_alerts::get_portfolio_alert_view,
             commands::portfolio_alerts::save_portfolio_alert_config,
             commands::portfolio_alerts::set_portfolio_alert_active,

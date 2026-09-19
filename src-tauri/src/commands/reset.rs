@@ -20,6 +20,7 @@ pub(crate) fn reset_database_state(conn: &mut Connection, now: &str) -> Result<(
         .map_err(|error| format!("failed to clear stock operation review cache: {error}"))?;
 
     for table in [
+        "alert_history",
         "chat_messages",
         "chat_sessions",
         "quarterly_holding_snapshots",
@@ -205,6 +206,24 @@ mod tests {
         assert_eq!(row_count(&conn, "portfolio_alert_breaches"), 0);
         assert_eq!(row_count(&conn, "portfolio_alert_targets"), 0);
         assert_eq!(row_count(&conn, "portfolio_alert_configs"), 0);
+    }
+
+    #[test]
+    fn factory_reset_clears_alert_history() {
+        let db = Database::new(":memory:").unwrap();
+        let mut conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO alert_history
+               (id, kind, title, message, scope_name, account_name, triggered_at, details_json)
+             VALUES ('history-1', 'PRICE', 'Title', 'Message', 'Apple', 'Long term',
+                     '2026-09-19T10:00:00Z', '[]')",
+            [],
+        )
+        .unwrap();
+
+        reset_database_state(&mut conn, "2026-09-19T11:00:00Z").unwrap();
+
+        assert_eq!(row_count(&conn, "alert_history"), 0);
     }
 
     #[test]

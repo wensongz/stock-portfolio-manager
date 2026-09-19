@@ -3,6 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { startPortfolioAlertEventListener } from "./portfolioAlertEventListener.ts";
 import { createPortfolioAlertStore } from "../../stores/portfolioAlertStore.ts";
+import { buildPortfolioAlertNotificationPresentation } from "./portfolioAlertViewModel.ts";
 
 function overallScope() {
   return { kind: "OVERALL", market: null, accountId: null };
@@ -16,6 +17,7 @@ function notification() {
     breach: {
       configId: "config-us",
       breachKey: "category:growth",
+      categoryName: "成长股",
       breachKind: "CATEGORY_DEVIATION",
       direction: "OVERWEIGHT",
       firstTriggeredAt,
@@ -39,9 +41,11 @@ test("app-lifetime listener presents an event received while the alerts tab is u
 
   emit(notification());
 
-  assert.deepEqual(
-    store.getState().takePendingNotifications().map((breach) => breach.breachKey),
-    ["category:growth"],
+  const pending = store.getState().takePendingNotifications();
+  assert.deepEqual(pending.map((breach) => breach.breachKey), ["category:growth"]);
+  assert.equal(
+    buildPortfolioAlertNotificationPresentation(pending[0]).description,
+    "投资类别 成长股：类别配置超配",
   );
   assert.deepEqual(store.getState().takePendingNotifications(), []);
   dispose();

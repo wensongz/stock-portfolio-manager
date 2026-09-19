@@ -303,8 +303,10 @@ export function buildPortfolioAlertNotificationPresentation(
   breach: PortfolioAlertBreach,
 ): PortfolioAlertNotificationPresentation {
   const breachParts = breach.breachKey.split(":");
+  const categoryName = breach.categoryName?.trim()
+    || (breach.breachKey === "category:uncategorized" ? "未分类" : "");
   const subject = breach.breachKey.startsWith("category:")
-    ? `投资类别 ${breach.breachKey.slice("category:".length)}`
+    ? categoryName ? `投资类别 ${categoryName}` : "投资类别"
     : `标的 ${breachParts[breachParts.length - 1] ?? breach.breachKey}`;
   const reason = breach.breachKind === "CONCENTRATION"
     ? "单票集中度超过阈值"

@@ -2,6 +2,8 @@ pub mod ai_chat_service;
 pub mod ai_config_service;
 pub mod ai_models_service;
 pub mod ai_tools;
+pub mod alert_history_service;
+pub(crate) mod alert_history_snapshot;
 pub mod alert_service;
 pub mod backup_service;
 pub mod cash_reconciliation_service;

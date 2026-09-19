@@ -1,6 +1,7 @@
 pub mod account;
 pub mod ai_config;
 pub mod alert;
+pub mod alert_history;
 pub mod category;
 pub mod dashboard;
 pub mod dividend;

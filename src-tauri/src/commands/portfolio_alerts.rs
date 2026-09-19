@@ -146,6 +146,81 @@ mod tests {
         (db, quote_cache, config_id, quotes)
     }
 
+    fn category_fixture() -> (Database, QuoteCache, String, String) {
+        let db = Database::new(":memory:").unwrap();
+        let config_id = "config-category".to_string();
+        let category_id = "8d635f43-bc6d-4c11-a3df-91bb99a95ed8".to_string();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, name, market, created_at, updated_at)
+                 VALUES ('acct-us', 'US', 'US', '2026-09-06', '2026-09-06')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO categories (id, name, color, icon, created_at)
+                 VALUES (?1, '创新成长', '#00AA00', 'growth', '2026-09-06')",
+                [&category_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO categories (id, name, color, icon, created_at)
+                 VALUES ('cash', '现金储备', '#AAAAAA', 'cash', '2026-09-06')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
+                 VALUES ('holding-aapl', 'acct-us', 'AAPL', 'Apple', 'US', ?1, 10, 1, 'USD', '2026-09-06', '2026-09-06')",
+                [&category_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO holdings
+                 (id, account_id, symbol, name, market, category_id, shares, avg_cost, currency, created_at, updated_at)
+                 VALUES ('holding-cash', 'acct-us', '$CASH-USD', 'Cash', 'US', 'cash', 100, 1, 'USD', '2026-09-06', '2026-09-06')",
+                [],
+            )
+            .unwrap();
+        }
+        portfolio_alert_service::save_portfolio_alert_config(
+            &db,
+            SavePortfolioAlertConfigInput {
+                id: Some(config_id.clone()),
+                scope: PortfolioAlertScope {
+                    kind: PortfolioAlertScopeKind::Market,
+                    market: Some("US".to_string()),
+                    account_id: None,
+                },
+                base_currency: "USD".to_string(),
+                deviation_threshold: 20.0,
+                concentration_threshold: 100.0,
+                is_active: true,
+                targets: vec![
+                    PortfolioAlertTarget {
+                        category_id: category_id.clone(),
+                        target_percent: 50.0,
+                    },
+                    PortfolioAlertTarget {
+                        category_id: "cash".to_string(),
+                        target_percent: 50.0,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let quote_cache = QuoteCache::new();
+        quote_cache.set(StockQuote {
+            market: "US".to_string(),
+            symbol: "AAPL".to_string(),
+            current_price: 100.0,
+            ..StockQuote::default()
+        });
+        (db, quote_cache, config_id, category_id)
+    }
+
     #[tokio::test]
     async fn persisted_complete_refresh_evaluates_real_breaches_and_emits_exact_payloads() {
         // This catches disconnected orchestration tests: all notifications here
@@ -233,6 +308,46 @@ mod tests {
         assert_eq!(persisted.2, "ABOVE_LIMIT");
         assert_eq!(persisted.3, notification.breach.first_triggered_at);
         assert_eq!(persisted.4, notification.breach.last_seen_at);
+    }
+
+    #[tokio::test]
+    async fn category_evaluation_and_emitted_event_use_the_same_name_without_exposing_the_id() {
+        let (evaluation_db, evaluation_quotes, config_id, category_id) = category_fixture();
+        let evaluation = portfolio_alert_service::evaluate_portfolio_alert(
+            &evaluation_db,
+            &evaluation_quotes,
+            None,
+            &config_id,
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap();
+        let breach_key = format!("category:{category_id}");
+        let evaluated = evaluation
+            .newly_triggered
+            .iter()
+            .find(|breach| breach.breach_key == breach_key)
+            .unwrap();
+        assert_eq!(evaluated.category_name.as_deref(), Some("创新成长"));
+
+        let (event_db, event_quotes, _, _) = category_fixture();
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = emitted.clone();
+        evaluate_portfolio_alerts_with_sink(
+            &event_db,
+            &event_quotes,
+            &ExchangeRateCache::new(),
+            |notification| captured.lock().unwrap().push(notification),
+        )
+        .await;
+        let emitted = emitted.lock().unwrap();
+        let notification = emitted
+            .iter()
+            .find(|notification| notification.breach.breach_key == breach_key)
+            .unwrap();
+        assert_eq!(notification.breach.category_name, evaluated.category_name);
+        assert_eq!(notification.message, "资产配置偏离预警：创新成长");
+        assert!(!notification.message.contains(&category_id));
     }
 
     #[tokio::test]

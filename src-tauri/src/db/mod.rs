@@ -1,3 +1,4 @@
+mod alert_history_schema;
 pub(crate) mod migrations;
 mod quarterly_schema;
 mod schema;

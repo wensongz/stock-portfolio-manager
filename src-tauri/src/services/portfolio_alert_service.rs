@@ -404,8 +404,20 @@ fn load_active_breaches(
 ) -> Result<Vec<PortfolioAlertBreach>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT breach_key, breach_kind, direction, first_triggered_at, last_seen_at
-             FROM portfolio_alert_breaches WHERE config_id = ?1 ORDER BY breach_key",
+            "SELECT b.breach_key, b.breach_kind, b.direction,
+                    b.first_triggered_at, b.last_seen_at,
+                    CASE
+                        WHEN b.breach_kind != 'CATEGORY_DEVIATION' THEN NULL
+                        WHEN b.breach_key = 'category:uncategorized' THEN '未分类'
+                        ELSE (
+                            SELECT c.name
+                            FROM categories c
+                            WHERE b.breach_key = 'category:' || c.id
+                        )
+                    END AS category_name
+             FROM portfolio_alert_breaches b
+             WHERE b.config_id = ?1
+             ORDER BY b.breach_key",
         )
         .map_err(|error| error.to_string())?;
     let breaches = statement
@@ -436,6 +448,7 @@ fn load_active_breaches(
             Ok(PortfolioAlertBreach {
                 config_id: config_id.to_string(),
                 breach_key: row.get(0)?,
+                category_name: row.get(5)?,
                 breach_kind: kind,
                 direction,
                 first_triggered_at: row.get(3)?,
@@ -583,6 +596,7 @@ fn proposed_breaches(
             PortfolioAlertBreach {
                 config_id: config_id.to_string(),
                 breach_key: key,
+                category_name: Some(category.category_name.clone()),
                 breach_kind: PortfolioAlertBreachKind::CategoryDeviation,
                 direction: match direction {
                     AllocationDirection::Overweight => PortfolioAlertBreachDirection::Overweight,
@@ -603,6 +617,7 @@ fn proposed_breaches(
             PortfolioAlertBreach {
                 config_id: config_id.to_string(),
                 breach_key: key,
+                category_name: None,
                 breach_kind: PortfolioAlertBreachKind::Concentration,
                 direction: PortfolioAlertBreachDirection::AboveLimit,
                 first_triggered_at: evaluated_at.to_string(),
@@ -737,6 +752,7 @@ fn persist_ready_transition(
     proposed: &BTreeMap<String, PortfolioAlertBreach>,
     evaluated_at: &str,
     guard: &EvaluationGuard,
+    positions: &[PortfolioAlertPositionInput],
 ) -> Result<(Vec<PortfolioAlertBreach>, Vec<PortfolioAlertBreach>), String> {
     let mut conn = db.conn.lock().map_err(|error| error.to_string())?;
     let transaction = conn.transaction().map_err(|error| error.to_string())?;
@@ -793,6 +809,14 @@ fn persist_ready_transition(
                 ],
             )
             .map_err(|error| error.to_string())?;
+        let history = super::alert_history_snapshot::portfolio_alert_history(
+            &transaction,
+            &guard.config,
+            snapshot,
+            breach,
+            positions,
+        )?;
+        super::alert_history_service::append_alert_history(&transaction, &history)?;
         newly_triggered.push(breach.clone());
     }
 
@@ -1060,7 +1084,13 @@ where
 fn portfolio_alert_notification_message(breach: &PortfolioAlertBreach) -> String {
     match breach.breach_kind {
         PortfolioAlertBreachKind::CategoryDeviation => {
-            format!("资产配置偏离预警：{}", breach.breach_key)
+            let category = breach
+                .category_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("投资类别");
+            format!("资产配置偏离预警：{category}")
         }
         PortfolioAlertBreachKind::Concentration => {
             format!("持仓集中度预警：{}", breach.breach_key)
@@ -1304,6 +1334,7 @@ where
                     &proposed,
                     evaluated_at,
                     &guard,
+                    &positions,
                 )?;
                 (active, newly_triggered, None)
             } else {
@@ -2378,6 +2409,7 @@ mod tests {
         let proposed = PortfolioAlertBreach {
             config_id: "config-1".to_string(),
             breach_key: "category:growth".to_string(),
+            category_name: Some("成长".to_string()),
             breach_kind: PortfolioAlertBreachKind::CategoryDeviation,
             direction: PortfolioAlertBreachDirection::Underweight,
             first_triggered_at: "preview-first".to_string(),
@@ -2883,6 +2915,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn category_breach_new_and_reloaded_payloads_keep_the_snapshot_name() {
+        let fixture = evaluation_fixture();
+        let category_id = "8d635f43-bc6d-4c11-a3df-91bb99a95ed8";
+        seed_categories(&fixture.db, [category_id]);
+        fixture
+            .db
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE categories SET name='创新成长' WHERE id = ?1",
+                [category_id],
+            )
+            .unwrap();
+        fixture
+            .db
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE holdings SET category_id = ?1 WHERE id='holding-cash'",
+                [category_id],
+            )
+            .unwrap();
+        let config = save_portfolio_alert_config(
+            &fixture.db,
+            input(
+                overall_scope(),
+                20.0,
+                100.0,
+                [("growth", 50.0), (category_id, 50.0)],
+            ),
+        )
+        .unwrap();
+
+        let first = evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &config.id,
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap();
+        let expected_key = format!("category:{category_id}");
+        let newly_triggered = first
+            .newly_triggered
+            .iter()
+            .find(|breach| breach.breach_key == expected_key)
+            .unwrap();
+        assert_eq!(newly_triggered.category_name.as_deref(), Some("创新成长"));
+
+        let second = evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &config.id,
+            "2026-09-06T10:05:00Z",
+        )
+        .await
+        .unwrap();
+        let reloaded = second
+            .active_breaches
+            .iter()
+            .find(|breach| breach.breach_key == expected_key)
+            .unwrap();
+        assert_eq!(reloaded.category_name.as_deref(), Some("创新成长"));
+    }
+
+    #[test]
+    fn active_breach_loader_names_uncategorized_and_tolerates_deleted_categories() {
+        let db = configured_db();
+        seed_categories(&db, ["growth", "deleted-category"]);
+        let config = save_portfolio_alert_config(
+            &db,
+            input(overall_scope(), 20.0, 100.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            for (key, kind, direction) in [
+                ("category:uncategorized", "CATEGORY_DEVIATION", "OVERWEIGHT"),
+                (
+                    "category:deleted-category",
+                    "CATEGORY_DEVIATION",
+                    "UNDERWEIGHT",
+                ),
+                ("security:US:AAPL", "CONCENTRATION", "ABOVE_LIMIT"),
+            ] {
+                conn.execute(
+                    "INSERT INTO portfolio_alert_breaches
+                     (config_id, breach_key, breach_kind, direction, first_triggered_at, last_seen_at)
+                     VALUES (?1, ?2, ?3, ?4, 'now', 'now')",
+                    rusqlite::params![config.id, key, kind, direction],
+                )
+                .unwrap();
+            }
+            conn.execute("DELETE FROM categories WHERE id='deleted-category'", [])
+                .unwrap();
+        }
+
+        let conn = db.conn.lock().unwrap();
+        let loaded = load_active_breaches(&conn, &config.id).unwrap();
+        let by_key = loaded
+            .iter()
+            .map(|breach| (breach.breach_key.as_str(), breach.category_name.as_deref()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_key["category:uncategorized"], Some("未分类"));
+        assert_eq!(by_key["category:deleted-category"], None);
+        assert_eq!(by_key["security:US:AAPL"], None);
+    }
+
+    #[tokio::test]
     async fn recovery_removes_active_row_and_later_breach_notifies_again() {
         let fixture = evaluation_fixture();
         evaluate_portfolio_alert(
@@ -2923,6 +3068,164 @@ mod tests {
             rebreach.newly_triggered[0].first_triggered_at,
             "2026-09-06T10:10:00Z"
         );
+    }
+
+    #[tokio::test]
+    async fn portfolio_history_retains_detailed_named_snapshots_through_recovery_and_deletion() {
+        let fixture = evaluation_fixture();
+        fixture
+            .db
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE accounts SET name='美股长期账户' WHERE id='acct-us'",
+                [],
+            )
+            .unwrap();
+        let config = save_portfolio_alert_config(
+            &fixture.db,
+            input(account_scope("acct-us"), 20.0, 60.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        for (at, price) in [
+            ("2026-09-06T10:00:00Z", 100.0),
+            ("2026-09-06T10:01:00Z", 100.0),
+            ("2026-09-06T10:05:00Z", 10.0),
+            ("2026-09-06T10:10:00Z", 120.0),
+        ] {
+            fixture.quote_cache.set(quote("US", "AAPL", price));
+            evaluate_portfolio_alert(
+                &fixture.db,
+                &fixture.quote_cache,
+                Some(&fixture.rates),
+                &config.id,
+                at,
+            )
+            .await
+            .unwrap();
+        }
+        set_portfolio_alert_active(&fixture.db, &config.id, false).unwrap();
+        fixture
+            .db
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("UPDATE accounts SET name='已改名'; DELETE FROM accounts;")
+            .unwrap();
+        let page = crate::services::alert_history_service::get_alert_history(
+            &fixture.db,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(page.total, 2, "continuous breaches must not flood history");
+        assert_eq!(page.items[0].triggered_at, "2026-09-06T10:10:00Z");
+        assert_eq!(page.items[1].triggered_at, "2026-09-06T10:00:00Z");
+        for saved in &page.items {
+            assert_eq!(saved.account_name.as_deref(), Some("美股长期账户"));
+            assert!(saved.scope_name.contains("美股长期账户"));
+            let text = serde_json::to_string(&saved.details).unwrap();
+            assert!(text.contains("AAPL"), "{text}");
+            assert!(text.contains("60.00%"), "{text}");
+            assert!(text.contains("USD"), "{text}");
+            assert!(!text.contains("acct-us"), "{text}");
+        }
+        let first = serde_json::to_string(&page.items[1].details).unwrap();
+        assert!(first.contains("90.91%"), "{first}");
+        assert!(first.contains("1100.00"), "{first}");
+    }
+
+    #[tokio::test]
+    async fn history_failure_rolls_back_portfolio_breach_and_snapshot() {
+        let fixture = evaluation_fixture();
+        fixture
+            .db
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_portfolio_history BEFORE INSERT ON alert_history
+             BEGIN SELECT RAISE(ABORT, 'history unavailable'); END;",
+            )
+            .unwrap();
+        let result = evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &fixture.config_id,
+            "2026-09-06T10:00:00Z",
+        )
+        .await;
+        assert!(result.unwrap_err().contains("history unavailable"));
+        assert_eq!(breach_count(&fixture.db), 0);
+        assert!(
+            get_portfolio_alert_config_by_id(&fixture.db, &fixture.config_id)
+                .unwrap()
+                .last_snapshot
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn category_history_records_named_allocation_and_relative_deviation() {
+        let fixture = evaluation_fixture();
+        seed_categories(&fixture.db, ["cash-category"]);
+        fixture
+            .db
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE accounts SET name='退休账户';
+             UPDATE categories SET name='成长投资' WHERE id='growth';
+             UPDATE categories SET name='现金储备' WHERE id='cash-category';
+             UPDATE holdings SET category_id='cash-category' WHERE id='holding-cash';",
+            )
+            .unwrap();
+        let config = save_portfolio_alert_config(
+            &fixture.db,
+            input(
+                overall_scope(),
+                20.0,
+                100.0,
+                [("growth", 50.0), ("cash-category", 50.0)],
+            ),
+        )
+        .unwrap();
+        evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &config.id,
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap();
+        let history = crate::services::alert_history_service::get_alert_history(
+            &fixture.db,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(history.total, 2);
+        let growth = history
+            .items
+            .iter()
+            .find(|item| item.title.contains("成长投资"))
+            .unwrap();
+        let text = serde_json::to_string(&growth.details).unwrap();
+        for expected in [
+            "90.91%",
+            "50.00%",
+            "81.82%",
+            "20.00%",
+            "550.00 USD",
+            "退休账户",
+            "AAPL",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(!text.contains("acct-us"));
+        assert!(!text.contains("cash-category"));
     }
 
     #[tokio::test]

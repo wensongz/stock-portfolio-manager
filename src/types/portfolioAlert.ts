@@ -100,6 +100,7 @@ export interface MissingPortfolioAlertData {
 export interface PortfolioAlertBreach {
   configId: string;
   breachKey: string;
+  categoryName?: string | null;
   breachKind: PortfolioAlertBreachKind;
   direction: PortfolioAlertBreachDirection;
   firstTriggeredAt: string;

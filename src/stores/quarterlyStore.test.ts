@@ -22,6 +22,191 @@ function transactions(id) {
   return [{ symbol: id, transactions: [] }];
 }
 
+test("initializing quarterly analysis fills gaps once and preserves existing snapshots", async () => {
+  const existing = { id: "existing", quarter: "2025-Q2", overall_notes: "Keep my notes" };
+  const snapshots = [existing];
+  const created = [];
+  let listReads = 0;
+  const store = createQuarterlyStore(async (command, args) => {
+    switch (command) {
+      case "ensure_current_quarter_snapshot": return null;
+      case "check_missing_snapshots":
+        return ["2024-Q4", "2025-Q1", "2025-Q3"].filter(q => !snapshots.some(s => s.quarter === q));
+      case "create_quarterly_snapshot": {
+        created.push(args.quarter);
+        const snapshot = { id: args.quarter, quarter: args.quarter };
+        snapshots.push(snapshot);
+        return snapshot;
+      }
+      case "get_quarterly_snapshots": listReads++; return [...snapshots];
+      default: throw new Error(`Unexpected command: ${command}`);
+    }
+  });
+
+  await store.getState().initializeSnapshots();
+  assert.deepEqual(created, ["2024-Q4", "2025-Q1", "2025-Q3"]);
+  assert.equal(listReads, 2);
+  assert.equal(store.getState().snapshots.length, 4);
+  assert.equal(store.getState().snapshots[0], existing);
+  assert.deepEqual(store.getState().missingQuarters, []);
+  assert.equal(store.getState().initializationError, null);
+  assert.equal(store.getState().initializationLoading, false);
+
+  await store.getState().initializeSnapshots();
+  assert.equal(created.length, 3);
+  assert.equal(listReads, 3);
+  assert.equal(store.getState().snapshots[0].overall_notes, "Keep my notes");
+});
+
+test("existing snapshots become usable before gap detection or backfill finishes", async () => {
+  const pendingScan = deferred();
+  const pendingCreate = deferred();
+  const existing = { id: "existing", quarter: "2025-Q2" };
+  const added = { id: "added", quarter: "2025-Q1" };
+  let created = false;
+  const store = createQuarterlyStore(async (command) => {
+    switch (command) {
+      case "check_missing_snapshots": return pendingScan.promise;
+      case "create_quarterly_snapshot":
+        await pendingCreate.promise;
+        created = true;
+        return added;
+      case "get_quarterly_snapshots": return created ? [existing, added] : [existing];
+      default: throw new Error(`Unexpected command: ${command}`);
+    }
+  });
+  const initializing = store.getState().initializeSnapshots();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(store.getState().snapshots, [existing]);
+  assert.equal(store.getState().listLoading, false);
+  assert.equal(store.getState().initializationLoading, true);
+
+  pendingScan.resolve(["2025-Q1"]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(store.getState().snapshots, [existing]);
+  assert.equal(store.getState().listLoading, false);
+  const loadingChanges = [];
+  const unsubscribe = store.subscribe(state => loadingChanges.push(state.listLoading));
+  pendingCreate.resolve();
+  await initializing;
+  unsubscribe();
+  assert.deepEqual(store.getState().snapshots, [existing, added]);
+  assert.ok(loadingChanges.every(loading => !loading));
+  assert.equal(store.getState().initializationLoading, false);
+});
+
+test("overlapping page initialization shares one backfill and stays busy until the list loads", async () => {
+  const pendingCreate = deferred();
+  const pendingList = deferred();
+  let created = 0;
+  const store = createQuarterlyStore(async (command) => {
+    switch (command) {
+      case "ensure_current_quarter_snapshot": return null;
+      case "check_missing_snapshots": return ["2025-Q1"];
+      case "create_quarterly_snapshot": created++; return pendingCreate.promise;
+      case "get_quarterly_snapshots": return pendingList.promise;
+      default: throw new Error(`Unexpected command: ${command}`);
+    }
+  });
+  const first = store.getState().initializeSnapshots();
+  const second = store.getState().initializeSnapshots();
+  assert.equal(store.getState().initializationLoading, true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(created, 1);
+  pendingCreate.resolve({ id: "new", quarter: "2025-Q1" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(store.getState().initializationLoading, true);
+  pendingList.resolve([{ id: "new", quarter: "2025-Q1" }]);
+  await Promise.all([first, second]);
+  assert.equal(created, 1);
+  assert.equal(store.getState().initializationLoading, false);
+  assert.equal(store.getState().snapshots[0].id, "new");
+});
+
+test("a failed quarter does not block later quarters and can be retried", async () => {
+  const snapshots = [];
+  const attempted = [];
+  let fail = true;
+  const store = createQuarterlyStore(async (command, args) => {
+    switch (command) {
+      case "ensure_current_quarter_snapshot": return null;
+      case "check_missing_snapshots":
+        return ["2025-Q1", "2025-Q2"].filter(q => !snapshots.some(s => s.quarter === q));
+      case "create_quarterly_snapshot": {
+        attempted.push(args.quarter);
+        if (fail && args.quarter === "2025-Q1") throw new Error("missing historical exchange rates");
+        const snapshot = { id: args.quarter, quarter: args.quarter };
+        snapshots.push(snapshot);
+        return snapshot;
+      }
+      case "get_quarterly_snapshots": return [...snapshots];
+      default: throw new Error(`Unexpected command: ${command}`);
+    }
+  });
+  await store.getState().initializeSnapshots();
+  assert.deepEqual(attempted, ["2025-Q1", "2025-Q2"]);
+  assert.deepEqual(store.getState().missingQuarters, ["2025-Q1"]);
+  assert.deepEqual(store.getState().snapshots.map(s => s.quarter), ["2025-Q2"]);
+  assert.match(store.getState().initializationError, /2025-Q1.*missing historical exchange rates/);
+  assert.equal(store.getState().initializationLoading, false);
+
+  fail = false;
+  await store.getState().initializeSnapshots();
+  assert.deepEqual(attempted, ["2025-Q1", "2025-Q2", "2025-Q1"]);
+  assert.deepEqual(store.getState().missingQuarters, []);
+  assert.equal(store.getState().initializationError, null);
+});
+
+test("a failed gap scan still loads existing snapshots and reports the error", async () => {
+  const store = createQuarterlyStore(async (command) => {
+    switch (command) {
+      case "ensure_current_quarter_snapshot": return null;
+      case "check_missing_snapshots": throw new Error("Bad transaction date");
+      case "get_quarterly_snapshots": return [{ id: "existing", quarter: "2025-Q2" }];
+      default: throw new Error(`Unexpected command: ${command}`);
+    }
+  });
+  await store.getState().initializeSnapshots();
+  assert.equal(store.getState().snapshots[0].id, "existing");
+  assert.match(store.getState().initializationError, /Bad transaction date/);
+  assert.equal(store.getState().initializationLoading, false);
+});
+
+test("initialization still ensures the current quarter when there is no transaction history", async () => {
+  let current = null;
+  const store = createQuarterlyStore(async (command) => {
+    switch (command) {
+      case "ensure_current_quarter_snapshot": current = { id: "current", quarter: "2026-Q3" }; return current;
+      case "check_missing_snapshots": return [];
+      case "get_quarterly_snapshots": return [current];
+      default: throw new Error(`Unexpected command: ${command}`);
+    }
+  });
+  await store.getState().initializeSnapshots();
+  assert.equal(store.getState().snapshots[0].id, "current");
+  assert.deepEqual(store.getState().missingQuarters, []);
+});
+
+test("current-quarter creation errors remain visible without transaction history", async () => {
+  let fail = true;
+  const store = createQuarterlyStore(async (command) => {
+    switch (command) {
+      case "ensure_current_quarter_snapshot":
+        if (fail) throw new Error("current quotes unavailable");
+        return null;
+      case "check_missing_snapshots": return [];
+      case "get_quarterly_snapshots": return [];
+      default: throw new Error(`Unexpected command: ${command}`);
+    }
+  });
+  await store.getState().initializeSnapshots();
+  assert.match(store.getState().initializationError, /当前季度.*current quotes unavailable/);
+  assert.equal(store.getState().initializationLoading, false);
+  fail = false;
+  await store.getState().initializeSnapshots();
+  assert.equal(store.getState().initializationError, null);
+});
+
 test("switching snapshots clears the detail bundle and ignores stale results", async () => {
   const requests = new Map();
   const invoke = (command, args) => {

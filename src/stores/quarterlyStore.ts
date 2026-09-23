@@ -24,6 +24,8 @@ export interface QuarterlyState {
 
   listLoading: boolean;
   listError: string | null;
+  initializationLoading: boolean;
+  initializationError: string | null;
   detailLoading: boolean;
   detailError: string | null;
   comparisonLoading: boolean;
@@ -33,13 +35,13 @@ export interface QuarterlyState {
   mutationLoading: boolean;
   mutationError: string | null;
 
-  fetchSnapshots: () => Promise<void>;
+  fetchSnapshots: (options?: { silent?: boolean }) => Promise<void>;
+  initializeSnapshots: () => Promise<void>;
   fetchDetail: (snapshotId: string) => Promise<void>;
   refreshSnapshot: (snapshotId: string) => Promise<void>;
   createSnapshot: (quarter?: string) => Promise<QuarterlySnapshot | null>;
   deleteSnapshot: (snapshotId: string) => Promise<void>;
   fetchMissingQuarters: () => Promise<void>;
-  ensureCurrentQuarterSnapshot: () => Promise<QuarterlySnapshot | null>;
   compareQuarters: (quarter1: string, quarter2: string) => Promise<void>;
   fetchTrends: () => Promise<void>;
   updateHoldingNotes: (snapshotId: string, holdingSnapshotId: string, notes: string) => Promise<void>;
@@ -56,6 +58,7 @@ export const createQuarterlyStore = (invokeFn: QuarterlyInvoke = invoke) => {
   let missingGeneration = 0;
   let mutationGeneration = 0;
   let activeComparisonKey: string | null = null;
+  let initializationPromise: Promise<void> | null = null;
 
   return create<QuarterlyState>((set, get) => {
     const loadDetailBundle = async (
@@ -125,6 +128,8 @@ export const createQuarterlyStore = (invokeFn: QuarterlyInvoke = invoke) => {
 
       listLoading: false,
       listError: null,
+      initializationLoading: false,
+      initializationError: null,
       detailLoading: false,
       detailError: null,
       comparisonLoading: false,
@@ -134,9 +139,68 @@ export const createQuarterlyStore = (invokeFn: QuarterlyInvoke = invoke) => {
       mutationLoading: false,
       mutationError: null,
 
-      fetchSnapshots: async () => {
+      initializeSnapshots: () => {
+        // React StrictMode and quick page re-entry must share one backfill.
+        if (initializationPromise) return initializationPromise;
+
+        const initialize = async () => {
+          const generation = ++missingGeneration;
+          const errors: string[] = [];
+          let created = false;
+          set({ initializationLoading: true, initializationError: null });
+          // Existing reports must not wait for historical quotes or rebuilding.
+          const initialList = get().fetchSnapshots();
+          try {
+            const missing = await invokeFn<string[]>("check_missing_snapshots");
+            if (generation === missingGeneration) set({ missingQuarters: missing });
+
+            // With transaction history the scan includes the current quarter.
+            // Holdings-only imports still need the existing current-quarter check.
+            if (missing.length === 0) {
+              try {
+                const snapshot = await invokeFn<QuarterlySnapshot | null>("ensure_current_quarter_snapshot");
+                created = snapshot !== null;
+              } catch (err) {
+                errors.push(`当前季度：${String(err)}`);
+              }
+            }
+
+            // The backend supplies chronological gaps and rebuilds historical
+            // holdings from transactions. Avoid refreshing the list per quarter.
+            for (const quarter of missing) {
+              try {
+                await invokeFn<QuarterlySnapshot>("create_quarterly_snapshot", { quarter });
+                created = true;
+                if (generation === missingGeneration) {
+                  set(state => ({
+                    missingQuarters: state.missingQuarters.filter(q => q !== quarter),
+                  }));
+                }
+              } catch (err) {
+                errors.push(`${quarter}: ${String(err)}`);
+              }
+            }
+          } catch (err) {
+            errors.push(`检查缺失季度失败：${String(err)}`);
+          } finally {
+            await initialList;
+            if (created) await get().fetchSnapshots({ silent: true });
+            set({
+              initializationLoading: false,
+              initializationError: errors.length > 0 ? errors.join("\n") : null,
+            });
+          }
+        };
+
+        initializationPromise = initialize().finally(() => {
+          initializationPromise = null;
+        });
+        return initializationPromise;
+      },
+
+      fetchSnapshots: async ({ silent = false } = {}) => {
         const generation = ++listGeneration;
-        set({ listLoading: true, listError: null });
+        set({ ...(!silent ? { listLoading: true } : {}), listError: null });
         try {
           const snapshots = await invokeFn<QuarterlySnapshot[]>("get_quarterly_snapshots");
           if (generation === listGeneration) {
@@ -202,17 +266,6 @@ export const createQuarterlyStore = (invokeFn: QuarterlyInvoke = invoke) => {
           }
         } catch (err) {
           console.error("fetchMissingQuarters error:", err);
-        }
-      },
-
-      ensureCurrentQuarterSnapshot: async () => {
-        try {
-          return await invokeFn<QuarterlySnapshot | null>(
-            "ensure_current_quarter_snapshot",
-          );
-        } catch (err) {
-          console.error("ensureCurrentQuarterSnapshot error:", err);
-          return null;
         }
       },
 

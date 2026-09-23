@@ -1,12 +1,10 @@
 import { useEffect, useState } from "react";
 import {
+  Alert,
   Button,
   Card,
-  Col,
   Popconfirm,
-  Row,
   Space,
-  Statistic,
   Table,
   Tag,
   Typography,
@@ -37,29 +35,24 @@ export default function QuarterlyPage() {
   const { pnlColorDark } = usePnlColor();
   const {
     snapshots,
-    missingQuarters,
     listLoading,
+    listError,
     mutationLoading,
-    fetchSnapshots,
-    fetchMissingQuarters,
+    mutationError,
+    initializationLoading,
+    initializationError,
+    initializeSnapshots,
     createSnapshot,
     deleteSnapshot,
-    ensureCurrentQuarterSnapshot,
   } = useQuarterlyStore();
   const loading = listLoading || mutationLoading;
+  const mutationDisabled = loading || initializationLoading;
 
   const [creating, setCreating] = useState(false);
 
   useEffect(() => {
-    const init = async () => {
-      const created = await ensureCurrentQuarterSnapshot();
-      if (created) {
-        message.success(`已自动创建当前季度快照 ${created.quarter}`);
-      }
-      await Promise.all([fetchSnapshots(), fetchMissingQuarters()]);
-    };
-    init();
-  }, []);
+    void initializeSnapshots();
+  }, [initializeSnapshots]);
 
   const handleCreateCurrent = async () => {
     setCreating(true);
@@ -70,20 +63,9 @@ export default function QuarterlyPage() {
     }
   };
 
-  const handleCreateMissing = async (quarter: string) => {
-    setCreating(true);
-    const snap = await createSnapshot(quarter);
-    setCreating(false);
-    if (snap) {
-      message.success(`已补录季度快照 ${snap.quarter}`);
-      fetchMissingQuarters();
-    }
-  };
-
   const handleDelete = async (id: string) => {
     await deleteSnapshot(id);
     message.success("快照已删除");
-    fetchMissingQuarters();
   };
 
   const columns = [
@@ -152,7 +134,7 @@ export default function QuarterlyPage() {
             okText="删除"
             cancelText="取消"
           >
-            <Button size="small" danger icon={<DeleteOutlined />}>
+            <Button size="small" danger icon={<DeleteOutlined />} disabled={mutationDisabled}>
               删除
             </Button>
           </Popconfirm>
@@ -171,7 +153,7 @@ export default function QuarterlyPage() {
         <Space>
           <Button
             icon={<ReloadOutlined />}
-            onClick={() => { fetchSnapshots(); fetchMissingQuarters(); }}
+            onClick={() => void initializeSnapshots()}
             loading={loading}
             size="small"
           >
@@ -182,6 +164,7 @@ export default function QuarterlyPage() {
             icon={<PlusOutlined />}
             onClick={handleCreateCurrent}
             loading={creating}
+            disabled={mutationDisabled}
           >
             创建当前季度快照
           </Button>
@@ -202,49 +185,18 @@ export default function QuarterlyPage() {
         </Space>
       </div>
 
-      {/* Summary Cards */}
-      <Row gutter={[16, 16]} className="mb-4">
-        <Col xs={24} sm={8}>
-          <Card size="small">
-            <Statistic title="已有快照" value={snapshots.length} suffix="个" />
-          </Card>
-        </Col>
-        <Col xs={24} sm={8}>
-          <Card size="small">
-            <Statistic title="缺失快照" value={missingQuarters.length} suffix="个" />
-          </Card>
-        </Col>
-        <Col xs={24} sm={8}>
-          <Card size="small">
-            <Statistic
-              title="最新季度"
-              value={snapshots.length > 0 ? snapshots[0].quarter : "—"}
-            />
-          </Card>
-        </Col>
-      </Row>
-
-      {/* Missing quarters alert */}
-      {missingQuarters.length > 0 && (
-        <Card
-          size="small"
+      {initializationError && (
+        <Alert
+          type="warning"
+          showIcon
+          title="部分季度快照未能自动生成"
+          description={<div style={{ whiteSpace: "pre-wrap" }}>{initializationError}</div>}
+          action={<Button size="small" onClick={() => void initializeSnapshots()} disabled={mutationDisabled}>重试</Button>}
           className="mb-4"
-          title={<Text type="warning">⚠️ 以下季度缺少快照，可点击补录</Text>}
-        >
-          <Space wrap>
-            {missingQuarters.map((q) => (
-              <Button
-                key={q}
-                size="small"
-                icon={<PlusOutlined />}
-                onClick={() => handleCreateMissing(q)}
-                loading={creating}
-              >
-                {q}
-              </Button>
-            ))}
-          </Space>
-        </Card>
+        />
+      )}
+      {(listError || mutationError) && (
+        <Alert type="error" showIcon title={listError || mutationError} className="mb-4" />
       )}
 
       {/* Snapshots Table */}

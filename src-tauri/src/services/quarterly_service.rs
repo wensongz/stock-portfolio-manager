@@ -494,25 +494,31 @@ pub async fn refresh_quarterly_snapshot(
 
 /// Find quarters that have no snapshot, from the first transaction quarter to the current quarter.
 pub fn check_missing_snapshots(db: &Database) -> Result<Vec<String>, String> {
-    // Find the earliest transaction date
-    let earliest: Option<String> = {
+    // Use the same UTC date boundary as historical transaction replay. Count
+    // invalid dates explicitly because MIN would otherwise silently skip them.
+    let (earliest, invalid_dates): (Option<String>, i64) = {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
-        conn.query_row("SELECT MIN(traded_at) FROM transactions", [], |row| {
-            row.get::<_, Option<String>>(0)
-        })
+        conn.query_row(
+            "SELECT MIN(DATE(traded_at)), COUNT(*) - COUNT(DATE(traded_at)) FROM transactions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .map_err(|error| error.to_string())?
     };
 
+    if invalid_dates > 0 {
+        return Err("Bad transaction date while checking missing quarterly snapshots".into());
+    }
     let Some(earliest_str) = earliest else {
         return Ok(vec![]);
     };
 
-    let date_part = earliest_str
-        .get(..10)
-        .ok_or_else(|| format!("Bad transaction date: {earliest_str}"))?;
-    let earliest_date = NaiveDate::parse_from_str(date_part, "%Y-%m-%d")
+    let earliest_date = NaiveDate::parse_from_str(&earliest_str, "%Y-%m-%d")
         .map_err(|e| format!("Bad transaction date '{earliest_str}': {e}"))?;
     let today = Utc::now().date_naive();
+    if earliest_date > today {
+        return Ok(vec![]);
+    }
 
     // Collect all quarters from earliest to current
     let mut all_quarters: Vec<String> = Vec::new();
@@ -592,6 +598,92 @@ pub async fn ensure_current_quarter_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn missing_snapshot_db(dates: &[String]) -> Database {
+        let db = Database::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, name, market, created_at, updated_at)
+                 VALUES ('acct', 'Account', 'US', '2025-01-01', '2025-01-01')",
+                [],
+            )
+            .unwrap();
+            for (index, date) in dates.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO transactions
+                     (id, account_id, symbol, name, market, transaction_type, shares, price,
+                      total_amount, commission, currency, traded_at, created_at)
+                     VALUES (?1, 'acct', 'AAPL', 'Apple', 'US', 'OPEN', 1, 1, 1, 0,
+                             'USD', ?2, '2025-01-01')",
+                    rusqlite::params![format!("tx-{index}"), date],
+                )
+                .unwrap();
+            }
+        }
+        db
+    }
+
+    #[test]
+    fn missing_snapshot_scan_uses_utc_quarters_for_offset_transactions() {
+        let today = Utc::now().date_naive();
+        let current = date_to_quarter(today);
+        let (year, quarter) = parse_quarter(&current).unwrap();
+        let start = quarter_start_date(year, quarter);
+        let db = missing_snapshot_db(&[
+            format!("{start}T00:00:00Z"),
+            format!("{start}T00:30:00+08:00"),
+        ]);
+
+        assert_eq!(
+            check_missing_snapshots(&db).unwrap(),
+            vec![previous_quarter(&current).unwrap(), current]
+        );
+    }
+
+    #[test]
+    fn missing_snapshot_scan_rejects_invalid_timestamp_after_valid_date_prefix() {
+        let db = missing_snapshot_db(&[format!("{}Tinvalid", Utc::now().date_naive())]);
+
+        assert!(check_missing_snapshots(&db).is_err());
+    }
+
+    #[test]
+    fn missing_snapshot_scan_returns_empty_for_no_or_only_future_transactions() {
+        let today = Utc::now().date_naive();
+        for dates in [
+            vec![],
+            vec![today.succ_opt().unwrap().to_string()],
+            vec![format!("{}-01-01", today.year() + 1)],
+        ] {
+            let db = missing_snapshot_db(&dates);
+            assert!(check_missing_snapshots(&db).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_snapshot_scan_includes_idle_quarters_and_skips_existing_snapshots() {
+        let current = date_to_quarter(Utc::now().date_naive());
+        let previous = previous_quarter(&current).unwrap();
+        let idle = previous_quarter(&previous).unwrap();
+        let first = previous_quarter(&idle).unwrap();
+        let (year, quarter) = parse_quarter(&first).unwrap();
+        let db = missing_snapshot_db(&[quarter_start_date(year, quarter).to_string()]);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO quarterly_snapshots (id, quarter, snapshot_date, created_at)
+                 VALUES ('existing', ?1, '2025-01-01', '2025-01-01')",
+                [&previous],
+            )
+            .unwrap();
+
+        assert_eq!(
+            check_missing_snapshots(&db).unwrap(),
+            vec![first, idle, current]
+        );
+    }
 
     #[test]
     fn quarter_helpers_cover_calendar_boundaries() {

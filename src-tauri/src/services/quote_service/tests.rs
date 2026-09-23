@@ -76,6 +76,72 @@ fn realtime_http_400_with_expired_cookie_code_uses_cookie_warning() {
 }
 
 #[test]
+fn xueqiu_http_error_responses_use_cookie_warning_without_a_known_cookie_code() {
+    for error in [
+        "Xueqiu API error for realtime quotes: HTTP 403 Forbidden. Response: ",
+        "Xueqiu API error for AAPL: HTTP 500 Internal Server Error. Response: ",
+        "Failed to initialize Xueqiu token: HTTP 403 Forbidden",
+    ] {
+        assert_eq!(
+            quote_warning_for_error(error).as_deref(),
+            Some("雪球 Cookie 已过期，请到 设置 → 通用设置 → 雪球 Cookie 设置 中设置 Cookie。"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn xueqiu_business_error_responses_use_cookie_warning_for_any_nonzero_code() {
+    let (batches, _) = plan_xueqiu_realtime_batches(&[("AAPL".to_string(), "US".to_string())]);
+    for code in [400016, 400017, -1] {
+        let body = format!(r#"{{"error_code":{code},"error_description":"Rejected","data":null}}"#);
+        let batch_error = parse_xueqiu_realtime_body(&body, &batches[0]).unwrap_err();
+        let single_error =
+            parse_xueqiu_quote("AAPL", "US", serde_json::from_str(&body).unwrap()).unwrap_err();
+        for error in [batch_error, single_error] {
+            assert_eq!(
+                quote_warning_for_error(&error).as_deref(),
+                Some("雪球 Cookie 已过期，请到 设置 → 通用设置 → 雪球 Cookie 设置 中设置 Cookie。"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn xueqiu_errors_without_response_codes_keep_the_service_warning() {
+    for error in [
+        "Network error fetching AAPL from Xueqiu: connection refused",
+        "Network error fetching AAPL from Xueqiu: operation timed out",
+        "Failed to initialize Xueqiu token: error sending request for url (https://xueqiu.com/)",
+        "Failed to parse Xueqiu realtime response: expected value",
+        "No data from Xueqiu realtime quotes",
+    ] {
+        assert_eq!(
+            quote_warning_for_error(error).as_deref(),
+            Some(XUEQIU_API_FAILED_HINT),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn xueqiu_cookie_warning_survives_later_network_failures() {
+    let mut warning = quote_warning_for_error("Network error fetching AAPL from Xueqiu: timed out");
+    merge_quote_warning(
+        &mut warning,
+        quote_warning_for_error(
+            "Xueqiu API error for realtime quotes: code=400017, message=Rejected",
+        ),
+    );
+    merge_quote_warning(
+        &mut warning,
+        quote_warning_for_error("Network error fetching MSFT from Xueqiu: connection refused"),
+    );
+    assert_eq!(warning.as_deref(), Some(XUEQIU_COOKIE_EXPIRED_HINT));
+}
+
+#[test]
 fn unrelated_xueqiu_error_containing_400016_is_not_cookie_expiry() {
     let error = "Network error fetching symbol 400016 from Xueqiu";
     assert_eq!(

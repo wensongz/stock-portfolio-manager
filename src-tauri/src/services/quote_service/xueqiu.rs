@@ -43,14 +43,13 @@ impl Default for QuoteServiceState {
 }
 
 pub(super) const XUEQIU_COOKIE_EXPIRED_HINT: &str =
-    "雪球 Cookie 可能已经过期，请到设置页面更新雪球 Cookie。";
+    "雪球 Cookie 已过期，请到 设置 → 通用设置 → 雪球 Cookie 设置 中设置 Cookie。";
 pub(super) const XUEQIU_API_FAILED_HINT: &str = "访问雪球行情服务失败，请检查网络连接或稍后重试。";
 
-pub(super) fn is_xueqiu_cookie_expired_error(err: &str) -> bool {
-    err.contains("Xueqiu API error")
-        && (err.contains("400016")
-            || err.contains("重新登录帐号后再试")
-            || err.contains("刷新页面或者重新登录帐号后再试"))
+fn is_xueqiu_response_error(err: &str) -> bool {
+    // These prefixes identify received HTTP/API error responses. Connection
+    // failures and timeouts use separate prefixes and keep the service warning.
+    err.contains("Xueqiu API error") || err.contains("Failed to initialize Xueqiu token: HTTP ")
 }
 
 pub(super) fn is_xueqiu_request_error(err: &str) -> bool {
@@ -58,7 +57,7 @@ pub(super) fn is_xueqiu_request_error(err: &str) -> bool {
 }
 
 pub(super) fn quote_warning_for_error(err: &str) -> Option<String> {
-    if is_xueqiu_cookie_expired_error(err) {
+    if is_xueqiu_response_error(err) {
         Some(XUEQIU_COOKIE_EXPIRED_HINT.to_string())
     } else if is_xueqiu_request_error(err) {
         Some(XUEQIU_API_FAILED_HINT.to_string())

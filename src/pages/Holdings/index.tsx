@@ -48,6 +48,7 @@ import type {
 } from "../../types";
 import dayjs from "dayjs";
 import { canEditOpening } from "./holdingEditPolicy";
+import { normalizeHoldingSymbol } from "./holdingSymbol";
 import CashBalancePreview from "./CashBalancePreview";
 import { cashBalanceEditDecision, cashBalanceSaveCommand, createEditSession, createHoldingRequest, emptyHoldingRequest, formatCashDelta, mergeHoldingQuote } from "./cashBalanceEditing";
 import { formatMoney } from "../../lib/formatMoney";
@@ -245,6 +246,13 @@ export default function HoldingsPage() {
       if (isCashSymbol(symbol.trim())) return;
       const market: Market | undefined = form.getFieldValue("market");
       if (!market) return;
+      const quoteSymbol = editingHolding
+        ? symbol.trim()
+        : normalizeHoldingSymbol(symbol, market);
+      if (!editingHolding && quoteSymbol !== symbol) {
+        form.setFieldsValue({ symbol: quoteSymbol });
+        setSymbolSearch(quoteSymbol);
+      }
 
       setQuoteWarning(null);
       setFetchingName(true);
@@ -255,7 +263,7 @@ export default function HoldingsPage() {
           HK: "get_hk_quote",
         };
         const outcome = await invoke<QuoteCommandResult<StockQuote>>(commandMap[market], {
-          symbol: symbol.trim(),
+          symbol: quoteSymbol,
         });
         const quote = outcome.data;
         if (quote && quote.name) {
@@ -268,7 +276,7 @@ export default function HoldingsPage() {
         setFetchingName(false);
       }
     },
-    [applyQuoteMetadata, form, setQuoteWarning],
+    [applyQuoteMetadata, editingHolding, form, setQuoteWarning],
   );
 
   const handleSymbolBlur = useCallback(
@@ -292,6 +300,18 @@ export default function HoldingsPage() {
     },
     [symbolOptions, form],
   );
+
+  // The account or market may be selected after the stock code was entered.
+  useEffect(() => {
+    if (!modalOpen || editingHolding) return;
+    const symbol: string | undefined = form.getFieldValue("symbol");
+    if (!symbol) return;
+    const normalized = normalizeHoldingSymbol(symbol, selectedFormMarket);
+    if (normalized !== symbol) {
+      form.setFieldsValue({ symbol: normalized });
+      setSymbolSearch(normalized);
+    }
+  }, [editingHolding, form, modalOpen, selectedFormMarket]);
 
   useEffect(() => {
     fetchHoldings();
@@ -355,7 +375,10 @@ export default function HoldingsPage() {
         void fetchHoldingQuotes([]);
         if (editSession.isCurrent(token)) message.success(isCashSymbol(updated.symbol) ? "现金余额更新成功" : "持仓更新成功");
       } else {
-        await createHolding(values);
+        await createHolding({
+          ...values,
+          symbol: normalizeHoldingSymbol(values.symbol, values.market),
+        });
         if (editSession.isCurrent(token)) message.success("持仓创建成功");
       }
       if (editSession.isCurrent(token)) closeEditModal();
@@ -960,6 +983,8 @@ export default function HoldingsPage() {
                 label={isEditingCash ? "现金代码" : "股票代码"}
                 style={{ marginBottom: 12 }}
                 rules={[{ required: true, message: "请输入股票代码" }]}
+                normalize={editingHolding ? undefined : (value: string) =>
+                  normalizeHoldingSymbol(value, form.getFieldValue("market"))}
               >
                 <AutoComplete
                   disabled={saving || identityFieldsLocked}

@@ -46,24 +46,126 @@ pub(super) const XUEQIU_COOKIE_EXPIRED_HINT: &str =
     "雪球 Cookie 已过期，请到 设置 → 通用设置 → 雪球 Cookie 设置 中设置 Cookie。";
 pub(super) const XUEQIU_API_FAILED_HINT: &str = "访问雪球行情服务失败，请检查网络连接或稍后重试。";
 
-fn is_xueqiu_response_error(err: &str) -> bool {
-    // These prefixes identify received HTTP/API error responses. Connection
-    // failures and timeouts use separate prefixes and keep the service warning.
-    err.contains("Xueqiu API error") || err.contains("Failed to initialize Xueqiu token: HTTP ")
-}
-
 pub(super) fn is_xueqiu_request_error(err: &str) -> bool {
     err.contains("Xueqiu") || err.contains("xueqiu.com") || err.contains("stock.xueqiu.com")
 }
 
-pub(super) fn quote_warning_for_error(err: &str) -> Option<String> {
-    if is_xueqiu_response_error(err) {
-        Some(XUEQIU_COOKIE_EXPIRED_HINT.to_string())
-    } else if is_xueqiu_request_error(err) {
-        Some(XUEQIU_API_FAILED_HINT.to_string())
-    } else {
-        None
+/// Read only the API error fields, independently of the success payload shape.
+#[derive(Deserialize)]
+struct XueqiuApiError {
+    #[serde(default, deserialize_with = "deserialize_xueqiu_error_code")]
+    error_code: Option<i32>,
+    #[serde(alias = "description")]
+    error_description: Option<String>,
+}
+
+fn deserialize_xueqiu_error_code<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Code {
+        Number(i32),
+        Text(String),
     }
+
+    Option::<Code>::deserialize(deserializer)?
+        .map(|code| match code {
+            Code::Number(value) => Ok(value),
+            Code::Text(value) => value.parse().map_err(serde::de::Error::custom),
+        })
+        .transpose()
+}
+
+fn xueqiu_business_error(err: &str) -> Option<(i32, String)> {
+    if !err.starts_with("Xueqiu API error") {
+        return None;
+    }
+    if let Some((_, body)) = err.split_once(". Response: ") {
+        let response: XueqiuApiError = serde_json::from_str(body).ok()?;
+        return response
+            .error_code
+            .filter(|code| *code != 0)
+            .map(|code| (code, response.error_description.unwrap_or_default()));
+    }
+    let (code, description) = if let Some((_, detail)) = err.split_once(": code=") {
+        detail.split_once(", message=")?
+    } else {
+        err.strip_prefix("Xueqiu API error ")?.split_once(": ")?
+    };
+    let code = code.parse::<i32>().ok().filter(|code| *code != 0)?;
+    Some((code, description.to_string()))
+}
+
+pub(super) fn quote_warning_for_error(err: &str) -> Option<String> {
+    // Fallback providers append their own errors; classify the original failure.
+    let err = err.split("; fallback failed:").next().unwrap_or(err);
+    if !is_xueqiu_request_error(err) {
+        return None;
+    }
+    let invalid_cn_symbol = err
+        .strip_prefix("Invalid CN symbol for Xueqiu: ")
+        .or_else(|| {
+            err.strip_prefix("Unknown CN market prefix '")?
+                .split_once("' in symbol ")?
+                .1
+                .strip_suffix(" for Xueqiu")
+        });
+    if let Some(symbol) = invalid_cn_symbol {
+        return Some(format!(
+            "A 股代码「{}」格式不正确，请添加 sh 或 sz 前缀（如 sh601069、sz000858）。",
+            symbol
+        ));
+    }
+    if let Some((code, description)) = xueqiu_business_error(err) {
+        if code == 400016 {
+            return Some(XUEQIU_COOKIE_EXPIRED_HINT.to_string());
+        }
+        let description = if description.trim().is_empty() {
+            "未知错误"
+        } else {
+            description.trim()
+        };
+        return Some(format!(
+            "雪球行情服务返回错误：{}（错误码：{}）",
+            description, code
+        ));
+    }
+    if err.starts_with("Xueqiu API error")
+        || err.starts_with("Failed to initialize Xueqiu token: HTTP ")
+    {
+        if let Some((_, status)) = err.split_once("HTTP ") {
+            let code: String = status.chars().take_while(char::is_ascii_digit).collect();
+            if !code.is_empty() {
+                return Some(format!("雪球行情服务返回 HTTP {}，请稍后重试。", code));
+            }
+        }
+    }
+    if err.starts_with("Failed to parse Xueqiu") {
+        return Some("雪球返回的行情数据格式异常，请稍后重试。".to_string());
+    }
+    if err.starts_with("No data from Xueqiu")
+        || err.starts_with("No quote data from Xueqiu")
+        || err.starts_with("Missing stock name in Xueqiu")
+        || err.starts_with("Missing current price in Xueqiu")
+        || err == "Xueqiu realtime response omitted a symbol"
+    {
+        return Some("雪球未返回完整的股票行情，请检查股票代码和市场。".to_string());
+    }
+    if err.starts_with("Invalid HK symbol for Xueqiu")
+        || err.starts_with("Invalid symbol for Xueqiu")
+        || err == "Xueqiu realtime symbol normalization failed"
+    {
+        return Some("股票代码格式不正确，请检查股票代码和市场。".to_string());
+    }
+    if err.starts_with("Network error")
+        || err.starts_with("Failed to initialize Xueqiu token:")
+        || err.starts_with("Failed to read Xueqiu")
+    {
+        return Some(XUEQIU_API_FAILED_HINT.to_string());
+    }
+    Some(format!("雪球行情服务错误：{}", err))
 }
 
 /// Set (or clear) the user-provided Xueqiu cookie string.
@@ -311,7 +413,9 @@ const XUEQIU_RESPONSE_PREVIEW_LEN: usize = 200;
 #[derive(Debug, Deserialize)]
 pub(super) struct XueqiuResponse {
     pub(super) data: Option<XueqiuData>,
+    #[serde(default, deserialize_with = "deserialize_xueqiu_error_code")]
     pub(super) error_code: Option<i32>,
+    #[serde(alias = "description")]
     pub(super) error_description: Option<String>,
 }
 
@@ -378,6 +482,7 @@ struct XueqiuRealtimeQuote {
 #[derive(Debug, Deserialize)]
 struct XueqiuRealtimeResponse {
     data: Option<Vec<XueqiuRealtimeQuote>>,
+    #[serde(default, deserialize_with = "deserialize_xueqiu_error_code")]
     error_code: Option<i32>,
     #[serde(alias = "description")]
     error_description: Option<String>,
@@ -850,6 +955,29 @@ pub(super) fn parse_xueqiu_realtime_body(
     Ok(quotes)
 }
 
+/// Preserve API error fields before limiting previews of unstructured bodies.
+pub(super) fn format_xueqiu_http_error(
+    symbol: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> String {
+    if let Ok(response) = serde_json::from_str::<XueqiuApiError>(body) {
+        if let Some(code) = response.error_code.filter(|code| *code != 0) {
+            return format!(
+                "Xueqiu API error for {}: code={}, message={}",
+                symbol,
+                code,
+                response.error_description.unwrap_or_default()
+            );
+        }
+    }
+    let preview: String = body.chars().take(XUEQIU_RESPONSE_PREVIEW_LEN).collect();
+    format!(
+        "Xueqiu API error for {}: HTTP {}. Response: {}",
+        symbol, status, preview
+    )
+}
+
 /// Fetch one planned batch from Xueqiu's multi-symbol realtime endpoint.
 pub(super) async fn fetch_xueqiu_realtime_batch(
     state: &QuoteServiceState,
@@ -866,17 +994,8 @@ pub(super) async fn fetch_xueqiu_realtime_batch(
     let response = send_xueqiu_request(state, &url, "realtime batch").await?;
     if !response.status().is_success() {
         let status = response.status();
-        let body_preview = response
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
-            .collect::<String>();
-        return Err(format!(
-            "Xueqiu API error for realtime quotes: HTTP {}. Response: {}",
-            status, body_preview
-        ));
+        let body = response.text().await.unwrap_or_default();
+        return Err(format_xueqiu_http_error("realtime quotes", status, &body));
     }
     let body = response
         .text()
@@ -900,17 +1019,8 @@ pub(super) async fn fetch_xueqiu_cn_quote(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body_preview = response
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
-            .collect::<String>();
-        return Err(format!(
-            "Xueqiu API error for {}: HTTP {}. Response: {}",
-            symbol, status, body_preview
-        ));
+        let body = response.text().await.unwrap_or_default();
+        return Err(format_xueqiu_http_error(symbol, status, &body));
     }
 
     let body = response
@@ -937,17 +1047,8 @@ pub(super) async fn fetch_xueqiu_us_quote(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body_preview = response
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
-            .collect::<String>();
-        return Err(format!(
-            "Xueqiu API error for {}: HTTP {}. Response: {}",
-            symbol, status, body_preview
-        ));
+        let body = response.text().await.unwrap_or_default();
+        return Err(format_xueqiu_http_error(symbol, status, &body));
     }
 
     let body = response
@@ -974,17 +1075,8 @@ pub(super) async fn fetch_xueqiu_hk_quote(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body_preview = response
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(XUEQIU_RESPONSE_PREVIEW_LEN)
-            .collect::<String>();
-        return Err(format!(
-            "Xueqiu API error for {}: HTTP {}. Response: {}",
-            symbol, status, body_preview
-        ));
+        let body = response.text().await.unwrap_or_default();
+        return Err(format_xueqiu_http_error(symbol, status, &body));
     }
 
     let body = response

@@ -60,7 +60,7 @@ fn quote_service_state_keeps_credentials_while_warnings_are_request_values() {
     );
     assert_eq!(build_xueqiu_cookie_header(&second), None);
     assert_eq!(
-        quote_warning_for_error("Xueqiu request failed").as_deref(),
+        quote_warning_for_error("Network error fetching AAPL from Xueqiu: timed out").as_deref(),
         Some(XUEQIU_API_FAILED_HINT)
     );
     assert_eq!(quote_warning_for_error("unrelated provider failed"), None);
@@ -76,32 +76,52 @@ fn realtime_http_400_with_expired_cookie_code_uses_cookie_warning() {
 }
 
 #[test]
-fn xueqiu_http_error_responses_use_cookie_warning_without_a_known_cookie_code() {
-    for error in [
-        "Xueqiu API error for realtime quotes: HTTP 403 Forbidden. Response: ",
-        "Xueqiu API error for AAPL: HTTP 500 Internal Server Error. Response: ",
-        "Failed to initialize Xueqiu token: HTTP 403 Forbidden",
-    ] {
+fn xueqiu_missing_cn_prefix_reports_the_input_problem() {
+    let error = to_xueqiu_cn_symbol("601069").unwrap_err();
+    assert_eq!(
+        error,
+        "Unknown CN market prefix '60' in symbol 601069 for Xueqiu"
+    );
+    for detail in [error.clone(), format!("{error}; fallback failed: timeout")] {
         assert_eq!(
-            quote_warning_for_error(error).as_deref(),
-            Some("雪球 Cookie 已过期，请到 设置 → 通用设置 → 雪球 Cookie 设置 中设置 Cookie。"),
-            "{error}"
+            quote_warning_for_error(&detail).as_deref(),
+            Some("A 股代码「601069」格式不正确，请添加 sh 或 sz 前缀（如 sh601069、sz000858）。")
         );
+    }
+    assert_eq!(to_xueqiu_cn_symbol("sh601069").unwrap(), "SH601069");
+}
+
+#[test]
+fn xueqiu_http_errors_without_authentication_evidence_preserve_status() {
+    for (error, expected) in [
+        ("Xueqiu API error for realtime quotes: HTTP 403 Forbidden. Response: ", "雪球行情服务返回 HTTP 403，请稍后重试。"),
+        ("Xueqiu API error for AAPL: HTTP 500 Internal Server Error. Response: <html>unavailable</html>", "雪球行情服务返回 HTTP 500，请稍后重试。"),
+        ("Failed to initialize Xueqiu token: HTTP 429 Too Many Requests", "雪球行情服务返回 HTTP 429，请稍后重试。"),
+    ] {
+        assert_eq!(quote_warning_for_error(error).as_deref(), Some(expected), "{error}");
     }
 }
 
 #[test]
-fn xueqiu_business_error_responses_use_cookie_warning_for_any_nonzero_code() {
+fn xueqiu_business_errors_preserve_code_and_description() {
     let (batches, _) = plan_xueqiu_realtime_batches(&[("AAPL".to_string(), "US".to_string())]);
-    for code in [400016, 400017, -1] {
+    for (code, expected) in [
+        (400016, XUEQIU_COOKIE_EXPIRED_HINT),
+        (400017, "雪球行情服务返回错误：Rejected（错误码：400017）"),
+        (-1, "雪球行情服务返回错误：Rejected（错误码：-1）"),
+    ] {
         let body = format!(r#"{{"error_code":{code},"error_description":"Rejected","data":null}}"#);
         let batch_error = parse_xueqiu_realtime_body(&body, &batches[0]).unwrap_err();
-        let single_error =
-            parse_xueqiu_quote("AAPL", "US", serde_json::from_str(&body).unwrap()).unwrap_err();
+        let single_error = parse_xueqiu_quote(
+            "AAPL",
+            "US",
+            xueqiu::parse_xueqiu_body(&body, "AAPL").unwrap(),
+        )
+        .unwrap_err();
         for error in [batch_error, single_error] {
             assert_eq!(
                 quote_warning_for_error(&error).as_deref(),
-                Some("雪球 Cookie 已过期，请到 设置 → 通用设置 → 雪球 Cookie 设置 中设置 Cookie。"),
+                Some(expected),
                 "{error}"
             );
         }
@@ -109,13 +129,110 @@ fn xueqiu_business_error_responses_use_cookie_warning_for_any_nonzero_code() {
 }
 
 #[test]
-fn xueqiu_errors_without_response_codes_keep_the_service_warning() {
+fn xueqiu_http_business_errors_preserve_numeric_and_string_codes() {
+    for code in ["-1", "\"-1\""] {
+        let error = format!(
+            r#"Xueqiu API error for 601069: HTTP 400. Response: {{"error_description":"股票代码不存在","error_code":{code}}}; fallback failed: timeout"#
+        );
+        assert_eq!(
+            quote_warning_for_error(&error).as_deref(),
+            Some("雪球行情服务返回错误：股票代码不存在（错误码：-1）")
+        );
+    }
+    let error = r#"Xueqiu API error for 601069: HTTP 400. Response: {"error_description":"遇到错误，请刷新页面或者重新登录帐号后再试","error_uri":"/v5/stock/quote.json","error_data":null,"error_code":"400016"}"#;
+    assert_eq!(
+        quote_warning_for_error(error).as_deref(),
+        Some(XUEQIU_COOKIE_EXPIRED_HINT)
+    );
+}
+
+#[test]
+fn xueqiu_http_error_details_survive_long_response_bodies() {
+    for (code, expected) in [
+        ("-1", "雪球行情服务返回错误：股票代码不存在（错误码：-1）"),
+        ("400016", XUEQIU_COOKIE_EXPIRED_HINT),
+    ] {
+        let body = serde_json::json!({
+            "error_data": "context".repeat(50),
+            "error_description": "股票代码不存在",
+            "error_code": code,
+        });
+        // Put ancillary data before the meaningful error fields, beyond the preview limit.
+        let body = format!(
+            r#"{{"error_data":{},"error_description":{},"error_code":{}}}"#,
+            body["error_data"], body["error_description"], body["error_code"]
+        );
+        let error =
+            xueqiu::format_xueqiu_http_error("601069", reqwest::StatusCode::BAD_REQUEST, &body);
+        assert_eq!(quote_warning_for_error(&error).as_deref(), Some(expected));
+    }
+}
+
+#[test]
+fn xueqiu_json_string_error_codes_are_reported_as_business_errors() {
+    let (batches, _) = plan_xueqiu_realtime_batches(&[("AAPL".to_string(), "US".to_string())]);
+    let body = r#"{"error_code":"400016","error_description":"重新登录帐号后再试","data":null}"#;
+    let single_error = parse_xueqiu_quote(
+        "AAPL",
+        "US",
+        xueqiu::parse_xueqiu_body(body, "AAPL").unwrap(),
+    )
+    .unwrap_err();
+    let batch_error = parse_xueqiu_realtime_body(body, &batches[0]).unwrap_err();
+    for error in [single_error, batch_error] {
+        assert_eq!(
+            quote_warning_for_error(&error).as_deref(),
+            Some(XUEQIU_COOKIE_EXPIRED_HINT)
+        );
+    }
+}
+
+#[test]
+fn xueqiu_response_data_errors_are_not_network_failures() {
+    for (error, expected) in [
+        (
+            "Failed to parse Xueqiu realtime response: expected value",
+            "雪球返回的行情数据格式异常，请稍后重试。",
+        ),
+        (
+            "No data from Xueqiu realtime quotes",
+            "雪球未返回完整的股票行情，请检查股票代码和市场。",
+        ),
+        (
+            "No quote data from Xueqiu for 601069.",
+            "雪球未返回完整的股票行情，请检查股票代码和市场。",
+        ),
+        (
+            "Missing current price in Xueqiu response for 601069",
+            "雪球未返回完整的股票行情，请检查股票代码和市场。",
+        ),
+        (
+            "Xueqiu realtime response omitted a symbol",
+            "雪球未返回完整的股票行情，请检查股票代码和市场。",
+        ),
+        (
+            "Xueqiu realtime symbol normalization failed",
+            "股票代码格式不正确，请检查股票代码和市场。",
+        ),
+        (
+            "Xueqiu request failed",
+            "雪球行情服务错误：Xueqiu request failed",
+        ),
+    ] {
+        assert_eq!(
+            quote_warning_for_error(error).as_deref(),
+            Some(expected),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn xueqiu_transport_errors_keep_the_network_warning() {
     for error in [
         "Network error fetching AAPL from Xueqiu: connection refused",
         "Network error fetching AAPL from Xueqiu: operation timed out",
         "Failed to initialize Xueqiu token: error sending request for url (https://xueqiu.com/)",
-        "Failed to parse Xueqiu realtime response: expected value",
-        "No data from Xueqiu realtime quotes",
     ] {
         assert_eq!(
             quote_warning_for_error(error).as_deref(),
@@ -131,7 +248,7 @@ fn xueqiu_cookie_warning_survives_later_network_failures() {
     merge_quote_warning(
         &mut warning,
         quote_warning_for_error(
-            "Xueqiu API error for realtime quotes: code=400017, message=Rejected",
+            "Xueqiu API error for realtime quotes: code=400016, message=Rejected",
         ),
     );
     merge_quote_warning(
@@ -2167,14 +2284,16 @@ fn test_parse_xueqiu_quote_no_data() {
 
 #[test]
 fn test_parse_xueqiu_quote_no_quote() {
-    let resp = XueqiuResponse {
-        data: Some(XueqiuData { quote: None }),
-        error_code: Some(0),
-        error_description: None,
-    };
-    let result = parse_xueqiu_quote("sh999999", "CN", resp);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("No quote data from Xueqiu"));
+    // Authenticated quote.json response for bare 601069, observed 2026-09-24:
+    // HTTP 200 with no business error, but no quote for the unprefixed symbol.
+    let body = r#"{"data":{"market":null,"quote":null,"others":null,"tags":null},"error_code":0,"error_description":""}"#;
+    let resp = xueqiu::parse_xueqiu_body(body, "601069").unwrap();
+    let error = parse_xueqiu_quote("601069", "CN", resp).unwrap_err();
+    assert_eq!(error, "No quote data from Xueqiu for 601069.");
+    assert_eq!(
+        quote_warning_for_error(&error).as_deref(),
+        Some("雪球未返回完整的股票行情，请检查股票代码和市场。")
+    );
 }
 
 #[test]

@@ -20,7 +20,15 @@ interface ImportWizardProps<Row extends ImportRow> {
   width?: number;
 }
 
-export default function ImportWizard<Row extends ImportRow>({
+export default function ImportWizard<Row extends ImportRow>(props: ImportWizardProps<Row>) {
+  // The wizard owns state above Modal's destroyOnHidden boundary. Unmount that
+  // state even when the parent closes after import, and isolate each account.
+  if (!props.open) return null;
+  const { accountId, source, kind } = props.adapter;
+  return <ImportWizardSession key={JSON.stringify([accountId, source, kind])} {...props} />;
+}
+
+function ImportWizardSession<Row extends ImportRow>({
   open,
   title,
   accountName,

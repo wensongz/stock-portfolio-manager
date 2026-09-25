@@ -39,6 +39,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "esbuild": "^0.28.1",
+    "happy-dom": "^20.14.5",
     "postcss": "^8.5.19",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",

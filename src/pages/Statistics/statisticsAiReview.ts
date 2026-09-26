@@ -11,6 +11,12 @@ const marketNames: Record<Market, string> = {
   HK: "港股",
 };
 
+const marketCurrencies: Record<Market, string> = {
+  US: "美元（USD）",
+  CN: "人民币（CNY）",
+  HK: "港元（HKD）",
+};
+
 const reviewRequirements =
   "请从芒格视角检查持仓集中度、能力圈、护城河、估值纪律、认知偏误与永久损失风险；先指出最可能导致失败的地方，再给出有优先级的调仓建议、建议目标仓位和执行条件。不要只根据当前浮盈亏判断投资质量；事实不足时请明确说明，并按需查询最新数据。";
 
@@ -25,7 +31,7 @@ export function buildStatisticsAiReviewPrefill(
       toolArguments = {};
       break;
     case "market":
-      target = `仅复盘${marketNames[scope.market]}（${scope.market}）范围内的持仓，忽略其他市场`;
+      target = `仅复盘${marketNames[scope.market]}（${scope.market}）范围内的持仓，忽略其他市场；本次复盘以${marketCurrencies[scope.market]}为计价单位`;
       toolArguments = { market: scope.market };
       break;
     case "account":

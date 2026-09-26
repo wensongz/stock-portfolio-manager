@@ -20,7 +20,9 @@ use crate::models::dashboard::DashboardSummary;
 use crate::models::option_review::OptionReviewReport;
 use crate::models::quote::ExchangeRates;
 use crate::models::stock_operation_review::StockOperationReviewQuery;
-use crate::services::ai_chat_service::{build_portfolio_context, PortfolioScope};
+use crate::services::ai_chat_service::{
+    build_portfolio_context, portfolio_performance_currency, PortfolioScope,
+};
 use crate::services::alert_service;
 use crate::services::exchange_rate_service::{
     convert_currency, get_cached_rates, load_exchange_rates_from_db, ExchangeRateCache,
@@ -132,7 +134,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "get_holdings_detail",
-                "description": "获取用户当前持仓的明细列表（每只持仓的代码、名称、市场、持仓量、均价、现价、市值、盈亏等）。当需要逐只持仓分析或排序时调用。",
+                "description": "获取当前复盘范围内的持仓明细（代码、名称、市场、持仓量、均价、现价、市值、盈亏等）。所有价格及金额均为该行 currency 标明的原币；market_value 是原币市值，未换算为美元。按市场复盘时，目标计价币种为 A股 CN/CNY、港股 HK/HKD、美股 US/USD；外币现金等持仓须按其实际 currency 换算后汇总，不同币种不可直接相加或比较仓位。当需要逐只持仓分析或排序时调用。",
                 "parameters": {
                     "type": "object",
                     "properties": {}
@@ -544,6 +546,11 @@ impl<'a> ToolCtx<'a> {
             .as_ref()
             .map(PortfolioScope::performance_filter)
             .unwrap_or_default()
+    }
+
+    fn performance_currency(&self) -> Result<&'static str, ToolResult> {
+        portfolio_performance_currency(self.db, self.portfolio_scope.as_ref())
+            .map_err(ToolResult::err_json)
     }
 }
 
@@ -1331,14 +1338,46 @@ async fn tool_holdings_detail(ctx: &ToolCtx<'_>) -> ToolResult {
                         .as_ref()
                         .is_none_or(|scope| scope.matches_holding(holding))
                 })
+                // The read model's USD field is only populated by holdings_with_usd.
+                // Expose an explicit native-currency contract to the model instead
+                // of serializing the UI's unconverted comparison field.
+                .map(|holding| {
+                    json!({
+                        "id": holding.id,
+                        "account_id": holding.account_id,
+                        "account_name": holding.account_name,
+                        "symbol": holding.symbol,
+                        "name": holding.name,
+                        "market": holding.market,
+                        "category_name": holding.category_name,
+                        "category_color": holding.category_color,
+                        "shares": holding.shares,
+                        "avg_cost": holding.avg_cost,
+                        "current_price": holding.current_price,
+                        "daily_change_percent": holding.daily_change_percent,
+                        "market_value": holding.market_value,
+                        "cost_value": holding.cost_value,
+                        "pnl": holding.pnl,
+                        "pnl_percent": holding.pnl_percent,
+                        "daily_pnl": holding.daily_pnl,
+                        "currency": holding.currency,
+                    })
+                })
                 .collect();
-            ToolResult::ok_json(json!({ "holdings": holdings }))
+            ToolResult::ok_json(json!({
+                "holdings": holdings,
+                "currency_note": "每条持仓的 avg_cost、current_price、market_value、cost_value、pnl、daily_pnl 均以该行 currency 计价，未做汇率换算；跨币种汇总或比较仓位前须统一计价币种。",
+            }))
         }
         Err(e) => ToolResult::err_json(format!("获取持仓明细失败：{e}")),
     }
 }
 
 async fn tool_performance_metrics(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+    let currency = match ctx.performance_currency() {
+        Ok(currency) => currency,
+        Err(error) => return error,
+    };
     let days = args
         .get("periodDays")
         .and_then(|v| v.as_i64())
@@ -1353,6 +1392,7 @@ async fn tool_performance_metrics(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult
             // don't blow the context budget. The headline metrics are what the
             // model actually needs for most questions.
             let compact = json!({
+                "currency": currency,
                 "start_date": summary.start_date,
                 "end_date": summary.end_date,
                 "start_value": summary.start_value,
@@ -1486,6 +1526,10 @@ fn period_window(args: &Value) -> (chrono::NaiveDate, chrono::NaiveDate) {
 }
 
 async fn tool_return_attribution(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+    let currency = match ctx.performance_currency() {
+        Ok(currency) => currency,
+        Err(error) => return error,
+    };
     let (start, end) = period_window(args);
     let filter = ctx.performance_filter();
     match performance_service::get_return_attribution(ctx.db, start, end, &filter) {
@@ -1500,6 +1544,7 @@ async fn tool_return_attribution(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult 
             });
             holdings.truncate(15);
             ToolResult::ok_json(json!({
+                "currency": currency,
                 "total_pnl": attr.total_pnl,
                 "by_market": attr.by_market,
                 "by_category": attr.by_category,
@@ -1511,15 +1556,25 @@ async fn tool_return_attribution(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult 
 }
 
 async fn tool_monthly_returns(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+    let currency = match ctx.performance_currency() {
+        Ok(currency) => currency,
+        Err(error) => return error,
+    };
     let (start, end) = period_window(args);
     let filter = ctx.performance_filter();
     match performance_service::get_monthly_returns(ctx.db, start, end, &filter) {
-        Ok(returns) => ToolResult::ok_json(json!({ "monthly_returns": returns })),
+        Ok(returns) => ToolResult::ok_json(json!({
+            "currency": currency,
+            "monthly_returns": returns,
+        })),
         Err(e) => ToolResult::err_json(format!("月度收益查询失败：{e}")),
     }
 }
 
 async fn tool_drawdown_analysis(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+    if let Err(error) = ctx.performance_currency() {
+        return error;
+    }
     let (start, end) = period_window(args);
     let filter = ctx.performance_filter();
     match performance_service::get_drawdown_analysis(ctx.db, start, end, &filter) {
@@ -1536,6 +1591,9 @@ async fn tool_drawdown_analysis(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 }
 
 async fn tool_risk_metrics(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+    if let Err(error) = ctx.performance_currency() {
+        return error;
+    }
     let (start, end) = period_window(args);
     let filter = ctx.performance_filter();
     match performance_service::get_risk_metrics(ctx.db, start, end, &filter) {
@@ -1552,6 +1610,10 @@ async fn tool_risk_metrics(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
 }
 
 async fn tool_holding_ranking(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+    let currency = match ctx.performance_currency() {
+        Ok(currency) => currency,
+        Err(error) => return error,
+    };
     let (start, end) = period_window(args);
     let sort_by = args.get("sortBy").and_then(|v| v.as_str()).unwrap_or("pnl");
     let limit = args
@@ -1563,7 +1625,11 @@ async fn tool_holding_ranking(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     match performance_service::get_holding_performance_ranking(
         ctx.db, start, end, sort_by, limit, &filter,
     ) {
-        Ok(ranking) => ToolResult::ok_json(json!({ "ranking": ranking, "sort_by": sort_by })),
+        Ok(ranking) => ToolResult::ok_json(json!({
+            "currency": currency,
+            "ranking": ranking,
+            "sort_by": sort_by,
+        })),
         Err(e) => ToolResult::err_json(format!("持仓排名查询失败：{e}")),
     }
 }
@@ -2458,6 +2524,335 @@ mod tests {
                 result.content
             );
         }
+    }
+
+    #[tokio::test]
+    async fn holdings_detail_reports_native_amounts_and_currency_for_each_market() {
+        let db = Database::new(":memory:").unwrap();
+        let cache = ExchangeRateCache::new();
+        let quotes = QuoteCache::new();
+        let state = QuoteServiceState::new();
+        let cases = [
+            ("CN", "CNY", "600000", 72.0, 60.0, 720.0, 600.0),
+            ("HK", "HKD", "0700", 78.0, 65.0, 780.0, 650.0),
+            ("US", "USD", "AAPL", 10.0, 9.0, 100.0, 90.0),
+        ];
+        for (market, currency, symbol, price, cost, _, _) in cases {
+            {
+                let conn = db.conn.lock().unwrap();
+                conn.execute(
+                    "INSERT INTO accounts (id, name, market, created_at, updated_at)
+                     VALUES (?1, ?1, ?1, '2026-01-01', '2026-01-01')",
+                    [market],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO holdings
+                     (id, account_id, symbol, name, market, shares, avg_cost, currency, created_at, updated_at)
+                     VALUES (?1, ?1, ?2, ?2, ?1, 10, ?3, ?4, '2026-01-01', '2026-01-01')",
+                    rusqlite::params![market, symbol, cost, currency],
+                )
+                .unwrap();
+            }
+            quotes.set(crate::models::StockQuote {
+                symbol: symbol.to_string(),
+                market: market.to_string(),
+                current_price: price,
+                change: 1.0,
+                ..crate::models::StockQuote::default()
+            });
+        }
+
+        // Native-currency tool results must be correct both offline and with FX cached.
+        for with_rates in [false, true] {
+            if with_rates {
+                cache.set(ExchangeRates {
+                    usd_cny: 7.2,
+                    usd_hkd: 7.8,
+                    cny_hkd: 7.8 / 7.2,
+                    updated_at: "2026-09-26T00:00:00Z".to_string(),
+                });
+            }
+            for (market, currency, symbol, price, _, value, cost_value) in cases {
+                let ctx = restricted_context(&db, &cache, &quotes, &state, Some(market), None);
+                let result = execute_tool(&ctx, "get_holdings_detail", "{}").await;
+                assert!(result.ok, "{}", result.content);
+                let payload: Value = serde_json::from_str(&result.content).unwrap();
+                let holdings = payload["holdings"].as_array().unwrap();
+                assert_eq!(holdings.len(), 1);
+                let holding = &holdings[0];
+                assert_eq!(holding["symbol"], symbol);
+                assert_eq!(holding["market"], market);
+                assert_eq!(holding["currency"], currency);
+                assert_eq!(holding["current_price"], price);
+                assert_eq!(holding["market_value"], value);
+                assert_eq!(holding["cost_value"], cost_value);
+                assert_eq!(holding["daily_pnl"], 10.0);
+                assert!(
+                    holding.get("market_value_usd").is_none(),
+                    "{}",
+                    result.content
+                );
+            }
+        }
+
+        let ctx = ToolCtx::for_untrusted_model_turn(&db, &cache, &quotes, &state, "", None);
+        let result = execute_tool(&ctx, "get_holdings_detail", "{}").await;
+        let payload: Value = serde_json::from_str(&result.content).unwrap();
+        let holdings = payload["holdings"].as_array().unwrap();
+        assert_eq!(holdings.len(), 3);
+        for (market, currency, _, _, _, value, _) in cases {
+            let holding = holdings.iter().find(|row| row["market"] == market).unwrap();
+            assert_eq!(holding["currency"], currency);
+            assert_eq!(holding["market_value"], value);
+            assert!(holding.get("market_value_usd").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn performance_tools_report_currency_consistent_with_valuation_scope() {
+        use chrono::Datelike;
+
+        let db = Database::new(":memory:").unwrap();
+        let cache = ExchangeRateCache::new();
+        let quotes = QuoteCache::new();
+        let state = QuoteServiceState::new();
+        // Keep both valuations in one past month, inside the tools' default window.
+        let start = (Utc::now().date_naive() - Duration::days(32))
+            .with_day(1)
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            for (day, usd_total, cn_value, hk_value, us_value) in [
+                (0, 300.0, 720.0, 780.0, 100.0),
+                (1, 330.0, 792.0, 858.0, 110.0),
+            ] {
+                let date = (start + Duration::days(day)).to_string();
+                conn.execute(
+                    "INSERT INTO daily_portfolio_values (date, total_value, exchange_rates)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        date,
+                        usd_total,
+                        json!({
+                            "usd_cny": 7.2, "usd_hkd": 7.8,
+                            "cny_hkd": 7.8 / 7.2, "updated_at": date,
+                        })
+                        .to_string(),
+                    ],
+                )
+                .unwrap();
+                for (market, symbol, value) in [
+                    ("CN", "600000", cn_value),
+                    ("HK", "0700", hk_value),
+                    ("US", "AAPL", us_value),
+                ] {
+                    conn.execute(
+                        "INSERT INTO daily_holding_snapshots
+                         (date, account_id, symbol, market, shares, close_price, market_value)
+                         VALUES (?1, ?2, ?3, ?2, 1, ?4, ?4)",
+                        rusqlite::params![date, market, symbol, value],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+
+        let mut currency_errors = vec![];
+        for tool in [
+            "get_performance_metrics",
+            "get_return_attribution",
+            "get_monthly_returns",
+            "get_holding_ranking",
+        ] {
+            for (market, currency, start_value, end_value, pnl) in [
+                (Some("CN"), "CNY", 720.0, 792.0, 72.0),
+                (Some("HK"), "HKD", 780.0, 858.0, 78.0),
+                (Some("US"), "USD", 100.0, 110.0, 10.0),
+                (None, "USD", 300.0, 330.0, 30.0),
+            ] {
+                let scope = market.map(|market| PortfolioScope {
+                    market: Some(market.to_string()),
+                    ..PortfolioScope::default()
+                });
+                let ctx =
+                    ToolCtx::for_untrusted_model_turn(&db, &cache, &quotes, &state, "", scope);
+                let result = execute_tool(&ctx, tool, "{}").await;
+                assert!(result.ok, "{tool} {market:?}: {}", result.content);
+                let payload: Value = serde_json::from_str(&result.content).unwrap();
+                if payload["currency"] != currency {
+                    currency_errors.push(format!(
+                        "{tool} {market:?}: expected {currency}, got {}",
+                        payload["currency"]
+                    ));
+                }
+
+                let assert_amount = |actual: f64, expected: f64| {
+                    assert!(
+                        (actual - expected).abs() < 1e-9,
+                        "{tool} {market:?}: expected {expected}, got {actual}"
+                    );
+                };
+                match tool {
+                    "get_performance_metrics" => {
+                        assert_amount(payload["start_value"].as_f64().unwrap(), start_value);
+                        assert_amount(payload["end_value"].as_f64().unwrap(), end_value);
+                        assert_amount(payload["total_pnl"].as_f64().unwrap(), pnl);
+                    }
+                    "get_return_attribution" => {
+                        assert_amount(payload["total_pnl"].as_f64().unwrap(), pnl);
+                        for group in ["by_market", "by_category", "by_holding_top15"] {
+                            assert_amount(
+                                payload[group]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|row| row["pnl"].as_f64().unwrap())
+                                    .sum(),
+                                pnl,
+                            );
+                        }
+                    }
+                    _ => {
+                        let group = if tool == "get_monthly_returns" {
+                            "monthly_returns"
+                        } else {
+                            "ranking"
+                        };
+                        let rows = payload[group].as_array().unwrap();
+                        assert!(!rows.is_empty());
+                        for (field, expected) in [
+                            ("start_value", start_value),
+                            ("end_value", end_value),
+                            ("pnl", pnl),
+                        ] {
+                            assert_amount(
+                                rows.iter().map(|row| row[field].as_f64().unwrap()).sum(),
+                                expected,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(currency_errors.is_empty(), "{}", currency_errors.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn performance_tools_reject_foreign_currency_cash_in_the_selected_history() {
+        let cache = ExchangeRateCache::new();
+        let quotes = QuoteCache::new();
+        let state = QuoteServiceState::new();
+        let mut guard_errors = vec![];
+        for source in ["holdings", "transactions", "snapshots"] {
+            let db = Database::new(":memory:").unwrap();
+            {
+                let conn = db.conn.lock().unwrap();
+                // A normal overall portfolio has several currencies, each native
+                // to its market. The guard must permit this existing behavior.
+                for (market, currency) in [("CN", "CNY"), ("HK", "HKD"), ("US", "USD")] {
+                    conn.execute(
+                        "INSERT INTO accounts (id, name, market, created_at, updated_at)
+                         VALUES (?1, ?1, ?1, '2026-01-01', '2026-01-01')",
+                        [market],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT INTO holdings
+                         (id, account_id, symbol, name, market, shares, avg_cost, currency, created_at, updated_at)
+                         VALUES (?1, ?1, ?1, ?1, ?1, 1, 100, ?2, '2026-01-01', '2026-01-01')",
+                        rusqlite::params![market, currency],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT INTO transactions
+                         (id, account_id, symbol, name, market, transaction_type, shares, price,
+                          total_amount, commission, currency, traded_at, created_at)
+                         VALUES (?1, ?1, ?1, ?1, ?1, 'BUY', 1, 100, 100, 0, ?2, '2026-01-01', '2026-01-01')",
+                        rusqlite::params![market, currency],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT INTO daily_holding_snapshots
+                         (date, account_id, symbol, market, shares, close_price, market_value)
+                         VALUES ('2026-01-01', ?1, ?2, ?1, 100, 1, 100)",
+                        rusqlite::params![market, format!("$CASH-{currency}")],
+                    )
+                    .unwrap();
+                }
+                conn.execute(
+                    "INSERT INTO accounts (id, name, market, created_at, updated_at)
+                     VALUES ('hk-foreign', 'HK foreign cash', 'HK', '2026-01-01', '2026-01-01')",
+                    [],
+                )
+                .unwrap();
+            }
+            let overall = ToolCtx::for_untrusted_model_turn(&db, &cache, &quotes, &state, "", None);
+            let tools = [
+                "get_performance_metrics",
+                "get_return_attribution",
+                "get_monthly_returns",
+                "get_holding_ranking",
+                "get_drawdown_analysis",
+                "get_risk_metrics",
+            ];
+            for tool in tools {
+                let result = execute_tool(&overall, tool, "{}").await;
+                assert!(
+                    result.ok,
+                    "native multi-market portfolio: {}",
+                    result.content
+                );
+            }
+            {
+                let conn = db.conn.lock().unwrap();
+                let sql = match source {
+                    "holdings" =>
+                        "INSERT INTO holdings
+                         (id, account_id, symbol, name, market, shares, avg_cost, currency, created_at, updated_at)
+                         VALUES ('cash', 'hk-foreign', '$CASH-USD', 'USD cash', 'HK', 100, 1, 'USD', '2026-01-01', '2026-01-01')",
+                    "transactions" =>
+                        "INSERT INTO transactions
+                         (id, account_id, symbol, name, market, transaction_type, shares, price,
+                          total_amount, commission, currency, traded_at, created_at)
+                         VALUES ('cash', 'hk-foreign', '$CASH-USD', 'USD cash', 'HK', 'BUY', 100, 1, 100, 0, 'USD', '2026-01-01', '2026-01-01')",
+                    _ =>
+                        "INSERT INTO daily_holding_snapshots
+                         (date, account_id, symbol, market, shares, close_price, market_value)
+                         VALUES ('2026-01-01', 'hk-foreign', '$CASH-USD', 'HK', 100, 1, 100)",
+                };
+                conn.execute(sql, []).unwrap();
+            }
+            for tool in tools {
+                for market in [Some("HK"), None] {
+                    let ctx = restricted_context(&db, &cache, &quotes, &state, market, None);
+                    let result = execute_tool(&ctx, tool, "{}").await;
+                    let payload: Value = serde_json::from_str(&result.content).unwrap();
+                    if result.ok
+                        || !payload["error"]
+                            .as_str()
+                            .is_some_and(|error| error.contains("历史绩效未统一币种"))
+                    {
+                        guard_errors
+                            .push(format!("{source} {tool} {market:?}: {}", result.content));
+                    } else {
+                        assert_eq!(payload.as_object().unwrap().len(), 1, "{}", result.content);
+                    }
+                }
+                // Unrelated markets and another account in the same market stay usable.
+                for (market, account) in [("CN", None), ("HK", Some("HK"))] {
+                    let ctx =
+                        restricted_context(&db, &cache, &quotes, &state, Some(market), account);
+                    let result = execute_tool(&ctx, tool, "{}").await;
+                    assert!(
+                        result.ok,
+                        "{source} {tool} outside scope: {}",
+                        result.content
+                    );
+                }
+            }
+        }
+        assert!(guard_errors.is_empty(), "{}", guard_errors.join("\n"));
     }
 
     #[tokio::test]

@@ -110,6 +110,53 @@ impl PortfolioScope {
     }
 }
 
+/// Confirm that historical performance can use its existing market-based
+/// currency assumptions. Snapshot rows do not retain a currency column, so
+/// inspect known holding/transaction currencies and cash symbols across the
+/// selected scope before exposing monetary results to the assistant.
+pub(crate) fn portfolio_performance_currency(
+    db: &Database,
+    scope: Option<&PortfolioScope>,
+) -> Result<&'static str, String> {
+    let market = scope.and_then(|scope| scope.market.as_deref());
+    let account_id = scope.and_then(|scope| scope.account_id.as_deref());
+    if account_id.is_some() && market.is_none() {
+        return Err(
+            "历史绩效未统一币种：账户范围缺少明确市场，无法可靠比较，已省略绩效数值。".to_string(),
+        );
+    }
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let incompatible: bool = conn
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM (
+                    SELECT account_id, market, currency FROM holdings
+                    UNION ALL
+                    SELECT account_id, market, currency FROM transactions
+                    UNION ALL
+                    SELECT account_id, market, UPPER(SUBSTR(symbol, 7)) AS currency
+                    FROM daily_holding_snapshots WHERE UPPER(symbol) LIKE '$CASH-%'
+                )
+                WHERE (?1 IS NULL OR market = ?1)
+                  AND (?2 IS NULL OR account_id = ?2)
+                  AND currency <> CASE market
+                      WHEN 'CN' THEN 'CNY' WHEN 'HK' THEN 'HKD' WHEN 'US' THEN 'USD'
+                      ELSE '' END
+            )",
+            rusqlite::params![market, account_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("校验历史绩效币种失败：{error}"))?;
+    if incompatible {
+        return Err("历史绩效未统一币种：所选范围的持仓、交易或现金快照存在非市场本币金额，无法可靠比较，已省略绩效数值。".to_string());
+    }
+    Ok(match market {
+        Some("CN") => "CNY",
+        Some("HK") => "HKD",
+        _ => "USD",
+    })
+}
+
 /// Parameters for a chat turn.
 #[derive(Debug, Clone)]
 pub struct ChatParams {

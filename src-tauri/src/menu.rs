@@ -122,12 +122,18 @@ fn build_macos_menu(app: &AppHandle, l: &Labels) -> tauri::Result<Menu<tauri::Wr
     let hide_text = format!("{} {}", l.hide_prefix, app_name);
     let quit_text = format!("{} {}", l.quit_prefix, app_name);
 
+    // Embed the app icon so the About panel also displays it in unbundled dev builds.
+    let about_metadata = tauri::menu::AboutMetadata {
+        icon: Some(tauri::include_image!("icons/128x128@2x.png")),
+        ..Default::default()
+    };
+
     let app_menu = Submenu::with_items(
         app,
         app_name,
         true,
         &[
-            &PredefinedMenuItem::about(app, Some(&about_text), None)?,
+            &PredefinedMenuItem::about(app, Some(&about_text), Some(about_metadata))?,
             &PredefinedMenuItem::separator(app)?,
             &PredefinedMenuItem::hide(app, Some(&hide_text))?,
             &PredefinedMenuItem::hide_others(app, Some(l.hide_others))?,

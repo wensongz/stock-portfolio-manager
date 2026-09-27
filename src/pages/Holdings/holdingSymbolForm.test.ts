@@ -41,11 +41,14 @@ function exerciseHoldingForm(cases) {
       },
       message: { success() {}, error: (text) => errors.push(text) },
     }));
-    let commands;
+    let commands, quoteScenario, resolveQuote;
     const timestamp = "2026-09-24T02:00:00.000Z";
     globalThis.window = { __TAURI_INTERNALS__: { invoke: async (command, args) => {
       commands.push({ command, args });
       if (["get_cn_quote", "get_us_quote", "get_hk_quote"].includes(command)) {
+        if (quoteScenario.deferQuote) await new Promise((resolve) => { resolveQuote = resolve; });
+        if (quoteScenario.quoteFails) throw new Error("行情查询失败");
+        if (quoteScenario.emptyQuote) return { data: null, warning: null, refreshedAt: null };
         return { data: {
           symbol: args.symbol, name: "查得的股票名称", market: fields.market,
           current_price: 10, previous_close: 10, change: 0, change_percent: 0,
@@ -66,6 +69,8 @@ function exerciseHoldingForm(cases) {
     const { default: HoldingsPage } = await import("./src/pages/Holdings/index.tsx");
     const results = [];
     for (const scenario of ${JSON.stringify(cases)}) {
+      quoteScenario = scenario;
+      let fieldsBeforeQuote;
       fields = {};
       commands = [];
       errors.length = 0;
@@ -84,12 +89,15 @@ function exerciseHoldingForm(cases) {
         fields.symbol = symbolField.normalize?.(scenario.symbol, "", fields) ?? scenario.symbol;
       } else if (scenario.action === "blur") {
         symbolField.children.props.onBlur();
+        fieldsBeforeQuote = { ...fields };
+        if (scenario.changeDuringQuote) mainForm.setFieldsValue(scenario.changeDuringQuote);
+        if (scenario.deferQuote) resolveQuote();
         await new Promise((resolve) => setImmediate(resolve));
       } else {
         // Bypass blur and field normalization to exercise the submit guard itself.
         await onFinish({ ...fields });
       }
-      results.push({ fields: { ...fields }, commands, errors: [...errors], holdings: useHoldingStore.getState().holdings });
+      results.push({ fields: { ...fields }, fieldsBeforeQuote, commands, errors: [...errors], holdings: useHoldingStore.getState().holdings });
     }
     process.stdout.write(JSON.stringify(results));
   `;
@@ -140,6 +148,66 @@ test("submitting a new mainland stock or fund holding normalizes the stored symb
     assert.equal(result.commands[0].args.market, "CN");
     assert.equal(result.holdings[0].symbol, cnSymbols[index].expected);
     assert.deepEqual(result.errors, []);
+  });
+});
+
+const hkSymbols = [
+  { symbol: "700", expected: "700.HK" },
+  { symbol: "9988", expected: "9988.HK" },
+  { symbol: "0700", expected: "700.HK" },
+];
+
+test("HK digits remain editable until blur, then a successful name lookup completes the code", () => {
+  const results = exerciseHoldingForm(hkSymbols.flatMap(({ symbol }) => [
+    { symbol, market: "HK", action: "type" },
+    { symbol, market: "HK", action: "blur", deferQuote: true },
+  ]));
+  hkSymbols.forEach(({ symbol, expected }, index) => {
+    const typed = results[index * 2];
+    const lookup = results[index * 2 + 1];
+    assert.equal(typed.fields.symbol, symbol, "typing the third digit must still allow a fourth digit");
+    assert.deepEqual(typed.commands, []);
+    assert.deepEqual(lookup.commands, [{ command: "get_hk_quote", args: { symbol: expected } }]);
+    assert.equal(lookup.fieldsBeforeQuote.symbol, symbol);
+    assert.equal(lookup.fieldsBeforeQuote.name, "手动填写的名称");
+    assert.equal(lookup.fields.symbol, expected);
+    assert.equal(lookup.fields.name, "查得的股票名称");
+    assert.deepEqual(lookup.errors, []);
+  });
+});
+
+test("HK holdings save with the suffix even when submitted without blur", () => {
+  const results = exerciseHoldingForm(hkSymbols.map(({ symbol }) => ({ symbol, market: "HK", action: "submit" })));
+  results.forEach((result, index) => {
+    assert.equal(result.commands.length, 1);
+    assert.equal(result.commands[0].command, "create_holding");
+    assert.equal(result.commands[0].args.symbol, hkSymbols[index].expected);
+    assert.equal(result.holdings[0].symbol, hkSymbols[index].expected);
+    assert.deepEqual(result.errors, []);
+  });
+});
+
+test("failed or empty HK lookups preserve the entered code and name", () => {
+  const results = exerciseHoldingForm([
+    { symbol: "700", market: "HK", action: "blur", quoteFails: true },
+    { symbol: "700", market: "HK", action: "blur", emptyQuote: true },
+  ]);
+  for (const result of results) {
+    assert.deepEqual(result.commands, [{ command: "get_hk_quote", args: { symbol: "700.HK" } }]);
+    assert.equal(result.fields.symbol, "700");
+    assert.equal(result.fields.name, "手动填写的名称");
+  }
+});
+
+test("HK lookup results cannot overwrite a different code or market entered during the request", () => {
+  const changes = [{ symbol: "9988" }, { market: "US" }];
+  const results = exerciseHoldingForm(changes.map((changeDuringQuote) => ({
+    symbol: "700", market: "HK", action: "blur", deferQuote: true, changeDuringQuote,
+  })));
+  results.forEach((result, index) => {
+    assert.equal(result.fields.symbol, changes[index].symbol ?? "700");
+    assert.equal(result.fields.market, changes[index].market ?? "HK");
+    assert.equal(result.fields.name, "手动填写的名称");
   });
 });
 

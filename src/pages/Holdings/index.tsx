@@ -249,10 +249,11 @@ export default function HoldingsPage() {
       const quoteSymbol = editingHolding
         ? symbol.trim()
         : normalizeHoldingSymbol(symbol, market);
-      if (!editingHolding && quoteSymbol !== symbol) {
+      if (!editingHolding && market !== "HK" && quoteSymbol !== symbol) {
         form.setFieldsValue({ symbol: quoteSymbol });
         setSymbolSearch(quoteSymbol);
       }
+      const lookupSymbol = form.getFieldValue("symbol");
 
       setQuoteWarning(null);
       setFetchingName(true);
@@ -266,8 +267,12 @@ export default function HoldingsPage() {
           symbol: quoteSymbol,
         });
         const quote = outcome.data;
-        if (quote && quote.name) {
-          form.setFieldsValue({ name: quote.name });
+        if (quote && quote.name && form.getFieldValue("market") === market &&
+            form.getFieldValue("symbol") === lookupSymbol) {
+          form.setFieldsValue(editingHolding
+            ? { name: quote.name }
+            : { name: quote.name, symbol: quoteSymbol });
+          if (!editingHolding) setSymbolSearch(quoteSymbol);
         }
         applyQuoteMetadata(outcome);
       } catch (error) {
@@ -303,7 +308,8 @@ export default function HoldingsPage() {
 
   // The account or market may be selected after the stock code was entered.
   useEffect(() => {
-    if (!modalOpen || editingHolding) return;
+    // HK codes complete after lookup so entering the third digit never prevents a fourth.
+    if (!modalOpen || editingHolding || selectedFormMarket === "HK") return;
     const symbol: string | undefined = form.getFieldValue("symbol");
     if (!symbol) return;
     const normalized = normalizeHoldingSymbol(symbol, selectedFormMarket);
@@ -983,8 +989,10 @@ export default function HoldingsPage() {
                 label={isEditingCash ? "现金代码" : "股票代码"}
                 style={{ marginBottom: 12 }}
                 rules={[{ required: true, message: "请输入股票代码" }]}
-                normalize={editingHolding ? undefined : (value: string) =>
-                  normalizeHoldingSymbol(value, form.getFieldValue("market"))}
+                normalize={editingHolding ? undefined : (value: string) => {
+                  const market = form.getFieldValue("market");
+                  return market === "HK" ? value : normalizeHoldingSymbol(value, market);
+                }}
               >
                 <AutoComplete
                   disabled={saving || identityFieldsLocked}

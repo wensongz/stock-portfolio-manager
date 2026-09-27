@@ -36,7 +36,7 @@ const menuItems = [
   { key: "/alerts", icon: <BellOutlined />, label: ALERTS_MENU_LABEL },
   { key: "/import", icon: <ImportOutlined />, label: "导入导出" },
   { key: "/settings", icon: <SettingOutlined />, label: "设置" },
-];
+].map((item) => ({ ...item, style: { marginBlock: 2 } }));
 
 interface Props {
   children: React.ReactNode;

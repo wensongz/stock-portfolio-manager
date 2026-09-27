@@ -992,7 +992,7 @@ export default function HoldingsPage() {
                   onSearch={setSymbolSearch}
                   onSelect={handleSymbolSelect}
                   onBlur={handleSymbolBlur}
-                  placeholder="如：AAPL, sh600519, 0700.HK"
+                  placeholder="如：AAPL, sh600519, 700.HK"
                 />
               </Form.Item>
             </Col>

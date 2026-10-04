@@ -340,3 +340,130 @@ fn arithmetic_overflow_rolls_back_only_the_invalid_row() {
     assert_eq!(n, 0);
     undo_import_batch(&db, &a.id).unwrap();
 }
+
+#[test]
+fn fractional_account_state_remains_undoable_after_reads_and_repeated_submit() {
+    let db = database();
+    create_holding_in(
+        &db.conn.lock().unwrap(),
+        &CreateHoldingInput {
+            account_id: "a".into(),
+            symbol: "BASE".into(),
+            name: "Existing position".into(),
+            market: "US".into(),
+            currency: "USD".into(),
+            category_id: None,
+            shares: 2.0,
+            avg_cost: 440.84788000000003,
+        },
+    )
+    .unwrap();
+    let initial = state::capture(&db.conn.lock().unwrap(), "a").unwrap();
+    let mut row = buy("1", 5.0);
+    row["data"]["price"] = json!(24.9);
+    row["data"]["total_amount"] = json!(124.5);
+    row["data"]["commission"] = json!(2.8284000000000002);
+    let req = request("fractional", vec![row]);
+    let preview = preview_import_batch(&db, &req).unwrap();
+    let applied = apply_all(&db, &preview);
+    assert_eq!(applied.rows[0].status, "imported");
+    assert_eq!(applied.conflict, None);
+    assert!(applied.can_undo);
+    let after = state::capture(&db.conn.lock().unwrap(), "a").unwrap();
+
+    for _ in 0..2 {
+        let read = get_import_batch(&db, &applied.id).unwrap();
+        assert_eq!(read.conflict, None);
+        assert!(read.can_undo);
+        assert!(list_import_batches(&db, Some("a")).unwrap()[0].can_undo);
+        assert_eq!(preview_import_batch(&db, &req).unwrap().id, applied.id);
+        let repeated = apply_import_batch(&db, &applied.id, &["1".into()], &[]).unwrap();
+        assert_eq!(repeated.rows[0].record_id, applied.rows[0].record_id);
+        assert_eq!(
+            state::capture(&db.conn.lock().unwrap(), "a").unwrap(),
+            after
+        );
+    }
+
+    assert_eq!(
+        undo_import_batch(&db, &applied.id).unwrap().status,
+        "undone"
+    );
+    assert_eq!(
+        state::capture(&db.conn.lock().unwrap(), "a").unwrap(),
+        initial
+    );
+}
+
+#[test]
+fn fractional_computed_cost_does_not_block_retrying_failed_rows() {
+    let db = database();
+    db.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_msft BEFORE INSERT ON transactions WHEN NEW.symbol='MSFT' BEGIN SELECT RAISE(ABORT,'temporary failure'); END;").unwrap();
+    let mut first = buy("1", 1.0);
+    first["data"]["price"] = json!(440.04);
+    first["data"]["total_amount"] = json!(440.04);
+    first["data"]["commission"] = json!(0.80788);
+    let mut second = buy("2", 3.0);
+    second["data"]["symbol"] = json!("MSFT");
+    let preview =
+        preview_import_batch(&db, &request("retry-fractional", vec![first, second])).unwrap();
+    let applied = apply_all(&db, &preview);
+    assert_eq!(applied.rows[0].status, "imported");
+    assert_eq!(applied.rows[1].status, "failed");
+    let cost: f64 = db
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT avg_cost FROM holdings WHERE symbol='AAPL'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cost, 440.84788000000003);
+    assert_eq!(applied.conflict, None);
+    db.conn
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_msft;")
+        .unwrap();
+
+    let retried = apply_all(&db, &applied);
+    assert!(retried.rows.iter().all(|r| r.status == "imported"));
+    assert_eq!(retried.rows[0].record_id, applied.rows[0].record_id);
+    assert_eq!(shares(&db, "AAPL"), 1.0);
+    assert_eq!(shares(&db, "MSFT"), 3.0);
+    assert_eq!(retried.conflict, None);
+    assert!(retried.can_undo);
+    undo_import_batch(&db, &retried.id).unwrap();
+    let restored = state::capture(&db.conn.lock().unwrap(), "a").unwrap();
+    assert!(restored.holdings.is_empty());
+    assert!(restored.transactions.is_empty());
+}
+
+#[test]
+fn one_ulp_account_edit_still_blocks_retry_and_undo_without_writes() {
+    let db = database();
+    let preview = preview_import_batch(&db, &request("edited", vec![buy("1", 10.0)])).unwrap();
+    let applied = apply_all(&db, &preview);
+    let changed_cost = f64::from_bits(10.1_f64.to_bits() + 1);
+    db.conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE holdings SET avg_cost=?1 WHERE symbol='AAPL'",
+            [changed_cost],
+        )
+        .unwrap();
+    let edited = state::capture(&db.conn.lock().unwrap(), "a").unwrap();
+
+    let read = get_import_batch(&db, &applied.id).unwrap();
+    assert!(read.conflict.is_some());
+    assert!(!read.can_undo);
+    assert!(apply_import_batch(&db, &applied.id, &["1".into()], &[]).is_err());
+    assert!(undo_import_batch(&db, &applied.id).is_err());
+    assert_eq!(
+        state::capture(&db.conn.lock().unwrap(), "a").unwrap(),
+        edited
+    );
+}

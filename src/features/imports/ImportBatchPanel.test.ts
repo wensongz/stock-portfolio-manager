@@ -20,20 +20,21 @@ function runPanelScenario(scenario) {
     const { createRoot } = await import("react-dom/client");
     const h = React.createElement;
     const passthrough = ({ children }) => h("div", null, children);
+    const notifications = [];
     mock.module("antd", () => ({
       Modal: ({ open, title, children, footer, closable, keyboard, maskClosable, onCancel }) => open
         ? h("section", { role: "dialog", "data-closable": String(closable), "data-keyboard": String(keyboard), "data-mask": String(maskClosable) },
           title, children, footer, h("button", { disabled: closable === false, onClick: onCancel }, "关闭窗口")) : null,
       Button: ({ children, onClick, disabled, loading }) => h("button", { onClick, disabled: disabled || loading }, children),
       Space: passthrough, Typography: { Text: passthrough, Title: passthrough, Paragraph: passthrough }, Tag: passthrough,
-      Alert: ({ title, description }) => h("div", { role: "alert" }, title, description),
+      Alert: ({ type, title, description }) => h("div", { role: "alert", "data-type": type }, title, description),
       Input: () => null, InputNumber: () => null,
       Table: ({ dataSource, rowSelection }) => h("div", null, dataSource.map(row => h("div", { key: row.key ?? row.symbol },
         rowSelection && h("input", { type: "checkbox", "data-key": row.key,
           checked: rowSelection.selectedRowKeys.includes(row.key), disabled: rowSelection.getCheckboxProps(row).disabled,
           onChange: event => rowSelection.onChange(event.target.checked ? [...rowSelection.selectedRowKeys, row.key] : rowSelection.selectedRowKeys.filter(key => key !== row.key)) }),
         row.data?.symbol, row.status, row.error))),
-      message: { success() {}, warning() {}, error() {} },
+      message: { success(text) { notifications.push(text); }, warning() {}, error() {} },
     }));
     const { default: ImportBatchPanel } = await import("./src/features/imports/ImportBatchPanel.tsx");
     const scenario = ${JSON.stringify(scenario)};
@@ -44,12 +45,27 @@ function runPanelScenario(scenario) {
       kind: "transactions", status: "preview", created_at: "2026-09-25T00:00:00Z",
       rows: [row("a"), row("b"), row("c")], reconciliation: [], can_undo: false, conflict: null };
     if (["initial", "initial-skip", "revise"].includes(scenario)) batch.rows = [row("ready"), ...Array.from({ length: 12 }, (_, index) => row("failed-" + index, "failed"))];
+    if (scenario === "history-conflict") batch = { ...batch, status: "applied", rows: batch.rows.map(item => row(item.key, "imported")), conflict: "账户已有后续变更，不能继续导入或撤销" };
+    if (scenario === "rejected-conflict") batch = { ...batch, status: "applied", rows: [row("a", "imported"), row("b"), row("c", "imported")] };
+    if (scenario === "rejected-unavailable") batch = { ...batch, status: "applied", rows: [row("a", "imported"), row("b"), row("c", "failed")] };
     const requests = [];
     let imports = 0, revisions = 0;
     dom.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
       requests.push({ command, ...args });
+      if (command === "get_import_batch") {
+        if (scenario === "rejected-unavailable") throw new Error("暂时无法读取批次状态");
+        if (scenario === "rejected-suspected") return { ...batch, status: "applied", rows: [row("a", "imported"), row("b", "suspected"), row("c", "imported")] };
+        if (scenario === "rejected-confirmed") return { ...batch, status: "applied", rows: batch.rows.map(item => row(item.key, item.key === "c" ? "duplicate" : "imported")), conflict: "账户已有后续变更，不能继续导入或撤销" };
+        return { ...batch, conflict: scenario === "rejected-conflict" ? "账户已有后续变更，不能继续导入或撤销" : batch.conflict };
+      }
+      if (scenario === "rejected-confirmed") throw new Error("连接中断，未收到提交结果");
+      if (scenario === "rejected-unavailable" || (scenario === "rejected-suspected" && requests.length === 1)) throw new Error("连接中断，未收到提交结果");
       if (scenario === "rejected" && requests.length === 1) throw new Error("连接中断，请重试");
-      if (scenario === "happy" || scenario === "rejected" || (scenario === "retry" && requests.length === 3)) {
+      if (scenario === "rejected-conflict") throw new Error("账户已有后续变更，本次操作被拒绝");
+      if (["success-conflict", "duplicate-conflict"].includes(scenario)) return { ...batch, status: "applied", can_undo: false,
+        rows: batch.rows.map(item => row(item.key, scenario === "duplicate-conflict" && item.key === "c" ? "duplicate" : "imported")),
+        conflict: "账户已有后续变更，不能继续导入或撤销" };
+      if (scenario === "happy" || scenario === "rejected" || scenario === "rejected-suspected" || (scenario === "retry" && requests.length === 3)) {
         return { ...batch, status: "applied", can_undo: true, rows: batch.rows.map(item => args.rowKeys.includes(item.key) ? row(item.key, "imported") : item) };
       }
       if (scenario === "suspected") return { ...batch, status: "applied", can_undo: true, rows: [row("a", "imported"),
@@ -75,21 +91,36 @@ function runPanelScenario(scenario) {
         keyboard: dialog?.getAttribute("data-keyboard"), mask: dialog?.getAttribute("data-mask"), imports, revisions,
         selected: [...container.querySelectorAll("input:checked")].map(input => input.dataset.key),
         retryDisabled: button("查看并重试")?.disabled ?? null, reviseAvailable: !!button("返回修改"),
+        alerts: [...container.querySelectorAll("[role=alert]")].map(alert => ({ type: alert.dataset.type, text: alert.textContent })),
+        notifications: [...notifications], applyDisabled: button("所选行")?.disabled ?? null, undoDisabled: button("撤销批次")?.disabled ?? null,
         rows: batch.rows.map(item => ({ key: item.key, status: item.status })) };
     };
     await act(async () => render());
     let result;
-    if (["initial", "initial-skip", "revise"].includes(scenario)) {
+    if (scenario === "history-conflict") result = { before: snapshot(), requests };
+    else if (["initial", "initial-skip", "revise"].includes(scenario)) {
       const before = snapshot();
       await click(scenario === "revise" ? "返回修改" : scenario === "initial-skip" ? "暂时跳过" : "查看并重试");
       const after = snapshot();
       batch = { ...batch }; await act(async () => render());
       result = { before, after, rerender: snapshot(), requests };
     } else {
+      if (scenario === "rejected-unavailable") await click("暂时跳过");
       if (scenario === "rejected") await act(async () => container.querySelector('[data-key="c"]').click());
-      await click("导入所选行");
+      await click("导入所选行") || await click("导入 / 重试所选行");
       const before = snapshot();
-      if (["skip", "total", "conflict"].includes(scenario)) {
+      if (["rejected-suspected", "rejected-unavailable"].includes(scenario)) {
+        await click("查看并重试");
+        const afterChoice = snapshot();
+        const callsAfterChoice = requests.length;
+        let appliedWithoutConfirmation = false;
+        if (scenario === "rejected-suspected") {
+          appliedWithoutConfirmation = await click("导入 / 重试所选行");
+          await act(async () => container.querySelector('[data-key="b"]').click());
+          await click("导入 / 重试所选行");
+        }
+        result = { before, afterChoice, callsAfterChoice, appliedWithoutConfirmation, after: snapshot(), requests };
+      } else if (["skip", "total", "conflict"].includes(scenario)) {
         await click("暂时跳过");
         batch = { ...batch }; await act(async () => render());
         result = { before, after: snapshot(), requests };
@@ -113,6 +144,7 @@ function runPanelScenario(scenario) {
 test("partial failures remain open until the user retries only failed rows, including repeated failures", () => {
   const result = runPanelScenario("retry");
   assert.equal(result.before.imports, 0, "partial failures must not close the parent import window");
+  assert.match(result.before.dialog, /已成功导入 1 条/);
   assert.match(result.before.dialog, /SYMBOL-b.*失败原因-b.*原始记录-b/s);
   assert.match(result.before.dialog, /SYMBOL-c.*失败原因-c.*原始记录-c/s);
   assert.equal(result.before.closable, "false");
@@ -189,8 +221,8 @@ test("a rejected apply preserves the batch and presents actionable retry choices
   assert.match(result.before.dialog, /原始记录-a/);
   assert.deepEqual(result.before.rows.map(row => row.status), ["ready", "ready", "ready"]);
   assert.deepEqual(result.afterChoice.selected, ["a", "b"]);
-  assert.equal(result.callsAfterChoice, 1);
-  assert.deepEqual(result.requests.map(request => request.rowKeys), [["a", "b"], ["a", "b"]]);
+  assert.equal(result.callsAfterChoice, 2, "a rejected apply refreshes saved status before offering retry");
+  assert.deepEqual(result.requests.filter(request => request.command === "apply_import_batch").map(request => request.rowKeys), [["a", "b"], ["a", "b"]]);
   assert.equal(result.after.imports, 1);
 });
 
@@ -216,4 +248,91 @@ test("a fully successful apply still notifies the parent once", () => {
   assert.equal(result.before.imports, 1);
   assert.equal(result.before.dialog, null);
   assert.equal(result.requests.length, 1);
+});
+
+test("successful imports with a later conflict report saved success without opening an empty failure choice", () => {
+  const result = runPanelScenario("success-conflict");
+  assert.equal(result.before.dialog, null);
+  assert.equal(result.before.imports, 1);
+  assert.ok(result.before.alerts.some(alert => alert.type === "success" && /已成功导入 3 条/.test(alert.text)));
+  assert.ok(result.before.alerts.some(alert => alert.type === "warning" && /后续导入与撤销受限/.test(alert.text)));
+  assert.ok(result.before.notifications.some(text => /已成功导入 3 条/.test(text)));
+  assert.equal(result.before.applyDisabled, true);
+  assert.equal(result.before.undoDisabled, true);
+});
+
+test("duplicate rows are counted separately from successfully imported rows", () => {
+  const result = runPanelScenario("duplicate-conflict");
+  assert.equal(result.before.dialog, null);
+  assert.equal(result.before.imports, 1);
+  assert.ok(result.before.alerts.some(alert => /已成功导入 2 条.*明确重复 1 条/.test(alert.text)));
+  assert.ok(result.before.notifications.some(text => /已成功导入 2 条.*明确重复 1 条/.test(text)));
+});
+
+test("opening an imported batch with account changes reports a restriction without claiming a new failure", () => {
+  const result = runPanelScenario("history-conflict");
+  assert.equal(result.before.dialog, null);
+  assert.equal(result.before.imports, 0);
+  assert.deepEqual(result.requests, []);
+  assert.ok(result.before.alerts.some(alert => alert.type === "success" && /已成功导入 3 条/.test(alert.text)));
+  assert.ok(result.before.alerts.some(alert => alert.type === "warning" && /后续导入与撤销受限/.test(alert.text)));
+  assert.equal(result.before.applyDisabled, true);
+  assert.equal(result.before.undoDisabled, true);
+});
+
+test("an apply rejected by a new conflict preserves earlier imports without offering nonexistent failed rows", () => {
+  const result = runPanelScenario("rejected-conflict");
+  assert.equal(result.before.dialog, null);
+  assert.equal(result.before.imports, 0);
+  assert.deepEqual(result.before.rows.map(row => row.status), ["imported", "ready", "imported"]);
+  assert.ok(result.before.alerts.some(alert => alert.type === "error" && /本次操作结果尚未确认/.test(alert.text)));
+  assert.ok(result.before.alerts.some(alert => alert.type === "warning" && /后续导入与撤销受限/.test(alert.text)));
+  assert.ok(result.before.alerts.some(alert => /已成功导入 2 条/.test(alert.text)));
+  assert.equal(result.before.applyDisabled, true);
+  assert.equal(result.before.undoDisabled, true);
+  assert.deepEqual(result.requests.map(request => request.command), ["apply_import_batch", "get_import_batch"]);
+});
+
+test("a lost apply response uses saved completion to report success without retrying imported or duplicate records", () => {
+  const result = runPanelScenario("rejected-confirmed");
+  assert.equal(result.before.imports, 1);
+  assert.equal(result.before.dialog, null);
+  assert.deepEqual(result.before.rows.map(row => row.status), ["imported", "imported", "duplicate"]);
+  assert.ok(result.before.notifications.some(text => /已成功导入 2 条.*明确重复 1 条/.test(text)));
+  assert.ok(!result.before.alerts.some(alert => alert.type === "error"));
+  assert.equal(result.before.applyDisabled, true);
+  assert.deepEqual(result.requests.map(request => request.command), ["apply_import_batch", "get_import_batch"]);
+});
+
+test("recovering a lost response never selects newly suspected rows without fresh checkbox confirmation", () => {
+  const result = runPanelScenario("rejected-suspected");
+  assert.equal(result.before.imports, 0);
+  assert.match(result.before.dialog, /疑似重复/);
+  assert.match(result.before.dialog, /原始记录-b/);
+  assert.deepEqual(result.before.rows.map(row => row.status), ["imported", "suspected", "imported"]);
+  assert.deepEqual(result.afterChoice.selected, []);
+  assert.equal(result.afterChoice.applyDisabled, true);
+  assert.equal(result.appliedWithoutConfirmation, false);
+  assert.equal(result.callsAfterChoice, 2);
+  assert.deepEqual(result.requests.filter(request => request.command === "apply_import_batch").map(({ rowKeys, allowSuspectedKeys }) => ({ rowKeys, allowSuspectedKeys })), [
+    { rowKeys: ["a", "b", "c"], allowSuspectedKeys: [] },
+    { rowKeys: ["b"], allowSuspectedKeys: ["b"] },
+  ]);
+  assert.equal(result.after.imports, 1);
+  assert.equal(result.after.dialog, null);
+});
+
+test("when apply and status refresh both fail, retry preserves the original selected rows without claiming completion", () => {
+  const result = runPanelScenario("rejected-unavailable");
+  assert.equal(result.before.imports, 0);
+  assert.equal(result.afterChoice.imports, 0);
+  assert.deepEqual(result.before.notifications, []);
+  assert.deepEqual(result.before.rows, [{ key: "a", status: "imported" }, { key: "b", status: "ready" }, { key: "c", status: "failed" }]);
+  assert.deepEqual(result.afterChoice.rows, result.before.rows);
+  assert.match(result.before.dialog, /连接中断，未收到提交结果/);
+  assert.ok(result.before.alerts.some(alert => alert.type === "error" && /本次操作结果尚未确认/.test(alert.text)));
+  assert.deepEqual(result.afterChoice.selected, ["b"]);
+  assert.equal(result.callsAfterChoice, 2);
+  assert.deepEqual(result.requests.map(request => request.command), ["apply_import_batch", "get_import_batch"]);
+  assert.deepEqual(result.requests[0].rowKeys, ["b"]);
 });

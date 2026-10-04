@@ -13,7 +13,7 @@ use state::AccountState;
 use std::collections::HashSet;
 
 const CONFLICT: &str =
-    "账户在此批次提交后已有变更，请先撤销后续批次或核查后续交易；本次未修改账户数据。";
+    "账户状态与此批次提交后的快照不一致，请先核查后续交易或撤销后续批次，再继续导入或撤销。";
 fn json<T: serde::Serialize>(v: &T) -> Result<String, String> {
     serde_json::to_string(v).map_err(|e| e.to_string())
 }

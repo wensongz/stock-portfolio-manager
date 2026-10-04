@@ -20,7 +20,8 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Import audit snapshots must preserve SQLite f64 values for exact conflict checks and undo.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 rusqlite = { version = "0.40", features = ["backup", "bundled"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }

@@ -1,8 +1,10 @@
+import { format } from "echarts/core";
 import EChart from "./EChart";
 import { usePnlColor } from "../../hooks/usePnlColor";
 
 interface BarItem {
   name: string;
+  stockName?: string;
   value: number;
 }
 
@@ -36,9 +38,11 @@ export default function BarChart({
       : undefined,
     tooltip: {
       trigger: "axis",
-      formatter: (params: { name: string; value: number }[]) => {
+      formatter: (params: { name: string; value: number; dataIndex: number }[]) => {
         const p = params[0];
-        return `${p.name}<br/>${p.value >= 0 ? "+" : ""}${p.value.toFixed(2)}`;
+        const stockName = data[p.dataIndex]?.stockName;
+        const nameLine = stockName ? `${format.encodeHTML(stockName)}<br/>` : "";
+        return `${format.encodeHTML(p.name)}<br/>${nameLine}${p.value >= 0 ? "+" : ""}${p.value.toFixed(2)}`;
       },
     },
     grid: { left: "3%", right: "4%", bottom: "10%", containLabel: true },

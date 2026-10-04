@@ -470,10 +470,12 @@ export default function OverviewTab({ baseCurrency }: Props) {
 
   const gainersData = overview.top_gainers.map((g) => ({
     name: g.symbol,
+    stockName: g.name,
     value: parseFloat(g.pnl.toFixed(2)),
   }));
   const losersData = overview.top_losers.map((g) => ({
     name: g.symbol,
+    stockName: g.name,
     value: parseFloat(g.pnl.toFixed(2)),
   }));
 

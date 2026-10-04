@@ -13,6 +13,7 @@ import {
   Tag,
   Divider,
   Form,
+  Modal,
 } from "antd";
 import {
   UploadOutlined,
@@ -44,6 +45,11 @@ export default function ImportPage() {
   const [selectedAccountId, setSelectedAccountId] = useState("");
   const [loading, setLoading] = useState(false);
   const [rawCsvContent, setRawCsvContent] = useState("");
+  const [parseErrorsAcknowledged, setParseErrorsAcknowledged] = useState(false);
+  const [problem, setProblem] = useState<{ stage: "parse" | "preview" | "import" | "options"; details: string[] } | null>(null);
+  const [optionRecoveryAccounts, setOptionRecoveryAccounts] = useState<Set<string>>(() => new Set());
+  const [optionRecoveryConfirmed, setOptionRecoveryConfirmed] = useState(false);
+  const optionRecoveryRequired = dataType === "options" && optionRecoveryAccounts.has(selectedAccountId);
 
   // Export state
   const [exportFilters, setExportFilters] = useState<ExportFilters>({});
@@ -75,6 +81,12 @@ export default function ImportPage() {
 
   const handleFileUpload = (file: File) => {
     setLoading(true);
+    setPreview(null);
+    setBatch(null);
+    setOptionsImportResult(null);
+    setParseErrorsAcknowledged(false);
+    setOptionRecoveryConfirmed(false);
+    setProblem(null);
     const reader = new FileReader();
     reader.onload = async (e) => {
       const content = e.target?.result as string;
@@ -83,34 +95,38 @@ export default function ImportPage() {
       previewRequest.current = null;
       setLoading(true);
       try {
+        let result: ImportPreview;
         if (dataType === "options") {
-          const result = await invoke<ImportPreview>("parse_options_csv", {
+          result = await invoke<ImportPreview>("parse_options_csv", {
             csvContent: content,
           });
-          setPreview(result);
         } else {
-          const result = await invoke<ImportPreview>("parse_import_csv", {
+          result = await invoke<ImportPreview>("parse_import_csv", {
             content,
             dataType,
           });
-          setPreview(result);
         }
+        setPreview(result);
+        if (result.error_rows.length) setProblem({ stage: "preview", details: result.error_rows.map(error => `第 ${error.row} 行（${error.column}）：${error.message}`) });
+        else if (!result.valid_rows) setProblem({ stage: "parse", details: ["未识别到可导入记录，请检查文件格式与所选数据类型。"] });
         setCurrentStep(1);
       } catch (err) {
-        message.error("解析文件失败: " + String(err));
+        setProblem({ stage: "parse", details: [String(err)] });
       } finally {
         setLoading(false);
       }
     };
     reader.onerror = () => {
       setLoading(false);
-      message.error("读取文件失败，请重新选择文件");
+      setProblem({ stage: "parse", details: ["读取文件失败，请重新选择文件"] });
     };
     reader.readAsText(file, "UTF-8");
     return false;
   };
 
   const handleConfirmImport = async () => {
+    if (loading || problem || (preview?.error_rows.length && !parseErrorsAcknowledged)
+      || (optionRecoveryRequired && !optionRecoveryConfirmed)) return;
     if (!selectedAccountId) {
       message.warning("请先选择账户");
       return;
@@ -125,7 +141,12 @@ export default function ImportPage() {
         });
         setOptionsImportResult(result);
         setCurrentStep(2);
-        message.success(`成功导入 ${result.imported} 条记录`);
+        if (result.errors.length) {
+          if (result.imported > 0) setOptionRecoveryAccounts((previous) => new Set([...previous, selectedAccountId]));
+          setOptionRecoveryConfirmed(false);
+          setProblem({ stage: "options", details: result.errors });
+        }
+        else message.success(`成功导入 ${result.imported} 条记录`);
       } else {
         const fingerprint = JSON.stringify([rawCsvContent, dataType, selectedAccountId, fileName]);
         if (previewRequest.current?.fingerprint !== fingerprint) {
@@ -143,7 +164,7 @@ export default function ImportPage() {
         setHistoryRefresh((value) => value + 1);
       }
     } catch (err) {
-      message.error("导入失败: " + String(err));
+      setProblem({ stage: "import", details: [String(err)] });
     } finally {
       setLoading(false);
     }
@@ -195,6 +216,9 @@ export default function ImportPage() {
     previewRequest.current = null;
     setOptionsImportResult(null);
     setRawCsvContent("");
+    setParseErrorsAcknowledged(false);
+    setOptionRecoveryConfirmed(false);
+    setProblem(null);
   };
 
   const previewColumns =
@@ -286,7 +310,7 @@ export default function ImportPage() {
               <Select
                 value={dataType}
                 disabled={loading}
-                onChange={(v) => setDataType(v)}
+                onChange={(v) => { setDataType(v); setOptionRecoveryConfirmed(false); }}
                 style={{ width: 160 }}
                 options={[
                   { value: "holdings", label: "持仓数据" },
@@ -326,12 +350,11 @@ export default function ImportPage() {
             {preview.error_rows.length > 0 && (
               <Alert
                 type="warning"
-                title="发现数据错误（错误行将被跳过）"
+                title={parseErrorsAcknowledged ? "已确认暂时跳过以下错误行，请修正后补导入" : "发现数据错误，请选择处理方式"}
                 description={preview.error_rows
-                  .slice(0, 5)
-                  .map((e) => e.message)
+                  .map((e) => `第 ${e.row} 行：${e.message}`)
                   .join("\n")}
-                style={{ whiteSpace: "pre-line" }}
+                style={{ whiteSpace: "pre-line", maxHeight: 240, overflow: "auto" }}
               />
             )}
 
@@ -341,12 +364,19 @@ export default function ImportPage() {
                   placeholder="请选择账户"
                   style={{ width: 200 }}
                   value={selectedAccountId || undefined}
-                  onChange={setSelectedAccountId}
+                  onChange={(value) => { setSelectedAccountId(value); setOptionRecoveryConfirmed(false); }}
                   disabled={loading}
                   options={accounts.map((a) => ({ value: a.id, label: a.name }))}
                 />
               </Form.Item>
             </Form>
+
+            {optionRecoveryRequired && <Alert type="warning" showIcon title="此账户上次有期权记录已成功导入"
+              description={<Space orientation="vertical">
+                <span>请从文件中移除已成功导入的记录，仅重新上传失败记录。期权导入不会自动去重，重复上传会重复记账。</span>
+                <label><input type="checkbox" checked={optionRecoveryConfirmed} disabled={loading}
+                  onChange={(event) => setOptionRecoveryConfirmed(event.target.checked)} /> 我确认本次文件仅包含尚未成功导入的记录</label>
+              </Space>} />}
 
             <Table
               dataSource={preview.preview_data.slice(0, 10)}
@@ -364,7 +394,8 @@ export default function ImportPage() {
                 icon={<CheckCircleOutlined />}
                 loading={loading}
                 onClick={handleConfirmImport}
-                disabled={!selectedAccountId || preview.valid_rows === 0}
+                disabled={!selectedAccountId || preview.valid_rows === 0 || !!problem || (preview.error_rows.length > 0 && !parseErrorsAcknowledged)
+                  || (optionRecoveryRequired && !optionRecoveryConfirmed)}
               >
                 {dataType === "options" ? "确认导入" : "创建批次并选择导入行"}
               </Button>
@@ -380,14 +411,14 @@ export default function ImportPage() {
             }} onBusyChange={setBatchBusy} />}
             {optionsImportResult && (
               <Alert
-                type="success"
-                title="导入完成"
+                type={optionsImportResult.errors.length ? "warning" : "success"}
+                title={optionsImportResult.errors.length ? "部分记录尚未导入" : "导入完成"}
                 description={
                   <ul>
                     <li>成功导入：{optionsImportResult.imported} 条</li>
                     <li>跳过：{optionsImportResult.skipped} 条</li>
                     {optionsImportResult.errors.length > 0 && (
-                      <li>错误：{optionsImportResult.errors.length} 条</li>
+                      <li>错误：{optionsImportResult.errors.length} 条<ul>{optionsImportResult.errors.map((error, index) => <li key={index}>{error}</li>)}</ul></li>
                     )}
                   </ul>
                 }
@@ -401,6 +432,21 @@ export default function ImportPage() {
           </Space>
         )}
       </Card>
+      <Modal open={problem !== null} closable={false} keyboard={false} maskClosable={false}
+        title={problem?.stage === "preview" ? "解析发现错误，如何处理？"
+          : problem?.stage === "options" ? "部分记录导入失败，如何处理？"
+          : problem?.stage === "import" ? "导入未完成，如何处理？" : "解析未完成，如何处理？"}
+        footer={<Space wrap>
+          <Button disabled={loading} onClick={handleReset}>{problem?.stage === "options" ? "仅重新上传失败记录" : "重新选择文件"}</Button>
+          {problem?.stage === "preview" && !!preview?.valid_rows && <Button type="primary" disabled={loading}
+            onClick={() => { setParseErrorsAcknowledged(true); setProblem(null); }}>跳过错误行，继续检查</Button>}
+          {problem?.stage === "import" && <Button disabled={loading} onClick={() => setProblem(null)}>返回检查并重试</Button>}
+          {problem?.stage === "options" && <Button disabled={loading} onClick={() => setProblem(null)}>暂时跳过</Button>}
+        </Space>}>
+        <p>{problem?.stage === "options" ? `已成功导入 ${optionsImportResult?.imported ?? 0} 条。请另存只包含失败记录的文件，修正后上传，或暂时跳过。期权导入不会自动去重，重新上传整份原文件会重复记账。`
+          : "请先检查错误原因，修正文件后重新上传；存在有效记录时，也可以明确选择跳过错误行后继续。"}</p>
+        <div style={{ maxHeight: 360, overflow: "auto" }}>{problem?.details.map((detail, index) => <p key={index}>{detail}</p>)}</div>
+      </Modal>
       <ImportBatchHistory refreshKey={historyRefresh} />
     </div>
   );

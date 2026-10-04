@@ -15,7 +15,7 @@ export default function ImportFromFirstradeCsvModal(props: Props) {
       {...props}
       brokerName="Firstrade"
       fixedMarket="US"
-      parse={(text) => parseFirstradeTransactions(text)}
+      parse={(text, _market, issues) => parseFirstradeTransactions(text, issues)}
       uploadDescription="支持 Firstrade 导出的交易历史 CSV（Symbol、Quantity、Price、Action 等列）。"
     />
   );

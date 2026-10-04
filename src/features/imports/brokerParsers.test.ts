@@ -115,3 +115,55 @@ test('IB and Firstrade ignore zero execution-id placeholders', () => {
  const ft=parseFirstradeTransactions('Symbol,Action,Quantity,Price,TradeDate,Execution ID\nAAPL,BUY,1,10,2026-01-01,0');
  assert.equal(ib[0].external_id,null); assert.equal(ft[0].external_id,null);
 });
+
+test("IB imports Excel-formatted HK sell symbols without changing the execution or audit row", () => {
+  const header = "Acct ID,Symbol,Trade Date/Time,Settle Date,Exchange,Type,Quantity,Price,Proceeds,Comm,Fee,Order Type,Code,,,";
+  const lines = [
+    'U1234567,133.00,"2026-09-17, 01:33:50",2026/9/21,-,SELL,"-6,000",24.62,"147,720.00",-88.41,-152.21,LMT,C,,,',
+    'U1234567,87.00,"2026-09-22, 21:44:46",2026/9/25,-,SELL,"-10,000",15.04,"150,400.00",-90.01,-156.29,LMT,C;P,,,',
+  ];
+  const rows = parseIbTransactions([header, ...lines].join("\n"), "HK");
+
+  assert.deepEqual(rows.map(({ symbol, transaction_type, traded_at, shares, price, total_amount, commission }) =>
+    ({ symbol, transaction_type, traded_at, shares, price, total_amount, commission })), [
+    { symbol: "133.HK", transaction_type: "SELL", traded_at: "2026-09-17T01:33:50", shares: 6000, price: 24.62, total_amount: 147720, commission: 240.62 },
+    { symbol: "87.HK", transaction_type: "SELL", traded_at: "2026-09-22T21:44:46", shares: 10000, price: 15.04, total_amount: 150400, commission: 246.3 },
+  ]);
+  assert.deepEqual(rows.map((row) => row.raw), lines);
+});
+
+const symbolParsers = [
+  ["IB trades", (symbol, market) => parseIbTransactions(
+    `Symbol,Date/Time,Quantity,Price\n${symbol},2026-09-17,1,24.62`, market)[0]],
+  ["IB holdings", (symbol, market) => parseIbHoldings(
+    `Symbol,Quantity,Cost Price\n${symbol},1,24.62`, market).rows[0]],
+  ["Moomoo trades", (symbol, market) => parseMoomooTransactions(
+    `方向,代码,成交数量,成交价格\n买入,${symbol},1,24.62`, market)[0]],
+  ["Moomoo holdings", (symbol, market) => parseMoomooHoldings(
+    `代码,持有数量,摊薄成本价\n${symbol},1,24.62`, market).rows[0]],
+];
+
+for (const [name, parse] of symbolParsers) {
+  test(`${name} removes zero decimal suffixes from numeric HK codes`, () => {
+    for (const [input, expected] of [
+      ["133.00", "133.HK"],
+      ["87.00", "87.HK"],
+      ["00133.00", "133.HK"],
+      [" 00087.00 ", "87.HK"],
+      ["133.0", "133.HK"],
+      ["133.000", "133.HK"],
+      ["00133.00.HK", "133.HK"],
+      ["133", "133.HK"],
+      ["00700", "700.HK"],
+      ["00700.HK", "700.HK"],
+      ["13300.HK", "13300.HK"],
+      ["8700", "8700.HK"],
+    ]) {
+      assert.equal(parse(input, "HK").symbol, expected, input);
+    }
+  });
+
+  test(`${name} preserves dotted US tickers`, () => {
+    assert.equal(parse("brk.b", "US").symbol, "BRK.B");
+  });
+}

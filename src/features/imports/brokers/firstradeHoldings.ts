@@ -1,8 +1,11 @@
-import { parseCsvNumber, splitCsvLine, stripBom } from "../csv.ts";
-import type { HoldingImportRow, ParseResult } from "../types.ts";
+import { splitCsvLine, stripBom } from "../csv.ts";
+import { isImportSummary, parseImportNumber, recordImportIssue } from "../parseDiagnostics.ts";
+import type { HoldingImportRow, ImportParseIssue, ParseResult } from "../types.ts";
 
 export function parseFirstradeHoldings(text: string): ParseResult<HoldingImportRow> {
   const lines = stripBom(text).split(/\r?\n/);
+  const rows: HoldingImportRow[] = [];
+  const issues: ImportParseIssue[] = [];
   for (let i = 0; i < lines.length; i++) {
     const headers = splitCsvLine(lines[i]).map((field) => field.trim());
     if (!headers.includes("代号") || !headers.includes("股数") || !headers.includes("单位成本")) continue;
@@ -10,23 +13,36 @@ export function parseFirstradeHoldings(text: string): ParseResult<HoldingImportR
     const quantityIndex = headers.indexOf("股数");
     const costIndex = headers.indexOf("单位成本");
     const nameIndex = headers.indexOf("名称");
-    const rows: HoldingImportRow[] = [];
     for (let j = i + 1; j < lines.length; j++) {
       if (!lines[j].trim()) continue;
       const fields = splitCsvLine(lines[j]);
       const raw = (fields[symbolIndex] ?? "").trim();
-      const shares = parseCsvNumber(fields[quantityIndex]);
-      const avgCost = parseCsvNumber(fields[costIndex]);
-      if (!raw || /^(total|summary)$/i.test(raw) || !/[A-Za-z]/.test(raw)
-        || Number.isNaN(shares) || shares <= 0 || Number.isNaN(avgCost)) continue;
+      if (raw === "代号") break;
+      const name = (nameIndex === -1 ? "" : fields[nameIndex] ?? "").trim();
+      if (isImportSummary(raw || name) || /^(美元|股票|现金)$/.test(raw)) continue;
+      if (/^(Stocks|Bonds|Options|Cash|USD)$/i.test(raw) && !fields[quantityIndex]?.trim() && !fields[costIndex]?.trim()) continue;
+      if (!raw && !name && !fields[quantityIndex]?.trim() && !fields[costIndex]?.trim()) continue;
+      if (!/^[A-Za-z][A-Za-z0-9._/-]*$/.test(raw) && fields.filter((field) => field.trim()).length === 1) continue;
+      const shares = parseImportNumber(fields[quantityIndex]);
+      if (Number.isFinite(shares) && shares <= 0) continue;
+      const avgCost = parseImportNumber(fields[costIndex]);
+      const messages: string[] = [];
+      if (!raw) messages.push("缺少证券代码");
+      else if (!/^[A-Za-z][A-Za-z0-9._/-]*$/.test(raw)) messages.push("证券代码格式无效");
+      if (!Number.isFinite(shares)) messages.push("持仓数量缺失或不是有效数字");
+      if (!Number.isFinite(avgCost)) messages.push("成本价缺失或不是有效数字");
+      if (messages.length) {
+        recordImportIssue(issues, j + 1, lines[j], messages);
+        continue;
+      }
       const symbol = raw.toUpperCase();
       rows.push({
         key: String(rows.length), raw: lines[j], selected: true, symbol,
-        name: (nameIndex === -1 ? "" : fields[nameIndex] ?? "").trim() || symbol,
+        name: name || symbol,
         shares, avgCost,
       });
     }
-    if (rows.length) return { rows, warnings: [] };
   }
-  return { rows: [], warnings: ["未找到持仓数据。请确认 CSV 来自 Firstrade 持仓页面，且包含「代号、股数、单位成本」列"] };
+  return { rows, warnings: rows.length ? [] : ["未找到持仓数据。请确认 CSV 来自 Firstrade 持仓页面，且包含「代号、股数、单位成本」列"],
+    ...(issues.length ? { issues } : {}) };
 }

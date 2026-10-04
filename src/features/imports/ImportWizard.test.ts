@@ -20,8 +20,8 @@ function runWizardScenario(scenario) {
     const { createRoot } = await import("react-dom/client");
     const h = React.createElement;
     const passthrough = ({ children }) => h("div", null, children);
-    const Modal = ({ open, children, footer, onCancel, closable }) => open
-      ? h("section", null, children, footer, h("button", { onClick: onCancel, disabled: closable === false }, "关闭窗口"))
+    const Modal = ({ open, title, children, footer, onCancel, closable }) => open
+      ? h("section", { role: "dialog" }, h("h2", null, title), children, footer, h("button", { onClick: onCancel, disabled: closable === false }, "关闭窗口"))
       : null;
     const Upload = { Dragger: ({ beforeUpload, disabled, fileList }) => h("div", null,
       h("output", { "data-file": true }, fileList.map(file => file.name).join(",")),
@@ -32,18 +32,21 @@ function runWizardScenario(scenario) {
       Steps: ({ current }) => h("output", { "data-step": true }, String(current)),
       Alert: ({ message, title, description }) => h("div", { role: "alert" }, message, title, description),
       Table: ({ dataSource }) => h("div", null, dataSource.map(row => h("div", { key: row.key ?? row.symbol }, row.status ?? row.symbol))),
-      Typography: { Text: passthrough, Title: passthrough }, Tag: passthrough,
+      Typography: { Text: passthrough, Title: passthrough, Paragraph: passthrough }, Tag: passthrough,
       Input: () => null, InputNumber: () => null,
       message: { warning() {}, success() {}, error() {} },
     }));
     const { default: ImportWizard } = await import("./src/features/imports/ImportWizard.tsx");
     const row = { key: "row", raw: "original", selected: true, symbol: "SH600036" };
     const requests = [];
+    const applyRequests = [];
     let deferParse, deferPreview;
+    const scenario = ${JSON.stringify(scenario)};
     const batches = new Map();
     dom.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
       if (command === "preview_import_batch") {
         requests.push(args.request);
+        if (scenario === "preview-failure" && requests.length === 1) throw new Error("数据库暂时不可用");
         const batch = { id: args.request.request_id, account_id: args.request.account_id,
           source: args.request.source, file_name: args.request.file_name, parser_version: "1",
           kind: args.request.kind, status: "preview", created_at: "2026-09-25T00:00:00Z",
@@ -54,7 +57,14 @@ function runWizardScenario(scenario) {
         return batch;
       }
       if (command === "apply_import_batch") {
+        applyRequests.push(args);
         const batch = batches.get(args.batchId);
+        if (scenario.startsWith("partial-import") && applyRequests.length === 1) {
+          const result = { ...batch, status: "applied", can_undo: true, rows: batch.rows.map((row, index) => ({ ...row,
+            status: index === 0 ? "imported" : "failed", error: index === 0 ? null : "持仓不足", record_id: index === 0 ? "transaction" : null })) };
+          batches.set(batch.id, result);
+          return result;
+        }
         return { ...batch, status: "applied", can_undo: true,
           rows: batch.rows.map(row => ({ ...row, status: "imported", record_id: "transaction" })) };
       }
@@ -70,7 +80,13 @@ function runWizardScenario(scenario) {
       open, title: "导入交易", accountName: accountId,
       uploadTitle: "上传", uploadDescription: "CSV", columns: () => [],
       adapter: { accountId, source: "同花顺", kind: "transactions", toData: row => ({ symbol: row.symbol }),
-        parseFile: async () => { if (deferParse) await deferParse; return { rows: [row], warnings: [], sourceContent: "example" }; } },
+        parseFile: async () => {
+          if (deferParse) await deferParse;
+          if (scenario === "parse-failure") throw new Error("文件读取失败");
+          const issues = scenario === "partial-parse" || scenario === "empty-parse"
+            ? [{ line: 3, raw: "bad,quantity", message: "数量无效" }] : [];
+          return { rows: scenario === "empty-parse" ? [] : scenario.startsWith("partial-import") ? [row, { ...row, key: "failed", symbol: "133.HK" }] : [row], warnings: [], issues, sourceContent: "example" };
+        } },
       onClose: () => { open = false; render(); },
       // Mirrors the transaction and holding pages: successful imports hide the modal externally.
       onImported: () => { imports += 1; open = false; render(); },
@@ -85,7 +101,44 @@ function runWizardScenario(scenario) {
     const stage = async () => { await click("上传测试文件"); await click("检查"); };
     await act(async () => render());
     let result;
-    if (${JSON.stringify(scenario)} === "reopen") {
+    if (scenario.startsWith("partial-import")) {
+      await stage(); await click("导入所选行");
+      const before = snapshot();
+      const importsBeforeChoice = imports;
+      if (scenario === "partial-import-revise") {
+        await click("返回修改");
+        const editing = snapshot();
+        await click("检查"); await click("导入所选行");
+        result = { before, importsBeforeChoice, editing, after: snapshot(), requests, applyRequests, imports };
+      } else {
+        await click("查看并重试"); await click("完成");
+        const closing = snapshot();
+        await click("暂时跳过并完成");
+        result = { before, importsBeforeChoice, closing, after: snapshot(), imports };
+      }
+    } else if (scenario === "partial-parse") {
+      await click("上传测试文件");
+      const before = snapshot();
+      const checkDisabled = [...container.querySelectorAll("button")].find(button => button.textContent.startsWith("检查"))?.disabled;
+      const requestsBeforeChoice = requests.length;
+      if (container.textContent.includes("跳过错误行，继续检查")) {
+        await click("跳过错误行，继续检查");
+        await click("检查");
+      }
+      result = { before, checkDisabled, requestsBeforeChoice, after: snapshot(), requests };
+    } else if (scenario === "parse-failure" || scenario === "empty-parse") {
+      await click("上传测试文件");
+      result = { ...snapshot(), requests, imports,
+        buttons: [...container.querySelectorAll("button")].filter(button => !button.disabled).map(button => button.textContent) };
+    } else if (scenario === "preview-failure") {
+      await stage();
+      const before = snapshot();
+      if (container.textContent.includes("返回检查")) {
+        await click("返回检查");
+        await click("检查");
+      }
+      result = { before, after: snapshot(), requests, imports };
+    } else if (${JSON.stringify(scenario)} === "reopen") {
       await stage();
       const before = snapshot();
       await click("导入所选行");
@@ -170,4 +223,67 @@ test("finishing the import wizard clears it before the next open", () => {
   const result = runWizardScenario("finish");
   assert.equal(result.step, "0");
   assert.equal(result.file, "");
+});
+
+test("partial CSV parsing requires a choice before checking valid rows", () => {
+  const result = runWizardScenario("partial-parse");
+  assert.match(result.before.text, /有 1 条记录解析失败，如何处理/);
+  assert.match(result.before.text, /数量无效/);
+  assert.match(result.before.text, /bad,quantity/);
+  assert.equal(result.checkDisabled, true);
+  assert.equal(result.requestsBeforeChoice, 0);
+  assert.equal(result.after.step, "2");
+  assert.equal(result.requests.length, 1);
+  assert.equal(result.requests[0].rows.length, 1);
+});
+
+test("a CSV read failure asks whether to choose another file or cancel", () => {
+  const result = runWizardScenario("parse-failure");
+  assert.match(result.text, /解析未完成，如何处理/);
+  assert.match(result.text, /文件读取失败/);
+  assert.ok(result.buttons.includes("重新选择文件"));
+  assert.ok(result.buttons.includes("取消导入"));
+  assert.equal(result.requests.length, 0);
+  assert.equal(result.imports, 0);
+});
+
+test("an entirely invalid CSV cannot skip errors and import an empty result", () => {
+  const result = runWizardScenario("empty-parse");
+  assert.match(result.text, /数量无效/);
+  assert.ok(result.buttons.includes("重新选择文件"));
+  assert.ok(!result.buttons.includes("跳过错误行，继续检查"));
+  assert.equal(result.requests.length, 0);
+});
+
+test("a preview failure preserves rows and lets the user return to retry", () => {
+  const result = runWizardScenario("preview-failure");
+  assert.match(result.before.text, /批次检查失败，如何处理/);
+  assert.match(result.before.text, /数据库暂时不可用/);
+  assert.equal(result.after.step, "2");
+  assert.equal(result.requests.length, 2);
+  assert.equal(result.requests[0].request_id, result.requests[1].request_id);
+  assert.equal(result.imports, 0);
+});
+
+test("partial import stays open and returning to edit stages only failed records", () => {
+  const result = runWizardScenario("partial-import-revise");
+  assert.equal(result.before.step, "2");
+  assert.equal(result.importsBeforeChoice, 0);
+  assert.match(result.before.text, /持仓不足/);
+  assert.equal(result.editing.step, "1");
+  assert.match(result.editing.text, /133.HK/);
+  assert.doesNotMatch(result.editing.text, /SH600036/);
+  assert.deepEqual(result.requests[1].rows.map(row => row.key), ["failed"]);
+  assert.notEqual(result.requests[0].request_id, result.requests[1].request_id);
+  assert.deepEqual(result.applyRequests[1].rowKeys, ["failed"]);
+  assert.equal(result.imports, 1);
+  assert.equal(result.after.step, null);
+});
+
+test("closing an incomplete import requires explicit skip and refreshes the changed account", () => {
+  const result = runWizardScenario("partial-import-close");
+  assert.equal(result.importsBeforeChoice, 0);
+  assert.match(result.closing.text, /仍有记录导入失败，如何处理/);
+  assert.equal(result.imports, 1);
+  assert.equal(result.after.step, null);
 });

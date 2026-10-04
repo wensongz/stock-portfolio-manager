@@ -1,5 +1,6 @@
 import { parseCsvNumber, splitCsvLine, stripBom } from "../csv.ts";
-import type { HoldingImportRow, ParseResult } from "../types.ts";
+import { isImportSummary, parseImportNumber, recordImportIssue } from "../parseDiagnostics.ts";
+import type { HoldingImportRow, ImportParseIssue, ParseResult } from "../types.ts";
 
 function deriveSymbol(code: string, exchange: string): string {
   if (exchange.includes("上海") || exchange.toUpperCase().startsWith("SH")) return `sh${code}`;
@@ -71,20 +72,34 @@ export function parseCnHoldings(text: string): ParseResult<HoldingImportRow> {
   }
 
   const rows: HoldingImportRow[] = [];
+  const issues: ImportParseIssue[] = [];
   for (let i = headerIndex + 1; i < lines.length; i++) {
     if (!lines[i].trim()) continue;
     const fields = splitCsvLine(lines[i]);
     const rawCode = (fields[codeIndex] ?? "").trim();
+    const name = (fields[nameIndex] ?? "").trim();
+    if (rawCode === "证券代码" || isImportSummary(rawCode || name)
+      || /^(股票|现金|人民币|美元|港元|CNY|CNH|USD|HKD)$/i.test(rawCode)) continue;
+    if (!rawCode && !name && !fields[sharesIndex]?.trim() && !fields[costIndex]?.trim()) continue;
     const code = /^\d+$/.test(rawCode) ? rawCode.padStart(6, "0") : rawCode;
-    if (!/^\d{6}$/.test(code)) continue;
-    const shares = parseCsvNumber(fields[sharesIndex]);
-    const avgCost = parseCsvNumber(fields[costIndex]);
-    if (Number.isNaN(shares) || shares <= 0 || Number.isNaN(avgCost)) continue;
+    if (!/^\d{6}$/.test(code) && fields.filter((field) => field.trim()).length === 1) continue;
+    const shares = parseImportNumber(fields[sharesIndex]);
+    if (Number.isFinite(shares) && shares <= 0) continue;
+    const avgCost = parseImportNumber(fields[costIndex]);
+    const messages: string[] = [];
+    if (!rawCode) messages.push("缺少证券代码");
+    else if (!/^\d{6}$/.test(code)) messages.push("证券代码格式无效");
+    if (!Number.isFinite(shares)) messages.push("持仓数量缺失或不是有效数字");
+    if (!Number.isFinite(avgCost)) messages.push("成本价缺失或不是有效数字");
+    if (messages.length) {
+      recordImportIssue(issues, i + 1, lines[i], messages);
+      continue;
+    }
     const exchange = marketIndex === -1 ? "" : (fields[marketIndex] ?? "").trim();
     const symbol = deriveSymbol(code, exchange);
     rows.push({
       key: String(rows.length), raw: lines[i], selected: true, isCash: false, symbol,
-      name: (fields[nameIndex] ?? "").trim() || symbol, shares, avgCost,
+      name: name || symbol, shares, avgCost,
     });
   }
   if (cashAmount !== undefined && cashAmount > 0) {
@@ -93,5 +108,5 @@ export function parseCnHoldings(text: string): ParseResult<HoldingImportRow> {
       name: "现金 (CNY)", shares: cashAmount, avgCost: 1,
     });
   }
-  return { rows, warnings: [] };
+  return { rows, warnings: [], ...(issues.length ? { issues } : {}) };
 }

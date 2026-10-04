@@ -17,7 +17,7 @@ export default function ImportFromThsCsvModal(props: Props) {
       fixedMarket="CN"
       encodings={["utf-8", "gb18030"]}
       allowPay
-      parse={(text) => parseThsCsv(text)}
+      parse={(text, _market, issues) => parseThsCsv(text, issues)}
       uploadDescription="支持同花顺及兼容券商导出的 A 股历史成交 CSV；自动识别买入、卖出和分红。"
     />
   );

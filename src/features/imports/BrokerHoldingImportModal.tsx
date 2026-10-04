@@ -46,13 +46,16 @@ export default function BrokerHoldingImportModal({
     parseFile: async (file) => {
       const texts = await readFileAsText(file, encodings);
       let lastResult: ParseResult<HoldingImportRow> = { rows: [], warnings: [] };
+      let diagnosed: ParseResult<HoldingImportRow> | undefined;
       for (const text of texts) {
-        lastResult = parse(text, accountMarket);
-        if (lastResult.rows.length > 0) return { ...lastResult, sourceContent: text };
+        lastResult = { ...parse(text, accountMarket), sourceContent: text };
+        if (lastResult.rows.length > 0) return lastResult;
+        if (lastResult.issues?.length && !diagnosed) diagnosed = lastResult;
       }
+      if (diagnosed) return diagnosed;
       return lastResult.warnings.length > 0
         ? lastResult
-        : { rows: [], warnings: [`未从 CSV 中识别到 ${brokerName} 持仓记录，请确认导出格式是否正确。`] };
+        : { ...lastResult, warnings: [`未从 CSV 中识别到 ${brokerName} 持仓记录，请确认导出格式是否正确。`] };
     },
     prepareRows: shouldResolveNames ? async (rows) => {
       const names = await resolveStockNames(rows.map((row) => row.symbol), invoke as InvokeFunction);

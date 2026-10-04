@@ -1,3 +1,6 @@
+import type { ImportParseIssue } from "../../features/imports/types.ts";
+import { hasInvalidOptionalImportNumber, isImportSummary, isValidImportDate, parseImportNumber, recordImportIssue } from "../../features/imports/parseDiagnostics.ts";
+
 export type ThsTransactionType = "BUY" | "SELL" | "PAY";
 
 export interface ThsCsvRow {
@@ -42,7 +45,7 @@ function splitCsvLine(line: string): string[] {
 }
 
 function parseNum(s: string | undefined): number {
-  return parseFloat((s ?? "").replace(/,/g, "").trim());
+  return parseImportNumber(s);
 }
 
 function buildDateTime(date: string, time: string): string {
@@ -80,7 +83,7 @@ function explicitTransactionType(operation: string): "BUY" | "SELL" | null {
 }
 
 /** Parse A-share historical trades exported by THS and compatible brokers. */
-export function parseThsCsv(text: string): ThsCsvRow[] {
+export function parseThsCsv(text: string, issues?: ImportParseIssue[]): ThsCsvRow[] {
   const stripped = text.startsWith("\uFEFF") ? text.slice(1) : text;
   const lines = stripped.split(/\r?\n/);
 
@@ -131,21 +134,31 @@ export function parseThsCsv(text: string): ThsCsvRow[] {
     const cols = splitCsvLine(line);
     const get = (j: number) => (j !== -1 ? cols[j] ?? "" : "");
     const code = get(iCode).trim().replace(/^\d{1,5}$/, (s) => s.padStart(6, "0"));
-    if (!/^\d{6}$/.test(code)) continue;
+    if (isImportSummary(code) || code === "证券代码") continue;
 
     const operation = iOp !== -1 ? get(iOp).trim() : "";
-    if (operation === "上海存托服务费扣收") continue;
+    if (/(服务费|转账|转入|转出|利息|银行|配号)/.test(operation)) continue;
     const isDividend = operation === "红股派息"
       || operation === "股息入账"
       || operation === "红利";
 
     const shares = parseNum(get(iShares));
-    if (!isDividend && (isNaN(shares) || shares === 0)) continue;
+    if (!operation && !code && !get(iDate).trim()) continue;
 
     const price = parseNum(get(iPrice));
     const tradeAmount = parseNum(get(iAmount));
     const happenAmt = parseNum(get(iHappen));
 
+    const tradedAt = buildDateTime(get(iDate), get(iTime));
+    const errors: string[] = [];
+    if (!/^\d{6}$/.test(code)) errors.push("证券代码缺失或无效");
+    if (!isValidImportDate(tradedAt)) errors.push("成交日期或时间缺失或无效");
+    if (!isDividend && (!Number.isFinite(shares) || shares === 0)) errors.push("成交数量缺失或无效（不能为 0）");
+    if (!isDividend && (!Number.isFinite(price) || price <= 0)) errors.push("成交价格缺失或无效（需大于 0）");
+    for (const index of [iAmount, iHappen, iCommission, iStamp, iExtra, iTransfer]) {
+      if (index !== -1 && hasInvalidOptionalImportNumber(get(index))) errors.push(`${headers[index]}无效`);
+    }
+    if (errors.length) { recordImportIssue(issues, i + 1, line, errors); continue; }
     let transaction_type: ThsTransactionType;
     let total_amount: number;
 
@@ -153,7 +166,10 @@ export function parseThsCsv(text: string): ThsCsvRow[] {
       const dividendAmount = !isNaN(happenAmt) && happenAmt !== 0
         ? happenAmt
         : tradeAmount;
-      if (isNaN(dividendAmount) || dividendAmount === 0) continue;
+      if (isNaN(dividendAmount) || dividendAmount === 0) {
+        recordImportIssue(issues, i + 1, line, ["分红金额缺失或无效（不能为 0）"]);
+        continue;
+      }
       transaction_type = "PAY";
       total_amount = Math.abs(dividendAmount);
     } else {
@@ -176,7 +192,6 @@ export function parseThsCsv(text: string): ThsCsvRow[] {
     const exchange = get(iExchange);
     const symbol = deriveSymbol(code, exchange);
     const stockName = get(iName).trim();
-    const tradedAt = buildDateTime(get(iDate), get(iTime));
 
     rows.push({
       key: String(idx++),

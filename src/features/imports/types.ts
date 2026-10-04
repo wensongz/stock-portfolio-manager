@@ -32,9 +32,16 @@ export interface HoldingImportRow extends ImportRow {
   isCash?: boolean;
 }
 
+export interface ImportParseIssue {
+  line: number;
+  raw: string;
+  message: string;
+}
+
 export interface ParseResult<Row extends ImportRow> {
   rows: Row[];
   warnings: string[];
+  issues?: ImportParseIssue[];
   sourceContent?: string;
 }
 
@@ -43,4 +50,3 @@ export interface ImportResult {
   failed: number;
   errors: { name: string; error: string }[];
 }
-

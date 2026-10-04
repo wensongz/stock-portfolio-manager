@@ -6,7 +6,7 @@ import { readFileAsText } from "./csv.ts";
 import ImportWizard from "./ImportWizard.tsx";
 import { resolveStockNames, type InvokeFunction } from "./resolveStockNames.ts";
 import { transactionColumns } from "./transactionColumns.tsx";
-import type { TransactionImportRow } from "./types.ts";
+import type { ImportParseIssue, ParseResult, TransactionImportRow } from "./types.ts";
 import type { ImportAdapter } from "./useImportWizard.ts";
 
 interface BrokerTransactionImportModalProps {
@@ -16,7 +16,7 @@ interface BrokerTransactionImportModalProps {
   onImported: () => void;
   brokerName: string;
   uploadDescription: string;
-  parse: (text: string, market: Market) => TransactionImportRow[];
+  parse: (text: string, market: Market, issues?: ImportParseIssue[]) => TransactionImportRow[];
   fixedMarket?: Market;
   encodings?: string[];
   allowPay?: boolean;
@@ -39,11 +39,15 @@ export default function BrokerTransactionImportModal({
     accountId: account.id, source: brokerName, kind: "transactions",
     parseFile: async (file) => {
       const texts = await readFileAsText(file, encodings);
+      let diagnosed: ParseResult<TransactionImportRow> | undefined;
       for (const text of texts) {
-        const rows = parse(text, accountMarket);
-        if (rows.length > 0) return { rows, warnings: [], sourceContent: text };
+        const issues: ImportParseIssue[] = [];
+        const rows = parse(text, accountMarket, issues);
+        const result = { rows, warnings: [], ...(issues.length ? { issues } : {}), sourceContent: text };
+        if (rows.length > 0) return result;
+        if (issues.length && !diagnosed) diagnosed = result;
       }
-      return { rows: [], warnings: [`未从 CSV 中识别到 ${brokerName} 交易记录，请确认导出格式是否正确。`] };
+      return diagnosed ?? { rows: [], warnings: [`未从 CSV 中识别到 ${brokerName} 交易记录，请确认导出格式是否正确。`], sourceContent: texts[0] };
     },
     prepareRows: async (rows) => {
       const names = await resolveStockNames(rows.map((row) => row.symbol), invoke as InvokeFunction);

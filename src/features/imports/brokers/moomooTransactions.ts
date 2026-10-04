@@ -1,18 +1,12 @@
 import dayjs from "dayjs";
 import type { Market } from "../../../types";
-import { parseCsvNumber, splitCsvLine, stripBom } from "../csv.ts";
-import type { TransactionImportRow } from "../types.ts";
-
-function formatSymbol(code: string, market: Market): string {
-  const value = code.trim();
-  if (market === "HK") {
-    const digits = value.replace(/\D/g, "");
-    if (digits) return `${Number.parseInt(digits, 10)}.HK`;
-  }
-  return value.toUpperCase();
-}
+import { splitCsvLine, stripBom } from "../csv.ts";
+import type { ImportParseIssue, TransactionImportRow } from "../types.ts";
+import { formatBrokerSymbol } from "./symbol.ts";
+import { hasInvalidOptionalImportNumber, isImportSummary, isValidImportDate, parseImportNumber as parseCsvNumber, recordImportIssue } from "../parseDiagnostics.ts";
 
 function parseDate(raw: string): string {
+  if (!isValidImportDate(raw)) return "";
   const match = raw.trim().match(/^(\d{4})\/(\d{2})\/(\d{2})(?:\s+(\d{2}:\d{2}(?::\d{2})?))?/);
   if (match) {
     const time = match[4] ? (match[4].length === 5 ? `${match[4]}:00` : match[4]) : "09:30:00";
@@ -30,7 +24,7 @@ function detectMarket(value: string, fallback: Market): Market {
   return fallback;
 }
 
-export function parseMoomooTransactions(text: string, defaultMarket: Market): TransactionImportRow[] {
+export function parseMoomooTransactions(text: string, defaultMarket: Market, issues?: ImportParseIssue[]): TransactionImportRow[] {
   const lines = stripBom(text).split(/\r?\n/);
   const headerIndex = lines.findIndex((line) => splitCsvLine(line)[0]?.trim() === "方向");
   if (headerIndex === -1) return [];
@@ -61,7 +55,7 @@ export function parseMoomooTransactions(text: string, defaultMarket: Market): Tr
       for (const fill of group.fills) {
         rows.push({ key: String(key++), raw: fill.raw, external_id: fill.externalId,
           selected: true, transaction_type: group.direction, stock_name: group.name,
-          symbol: formatSymbol(group.code, group.market), traded_at: fill.time,
+          symbol: formatBrokerSymbol(group.code, group.market), traded_at: fill.time,
           price: fill.price, shares: fill.shares, total_amount: fill.amount, commission: fill.commission });
       }
       return;
@@ -71,7 +65,7 @@ export function parseMoomooTransactions(text: string, defaultMarket: Market): Tr
     rows.push({
       key: String(key++), raw: group.fills.map(fill => fill.raw),
       external_id: group.fills.length === 1 ? group.fills[0].externalId : null, selected: true, transaction_type: group.direction, stock_name: group.name,
-      symbol: formatSymbol(group.code, group.market), traded_at: group.fills[0].time,
+      symbol: formatBrokerSymbol(group.code, group.market), traded_at: group.fills[0].time,
       price: Math.round((shares > 0 ? amount / shares : group.fills[0].price) * 10_000) / 10_000,
       shares, total_amount: Math.round(amount * 100) / 100,
       commission: Math.round(group.fills.reduce((sum, fill) => sum + fill.commission, 0) * 100) / 100,
@@ -83,35 +77,46 @@ export function parseMoomooTransactions(text: string, defaultMarket: Market): Tr
     const fields = splitCsvLine(lines[i]);
     const direction = (fields[directionIndex] ?? "").trim();
     const main = direction === "买入" || direction === "卖出";
-    const child = direction === "" && group !== null;
-    if (!main && !child) continue;
-    const shares = parseCsvNumber(fields[sharesIndex]);
-    const price = parseCsvNumber(fields[priceIndex]);
-    if (Number.isNaN(shares) || Number.isNaN(price)) continue;
-    const amount = parseCsvNumber(fields[amountIndex]);
-    const commission = parseCsvNumber(fields[commissionIndex]);
-    const externalId = (fields[externalIndex] ?? "").trim();
-    const fill = {
-      raw: lines[i], externalId: /^0*$/.test(externalId) ? null : externalId,
-      shares: Math.abs(shares), price: Math.abs(price),
-      amount: Math.abs(Number.isNaN(amount) ? price * shares : amount),
-      time: parseDate(fields[timeIndex] ?? ""),
-      commission: Number.isNaN(commission) ? 0 : Math.abs(commission),
-    };
+    const code = (fields[codeIndex] ?? "").trim();
+    if (isImportSummary(direction) || isImportSummary(code)) { finalize(); group = null; continue; }
     if (main) {
-      const code = (fields[codeIndex] ?? "").trim();
-      if (!code) continue;
       finalize();
       const marketText = marketIndex === -1 ? "" : fields[marketIndex] ?? "";
       group = {
         direction: direction === "卖出" ? "SELL" : "BUY", code,
         name: (nameIndex === -1 ? "" : fields[nameIndex] ?? "").trim() || code,
         market: marketText ? detectMarket(marketText, defaultMarket) : defaultMarket,
-        fills: [fill],
+        fills: [],
       };
-    } else {
-      group!.fills.push(fill);
     }
+    const child = direction === "" && [sharesIndex, priceIndex, amountIndex, timeIndex]
+      .some(index => index !== -1 && (fields[index] ?? "").trim());
+    if (!main && !child) {
+      if (direction) { finalize(); group = null; }
+      continue;
+    }
+    const shares = parseCsvNumber(fields[sharesIndex]);
+    const price = parseCsvNumber(fields[priceIndex]);
+    const time = parseDate(fields[timeIndex] ?? "");
+    const errors: string[] = [];
+    if (!group?.code || !/^[A-Z0-9][A-Z0-9.\-/ ]*$/i.test(group.code)) errors.push("证券代码缺失或无效，无法确定成交所属订单");
+    if (!Number.isFinite(shares) || shares === 0) errors.push("成交数量缺失或无效（不能为 0）");
+    if (!Number.isFinite(price) || price <= 0) errors.push("成交价格缺失或无效（需大于 0）");
+    // Legacy parser callers may use exports without dates; import diagnostics must still surface them.
+    if (!time && (timeIndex !== -1 || issues)) errors.push("成交日期或时间缺失或无效");
+    for (const index of [amountIndex, commissionIndex]) {
+      if (index !== -1 && hasInvalidOptionalImportNumber(fields[index])) errors.push(`${headers[index]} 金额或费用无效`);
+    }
+    if (errors.length) { recordImportIssue(issues, i + 1, lines[i], errors); continue; }
+    const amount = parseCsvNumber(fields[amountIndex]);
+    const commission = parseCsvNumber(fields[commissionIndex]);
+    const externalId = (fields[externalIndex] ?? "").trim();
+    group!.fills.push({
+      raw: lines[i], externalId: /^0*$/.test(externalId) ? null : externalId,
+      shares: Math.abs(shares), price: Math.abs(price),
+      amount: Math.abs(Number.isNaN(amount) ? price * shares : amount), time,
+      commission: Number.isNaN(commission) ? 0 : Math.abs(commission),
+    });
   }
   finalize();
   return rows;

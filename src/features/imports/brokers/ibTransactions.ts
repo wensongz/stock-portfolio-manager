@@ -1,23 +1,18 @@
 import dayjs from "dayjs";
 import type { Market } from "../../../types";
-import { parseCsvNumber, splitCsvLine } from "../csv.ts";
-import type { TransactionImportRow } from "../types.ts";
+import { splitCsvLine, stripBom } from "../csv.ts";
+import type { ImportParseIssue, TransactionImportRow } from "../types.ts";
 import { getCurrencySymbol } from "../../../lib/formatMoney.ts";
+import { formatBrokerSymbol } from "./symbol.ts";
+import { hasInvalidOptionalImportNumber, isImportSummary, isValidImportDate, parseImportNumber as parseCsvNumber, recordImportIssue } from "../parseDiagnostics.ts";
 
 function validAccountId(value: string): boolean {
   return /^[A-Z]{1,3}\d+$/.test(value.trim());
 }
 
-function formatSymbol(symbol: string, market: Market): string {
-  if (market === "HK") {
-    const digits = symbol.replace(/\D/g, "");
-    if (digits) return `${Number.parseInt(digits, 10)}.HK`;
-  }
-  return symbol.toUpperCase();
-}
-
 function parseDate(raw: string): string {
   const cleaned = raw.trim();
+  if (!isValidImportDate(cleaned)) return "";
   const match = cleaned.match(/^(\d{4}-\d{2}-\d{2}),?\s*(\d{2}:\d{2}:\d{2})/);
   if (match) return `${match[1]}T${match[2]}`;
   const strict = dayjs(cleaned, ["YYYY/M/DD", "YYYY-M-D", "YYYY-MM-DD"], true);
@@ -26,7 +21,7 @@ function parseDate(raw: string): string {
   return fallback.isValid() ? fallback.format("YYYY-MM-DDTHH:mm:ss") : "";
 }
 
-function parseTradeTable(lines: string[], headerIndex: number, market: Market, structured: boolean): TransactionImportRow[] {
+function parseTradeTable(lines: string[], headerIndex: number, market: Market, structured: boolean, issues?: ImportParseIssue[]): TransactionImportRow[] {
   const headers = splitCsvLine(lines[headerIndex]).map((field) => field.trim());
   const column = (name: string) => headers.indexOf(name);
   const externalIndex = headers.findIndex(name => ["Trade ID", "TradeID", "Transaction ID", "Execution ID"].includes(name));
@@ -36,6 +31,8 @@ function parseTradeTable(lines: string[], headerIndex: number, market: Market, s
   const priceIndex = column("Price") !== -1 ? column("Price") : column("T. Price");
   const proceedsIndex = column("Proceeds");
   const typeIndex = column("Type");
+  const categoryIndex = column("Asset Category");
+  const discriminatorIndex = column("DataDiscriminator");
   const accountIndex = column("Acct ID");
   const commissionIndex = column("Comm");
   const feeIndex = column("Fee");
@@ -45,14 +42,30 @@ function parseTradeTable(lines: string[], headerIndex: number, market: Market, s
   const rows: TransactionImportRow[] = [];
   for (let i = headerIndex + 1; i < lines.length; i++) {
     const fields = splitCsvLine(lines[i]);
+    if (structured && fields[0]?.trim() === "Trades" && fields[1]?.trim() === "Header") break;
     if (structured && (fields[0]?.trim() !== "Trades" || fields[1]?.trim() !== "Data")) continue;
-    if (!structured && fields.length < 3) continue;
+    if (categoryIndex !== -1 && !/^(Stocks?|ETFs?|股票)$/i.test((fields[categoryIndex] ?? "").trim())) continue;
+    if (discriminatorIndex !== -1 && isImportSummary(fields[discriminatorIndex] ?? "")) continue;
+    const recognizedAccount = accountIndex !== -1 && validAccountId(fields[accountIndex] ?? "");
+    if (!structured && fields.length < 3 && !recognizedAccount) continue;
     const rawSymbol = (fields[symbolIndex] ?? "").trim();
-    if (!rawSymbol || rawSymbol.startsWith("Total") || rawSymbol === "Symbol") continue;
-    if (accountIndex !== -1 && !validAccountId(fields[accountIndex] ?? "")) continue;
+    if (rawSymbol === "Symbol" || isImportSummary(rawSymbol) || isImportSummary(fields[0] ?? "")) continue;
+    // IB emits currency heading rows with no security/trade fields.
+    if (!fields.slice(symbolIndex).some(field => field.trim()) && !recognizedAccount) continue;
     const quantity = parseCsvNumber(fields[quantityIndex]);
     const price = parseCsvNumber(fields[priceIndex]);
-    if (Number.isNaN(quantity) || Number.isNaN(price)) continue;
+    const tradedAt = parseDate(fields[dateIndex] ?? "");
+    const errors: string[] = [];
+    if (!rawSymbol || !/^[A-Z0-9][A-Z0-9.\-/ ]*$/i.test(rawSymbol)) errors.push("证券代码缺失或无效");
+    if (accountIndex !== -1 && !validAccountId(fields[accountIndex] ?? "")) errors.push("账户编号缺失或无效");
+    if (!Number.isFinite(quantity) || quantity === 0) errors.push("成交数量缺失或无效（不能为 0）");
+    if (!Number.isFinite(price) || price <= 0) errors.push("成交价格缺失或无效（需大于 0）");
+    if (!tradedAt) errors.push("成交日期或时间缺失或无效");
+    if (typeIndex !== -1 && !/^(BUY|SELL)$/i.test((fields[typeIndex] ?? "").trim())) errors.push("买卖方向缺失或无效");
+    for (const index of [proceedsIndex, commissionIndex, feeIndex, combinedFeeIndex]) {
+      if (index !== -1 && hasInvalidOptionalImportNumber(fields[index])) errors.push(`${headers[index]} 金额或费用无效`);
+    }
+    if (errors.length) { recordImportIssue(issues, i + 1, lines[i], errors); continue; }
     const action = typeIndex === -1
       ? (quantity >= 0 ? "BUY" : "SELL")
       : ((fields[typeIndex] ?? "").trim().toUpperCase() === "SELL" ? "SELL" : "BUY");
@@ -71,7 +84,7 @@ function parseTradeTable(lines: string[], headerIndex: number, market: Market, s
     const externalId = (fields[externalIndex] ?? "").trim();
     rows.push({
       key: String(i), raw: lines[i], external_id: /^0*$/.test(externalId) ? null : externalId, selected: true, transaction_type: action, stock_name: rawSymbol,
-      symbol: formatSymbol(rawSymbol, market), traded_at: parseDate(fields[dateIndex] ?? ""),
+      symbol: formatBrokerSymbol(rawSymbol, market), traded_at: tradedAt,
       price: Math.abs(price), shares,
       total_amount: Math.abs(Number.isNaN(proceeds) ? price * shares : proceeds), commission,
     });
@@ -94,7 +107,7 @@ function dividendNotes(description: string): string {
   return notes;
 }
 
-function parseDividends(lines: string[], headerIndex: number, market: Market): TransactionImportRow[] {
+function parseDividends(lines: string[], headerIndex: number, market: Market, issues?: ImportParseIssue[]): TransactionImportRow[] {
   const headers = splitCsvLine(lines[headerIndex]).map((field) => field.trim().toLowerCase());
   const dateIndex = headers.indexOf("date");
   const descriptionIndex = headers.indexOf("description");
@@ -105,14 +118,18 @@ function parseDividends(lines: string[], headerIndex: number, market: Market): T
     const fields = splitCsvLine(lines[i]);
     const date = (fields[dateIndex] ?? "").trim();
     const description = (fields[descriptionIndex] ?? "").trim();
-    if (!date || !description || description.toLowerCase().startsWith("total")) continue;
+    if (!description || isImportSummary(description)) continue;
     if (!/(dividend|股息|股利|分红|interest|利息)/i.test(description)) continue;
     const match = description.match(/^([0-9A-Z.\-]+)\s*\(/);
-    if (!match) continue;
-    const symbol = formatSymbol(match[1], market);
+    if (!match && /(interest|利息)/i.test(description)) continue;
+    const symbol = match ? formatBrokerSymbol(match[1], market) : "";
     const amount = parseCsvNumber(fields.slice(amountIndex).join(","));
     const tradedAt = parseDate(date);
-    if (!symbol || Number.isNaN(amount) || !tradedAt) continue;
+    const errors: string[] = [];
+    if (!symbol) errors.push("分红证券代码缺失或无效");
+    if (!Number.isFinite(amount)) errors.push("分红金额缺失或无效");
+    if (!tradedAt) errors.push("分红日期或时间缺失或无效");
+    if (errors.length) { recordImportIssue(issues, i + 1, lines[i], errors); continue; }
     rows.push({
       key: String(i), raw: lines[i], selected: true, transaction_type: "PAY", stock_name: symbol, symbol,
       traded_at: tradedAt, price: 0, shares: 0, total_amount: amount, commission: 0,
@@ -122,27 +139,28 @@ function parseDividends(lines: string[], headerIndex: number, market: Market): T
   return rows;
 }
 
-export function parseIbTransactions(text: string, market: Market): TransactionImportRow[] {
-  const lines = text.split(/\r?\n/);
+export function parseIbTransactions(text: string, market: Market, issues?: ImportParseIssue[]): TransactionImportRow[] {
+  const lines = stripBom(text).split(/\r?\n/);
+  const rows: TransactionImportRow[] = [];
+  let structured = false;
   for (let i = 0; i < lines.length; i++) {
     const fields = splitCsvLine(lines[i]);
     if (fields[0]?.trim() === "Trades" && fields[1]?.trim() === "Header") {
-      const rows = parseTradeTable(lines, i, market, true);
-      if (rows.length) return rows;
+      structured = true;
+      rows.push(...parseTradeTable(lines, i, market, true, issues));
     }
   }
+  if (structured) return rows;
   for (let i = 0; i < lines.length; i++) {
     const fields = splitCsvLine(lines[i]).map((field) => field.trim());
-    if (fields.includes("Symbol")) {
-      const rows = parseTradeTable(lines, i, market, false);
-      if (rows.length) return rows;
+    if (fields.includes("Symbol") && fields.includes("Quantity") && (fields.includes("Price") || fields.includes("T. Price"))) {
+      return parseTradeTable(lines, i, market, false, issues);
     }
   }
   for (let i = 0; i < lines.length; i++) {
     const fields = splitCsvLine(lines[i]).map((field) => field.trim().toLowerCase());
-    if (fields.includes("description")) {
-      const rows = parseDividends(lines, i, market);
-      if (rows.length) return rows;
+    if (fields.includes("description") && fields.includes("date") && fields.includes("amount")) {
+      return parseDividends(lines, i, market, issues);
     }
   }
   return [];

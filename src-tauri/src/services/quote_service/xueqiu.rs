@@ -1,4 +1,4 @@
-use super::timestamp_to_market_date;
+use super::{normalize_us_symbol, timestamp_to_market_date};
 use crate::models::{PriceCandle, StockQuote};
 use crate::services::http_client;
 use chrono::Utc;
@@ -739,9 +739,9 @@ pub(super) fn to_xueqiu_cn_symbol(symbol: &str) -> Result<String, String> {
 }
 
 /// Convert a US stock symbol to Xueqiu format.
-/// Replaces hyphens with dots (e.g., "BRK-B" → "BRK.B") and converts to uppercase.
+/// Normalizes share-class separators to dots (e.g., "BRK B" → "BRK.B").
 pub(super) fn to_xueqiu_us_symbol(symbol: &str) -> String {
-    symbol.to_uppercase().replace('-', ".")
+    normalize_us_symbol(symbol)
 }
 
 /// Convert a HK stock symbol to Xueqiu format.

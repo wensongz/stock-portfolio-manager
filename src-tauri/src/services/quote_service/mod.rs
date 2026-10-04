@@ -62,6 +62,25 @@ use yahoo::{fetch_yahoo_quotes_batch, plan_yahoo_quote_batches};
 /// Cash symbols follow the pattern `$CASH-{CURRENCY}`, e.g. `$CASH-USD`, `$CASH-CNY`, `$CASH-HKD`.
 pub const CASH_SYMBOL_PREFIX: &str = "$CASH-";
 
+/// Normalize US share-class aliases at the provider boundary, using dots.
+/// Imported symbols such as "BRK B" must retain their original storage keys.
+fn normalize_us_symbol(symbol: &str) -> String {
+    let normalized = symbol.trim().to_ascii_uppercase().replace(['-', '_'], ".");
+    if let Some((ticker, share_class)) = normalized.split_once(char::is_whitespace) {
+        let share_class = share_class.trim();
+        // Only interpret whitespace as a separator before a single class letter;
+        // arbitrary multi-word input must still fail the batch validators.
+        if !ticker.is_empty()
+            && ticker.chars().all(|ch| ch.is_ascii_alphanumeric())
+            && share_class.len() == 1
+            && share_class.chars().all(|ch| ch.is_ascii_alphabetic())
+        {
+            return format!("{ticker}.{share_class}");
+        }
+    }
+    normalized
+}
+
 #[derive(Debug, Clone)]
 pub struct QuoteFetchResult<T> {
     pub data: T,

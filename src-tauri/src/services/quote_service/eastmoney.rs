@@ -1,3 +1,4 @@
+use super::normalize_us_symbol;
 use crate::models::{PriceCandle, StockQuote};
 use crate::services::http_client;
 use chrono::Utc;
@@ -491,14 +492,14 @@ pub(super) fn to_eastmoney_secid(symbol: &str) -> Result<String, String> {
 
 /// Convert a US stock ticker to East Money secid format.
 /// Regular tickers use "105.{TICKER}" (e.g., "105.AAPL").
-/// Tickers with hyphens use "106.{TICKER}" with hyphens replaced by underscores
-/// (e.g., "BRK-B" → "106.BRK_B").
+/// Share-class tickers use "106.{TICKER}" with underscore separators
+/// (e.g., "BRK B", "BRK.B", "BRK-B", "BRK_B" → "106.BRK_B").
 pub(super) fn to_eastmoney_us_secid(symbol: &str) -> String {
-    let upper = symbol.to_uppercase();
-    if upper.contains('-') {
-        format!("106.{}", upper.replace('-', "_"))
+    let code = normalize_us_symbol(symbol).replace('.', "_");
+    if code.contains('_') {
+        format!("106.{}", code)
     } else {
-        format!("105.{}", upper)
+        format!("105.{}", code)
     }
 }
 
@@ -536,7 +537,7 @@ fn to_eastmoney_batch_secids(symbol: &str, market: &str) -> Result<Vec<String>, 
         }
         "HK" => Ok(vec![to_eastmoney_hk_secid(symbol)?]),
         "US" => {
-            let code = symbol.trim().to_uppercase().replace(['-', '.'], "_");
+            let code = normalize_us_symbol(symbol).replace('.', "_");
             if !is_safe_eastmoney_us_code(&code) {
                 return Err(format!("Invalid US symbol: {}", symbol));
             }

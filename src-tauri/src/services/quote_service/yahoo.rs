@@ -1,4 +1,4 @@
-use super::timestamp_to_market_date;
+use super::{normalize_us_symbol, timestamp_to_market_date};
 use crate::models::StockQuote;
 use crate::services::http_client;
 use chrono::Utc;
@@ -394,12 +394,12 @@ pub async fn fetch_yahoo_quote(symbol: &str, market: &str) -> Result<StockQuote,
     })
 }
 
-/// Convert a holding symbol + market to a Yahoo Finance ticker for historical queries.
+/// Convert a holding symbol + market to a Yahoo Finance ticker for quotes and history.
 pub fn to_yahoo_symbol(symbol: &str, market: &str) -> String {
     match market {
         "US" => {
-            // Yahoo Finance uses hyphens in US symbols (e.g., "BRK-B"), convert dots to hyphens.
-            symbol.trim().to_ascii_uppercase().replace('.', "-")
+            // Yahoo Finance uses hyphens for share classes (e.g., "BRK-B").
+            normalize_us_symbol(symbol).replace('.', "-")
         }
         "HK" => {
             let normalized = symbol.trim().to_ascii_uppercase();

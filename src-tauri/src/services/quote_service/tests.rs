@@ -444,11 +444,19 @@ fn eastmoney_batch_plan_caps_expanded_secids_at_two_hundred() {
 #[test]
 fn eastmoney_batch_parser_fans_one_api_quote_out_to_aliases() {
     let symbols = vec![
+        ("BRK B".to_string(), "US".to_string()),
         ("BRK-B".to_string(), "US".to_string()),
         ("BRK.B".to_string(), "US".to_string()),
+        ("BRK_B".to_string(), "US".to_string()),
     ];
     let (batches, invalid) = plan_eastmoney_quote_batches(&symbols);
     assert!(invalid.is_empty());
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].len(), 1);
+    assert_eq!(
+        batches[0][0].api_secids,
+        vec!["105.BRK_B", "106.BRK_B", "107.BRK_B", "153.BRK_B"]
+    );
     let body = r#"{
         "rc": 0,
         "data": {
@@ -461,7 +469,7 @@ fn eastmoney_batch_parser_fans_one_api_quote_out_to_aliases() {
     let quotes = parse_eastmoney_batch_body(body, &batches[0]).unwrap();
     let returned: Vec<&str> = quotes.iter().map(|quote| quote.symbol.as_str()).collect();
 
-    assert_eq!(returned, vec!["BRK-B", "BRK.B"]);
+    assert_eq!(returned, vec!["BRK B", "BRK-B", "BRK.B", "BRK_B"]);
 }
 
 #[test]
@@ -693,6 +701,11 @@ fn test_to_eastmoney_us_secid() {
     assert_eq!(to_eastmoney_us_secid("BRK-B"), "106.BRK_B");
     assert_eq!(to_eastmoney_us_secid("BRK-A"), "106.BRK_A");
     assert_eq!(to_eastmoney_us_secid("BF-B"), "106.BF_B");
+    for symbol in ["BRK B", "BRK.B", "BRK_B", " brk b ", "BRK  B"] {
+        assert_eq!(to_eastmoney_us_secid(symbol), "106.BRK_B", "{symbol}");
+    }
+    assert_eq!(to_eastmoney_us_secid("BRK A"), "106.BRK_A");
+    assert_eq!(to_eastmoney_us_secid("BF B"), "106.BF_B");
 }
 
 #[test]
@@ -1295,6 +1308,51 @@ fn test_to_yahoo_symbol_us() {
     assert_eq!(to_yahoo_symbol("BF.B", "US"), "BF-B");
     // Hyphens should remain unchanged
     assert_eq!(to_yahoo_symbol("BRK-B", "US"), "BRK-B");
+    for symbol in ["BRK B", "BRK_B", " brk b ", "BRK  B"] {
+        assert_eq!(to_yahoo_symbol(symbol, "US"), "BRK-B", "{symbol}");
+    }
+    assert_eq!(to_yahoo_symbol("BRK A", "US"), "BRK-A");
+    assert_eq!(to_yahoo_symbol("BF B", "US"), "BF-B");
+}
+
+#[test]
+fn yahoo_batch_share_class_aliases_use_one_api_symbol_and_preserve_stored_symbols() {
+    let symbols = vec![
+        ("BRK B".to_string(), "US".to_string()),
+        ("BRK.B".to_string(), "US".to_string()),
+        ("BRK-B".to_string(), "US".to_string()),
+        ("BRK_B".to_string(), "US".to_string()),
+    ];
+    let (batches, invalid) = plan_yahoo_quote_batches(&symbols);
+    assert!(invalid.is_empty());
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].len(), 1);
+    assert_eq!(batches[0][0].api_symbol, "BRK-B");
+    let url = url::Url::parse(&build_yahoo_spark_url(&batches[0])).unwrap();
+    assert_eq!(
+        url.query_pairs()
+            .find(|(key, _)| key == "symbols")
+            .unwrap()
+            .1,
+        "BRK-B"
+    );
+    let body = r#"{
+        "spark": {"result": [{"symbol":"BRK-B","response":[{
+            "meta":{"symbol":"BRK-B","regularMarketPrice":500.0,"previousClose":495.0}
+        }]}],"error":null}
+    }"#;
+
+    let quotes = parse_yahoo_spark_body(body, &batches[0]).unwrap();
+    assert_eq!(
+        quotes
+            .iter()
+            .map(|quote| quote.symbol.as_str())
+            .collect::<Vec<_>>(),
+        vec!["BRK B", "BRK.B", "BRK-B", "BRK_B"]
+    );
+    assert!(quotes
+        .iter()
+        .all(|quote| quote.market == "US" && quote.current_price == 500.0));
 }
 
 #[test]
@@ -1934,6 +1992,11 @@ fn test_to_xueqiu_us_symbol() {
     // Simple symbols without hyphens should just uppercase
     assert_eq!(to_xueqiu_us_symbol("AAPL"), "AAPL");
     assert_eq!(to_xueqiu_us_symbol("aapl"), "AAPL");
+    for symbol in ["BRK B", "BRK_B", " brk b ", "BRK  B"] {
+        assert_eq!(to_xueqiu_us_symbol(symbol), "BRK.B", "{symbol}");
+    }
+    assert_eq!(to_xueqiu_us_symbol("BRK A"), "BRK.A");
+    assert_eq!(to_xueqiu_us_symbol("BF B"), "BF.B");
 }
 
 #[test]
@@ -2066,8 +2129,10 @@ fn test_parse_xueqiu_realtime_body_ignores_unusable_items() {
 #[test]
 fn test_xueqiu_realtime_aliases_share_one_api_symbol_and_fan_out() {
     let symbols = vec![
+        ("BRK B".to_string(), "US".to_string()),
         ("BRK-B".to_string(), "US".to_string()),
         ("BRK.B".to_string(), "US".to_string()),
+        ("BRK_B".to_string(), "US".to_string()),
         ("aapl".to_string(), "US".to_string()),
         ("AAPL".to_string(), "US".to_string()),
         ("00700".to_string(), "HK".to_string()),
@@ -2096,7 +2161,7 @@ fn test_xueqiu_realtime_aliases_share_one_api_symbol_and_fan_out() {
     let returned_symbols: Vec<&str> = quotes.iter().map(|quote| quote.symbol.as_str()).collect();
     assert_eq!(
         returned_symbols,
-        vec!["BRK-B", "BRK.B", "aapl", "AAPL", "00700", "0700.HK"]
+        vec!["BRK B", "BRK-B", "BRK.B", "BRK_B", "aapl", "AAPL", "00700", "0700.HK"]
     );
 }
 

@@ -11,7 +11,6 @@ import {
   Col,
   InputNumber,
   Space,
-  Upload,
   message,
   Modal,
   Input,
@@ -19,7 +18,6 @@ import {
   Alert,
 } from "antd";
 import {
-  UploadOutlined,
   DeleteOutlined,
   DollarOutlined,
   StockOutlined,
@@ -53,6 +51,7 @@ import {
 } from "./activeOptionsViewModel";
 import type { ActiveUnderlyingSummary } from "./activeOptionsViewModel";
 import { formatMoney } from "../../lib/formatMoney";
+import OptionsCsvImport from "./OptionsCsvImport";
 
 const { Title, Text } = Typography;
 
@@ -72,7 +71,6 @@ export default function OptionsPage() {
     putSimulations,
     callSimulations,
     fetchContracts,
-    importOptionsCsv,
     simulateSellPut,
     simulateSellCall,
     deleteOptionRecords,
@@ -414,44 +412,22 @@ export default function OptionsPage() {
     [expiredContracts],
   );
 
-  // Handle CSV import
-  const handleImport = useCallback(
-    async (file: File) => {
-      if (!selectedAccountId) {
-        message.error("请先选择证券账户");
-        return false;
+  const handleImported = useCallback(
+    (accountId: string) => {
+      const refreshAccountId = resolveCurrentOptionAccount(
+        accountId,
+        selectedAccountIdRef.current,
+      );
+      if (refreshAccountId) {
+        activeUnderlyingSelectedByUserRef.current = false;
+        setSelectedActiveUnderlying(null);
+        expiredUnderlyingSelectedByUserRef.current = false;
+        setSelectedExpiredUnderlying(null);
+        fetchContracts(refreshAccountId);
+        fetchOptionReview(refreshAccountId, null);
       }
-      const text = await file.text();
-      try {
-        const result = await importOptionsCsv(selectedAccountId, text);
-        if (result.errors.length > 0) {
-          message.warning(
-            `导入完成：成功 ${result.imported} 条，跳过 ${result.skipped} 条，错误 ${result.errors.length} 条`
-          );
-          console.error("[期权导入错误]", result.errors);
-        } else {
-          message.success(
-            `导入成功：${result.imported} 条记录，跳过 ${result.skipped} 条`
-          );
-        }
-        const refreshAccountId = resolveCurrentOptionAccount(
-          selectedAccountId,
-          selectedAccountIdRef.current,
-        );
-        if (refreshAccountId) {
-          activeUnderlyingSelectedByUserRef.current = false;
-          setSelectedActiveUnderlying(null);
-          expiredUnderlyingSelectedByUserRef.current = false;
-          setSelectedExpiredUnderlying(null);
-          fetchContracts(refreshAccountId);
-          fetchOptionReview(refreshAccountId, null);
-        }
-      } catch (err) {
-        message.error(`导入失败: ${err}`);
-      }
-      return false; // Prevent default upload
     },
-    [selectedAccountId, importOptionsCsv, fetchContracts, fetchOptionReview]
+    [fetchContracts, fetchOptionReview]
   );
 
   // Handle stock price change and trigger simulation
@@ -1225,16 +1201,7 @@ export default function OptionsPage() {
               value: a.id,
             }))}
           />
-          <Upload
-            accept=".csv"
-            showUploadList={false}
-            beforeUpload={handleImport}
-            disabled={!selectedAccountId}
-          >
-            <Button icon={<UploadOutlined />} disabled={!selectedAccountId}>
-              导入CSV
-            </Button>
-          </Upload>
+          <OptionsCsvImport accountId={selectedAccountId} accountName={selectedAccountName} onImported={handleImported} />
           <Button
             icon={<DeleteOutlined />}
             danger

@@ -7,7 +7,7 @@ mod csv;
 mod simulation;
 
 pub use contracts::get_option_contracts_inner;
-pub use csv::ImportOptionsResult;
+pub use csv::{ImportOptionsResult, OptionsCsvPreview};
 pub use simulation::StockPriceInput;
 
 #[cfg(test)]
@@ -20,6 +20,15 @@ pub fn import_options_csv(
     csv_content: String,
 ) -> Result<ImportOptionsResult, String> {
     csv::import_options_csv_inner(&db, &account_id, &csv_content)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn preview_options_csv(
+    db: State<Database>,
+    account_id: String,
+    csv_content: String,
+) -> Result<OptionsCsvPreview, String> {
+    csv::preview_options_csv_inner(&db, &account_id, &csv_content)
 }
 
 #[tauri::command(rename_all = "camelCase")]

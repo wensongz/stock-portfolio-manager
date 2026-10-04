@@ -5,6 +5,7 @@ import type {
   SellPutSimulation,
   SellCallSimulation,
   ImportOptionsResult,
+  OptionsCsvPreview,
   StockPriceInput,
 } from "../types";
 
@@ -17,6 +18,7 @@ interface OptionState {
   contractsError: string | null;
 
   fetchContracts: (accountId: string) => Promise<void>;
+  previewOptionsCsv: (accountId: string, csvContent: string) => Promise<OptionsCsvPreview>;
   importOptionsCsv: (accountId: string, csvContent: string) => Promise<ImportOptionsResult>;
   simulateSellPut: (accountId: string, stockPrices: StockPriceInput[]) => Promise<void>;
   simulateSellCall: (accountId: string, stockPrices: StockPriceInput[]) => Promise<void>;
@@ -50,6 +52,9 @@ export const useOptionStore = create<OptionState>((set) => ({
       }
     }
   },
+
+  previewOptionsCsv: (accountId: string, csvContent: string) =>
+    invoke<OptionsCsvPreview>("preview_options_csv", { accountId, csvContent }),
 
   importOptionsCsv: async (accountId: string, csvContent: string) => {
     const result = await invoke<ImportOptionsResult>("import_options_csv", {

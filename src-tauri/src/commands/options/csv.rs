@@ -1,6 +1,8 @@
 use super::contracts;
 use crate::db::Database;
 use crate::services::option_matching::{match_options_fifo, MatchRecord};
+use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::hash::{Hash, Hasher};
 use tracing::warn;
 
 fn parse_option_symbol(symbol: &str) -> Result<(String, String, f64, String), String> {
@@ -50,6 +52,13 @@ struct ParsedOptionRow {
     settled_at: Option<String>,
 }
 
+struct ParsedOptionsCsv {
+    rows: Vec<ParsedOptionRow>,
+    total_rows: usize,
+    skipped: usize,
+    errors: Vec<String>,
+}
+
 fn parsed_row_match_record(row: &ParsedOptionRow) -> MatchRecord {
     MatchRecord {
         id: row.id.clone(),
@@ -65,13 +74,7 @@ fn parsed_row_match_record(row: &ParsedOptionRow) -> MatchRecord {
     }
 }
 
-pub(super) fn import_options_csv_inner(
-    db: &Database,
-    account_id: &str,
-    csv_content: &str,
-) -> Result<ImportOptionsResult, String> {
-    let mut conn = db.conn.lock().map_err(|e| e.to_string())?;
-
+fn parse_options_rows(csv_content: &str) -> Result<ParsedOptionsCsv, String> {
     // Strip UTF-8 BOM if present
     let content = csv_content.strip_prefix('\u{feff}').unwrap_or(csv_content);
 
@@ -85,7 +88,7 @@ pub(super) fn import_options_csv_inner(
         .map_err(|e| format!("Failed to read CSV headers: {}", e))?
         .clone();
 
-    let mut imported = 0;
+    let mut total_rows = 0;
     let mut skipped = 0;
     let mut errors: Vec<String> = Vec::new();
 
@@ -93,6 +96,7 @@ pub(super) fn import_options_csv_inner(
     let mut parsed: Vec<ParsedOptionRow> = Vec::new();
 
     for (i, result) in reader.records().enumerate() {
+        total_rows += 1;
         let record = match result {
             Ok(r) => r,
             Err(e) => {
@@ -238,7 +242,7 @@ pub(super) fn import_options_csv_inner(
         );
 
         parsed.push(ParsedOptionRow {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: String::new(),
             row_num: i + 2,
             option_symbol,
             underlying,
@@ -257,13 +261,75 @@ pub(super) fn import_options_csv_inner(
         });
     }
 
-    let transaction = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| e.to_string())?;
+    Ok(ParsedOptionsCsv {
+        rows: parsed,
+        total_rows,
+        skipped,
+        errors,
+    })
+}
 
+fn assign_import_ids(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    csv_content: &str,
+    rows: &mut [ParsedOptionRow],
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut statement = conn
+        .prepare("SELECT id FROM option_records")
+        .map_err(|error| error.to_string())?;
+    let existing_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    // FIFO uses IDs to break equal-time ties. Preview and import must therefore
+    // derive the same IDs and persist them unchanged. Salting against every
+    // account's existing IDs keeps re-imports valid without adding deduplication.
+    let mut content_hasher = DefaultHasher::new();
+    (account_id, csv_content).hash(&mut content_hasher);
+    let content_hash = content_hasher.finish();
+    for salt in 0..=u64::MAX {
+        let mut high_hasher = DefaultHasher::new();
+        (content_hash, salt, 0_u8).hash(&mut high_hasher);
+        let mut low_hasher = DefaultHasher::new();
+        (content_hash, salt, 1_u8).hash(&mut low_hasher);
+        let base = ((high_hasher.finish() as u128) << 64) | low_hasher.finish() as u128;
+        if base
+            .checked_add(rows.last().unwrap().row_num as u128)
+            .is_none()
+        {
+            continue;
+        }
+        let ids: Vec<_> = rows
+            .iter()
+            .map(|row| uuid::Uuid::from_u128(base + row.row_num as u128).to_string())
+            .collect();
+        if ids.iter().any(|id| existing_ids.contains(id)) {
+            continue;
+        }
+        for (row, id) in rows.iter_mut().zip(ids) {
+            row.id = id;
+        }
+        return Ok(());
+    }
+    Err("Could not allocate option import IDs".to_string())
+}
+
+fn validate_matching_rows(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    csv_content: &str,
+    parsed: &mut ParsedOptionsCsv,
+) -> Result<(), String> {
+    assign_import_ids(conn, account_id, csv_content, &mut parsed.rows)?;
     // ---- Boundary check: use the same conserved FIFO engine as status and review ----
-    let (existing_records, splits) = contracts::load_matching_inputs(&transaction, account_id)?;
-    let mut accepted: Vec<&ParsedOptionRow> = parsed.iter().collect();
+    let (existing_records, splits) = contracts::load_matching_inputs(conn, account_id)?;
+    let mut accepted: Vec<&ParsedOptionRow> = parsed.rows.iter().collect();
     loop {
         let mut candidates = existing_records.clone();
         candidates.extend(accepted.iter().map(|row| parsed_row_match_record(row)));
@@ -280,20 +346,72 @@ pub(super) fn import_options_csv_inner(
         accepted.retain(|row| !rejected_ids.contains(row.id.as_str()));
     }
     let accepted_ids: std::collections::HashSet<_> =
-        accepted.iter().map(|row| row.id.as_str()).collect();
+        accepted.iter().map(|row| row.id.clone()).collect();
     for row in parsed
+        .rows
         .iter()
         .filter(|row| !accepted_ids.contains(row.id.as_str()))
     {
-        errors.push(format!(
+        parsed.errors.push(format!(
             "Row {}: close record {} ({}) has no matching open record; skipped. \
              If the contract was split-adjusted, configure the split info in Settings first",
             row.row_num, row.option_symbol, row.code
         ));
     }
+    parsed.rows.retain(|row| accepted_ids.contains(&row.id));
+    Ok(())
+}
+
+/// Validate the complete import against current matching inputs without writing.
+pub(super) fn preview_options_csv_inner(
+    db: &Database,
+    account_id: &str,
+    csv_content: &str,
+) -> Result<OptionsCsvPreview, String> {
+    let mut parsed = parse_options_rows(csv_content)?;
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    validate_matching_rows(&conn, account_id, csv_content, &mut parsed)?;
+    let rows: Vec<_> = parsed
+        .rows
+        .into_iter()
+        .map(|row| OptionsCsvPreviewRow {
+            row_number: row.row_num,
+            option_symbol: row.option_symbol,
+            traded_at: row.traded_at,
+            action: row.action,
+            code: row.code,
+            quantity: row.quantity,
+            price: row.price,
+            amount: row.amount,
+            commission: row.commission,
+            fee: row.fee,
+        })
+        .collect();
+
+    Ok(OptionsCsvPreview {
+        total_rows: parsed.total_rows,
+        importable: rows.len(),
+        skipped: parsed.total_rows - rows.len(),
+        errors: parsed.errors,
+        rows,
+    })
+}
+
+pub(super) fn import_options_csv_inner(
+    db: &Database,
+    account_id: &str,
+    csv_content: &str,
+) -> Result<ImportOptionsResult, String> {
+    let mut parsed = parse_options_rows(csv_content)?;
+    let mut conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    validate_matching_rows(&transaction, account_id, csv_content, &mut parsed)?;
+    let imported = parsed.rows.len();
 
     // ---- Pass 2: insert the accepted subset ----
-    for row in accepted {
+    for row in parsed.rows {
         let now = chrono::Utc::now().to_rfc3339();
 
         transaction.execute(
@@ -320,13 +438,11 @@ pub(super) fn import_options_csv_inner(
             ],
         )
         .map_err(|e| format!("Row {}: {}", row.row_num, e))?;
-
-        imported += 1;
     }
 
-    if !errors.is_empty() {
-        warn!("[期权导入] 错误 {} 条:", errors.len());
-        for e in &errors {
+    if !parsed.errors.is_empty() {
+        warn!("[期权导入] 错误 {} 条:", parsed.errors.len());
+        for e in &parsed.errors {
             warn!("  - {}", e);
         }
     }
@@ -340,8 +456,8 @@ pub(super) fn import_options_csv_inner(
 
     Ok(ImportOptionsResult {
         imported,
-        skipped,
-        errors,
+        skipped: parsed.skipped,
+        errors: parsed.errors,
     })
 }
 
@@ -543,6 +659,30 @@ pub(super) fn parse_options_csv_inner(
 }
 
 // --- Helper types and functions ---
+
+#[derive(Debug, serde::Serialize)]
+pub struct OptionsCsvPreview {
+    pub total_rows: usize,
+    pub importable: usize,
+    /// Every input row that would not be inserted, including validation errors.
+    pub skipped: usize,
+    pub errors: Vec<String>,
+    pub rows: Vec<OptionsCsvPreviewRow>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct OptionsCsvPreviewRow {
+    pub row_number: usize,
+    pub option_symbol: String,
+    pub traded_at: Option<String>,
+    pub action: String,
+    pub code: String,
+    pub quantity: i64,
+    pub price: f64,
+    pub amount: f64,
+    pub commission: f64,
+    pub fee: f64,
+}
 
 #[derive(Debug, serde::Serialize)]
 pub struct ImportOptionsResult {

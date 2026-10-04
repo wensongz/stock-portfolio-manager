@@ -1,7 +1,10 @@
 #[rustfmt::skip]
 use super::*;
 use super::contracts::recompute_option_statuses;
-use super::csv::{export_options_csv_inner, get_field, import_options_csv_inner, normalize_action};
+use super::csv::{
+    export_options_csv_inner, get_field, import_options_csv_inner, normalize_action,
+    preview_options_csv_inner,
+};
 use crate::db::Database;
 use ::csv::StringRecord;
 
@@ -386,6 +389,338 @@ fn test_parse_english_header_csv_preview() {
         "expected no errors, got: {:?}",
         preview.error_rows
     );
+}
+
+#[test]
+fn test_options_csv_preview_serializes_only_accepted_rows_with_original_values() {
+    let (db, account_id) = db_with_account();
+    let csv = "账户,股票,交易时间,操作,股票数量,价格,金额,佣金,费用,代码
+a,AAPL 20FEB26 100 P,\"2026-01-15, 10:30:00\",卖出,-2,1.234567,246.9134,-0.123456,0.00005,O
+Total,,,,,,,,,
+a,AAPL 20FEB26 100 P,2026-01-15,卖出,1,invalid,200,0,0,O
+a,MSFT 20FEB26 100 P,2026-02-20,买入,1,0.10,10,0,0,C
+a,AAPL 20FEB26 100 P,2026-02-20,Buy to Close,2,0.987654,-197.5308,-1.005,0.04,C
+a,,2026-01-15,卖出,1,2.00,200,0,0,O
+a,BRK B 20MAR26 330 C,,买入,1,12.123456789,,,,O
+";
+    db.conn
+        .lock()
+        .unwrap()
+        .pragma_update(None, "query_only", true)
+        .unwrap();
+
+    let preview = preview_options_csv_inner(&db, &account_id, csv).unwrap();
+    assert_eq!(preview.total_rows, 7);
+    assert_eq!(preview.importable, 3);
+    assert_eq!(preview.skipped, 4);
+    assert_eq!(preview.errors.len(), 2);
+    let serialized = serde_json::to_value(preview).unwrap();
+    assert_eq!(
+        serialized["rows"],
+        serde_json::json!([
+            {
+                "row_number": 2,
+                "option_symbol": "AAPL 20FEB26 100 P",
+                "traded_at": "2026-01-15, 10:30:00",
+                "action": "SELL",
+                "code": "O",
+                "quantity": -2,
+                "price": 1.234567,
+                "amount": 246.9134,
+                "commission": -0.123456,
+                "fee": 0.00005,
+            },
+            {
+                "row_number": 6,
+                "option_symbol": "AAPL 20FEB26 100 P",
+                "traded_at": "2026-02-20",
+                "action": "BUY",
+                "code": "C",
+                "quantity": 2,
+                "price": 0.987654,
+                "amount": -197.5308,
+                "commission": -1.005,
+                "fee": 0.04,
+            },
+            {
+                "row_number": 8,
+                "option_symbol": "BRK B 20MAR26 330 C",
+                "traded_at": null,
+                "action": "BUY",
+                "code": "O",
+                "quantity": 1,
+                "price": 12.123456789,
+                "amount": 0.0,
+                "commission": 0.0,
+                "fee": 0.0,
+            },
+        ])
+    );
+    let count: i64 = db
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM option_records", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "preview rows must not be inserted");
+}
+
+#[test]
+fn test_options_csv_preview_rows_exclude_excess_closes_after_fifo_validation() {
+    let (db, account_id) = db_with_account();
+    insert_exposure_record(
+        &db,
+        &account_id,
+        "P",
+        "existing-open",
+        1,
+        true,
+        "2026-08-01",
+    );
+    let csv = "Symbol,Trade Date,Action,Quantity,Price,Code
+AAPL 18SEP26 100 P,2026-08-02,BUY,2,0.5,C
+";
+
+    let preview = preview_options_csv_inner(&db, &account_id, csv).unwrap();
+    assert_eq!(preview.importable, 0);
+    assert_eq!(preview.skipped, 1);
+    assert_eq!(preview.errors.len(), 1);
+    assert_eq!(
+        serde_json::to_value(preview).unwrap()["rows"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn test_options_csv_preview_counts_every_row_using_import_validation() {
+    let (db, account_id) = db_with_account();
+    let csv = "账户,股票,交易时间,操作,股票数量,价格,金额,佣金,费用,代码
+a,AAPL 20FEB26 100 P,2026-01-15,卖出,1,2.00,200,0,0,O
+a,AAPL 20FEB26 100 P,2026-02-20,买入,1,0.10,10,0,0,C
+a,AAPL 20FEB26 100 P,2026-01-15,卖出,1,oops,200,0,0,O
+a,AAPL 20FEB26 100 P,2026-01-15,卖出,1.5,2.00,200,0,0,O
+a,AAPL 20FEB26 100 P,2026-01-15,卖出,1,2.00,NaN,0,0,O
+a,MSFT 20FEB26 100 P,2026-02-20,买入,1,0.10,10,0,0,C
+Total,,,,,,,,,
+a,,2026-01-15,卖出,1,2.00,200,0,0,O
+,AAPL 20FEB26 100 P,2026-01-15,卖出,1,2.00,200,0,0,O
+";
+
+    let preview = preview_options_csv_inner(&db, &account_id, csv).unwrap();
+    assert_eq!(preview.total_rows, 9);
+    assert_eq!(preview.importable, 2);
+    assert_eq!(preview.skipped, 7);
+    assert_eq!(preview.errors.len(), 4);
+    assert!(preview
+        .errors
+        .iter()
+        .any(|error| error.contains("Row 4") && error.contains("price")));
+    assert!(preview
+        .errors
+        .iter()
+        .any(|error| error.contains("Row 5") && error.contains("quantity")));
+    assert!(preview
+        .errors
+        .iter()
+        .any(|error| error.contains("Row 6") && error.contains("amount")));
+    assert!(preview
+        .errors
+        .iter()
+        .any(|error| error.contains("Row 7") && error.contains("no matching open")));
+
+    let imported = import_options_csv_inner(&db, &account_id, csv).unwrap();
+    assert_eq!(imported.imported, 2);
+    assert_eq!(
+        imported.skipped, 3,
+        "legacy result counts ordinary skips separately"
+    );
+    assert_eq!(imported.errors, preview.errors);
+    assert_eq!(preview.skipped, imported.skipped + imported.errors.len());
+}
+
+#[test]
+fn test_options_csv_preview_matches_existing_records_without_any_database_writes() {
+    let (db, account_id) = db_with_account();
+    insert_exposure_record(
+        &db,
+        &account_id,
+        "P",
+        "existing-open",
+        3,
+        true,
+        "2026-08-01",
+    );
+    let csv = "Symbol,Trade Date,Action,Quantity,Price,Code
+AAPL 18SEP26 100 P,2026-08-02,BUY,3,0.5,C
+";
+    {
+        let conn = db.conn.lock().unwrap();
+        conn.pragma_update(None, "query_only", true).unwrap();
+    }
+
+    let preview = preview_options_csv_inner(&db, &account_id, csv)
+        .expect("preview must work on a query-only database");
+    assert_eq!(preview.total_rows, 1);
+    assert_eq!(preview.importable, 1);
+    assert_eq!(preview.skipped, 0);
+    assert!(preview.errors.is_empty());
+    {
+        let conn = db.conn.lock().unwrap();
+        let (count, status): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), contract_status FROM option_records",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "preview must not insert the close");
+        assert_eq!(
+            status, "active",
+            "preview must not update the open's status"
+        );
+        conn.pragma_update(None, "query_only", false).unwrap();
+    }
+
+    let imported = import_options_csv_inner(&db, &account_id, csv).unwrap();
+    assert_eq!(imported.imported, 1);
+    let status: String = db
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT contract_status FROM option_records WHERE id = 'existing-open'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "closed", "confirmed import still recomputes status");
+}
+
+#[test]
+fn test_options_csv_preview_does_not_match_another_accounts_open() {
+    let (db, account_id) = db_with_account();
+    insert_exposure_record(
+        &db,
+        &account_id,
+        "P",
+        "existing-open",
+        1,
+        true,
+        "2026-08-01",
+    );
+    let csv = "Symbol,Trade Date,Action,Quantity,Price,Code
+AAPL 18SEP26 100 P,2026-08-02,BUY,1,0.5,C
+";
+
+    let preview = preview_options_csv_inner(&db, "another-account", csv).unwrap();
+    assert_eq!(preview.total_rows, 1);
+    assert_eq!(preview.importable, 0);
+    assert_eq!(preview.skipped, 1);
+    assert_eq!(preview.errors.len(), 1);
+    assert!(preview.errors[0].contains("no matching open"));
+}
+
+#[test]
+fn test_options_csv_preview_preserves_duplicate_open_import_behavior() {
+    let (db, account_id) = db_with_account();
+    let csv = "Symbol,Trade Date,Action,Quantity,Price,Code
+AAPL 18SEP26 100 P,2026-08-01,SELL,1,2,O
+AAPL 18SEP26 100 P,2026-08-01,SELL,1,2,O
+";
+
+    let preview = preview_options_csv_inner(&db, &account_id, csv).unwrap();
+    assert_eq!(preview.importable, 2);
+    assert_eq!(preview.skipped, 0);
+    let imported = import_options_csv_inner(&db, &account_id, csv).unwrap();
+    assert_eq!(imported.imported, 2);
+    assert_eq!(imported.skipped, 0);
+    assert!(imported.errors.is_empty());
+
+    let repeated_preview = preview_options_csv_inner(&db, &account_id, csv).unwrap();
+    assert_eq!(repeated_preview.importable, 2);
+    let repeated_import = import_options_csv_inner(&db, &account_id, csv).unwrap();
+    assert_eq!(
+        repeated_import.imported, 2,
+        "a prior import must not cause ID collisions"
+    );
+    let count: i64 = db
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM option_records", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 4);
+}
+
+#[test]
+fn test_options_csv_preview_avoids_existing_ids_in_other_accounts() {
+    let (db, account_id) = db_with_account();
+    let csv = "Symbol,Trade Date,Action,Quantity,Price,Code
+AAPL 18SEP26 100 P,2026-08-01,SELL,1,2,O
+";
+    assert_eq!(
+        import_options_csv_inner(&db, &account_id, csv)
+            .unwrap()
+            .imported,
+        1
+    );
+    {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, name, market, created_at, updated_at)
+             SELECT 'another-account', 'Another Account', market, created_at, updated_at
+             FROM accounts WHERE id = ?1",
+            [&account_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE option_records SET account_id = 'another-account'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let preview = preview_options_csv_inner(&db, &account_id, csv).unwrap();
+    assert_eq!(preview.importable, 1);
+    let imported = import_options_csv_inner(&db, &account_id, csv)
+        .expect("IDs in other accounts must not collide with this import");
+    assert_eq!(imported.imported, 1);
+    let count: i64 = db
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM option_records", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn test_options_csv_preview_uses_stable_order_for_competing_same_time_closes() {
+    let (db, account_id) = db_with_account();
+    insert_exposure_record(
+        &db,
+        &account_id,
+        "P",
+        "existing-open",
+        3,
+        true,
+        "2026-08-01",
+    );
+    let csv = "Symbol,Trade Date,Action,Quantity,Price,Code
+AAPL 18SEP26 100 P,2026-08-02,BUY,3,0.5,C
+AAPL 18SEP26 100 P,2026-08-02,BUY,1,0.5,C
+AAPL 18SEP26 100 P,2026-08-02,BUY,1,0.5,C
+";
+
+    for _ in 0..10 {
+        let preview = preview_options_csv_inner(&db, &account_id, csv).unwrap();
+        assert_eq!(preview.total_rows, 3);
+        assert_eq!(preview.importable, 1);
+        assert_eq!(preview.skipped, 2);
+    }
+    let imported = import_options_csv_inner(&db, &account_id, csv).unwrap();
+    assert_eq!(imported.imported, 1);
+    assert_eq!(imported.errors.len(), 2);
 }
 
 /// A Chinese-header options trade CSV with one open and one close record.

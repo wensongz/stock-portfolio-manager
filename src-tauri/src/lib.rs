@@ -343,6 +343,7 @@ pub fn run() {
             commands::ocr::lookup_stock_name_by_symbol,
             // Options Management
             commands::options::import_options_csv,
+            commands::options::preview_options_csv,
             commands::options::get_option_contracts,
             commands::options::simulate_sell_put,
             commands::options::simulate_sell_call,

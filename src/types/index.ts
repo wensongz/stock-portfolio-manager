@@ -1120,6 +1120,27 @@ export interface ImportOptionsResult {
   errors: string[];
 }
 
+export interface OptionsCsvPreviewRow {
+  row_number: number;
+  option_symbol: string;
+  traded_at: string | null;
+  action: string;
+  code: string;
+  quantity: number;
+  price: number;
+  amount: number;
+  commission: number;
+  fee: number;
+}
+
+export interface OptionsCsvPreview {
+  total_rows: number;
+  importable: number;
+  skipped: number;
+  errors: string[];
+  rows: OptionsCsvPreviewRow[];
+}
+
 export interface StockSplit {
   id: number;
   stock_code: string;

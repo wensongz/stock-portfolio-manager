@@ -1,10 +1,10 @@
 import { useCallback, useEffect } from "react";
-import { Typography, Select, Card, Row, Col, Statistic, Spin, Button, Tooltip } from "antd";
+import { Typography, Card, Row, Col, Statistic, Spin, Button, Tooltip } from "antd";
 import { ReloadOutlined, SyncOutlined, DashboardOutlined } from "@ant-design/icons";
 import { useDashboardStore } from "../../stores/dashboardStore";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
 import { useQuoteStore } from "../../stores/quoteStore";
-import type { Currency } from "../../types";
+import BaseCurrencySelect from "../../components/BaseCurrencySelect";
 import SummaryCards from "./SummaryCards";
 import DashboardHoldingsTable from "./DashboardHoldingsTable";
 import QuickCharts from "./QuickCharts";
@@ -15,18 +15,13 @@ const { Title, Text } = Typography;
 
 export default function DashboardPage() {
   const { summary, holdingDetails, loading, error, fetchReport } = useDashboardStore();
-  const { baseCurrency, setBaseCurrency } = useExchangeRateStore();
+  const { baseCurrency } = useExchangeRateStore();
   const { loading: quotesLoading, lastUpdatedAt, fetchHoldingQuotes } = useQuoteStore();
   const rates = summary?.exchange_rates ?? null;
 
   useEffect(() => {
-    void fetchReport(useExchangeRateStore.getState().baseCurrency);
-  }, [fetchReport]);
-
-  const handleCurrencyChange = (currency: Currency) => {
-    setBaseCurrency(currency);
-    fetchReport(currency);
-  };
+    void fetchReport(baseCurrency);
+  }, [baseCurrency, fetchReport]);
 
   const handleRefreshQuotes = useCallback(async () => {
     await refreshDashboardQuotes({
@@ -53,17 +48,7 @@ export default function DashboardPage() {
               刷新行情
             </Button>
           </Tooltip>
-          <Text type="secondary">基准货币:</Text>
-          <Select
-            value={baseCurrency}
-            onChange={handleCurrencyChange}
-            size="small"
-            style={{ width: 120 }}
-          >
-            <Select.Option value="USD">USD 美元</Select.Option>
-            <Select.Option value="CNY">CNY 人民币</Select.Option>
-            <Select.Option value="HKD">HKD 港元</Select.Option>
-          </Select>
+          <BaseCurrencySelect />
         </div>
       </div>
 

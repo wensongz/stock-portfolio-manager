@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Typography, Tabs, Button, Select } from "antd";
+import { Typography, Tabs, Button } from "antd";
 import { ReloadOutlined, BarChartOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
 import {
@@ -10,6 +10,7 @@ import { useAccountStore } from "../../stores/accountStore";
 import { useCategoryStore } from "../../stores/categoryStore";
 import { useQuoteStore } from "../../stores/quoteStore";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
+import BaseCurrencySelect from "../../components/BaseCurrencySelect";
 import type { Currency, Market } from "../../types";
 import OverviewTab from "./OverviewTab";
 import MarketTab from "./MarketTab";
@@ -239,17 +240,7 @@ export default function StatisticsPage() {
           >
             刷新
           </Button>
-          <Text type="secondary">基准货币:</Text>
-          <Select
-            value={baseCurrency}
-            onChange={handleCurrencyChange}
-            size="small"
-            style={{ width: 120 }}
-          >
-            <Select.Option value="USD">USD 美元</Select.Option>
-            <Select.Option value="CNY">CNY 人民币</Select.Option>
-            <Select.Option value="HKD">HKD 港元</Select.Option>
-          </Select>
+          <BaseCurrencySelect onChange={handleCurrencyChange} />
         </div>
       </div>
 

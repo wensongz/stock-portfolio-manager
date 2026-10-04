@@ -1,27 +1,27 @@
 import EChart from "../../components/charts/EChart";
 import { Card, Col, Row } from "antd";
-import type { QuarterlyTrends } from "../../types";
+import type { Currency, QuarterlyTrends } from "../../types";
 import { formatQuarterlyMoney } from "./formatMoney";
 
 interface Props {
   trends: QuarterlyTrends;
+  baseCurrency: Currency;
   height?: number;
 }
 
-const formatUsd = (value: unknown) => formatQuarterlyMoney(Number(value), "USD");
-
-export default function TrendCharts({ trends, height = 300 }: Props) {
+export default function TrendCharts({ trends, baseCurrency, height = 300 }: Props) {
+  const formatValue = (value: unknown) => formatQuarterlyMoney(Number(value), baseCurrency);
   const { quarters, total_values, total_costs, total_pnls, market_values, category_values, holding_counts } =
     trends;
 
   // A) Total value + cost trend
   const valueOption = {
-    title: { text: "A) 总市值趋势 (USD)", left: "center", textStyle: { fontSize: 13 } },
-    tooltip: { valueFormatter: formatUsd, trigger: "axis" },
+    title: { text: `A) 总市值趋势 (${baseCurrency})`, left: "center", textStyle: { fontSize: 13 } },
+    tooltip: { valueFormatter: formatValue, trigger: "axis" },
     legend: { bottom: 0, data: ["总市值", "总成本"] },
     grid: { left: "3%", right: "4%", bottom: "15%", containLabel: true },
     xAxis: { type: "category", data: quarters },
-    yAxis: { name: "USD", type: "value", scale: true },
+    yAxis: { name: baseCurrency, type: "value", scale: true },
     series: [
       {
         name: "总市值",
@@ -43,12 +43,12 @@ export default function TrendCharts({ trends, height = 300 }: Props) {
 
   // B) Market value stacked area
   const marketOption = {
-    title: { text: "B) 各市场市值趋势 (USD)", left: "center", textStyle: { fontSize: 13 } },
-    tooltip: { valueFormatter: formatUsd, trigger: "axis" },
+    title: { text: `B) 各市场市值趋势 (${baseCurrency})`, left: "center", textStyle: { fontSize: 13 } },
+    tooltip: { valueFormatter: formatValue, trigger: "axis" },
     legend: { bottom: 0, data: ["🇺🇸 美股", "🇨🇳 A股", "🇭🇰 港股"] },
     grid: { left: "3%", right: "4%", bottom: "15%", containLabel: true },
     xAxis: { type: "category", data: quarters },
-    yAxis: { name: "USD", type: "value" },
+    yAxis: { name: baseCurrency, type: "value" },
     series: [
       {
         name: "🇺🇸 美股",
@@ -86,12 +86,12 @@ export default function TrendCharts({ trends, height = 300 }: Props) {
   // C) Category values stacked bar
   const categoryNames = Object.keys(category_values);
   const categoryOption = {
-    title: { text: "C) 各类别市值趋势 (USD)", left: "center", textStyle: { fontSize: 13 } },
-    tooltip: { valueFormatter: formatUsd, trigger: "axis", axisPointer: { type: "shadow" } },
+    title: { text: `C) 各类别市值趋势 (${baseCurrency})`, left: "center", textStyle: { fontSize: 13 } },
+    tooltip: { valueFormatter: formatValue, trigger: "axis", axisPointer: { type: "shadow" } },
     legend: { bottom: 0, data: categoryNames },
     grid: { left: "3%", right: "4%", bottom: "15%", containLabel: true },
     xAxis: { type: "category", data: quarters },
-    yAxis: { name: "USD", type: "value" },
+    yAxis: { name: baseCurrency, type: "value" },
     series: categoryNames.map((cat) => ({
       name: cat,
       type: "bar",
@@ -102,12 +102,12 @@ export default function TrendCharts({ trends, height = 300 }: Props) {
 
   // D) PnL trend
   const pnlOption = {
-    title: { text: "D) 持仓盈亏趋势 (USD)", left: "center", textStyle: { fontSize: 13 } },
-    tooltip: { valueFormatter: formatUsd, trigger: "axis" },
+    title: { text: `D) 持仓盈亏趋势 (${baseCurrency})`, left: "center", textStyle: { fontSize: 13 } },
+    tooltip: { valueFormatter: formatValue, trigger: "axis" },
     legend: { bottom: 0, data: ["持仓盈亏"] },
     grid: { left: "3%", right: "4%", bottom: "15%", containLabel: true },
     xAxis: { type: "category", data: quarters },
-    yAxis: { name: "USD", type: "value" },
+    yAxis: { name: baseCurrency, type: "value" },
     series: [
       {
         name: "持仓盈亏",

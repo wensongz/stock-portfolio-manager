@@ -99,3 +99,35 @@ test("category distribution headings render above and centered with their pie ch
     assert.ok(html.includes(`>${title}</figcaption>`), `missing external chart heading: ${title}`);
   }
 });
+
+test("snapshot detail follows global base currency using frozen rates and keeps market values native", () => {
+  const probe = String.raw`
+    globalThis.localStorage = { getItem: (key) => key === "base_currency" ? "CNY" : null, setItem: () => {} };
+    const React = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const { MemoryRouter, Routes, Route } = await import("react-router-dom");
+    const { useExchangeRateStore } = await import("./src/stores/exchangeRateStore.ts");
+    const { createQuarterlyStore } = await import("./src/stores/quarterlyStore.ts");
+    const { mock } = await import("bun:test");
+    let activeState;
+    mock.module("./src/stores/quarterlyStore.ts", () => ({ createQuarterlyStore, useQuarterlyStore: () => activeState }));
+    const { default: SnapshotDetail } = await import("./src/pages/Quarterly/SnapshotDetail.tsx");
+    const holding = { id: "one", quarterly_snapshot_id: "quarter", account_id: "account", account_name: "Main", symbol: "AAPL", name: "Apple", market: "US", currency: "USD", category_name: "成长股", category_color: "#999", shares: 1, avg_cost: 100, close_price: 100, market_value: 100, cost_value: 100, pnl: 10, pnl_percent: 10, weight: 100, notes: null };
+    const snapshot = { id: "quarter", quarter: "2026Q2", total_value: 100, total_cost: 90, total_pnl: 10, us_value: 100, us_cost: 90, cn_value: 0, cn_cost: 0, hk_value: 0, hk_cost: 0, holding_count: 1, exchange_rates: '{"usd_cny":7,"usd_hkd":7.8}', overall_notes: null };
+    useExchangeRateStore.setState({ baseCurrency: "CNY", rates: { usd_cny: 9, usd_hkd: 9 } });
+    const render = (snap) => {
+      activeState = { detail: { snapshot: snap, holdings: [holding] }, detailLoading: false, mutationLoading: false, detailError: null, mutationError: null, quarterlyTransactions: [], fetchDetail: () => {}, refreshSnapshot: () => {}, clearDetail: () => {} };
+      return renderToStaticMarkup(React.createElement(MemoryRouter, { initialEntries: ["/quarterly/quarter"] }, React.createElement(Routes, null, React.createElement(Route, { path: "/quarterly/:snapshotId", element: React.createElement(SnapshotDetail) })))).replace(/<[^>]*>/g, "");
+    };
+    process.stdout.write(JSON.stringify([render(snapshot), render({ ...snapshot, exchange_rates: null })]));
+  `;
+  const [converted, missing] = JSON.parse(execFileSync("bun", ["--eval", probe], { cwd: projectRoot, encoding: "utf8" }));
+  assert.match(converted, /总市值 \(CNY\)¥700\.00/);
+  assert.match(converted, /总成本 \(CNY\)¥630\.00/);
+  assert.match(converted, /持仓盈亏 \(CNY\)¥70\.00/);
+  assert.match(converted, /合计市值 \(CNY\)：¥700\.00/);
+  assert.match(converted, /整体 \(CNY\)/);
+  assert.match(converted, /美股\$100\.00成本 \$90\.00/);
+  assert.match(missing, /总市值 \(CNY\)无法折算/);
+  assert.match(missing, /合计市值 \(CNY\)：无法折算/);
+});

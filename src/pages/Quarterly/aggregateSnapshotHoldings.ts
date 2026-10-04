@@ -37,7 +37,7 @@ export function snapshotHoldingCurrency(holding: QuarterlyHoldingSnapshot): stri
   return cashCurrency ?? marketCurrency(holding.market);
 }
 
-function convertSnapshotValue(value: number, from: string, to: string, rates: SnapshotRates | null): number | null {
+export function convertSnapshotValue(value: number, from: string, to: string, rates: SnapshotRates | null): number | null {
   if (value === 0 || from === to) return value;
   if (!rates) return null;
   const perUsd: Record<string, number | undefined> = { USD: 1, CNY: rates.usd_cny, HKD: rates.usd_hkd };
@@ -52,6 +52,7 @@ function convertSnapshotValue(value: number, from: string, to: string, rates: Sn
 export function aggregateSnapshotHoldings(
   holdings: QuarterlyHoldingSnapshot[],
   rates: SnapshotRates | null = null,
+  baseCurrency = "USD",
 ): AggregatedSnapshotHolding[] {
   const grouped = new Map<string, QuarterlyHoldingSnapshot[]>();
 
@@ -85,7 +86,7 @@ export function aggregateSnapshotHoldings(
         pnl_percent: costValue > 0 ? (pnl / costValue) * 100 : null,
         weight: accountRows.reduce((sum, row) => sum + row.weight, 0),
         notes: accountRows.find((row) => row.notes)?.notes ?? null,
-        market_value_base: convertSnapshotValue(marketValue, currency, "USD", rates),
+        market_value_base: convertSnapshotValue(marketValue, currency, baseCurrency, rates),
         accountRows: [...accountRows].sort((a, b) => b.market_value - a.market_value),
       };
     })
@@ -96,8 +97,9 @@ export function buildSnapshotComposition(
   holdings: QuarterlyHoldingSnapshot[],
   rates: SnapshotRates | null,
   market?: string,
+  baseCurrency = "USD",
 ): { currency: string; categories: PieSlice[]; pieSlices: PieSlice[]; total: number | null; hasNegativeValues: boolean; hasMissingRates: boolean } {
-  const currency = marketCurrency(market);
+  const currency = market ? marketCurrency(market) : baseCurrency;
   const subset = market ? holdings.filter((holding) => holding.market === market) : holdings;
   const grouped = new Map<string, PieSlice>();
   const hasNegativeValues = subset.some((holding) => holding.market_value < 0);

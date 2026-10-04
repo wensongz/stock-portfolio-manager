@@ -114,3 +114,20 @@ test("quarterly holdings renders USD, CNY, and HKD cash quantities as integers w
   assert.match(html, /\$CASH-HKD\$CASH-HKD现金类3,457HK\$1\.000/);
   assert.match(html, /AAPLAAPL现金类12\.345\$1\.000/);
 });
+
+test("quarterly holdings total follows the selected base while row amounts stay native", () => {
+  const probe = String.raw`
+    globalThis.localStorage = { getItem: () => null, setItem: () => {} };
+    const React = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const { default: SnapshotHoldingsTable } = await import("./src/pages/Quarterly/SnapshotHoldingsTable.tsx");
+    const holding = { id: "one", quarterly_snapshot_id: "quarter", account_id: "account", account_name: "Main", symbol: "AAPL", name: "Apple", market: "US", currency: "USD", category_name: "成长股", category_color: "#999", shares: 1, avg_cost: 100, close_price: 100, market_value: 100, cost_value: 100, pnl: 0, pnl_percent: 0, weight: 100, notes: null };
+    const render = (snap) => renderToStaticMarkup(React.createElement(SnapshotHoldingsTable, { holdings: [holding], snapshotId: "quarter", baseCurrency: "CNY", snap })).replace(/<[^>]*>/g, "");
+    process.stdout.write(JSON.stringify([render({ exchange_rates: '{"usd_cny":7}' }), render({ exchange_rates: null })]));
+  `;
+  const [converted, missing] = JSON.parse(execFileSync("bun", ["--eval", probe], { cwd: projectRoot, encoding: "utf8" }));
+  assert.match(converted, /\$100\.00/);
+  assert.match(converted, /合计市值 \(CNY\)：¥700\.00/);
+  assert.match(missing, /合计市值 \(CNY\)：无法折算/);
+  assert.doesNotMatch(missing, /合计市值 \(CNY\)：¥100\.00/);
+});

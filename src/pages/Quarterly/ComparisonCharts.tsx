@@ -1,16 +1,16 @@
 import EChart from "../../components/charts/EChart";
-import type { QuarterComparison } from "../../types";
+import type { Currency, QuarterComparison } from "../../types";
 import { formatQuarterlyMoney } from "./formatMoney";
 
 interface Props {
   comparison: QuarterComparison;
+  baseCurrency: Currency;
   height?: number;
 }
 
-const formatUsd = (value: unknown) => formatQuarterlyMoney(Number(value), "USD");
-
-export default function ComparisonCharts({ comparison, height = 320 }: Props) {
+export default function ComparisonCharts({ comparison, baseCurrency, height = 320 }: Props) {
   const { quarter1, quarter2, by_market } = comparison;
+  const formatValue = (value: unknown) => formatQuarterlyMoney(Number(value), baseCurrency);
 
   // Bar chart: market value comparison
   const markets = by_market.map((m) => {
@@ -19,12 +19,12 @@ export default function ComparisonCharts({ comparison, height = 320 }: Props) {
   });
 
   const barOption = {
-    title: { text: "市场市值对比 (USD)", left: "center", textStyle: { fontSize: 14 } },
-    tooltip: { valueFormatter: formatUsd, trigger: "axis", axisPointer: { type: "shadow" } },
+    title: { text: `市场市值对比 (${baseCurrency})`, left: "center", textStyle: { fontSize: 14 } },
+    tooltip: { valueFormatter: formatValue, trigger: "axis", axisPointer: { type: "shadow" } },
     legend: { bottom: 0, data: [quarter1, quarter2] },
     grid: { left: "3%", right: "4%", bottom: "15%", containLabel: true },
     xAxis: { type: "category", data: markets },
-    yAxis: { name: "USD", type: "value" },
+    yAxis: { name: baseCurrency, type: "value" },
     series: [
       {
         name: quarter1,
@@ -45,12 +45,12 @@ export default function ComparisonCharts({ comparison, height = 320 }: Props) {
 
   // Bar chart: PnL comparison
   const pnlOption = {
-    title: { text: "市场持仓盈亏对比 (USD)", left: "center", textStyle: { fontSize: 14 } },
-    tooltip: { valueFormatter: formatUsd, trigger: "axis", axisPointer: { type: "shadow" } },
+    title: { text: `市场持仓盈亏对比 (${baseCurrency})`, left: "center", textStyle: { fontSize: 14 } },
+    tooltip: { valueFormatter: formatValue, trigger: "axis", axisPointer: { type: "shadow" } },
     legend: { bottom: 0, data: [quarter1, quarter2] },
     grid: { left: "3%", right: "4%", bottom: "15%", containLabel: true },
     xAxis: { type: "category", data: markets },
-    yAxis: { name: "USD", type: "value" },
+    yAxis: { name: baseCurrency, type: "value" },
     series: [
       {
         name: quarter1,

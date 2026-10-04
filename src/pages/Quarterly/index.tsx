@@ -21,18 +21,19 @@ import {
 } from "@ant-design/icons";
 import { useNavigate } from "react-router-dom";
 import { useQuarterlyStore } from "../../stores/quarterlyStore";
+import { useExchangeRateStore } from "../../stores/exchangeRateStore";
+import BaseCurrencySelect from "../../components/BaseCurrencySelect";
 import type { QuarterlySnapshot } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { convertSnapshotValue, parseSnapshotExchangeRates } from "./aggregateSnapshotHoldings";
+import { formatQuarterlyMoney } from "./formatMoney";
 
 const { Title, Text } = Typography;
-
-function fmt(val: number) {
-  return val.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
 
 export default function QuarterlyPage() {
   const navigate = useNavigate();
   const { pnlColorDark } = usePnlColor();
+  const { baseCurrency } = useExchangeRateStore();
   const {
     snapshots,
     listLoading,
@@ -68,6 +69,11 @@ export default function QuarterlyPage() {
     message.success("快照已删除");
   };
 
+  const formatSnapshotAmount = (amount: number, snapshot: QuarterlySnapshot, signed = false) => {
+    const value = convertSnapshotValue(amount, "USD", baseCurrency, parseSnapshotExchangeRates(snapshot.exchange_rates));
+    return value === null ? "无法折算（缺少有效快照汇率）" : `${signed && value >= 0 ? "+" : ""}${formatQuarterlyMoney(value, baseCurrency)}`;
+  };
+
   const columns = [
     {
       title: "季度",
@@ -85,18 +91,18 @@ export default function QuarterlyPage() {
       key: "snapshot_date",
     },
     {
-      title: "总市值 (USD)",
+      title: `总市值 (${baseCurrency})`,
       dataIndex: "total_value",
       key: "total_value",
-      render: (v: number) => <Text strong>${fmt(v)}</Text>,
+      render: (v: number, snapshot: QuarterlySnapshot) => <Text strong>{formatSnapshotAmount(v, snapshot)}</Text>,
     },
     {
-      title: "持仓盈亏 (USD)",
+      title: `持仓盈亏 (${baseCurrency})`,
       dataIndex: "total_pnl",
       key: "total_pnl",
-      render: (v: number) => (
+      render: (v: number, snapshot: QuarterlySnapshot) => (
         <Text style={{ color: pnlColorDark(v) }}>
-          {v >= 0 ? "+" : ""}${fmt(v)}
+          {formatSnapshotAmount(v, snapshot, true)}
         </Text>
       ),
     },
@@ -146,11 +152,11 @@ export default function QuarterlyPage() {
   return (
     <div>
       {/* Header */}
-      <div className="flex justify-between items-center mb-4">
+      <div className="flex justify-between items-center flex-wrap gap-2 mb-4">
         <Title level={2} className="!mb-0">
           <CalendarOutlined style={{ color: "#722ed1" }} /> 季度分析
         </Title>
-        <Space>
+        <Space wrap>
           <Button
             icon={<ReloadOutlined />}
             onClick={() => void initializeSnapshots()}
@@ -159,6 +165,7 @@ export default function QuarterlyPage() {
           >
             刷新
           </Button>
+          <BaseCurrencySelect />
           <Button
             type="primary"
             icon={<PlusOutlined />}

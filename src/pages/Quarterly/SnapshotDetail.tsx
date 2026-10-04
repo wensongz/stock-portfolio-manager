@@ -12,16 +12,18 @@ import {
   Typography,
 } from "antd";
 import PieChart from "../../components/charts/PieChart";
+import BaseCurrencySelect from "../../components/BaseCurrencySelect";
 import { ArrowLeftOutlined, EditOutlined, ReloadOutlined } from "@ant-design/icons";
 import { useNavigate, useParams } from "react-router-dom";
 import { useQuarterlyStore } from "../../stores/quarterlyStore";
 import { useAccountStore } from "../../stores/accountStore";
+import { useExchangeRateStore } from "../../stores/exchangeRateStore";
 import SnapshotHoldingsTable from "./SnapshotHoldingsTable";
 import QuarterlyNotesEditor from "./QuarterlyNotesEditor";
 import HoldingChangesTable from "./HoldingChangesTable";
 import QuarterlyTransactionsSection from "./QuarterlyTransactionsSection";
 import { usePnlColor } from "../../hooks/usePnlColor";
-import { buildSnapshotComposition, parseSnapshotExchangeRates } from "./aggregateSnapshotHoldings";
+import { buildSnapshotComposition, convertSnapshotValue, parseSnapshotExchangeRates } from "./aggregateSnapshotHoldings";
 import { formatQuarterlyMoney } from "./formatMoney";
 
 const { Title, Text } = Typography;
@@ -43,6 +45,7 @@ export default function SnapshotDetail() {
   const loading = detailLoading || mutationLoading;
 
   const { pnlColorDark } = usePnlColor();
+  const baseCurrency = useExchangeRateStore((state) => state.baseCurrency);
 
   const holdings = detail?.holdings ?? [];
 
@@ -87,6 +90,9 @@ export default function SnapshotDetail() {
 
   const snap = detail?.snapshot;
   const snapshotRates = parseSnapshotExchangeRates(snap?.exchange_rates);
+  const baseTotalValue = convertSnapshotValue(snap.total_value, "USD", baseCurrency, snapshotRates);
+  const baseTotalCost = convertSnapshotValue(snap.total_cost, "USD", baseCurrency, snapshotRates);
+  const baseTotalPnl = convertSnapshotValue(snap.total_pnl, "USD", baseCurrency, snapshotRates);
   const categoryLegend = [...new Map(holdings.map((holding) => [holding.category_name || "未分类", { name: holding.category_name || "未分类", color: holding.category_color }])).values()];
   const pnlColor = pnlColorDark(snap?.total_pnl ?? 0);
 
@@ -102,18 +108,21 @@ export default function SnapshotDetail() {
             📅 {snap?.quarter} 季度快照
           </Title>
         </Space>
-        <Button
-          icon={<ReloadOutlined />}
-          onClick={async () => {
-            if (snapshotId) {
-              await refreshSnapshot(snapshotId);
-            }
-          }}
-          loading={loading}
-          size="small"
-        >
-          刷新
-        </Button>
+        <Space>
+          <BaseCurrencySelect />
+          <Button
+            icon={<ReloadOutlined />}
+            onClick={async () => {
+              if (snapshotId) {
+                await refreshSnapshot(snapshotId);
+              }
+            }}
+            loading={loading}
+            size="small"
+          >
+            刷新
+          </Button>
+        </Space>
       </div>
 
       {errorFeedback}
@@ -123,27 +132,24 @@ export default function SnapshotDetail() {
         <Col xs={12} sm={6}>
           <Card size="small">
             <Statistic
-              title="总市值 (USD)"
-              value={snap?.total_value ?? 0}
-              formatter={(value) => formatQuarterlyMoney(Number(value), "USD")}
+              title={`总市值 (${baseCurrency})`}
+              value={baseTotalValue === null ? "无法折算" : formatQuarterlyMoney(baseTotalValue, baseCurrency)}
             />
           </Card>
         </Col>
         <Col xs={12} sm={6}>
           <Card size="small">
             <Statistic
-              title="总成本 (USD)"
-              value={snap?.total_cost ?? 0}
-              formatter={(value) => formatQuarterlyMoney(Number(value), "USD")}
+              title={`总成本 (${baseCurrency})`}
+              value={baseTotalCost === null ? "无法折算" : formatQuarterlyMoney(baseTotalCost, baseCurrency)}
             />
           </Card>
         </Col>
         <Col xs={12} sm={6}>
           <Card size="small">
             <Statistic
-              title="持仓盈亏 (USD)"
-              value={snap?.total_pnl ?? 0}
-              formatter={(value) => formatQuarterlyMoney(Number(value), "USD")}
+              title={`持仓盈亏 (${baseCurrency})`}
+              value={baseTotalPnl === null ? "无法折算" : formatQuarterlyMoney(baseTotalPnl, baseCurrency)}
               styles={{ content: {  color: pnlColor  } }}
             />
           </Card>
@@ -183,13 +189,13 @@ export default function SnapshotDetail() {
         <Card size="small" className="mb-4" title="类别分布">
           <Row gutter={[8, 8]}>
             {[
-              { label: "整体", market: undefined, currency: "USD" },
+              { label: "整体", market: undefined, currency: baseCurrency },
               { label: "🇨🇳 A股", market: "CN", currency: "CNY" },
               { label: "🇭🇰 港股", market: "HK", currency: "HKD" },
               { label: "🇺🇸 美股", market: "US", currency: "USD" },
             ].map(({ label, market, currency }) => {
               if (!holdings.some((holding) => !market || holding.market === market)) return null;
-              const composition = buildSnapshotComposition(holdings, snapshotRates, market);
+              const composition = buildSnapshotComposition(holdings, snapshotRates, market, baseCurrency);
               return (
                 <Col key={label} xs={24} sm={12} lg={6}>
                   {composition.pieSlices.length > 0 ? (
@@ -273,6 +279,7 @@ export default function SnapshotDetail() {
             snapshotId={snapshotId}
             loading={loading}
             snap={snap}
+            baseCurrency={baseCurrency}
           />
         </Card>
       )}

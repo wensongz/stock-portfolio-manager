@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Button, Space, Table, Tag, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { EditOutlined, HistoryOutlined } from "@ant-design/icons";
-import type { QuarterlyHoldingSnapshot, QuarterlySnapshot } from "../../types";
+import type { Currency, QuarterlyHoldingSnapshot, QuarterlySnapshot } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
 import { useTablePageSize } from "../../hooks/tablePageSize";
 import { formatHoldingShares } from "../../lib/formatMoney";
@@ -18,11 +18,12 @@ interface Props {
   snapshotId: string;
   loading?: boolean;
   snap?: QuarterlySnapshot;
+  baseCurrency?: Currency;
 }
 
 const fmtPct = (v: number | null) => v == null ? "-" : `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`;
 
-export default function SnapshotHoldingsTable({ holdings, snapshotId, loading, snap }: Props) {
+export default function SnapshotHoldingsTable({ holdings, snapshotId, loading, snap, baseCurrency = "USD" }: Props) {
   const [editorTarget, setEditorTarget] = useState<{ snapshotId: string; holding: QuarterlyHoldingSnapshot; showHistory: boolean } | null>(null);
   const targetIsCurrent = isHoldingEditorTargetCurrent(editorTarget, snapshotId, holdings);
   useEffect(() => {
@@ -32,7 +33,7 @@ export default function SnapshotHoldingsTable({ holdings, snapshotId, loading, s
   const { pageSize, onShowSizeChange } = useTablePageSize();
 
   const snapshotRates = useMemo(() => parseSnapshotExchangeRates(snap?.exchange_rates), [snap?.exchange_rates]);
-  const rows = useMemo(() => aggregateSnapshotHoldings(holdings, snapshotRates), [holdings, snapshotRates]);
+  const rows = useMemo(() => aggregateSnapshotHoldings(holdings, snapshotRates, baseCurrency), [holdings, snapshotRates, baseCurrency]);
   const totalValue = useMemo(() => rows.some((row) => row.market_value_base === null) ? null : rows.reduce((sum, row) => sum + (row.market_value_base ?? 0), 0), [rows]);
 
   const stockColumns: ColumnsType<AggregatedSnapshotHolding> = [
@@ -61,7 +62,7 @@ export default function SnapshotHoldingsTable({ holdings, snapshotId, loading, s
 
   return <>
     <Table dataSource={rows} columns={stockColumns} rowKey="id" loading={loading} size="small" className="account-detail-table" pagination={{ pageSize, showSizeChanger: true, onShowSizeChange }} scroll={{ x: 1100 }} expandable={{ expandedRowRender: (row) => <Table columns={accountColumns} dataSource={row.accountRows} rowKey="id" size="small" pagination={false} className="account-sub-table quarterly-holding-sub-table" />, rowExpandable: (row) => row.accountRows.length > 0 }} />
-    <div className="mt-2"><Text strong>合计市值 (USD)：{totalValue === null ? "无法折算（缺少有效快照汇率）" : formatQuarterlyMoney(totalValue, "USD")}</Text></div>
+    <div className="mt-2"><Text strong>合计市值 ({baseCurrency})：{totalValue === null ? "无法折算（缺少有效快照汇率）" : formatQuarterlyMoney(totalValue, baseCurrency)}</Text></div>
     {editorTarget && targetIsCurrent && <HoldingNotesEditor holding={editorTarget.holding} snapshotId={snapshotId} quarter={snap?.quarter} open onClose={() => setEditorTarget(null)} showHistory={editorTarget.showHistory} />}
   </>;
 }

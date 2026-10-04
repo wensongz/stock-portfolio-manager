@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
+  Alert,
   Button,
   Card,
   Col,
@@ -20,6 +21,9 @@ import ComparisonCharts from "./ComparisonCharts";
 import HoldingChangesTable from "./HoldingChangesTable";
 import { usePnlColor } from "../../hooks/usePnlColor";
 import { formatQuarterlyMoney } from "./formatMoney";
+import { useExchangeRateStore } from "../../stores/exchangeRateStore";
+import BaseCurrencySelect from "../../components/BaseCurrencySelect";
+import { convertQuarterComparison } from "./quarterlyCurrency";
 
 const { Title, Text } = Typography;
 
@@ -30,11 +34,14 @@ function fmt(v: number) {
 export default function QuarterComparisonPage() {
   const navigate = useNavigate();
   const { pnlColorDark } = usePnlColor();
+  const baseCurrency = useExchangeRateStore((state) => state.baseCurrency);
   const {
     snapshots,
     comparison,
     listLoading,
+    listError,
     comparisonLoading,
+    comparisonError,
     fetchSnapshots,
     compareQuarters,
     clearComparison,
@@ -63,7 +70,8 @@ export default function QuarterComparisonPage() {
 
   const quarterOptions = snapshots.map((s) => ({ label: s.quarter, value: s.quarter }));
 
-  const ov = comparison?.overview;
+  const displayedComparison = useMemo(() => comparison ? convertQuarterComparison(comparison, snapshots, baseCurrency) : null, [comparison, snapshots, baseCurrency]);
+  const ov = displayedComparison?.overview;
 
   return (
     <div>
@@ -81,6 +89,7 @@ export default function QuarterComparisonPage() {
       {/* Quarter Selector */}
       <Card size="small" className="mb-4">
         <Space align="center" wrap>
+          <BaseCurrencySelect />
           <Text>对比季度：</Text>
           <Select
             style={{ width: 140 }}
@@ -99,11 +108,14 @@ export default function QuarterComparisonPage() {
             loading={listLoading}
             placeholder="选择季度 2"
           />
-          <Button type="primary" onClick={handleCompare} loading={comparisonLoading} disabled={!q1 || !q2}>
+          <Button type="primary" onClick={handleCompare} loading={comparisonLoading} disabled={!q1 || !q2 || !!listError}>
             开始对比
           </Button>
         </Space>
       </Card>
+
+      {listError && <Alert type="error" showIcon title="季度快照列表加载失败" description={listError} action={<Button size="small" onClick={() => void fetchSnapshots()}>重试</Button>} className="mb-4" />}
+      {comparisonError && <Alert type="error" showIcon title="季度对比加载失败" description={comparisonError} action={<Button size="small" onClick={handleCompare} disabled={!q1 || !q2}>重试</Button>} className="mb-4" />}
 
       {comparisonLoading && (
         <div className="flex justify-center py-10">
@@ -111,37 +123,41 @@ export default function QuarterComparisonPage() {
         </div>
       )}
 
-      {comparison && !comparisonLoading && (
+      {comparison && !comparisonLoading && !listLoading && !listError && !comparisonError && !displayedComparison && (
+        <Alert type="warning" showIcon title={`缺少所选季度的有效快照汇率，无法以 ${baseCurrency} 显示对比金额`} className="mb-4" />
+      )}
+
+      {displayedComparison && !comparisonLoading && !listLoading && !listError && !comparisonError && (
         <>
           {/* Overview */}
           <Row gutter={[16, 16]} className="mb-4">
             <Col xs={12} sm={6}>
               <Card size="small">
                 <Statistic
-                  title={`${comparison.quarter1} 市值 (USD)`}
+                  title={`${displayedComparison.quarter1} 市值 (${baseCurrency})`}
                   value={ov?.q1_total_value ?? 0}
                   precision={2}
-                  formatter={(value) => formatQuarterlyMoney(Number(value), "USD")}
+                  formatter={(value) => formatQuarterlyMoney(Number(value), baseCurrency)}
                 />
               </Card>
             </Col>
             <Col xs={12} sm={6}>
               <Card size="small">
                 <Statistic
-                  title={`${comparison.quarter2} 市值 (USD)`}
+                  title={`${displayedComparison.quarter2} 市值 (${baseCurrency})`}
                   value={ov?.q2_total_value ?? 0}
                   precision={2}
-                  formatter={(value) => formatQuarterlyMoney(Number(value), "USD")}
+                  formatter={(value) => formatQuarterlyMoney(Number(value), baseCurrency)}
                 />
               </Card>
             </Col>
             <Col xs={12} sm={6}>
               <Card size="small">
                 <Statistic
-                  title="市值变化 (USD)"
+                  title={`市值变化 (${baseCurrency})`}
                   value={ov?.value_change ?? 0}
                   precision={2}
-                  formatter={(value) => `${Number(value) >= 0 ? "+" : ""}${formatQuarterlyMoney(Number(value), "USD")}`}
+                  formatter={(value) => `${Number(value) >= 0 ? "+" : ""}${formatQuarterlyMoney(Number(value), baseCurrency)}`}
                   styles={{
                     content: {
                       color: pnlColorDark(ov?.value_change ?? 0),
@@ -169,14 +185,14 @@ export default function QuarterComparisonPage() {
           </Row>
 
           {/* Charts */}
-          <ComparisonCharts comparison={comparison} />
+          <ComparisonCharts comparison={displayedComparison} baseCurrency={baseCurrency} />
 
           <Divider />
 
           {/* Market comparison table */}
           <Card size="small" className="mb-4" title="分市场对比">
             <Table
-              dataSource={comparison.by_market}
+              dataSource={displayedComparison.by_market}
               rowKey="market"
               size="small"
               pagination={false}
@@ -189,10 +205,10 @@ export default function QuarterComparisonPage() {
                     return <Tag>{labels[m] ?? m}</Tag>;
                   },
                 },
-                { title: `${comparison.quarter1} 市值 (USD)`, dataIndex: "q1_value", render: fmt },
-                { title: `${comparison.quarter2} 市值 (USD)`, dataIndex: "q2_value", render: fmt },
+                { title: `${displayedComparison.quarter1} 市值 (${baseCurrency})`, dataIndex: "q1_value", render: fmt },
+                { title: `${displayedComparison.quarter2} 市值 (${baseCurrency})`, dataIndex: "q2_value", render: fmt },
                 {
-                  title: "变化 (USD)",
+                  title: `变化 (${baseCurrency})`,
                   dataIndex: "value_change",
                   render: (v: number) => (
                     <Text style={{ color: pnlColorDark(v) }}>
@@ -200,8 +216,8 @@ export default function QuarterComparisonPage() {
                     </Text>
                   ),
                 },
-                { title: `${comparison.quarter1} 持仓盈亏 (USD)`, dataIndex: "q1_pnl", render: fmt },
-                { title: `${comparison.quarter2} 持仓盈亏 (USD)`, dataIndex: "q2_pnl", render: fmt },
+                { title: `${displayedComparison.quarter1} 持仓盈亏 (${baseCurrency})`, dataIndex: "q1_pnl", render: fmt },
+                { title: `${displayedComparison.quarter2} 持仓盈亏 (${baseCurrency})`, dataIndex: "q2_pnl", render: fmt },
               ]}
             />
           </Card>
@@ -209,7 +225,7 @@ export default function QuarterComparisonPage() {
           {/* Category comparison table */}
           <Card size="small" className="mb-4" title="分类别对比">
             <Table
-              dataSource={comparison.by_category}
+              dataSource={displayedComparison.by_category}
               rowKey="category_name"
               size="small"
               pagination={false}
@@ -221,10 +237,10 @@ export default function QuarterComparisonPage() {
                     <Tag color={record.category_color}>{name}</Tag>
                   ),
                 },
-                { title: `${comparison.quarter1} 市值 (USD)`, dataIndex: "q1_value", render: fmt },
-                { title: `${comparison.quarter2} 市值 (USD)`, dataIndex: "q2_value", render: fmt },
+                { title: `${displayedComparison.quarter1} 市值 (${baseCurrency})`, dataIndex: "q1_value", render: fmt },
+                { title: `${displayedComparison.quarter2} 市值 (${baseCurrency})`, dataIndex: "q2_value", render: fmt },
                 {
-                  title: "变化 (USD)",
+                  title: `变化 (${baseCurrency})`,
                   dataIndex: "value_change",
                   render: (v: number) => (
                     <Text style={{ color: pnlColorDark(v) }}>
@@ -240,9 +256,9 @@ export default function QuarterComparisonPage() {
 
           {/* Holding changes */}
           <HoldingChangesTable
-            changes={comparison.holding_changes}
-            quarter1={comparison.quarter1}
-            quarter2={comparison.quarter2}
+            changes={displayedComparison.holding_changes}
+            quarter1={displayedComparison.quarter1}
+            quarter2={displayedComparison.quarter2}
           />
         </>
       )}

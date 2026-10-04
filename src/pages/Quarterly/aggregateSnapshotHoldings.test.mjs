@@ -169,3 +169,32 @@ test("所需汇率为非数字、非正数或无限值时不输出无效金额",
     assert.equal(snapshotValues.buildSnapshotComposition([cash], { usd_cny }).total, null);
   }
 });
+
+test("所选人民币基准折算合计和整体分布，市场分布仍用市场本币", () => {
+  const holdings = [
+    { ...baseHolding, symbol: "US", market: "US", currency: "USD", market_value: 100 },
+    { ...baseHolding, symbol: "HK", market: "HK", currency: "HKD", market_value: 780 },
+  ];
+  const original = structuredClone(holdings);
+  const rows = aggregateSnapshotHoldings(holdings, rates, "CNY");
+  assert.deepEqual(rows.map((row) => row.market_value_base), [700, 700]);
+  assert.equal(rows[0].market_value, 100);
+  assert.deepEqual(holdings, original);
+  const overall = snapshotValues.buildSnapshotComposition(holdings, rates, undefined, "CNY");
+  assert.equal(overall.currency, "CNY");
+  assert.equal(overall.total, 1400);
+  assert.equal(snapshotValues.buildSnapshotComposition(holdings, rates, "HK", "CNY").currency, "HKD");
+  assert.equal(snapshotValues.buildSnapshotComposition(holdings, rates, "HK", "CNY").total, 780);
+});
+
+test("所选基准缺少所需历史汇率时明确不可折算", () => {
+  const partialRates = { usd_cny: 7 };
+  const hkd = { ...baseHolding, market: "HK", currency: "HKD", market_value: 780 };
+  assert.equal(aggregateSnapshotHoldings([hkd], partialRates, "CNY")[0].market_value_base, null);
+  const overall = snapshotValues.buildSnapshotComposition([hkd], partialRates, undefined, "CNY");
+  assert.equal(overall.currency, "CNY");
+  assert.equal(overall.total, null);
+  assert.equal(overall.hasMissingRates, true);
+  assert.equal(snapshotValues.convertSnapshotValue(100, "USD", "CNY", null), null);
+  assert.equal(snapshotValues.convertSnapshotValue(0, "USD", "CNY", null), 0);
+});

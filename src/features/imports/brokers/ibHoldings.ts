@@ -28,7 +28,10 @@ function parseTable(lines: string[], headerIndex: number, market: Market, struct
     const raw = (fields[symbolIndex] ?? "").trim();
     if (SUMMARY.test(raw) || isImportSummary(raw)) continue;
     if (!raw && !fields[quantityIndex]?.trim() && !fields[costIndex]?.trim()) continue;
-    const validSymbol = /^[A-Za-z0-9][A-Za-z0-9._/-]*(?: [A-Za-z0-9]{1,2})?$/.test(raw)
+    const symbol = formatBrokerSymbol(raw, market);
+    const validSymbol = (market === "US"
+      ? /^[A-Z0-9][A-Z0-9._/-]*$/.test(symbol)
+      : /^[A-Za-z0-9][A-Za-z0-9._/-]*(?: [A-Za-z0-9]{1,2})?$/.test(raw))
       && (market !== "HK" || /\d/.test(raw));
     if (!structured && !validSymbol && fields.filter((field) => field.trim()).length === 1) continue;
     const shares = parseImportNumber(fields[quantityIndex]);
@@ -43,7 +46,7 @@ function parseTable(lines: string[], headerIndex: number, market: Market, struct
       recordImportIssue(issues, i + 1, lines[i], messages);
       continue;
     }
-    rows.push({ key: String(rows.length), raw: lines[i], selected: true, symbol: formatBrokerSymbol(raw, market), name: raw, shares, avgCost });
+    rows.push({ key: String(rows.length), raw: lines[i], selected: true, symbol, name: raw, shares, avgCost });
   }
 }
 

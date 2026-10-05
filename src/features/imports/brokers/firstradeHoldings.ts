@@ -1,6 +1,7 @@
 import { splitCsvLine, stripBom } from "../csv.ts";
 import { isImportSummary, parseImportNumber, recordImportIssue } from "../parseDiagnostics.ts";
 import type { HoldingImportRow, ImportParseIssue, ParseResult } from "../types.ts";
+import { formatBrokerSymbol } from "./symbol.ts";
 
 export function parseFirstradeHoldings(text: string): ParseResult<HoldingImportRow> {
   const lines = stripBom(text).split(/\r?\n/);
@@ -22,20 +23,20 @@ export function parseFirstradeHoldings(text: string): ParseResult<HoldingImportR
       if (isImportSummary(raw || name) || /^(美元|股票|现金)$/.test(raw)) continue;
       if (/^(Stocks|Bonds|Options|Cash|USD)$/i.test(raw) && !fields[quantityIndex]?.trim() && !fields[costIndex]?.trim()) continue;
       if (!raw && !name && !fields[quantityIndex]?.trim() && !fields[costIndex]?.trim()) continue;
-      if (!/^[A-Za-z][A-Za-z0-9._/-]*$/.test(raw) && fields.filter((field) => field.trim()).length === 1) continue;
+      const symbol = formatBrokerSymbol(raw, "US");
+      if (!/^[A-Z][A-Z0-9._/-]*$/.test(symbol) && fields.filter((field) => field.trim()).length === 1) continue;
       const shares = parseImportNumber(fields[quantityIndex]);
       if (Number.isFinite(shares) && shares <= 0) continue;
       const avgCost = parseImportNumber(fields[costIndex]);
       const messages: string[] = [];
       if (!raw) messages.push("缺少证券代码");
-      else if (!/^[A-Za-z][A-Za-z0-9._/-]*$/.test(raw)) messages.push("证券代码格式无效");
+      else if (!/^[A-Z][A-Z0-9._/-]*$/.test(symbol)) messages.push("证券代码格式无效");
       if (!Number.isFinite(shares)) messages.push("持仓数量缺失或不是有效数字");
       if (!Number.isFinite(avgCost)) messages.push("成本价缺失或不是有效数字");
       if (messages.length) {
         recordImportIssue(issues, j + 1, lines[j], messages);
         continue;
       }
-      const symbol = raw.toUpperCase();
       rows.push({
         key: String(rows.length), raw: lines[j], selected: true, symbol,
         name: name || symbol,

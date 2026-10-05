@@ -8,6 +8,7 @@ import { parseIbHoldings } from "./brokers/ibHoldings.ts";
 import { parseMoomooHoldings } from "./brokers/moomooHoldings.ts";
 import { parseFirstradeHoldings } from "./brokers/firstradeHoldings.ts";
 import { parseCnHoldings } from "./brokers/cnHoldings.ts";
+import { formatBrokerSymbol } from "./brokers/symbol.ts";
 
 test("normalizes an IB structured trade and preserves fees and HK symbols", () => {
   const csv = `Trades,Header,Acct ID,Symbol,Trade Date/Time,Quantity,Price,Proceeds,Type,Comm,Fee
@@ -163,7 +164,73 @@ for (const [name, parse] of symbolParsers) {
     }
   });
 
-  test(`${name} preserves dotted US tickers`, () => {
-    assert.equal(parse("brk.b", "US").symbol, "BRK.B");
+  test(`${name} normalizes dotted US share classes`, () => {
+    assert.equal(parse("brk.b", "US").symbol, "BRK-B");
   });
 }
+
+const usStockFormats = [
+  { name: "IB holdings", header: "Symbol,Quantity,Cost Price", row: symbol => `${symbol},100,501.340`,
+    parse: text => parseIbHoldings(text, "US") },
+  { name: "Moomoo holdings", header: "代码,持有数量,摊薄成本价,币种", row: symbol => `${symbol},100,501.340,USD`,
+    parse: text => parseMoomooHoldings(text, "US") },
+  { name: "Firstrade holdings", header: "代号,股数,单位成本", row: symbol => `${symbol},100,501.340`,
+    parse: text => parseFirstradeHoldings(text) },
+  { name: "IB trades", header: "Symbol,Date/Time,Quantity,Price", row: symbol => `${symbol},2026-09-17,100,501.340`,
+    parse: text => { const issues = []; return { rows: parseIbTransactions(text, "US", issues), issues }; } },
+  { name: "Moomoo trades", header: "方向,代码,成交数量,成交价格,成交时间", row: symbol => `买入,${symbol},100,501.340,2026/09/17 09:30:00`,
+    parse: text => { const issues = []; return { rows: parseMoomooTransactions(text, "US", issues), issues }; } },
+  { name: "Firstrade trades", header: "Symbol,Action,Quantity,Price,TradeDate", row: symbol => `${symbol},BUY,100,501.340,2026-09-17`,
+    parse: text => { const issues = []; return { rows: parseFirstradeTransactions(text, issues), issues }; } },
+];
+
+for (const format of usStockFormats) {
+  test(`${format.name} stores US share-class aliases consistently while preserving audit rows`, () => {
+    for (const [input, expected] of [
+      ["BRK B", "BRK-B"], ["brk.b", "BRK-B"], ["BRK_B", "BRK-B"], ["BRK-B", "BRK-B"],
+      [" brk  b ", "BRK-B"], ["BRK\tB", "BRK-B"], ["BRK A", "BRK-A"], ["BF B", "BF-B"],
+      ["R1 B", "R1-B"], ["AAPL", "AAPL"], ["ABC.WS", "ABC.WS"],
+    ]) {
+      const raw = format.row(`"${input}"`);
+      const result = format.parse(`${format.header}\n${raw}`);
+      assert.equal(result.rows.length, 1, input);
+      assert.equal(result.rows[0].symbol, expected, input);
+      assert.equal(result.rows[0].shares, 100, input);
+      assert.equal(result.rows[0].avgCost ?? result.rows[0].price, 501.340, input);
+      assert.deepEqual([result.rows[0].raw].flat(), [raw], input);
+      assert.deepEqual(result.issues ?? [], [], input);
+    }
+  });
+
+  test(`${format.name} diagnoses invalid multi-word symbols instead of repairing them`, () => {
+    for (const input of ["bad symbol", "BRK BB", "1BRK B", "BRK B EXTRA"]) {
+      const raw = format.row(input);
+      const result = format.parse(`${format.header}\n${raw}`);
+      assert.deepEqual(result.rows, [], input);
+      assert.equal(result.issues?.length, 1, input);
+      assert.equal(result.issues[0].raw, raw, input);
+      assert.match(result.issues[0].message, /代码/, input);
+    }
+  });
+}
+
+test("broker symbol normalization only rewrites exact US share-class aliases", () => {
+  for (const symbol of ["ABC.WS", "ABC--B", "ABC._B", "ABC - B", "1ABC B", "BAD SYMBOL", "BRK BB"]) {
+    assert.equal(formatBrokerSymbol(symbol, "US"), symbol);
+  }
+  assert.equal(formatBrokerSymbol("BRK.B", "CN"), "BRK.B");
+  assert.equal(formatBrokerSymbol("00133.00.HK", "HK"), "133.HK");
+});
+
+test("IB dividends normalize share-class aliases and keep the original description", () => {
+  for (const input of ["BRK B", "BRK.B", "BRK_B", "BRK-B", "brk  b"]) {
+    const raw = `2026-09-17,${input}(US123) Cash Dividend USD 0.5,50`;
+    const issues = [];
+    const rows = parseIbTransactions(`Date,Description,Amount\n${raw}`, "US", issues);
+    assert.equal(rows.length, 1, input);
+    assert.equal(rows[0].symbol, "BRK-B", input);
+    assert.equal(rows[0].transaction_type, "PAY", input);
+    assert.equal(rows[0].raw, raw, input);
+    assert.deepEqual(issues, [], input);
+  }
+});

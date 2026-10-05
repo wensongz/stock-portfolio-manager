@@ -99,7 +99,10 @@ export function parseMoomooTransactions(text: string, defaultMarket: Market, iss
     const price = parseCsvNumber(fields[priceIndex]);
     const time = parseDate(fields[timeIndex] ?? "");
     const errors: string[] = [];
-    if (!group?.code || !/^[A-Z0-9][A-Z0-9.\-/ ]*$/i.test(group.code)) errors.push("证券代码缺失或无效，无法确定成交所属订单");
+    const validSymbol = group?.market === "US"
+      ? /^[A-Z0-9][A-Z0-9.\-/]*$/.test(formatBrokerSymbol(group.code, group.market))
+      : !!group?.code && /^[A-Z0-9][A-Z0-9.\-/ ]*$/i.test(group.code);
+    if (!validSymbol) errors.push("证券代码缺失或无效，无法确定成交所属订单");
     if (!Number.isFinite(shares) || shares === 0) errors.push("成交数量缺失或无效（不能为 0）");
     if (!Number.isFinite(price) || price <= 0) errors.push("成交价格缺失或无效（需大于 0）");
     // Legacy parser callers may use exports without dates; import diagnostics must still surface them.

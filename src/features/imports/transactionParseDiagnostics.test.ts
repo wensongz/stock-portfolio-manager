@@ -75,6 +75,29 @@ test("IB diagnoses malformed dividend rows without treating report totals as div
   assert.match(issues[0].message, /金额/);
 });
 
+test("IB dividend aliases do not admit invalid multi-word US symbols", () => {
+  for (const input of ["bad symbol", "BRK BB", "1BRK B", "BRK.B C", "BRK B EXTRA"]) {
+    const raw = `2026-09-17,${input}(US123) Cash Dividend USD 0.5,50`;
+    const issues = [];
+    const rows = parseIbTransactions(`Date,Description,Amount\n${raw}`, "US", issues);
+    assert.deepEqual(rows, [], input);
+    assert.equal(issues.length, 1, input);
+    assert.equal(issues[0].raw, raw, input);
+    assert.match(issues[0].message, /代码/, input);
+  }
+});
+
+test("IB dividend share-class parsing preserves HK symbol extraction rules", () => {
+  const valid = "2026-09-17,00133.00(HK123) Cash Dividend HKD 0.5,50";
+  const invalid = "2026-09-17,133 B(HK123) Cash Dividend HKD 0.5,50";
+  const issues = [];
+  const rows = parseIbTransactions(`Date,Description,Amount\n${valid}\n${invalid}`, "HK", issues);
+  assert.deepEqual(rows.map(row => [row.symbol, row.raw]), [["133.HK", valid]]);
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].raw, invalid);
+  assert.match(issues[0].message, /代码/);
+});
+
 test("Moomoo diagnoses invalid fills and never attaches a new order's fills to the preceding order", () => {
   const lines = [
     "方向,代码,名称,市场,成交数量,成交价格,成交金额,成交时间,合计费用",
@@ -111,7 +134,7 @@ test("Firstrade diagnoses invalid numeric/date/symbol fields and ignores non-tra
   assert.match(issues[0].message, /数量/);
 });
 
-test("broker trade diagnostics preserve legitimate share-class symbols containing a space", () => {
+test("broker trade diagnostics accept and normalize legitimate share-class symbols containing a space", () => {
   const parsers = [
     issues => parseIbTransactions("Symbol,Date/Time,Quantity,Price\nBRK B,2026-09-17,1,100", "US", issues),
     issues => parseMoomooTransactions("方向,代码,成交数量,成交价格,成交时间\n买入,BRK B,1,100,2026/09/17 09:30:00", "US", issues),
@@ -121,7 +144,7 @@ test("broker trade diagnostics preserve legitimate share-class symbols containin
     const issues = [];
     const rows = parse(issues);
     assert.equal(rows.length, 1);
-    assert.equal(rows[0].symbol, "BRK B");
+    assert.equal(rows[0].symbol, "BRK-B");
     assert.deepEqual(issues, []);
   }
 });

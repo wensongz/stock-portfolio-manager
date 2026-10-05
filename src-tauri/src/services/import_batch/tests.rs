@@ -39,6 +39,206 @@ fn shares(db: &Database, symbol: &str) -> f64 {
         )
         .unwrap()
 }
+
+#[test]
+fn share_class_import_normalizes_only_us_stock_aliases() {
+    for (market, symbol, expected) in [
+        ("US", "BRK B", "BRK-B"),
+        ("US", "BRK.B", "BRK-B"),
+        ("US", "BRK_B", "BRK-B"),
+        ("US", " brk  b ", "BRK-B"),
+        ("US", "BRK-B", "BRK-B"),
+        ("US", "BF B", "BF-B"),
+        ("US", "BRK A", "BRK-A"),
+        ("US", "AAPL", "AAPL"),
+        ("US", "$CASH-USD", "$CASH-USD"),
+        ("US", "BRK B 16JUN23 330 C", "BRK B 16JUN23 330 C"),
+        ("US", "bad symbol", "BAD SYMBOL"),
+        ("HK", "700.HK", "700.HK"),
+        ("HK", "BRK.B", "BRK.B"),
+    ] {
+        let mut data = buy("one", 1.0)["data"].clone();
+        data["market"] = json!(market);
+        data["symbol"] = json!(symbol);
+        let normalized = dedup::normalize("transactions", "a", &data).unwrap();
+        assert_eq!(normalized["symbol"], expected, "{market}: {symbol}");
+    }
+}
+
+#[test]
+fn share_class_trade_import_merges_position_and_keeps_source_and_undo() {
+    let db = database();
+    let mut first = buy("1", 600.0);
+    first["data"]["symbol"] = json!("BRK-B");
+    first["data"]["price"] = json!(489.4);
+    first["data"]["total_amount"] = json!(293640.0);
+    let initial = preview_import_batch(&db, &request("first", vec![first])).unwrap();
+    apply_all(&db, &initial);
+    let before = state::capture(&db.conn.lock().unwrap(), "a").unwrap();
+    let original_id = before
+        .holdings
+        .iter()
+        .find(|h| h["symbol"] == "BRK-B")
+        .unwrap()["id"]
+        .clone();
+
+    let mut row = buy("2", 100.0);
+    row["raw"] = json!("BRK B,BUY,100,501.33");
+    row["data"]["symbol"] = json!("BRK B");
+    row["data"]["price"] = json!(501.33);
+    row["data"]["total_amount"] = json!(50133.0);
+    row["data"]["traded_at"] = json!("2026-10-02");
+    let p = preview_import_batch(&db, &request("second", vec![row])).unwrap();
+    assert_eq!(p.rows[0].data["symbol"], "BRK-B");
+    assert_eq!(p.rows[0].raw, "BRK B,BUY,100,501.33");
+    let applied = apply_all(&db, &p);
+    assert_eq!(applied.rows[0].status, "imported");
+    let after = state::capture(&db.conn.lock().unwrap(), "a").unwrap();
+    let stock = after
+        .holdings
+        .iter()
+        .find(|h| h["symbol"] == "BRK-B")
+        .unwrap();
+    assert_eq!(stock["id"], original_id);
+    assert_eq!(stock["shares"], 700.0);
+    assert!((stock["avg_cost"].as_f64().unwrap() - 491.10714285714283).abs() < 1e-9);
+    assert_eq!(after.holdings.len(), 2);
+    assert_eq!(shares(&db, "$CASH-USD"), -343775.0);
+    assert!(after
+        .transactions
+        .iter()
+        .all(|t| t["symbol"] == "BRK-B" && t["holding_id"] == original_id));
+    undo_import_batch(&db, &applied.id).unwrap();
+    assert_eq!(
+        state::capture(&db.conn.lock().unwrap(), "a").unwrap(),
+        before
+    );
+}
+
+#[test]
+fn share_class_reimport_matches_legacy_batch_fingerprints_without_rewriting_audit() {
+    let db = database();
+    let mut row = buy("1", 10.0);
+    row["data"]["symbol"] = json!("BRK-B");
+    row["external_id"] = json!("exec-1");
+    let req = request("legacy", vec![row.clone()]);
+    let batch = preview_import_batch(&db, &req).unwrap();
+    apply_all(&db, &batch);
+    // Reproduce an old parser's persisted audit, including its pre-fix fingerprint.
+    let old_fp = json!([
+        "BRK B",
+        "US",
+        "USD",
+        "BUY",
+        "2026-01-01T00:00:00+00:00",
+        10.0,
+        10.0,
+        100.0,
+        1.0
+    ])
+    .to_string();
+    db.conn.lock().unwrap().execute(
+        "UPDATE import_batch_rows SET data=json_set(data,'$.symbol','BRK B'),fingerprint=?2 WHERE batch_id=?1",
+        params![batch.id, old_fp],
+    ).unwrap();
+    let old_data = get_import_batch(&db, &batch.id).unwrap().rows[0]
+        .data
+        .clone();
+
+    let mut same_file = req.clone();
+    same_file.request_id = "same-file".into();
+    same_file.rows[0].external_id = None;
+    assert_eq!(
+        preview_import_batch(&db, &same_file).unwrap().rows[0].status,
+        "duplicate"
+    );
+    let same_execution = request("same-execution", vec![row.clone()]);
+    assert_eq!(
+        preview_import_batch(&db, &same_execution).unwrap().rows[0].status,
+        "duplicate"
+    );
+    row["external_id"] = json!("exec-2");
+    assert_eq!(
+        preview_import_batch(&db, &request("distinct", vec![row.clone()]))
+            .unwrap()
+            .rows[0]
+            .status,
+        "ready"
+    );
+    row["external_id"] = json!("exec-1");
+    row["data"]["price"] = json!(11.0);
+    assert_eq!(
+        preview_import_batch(&db, &request("conflict", vec![row]))
+            .unwrap()
+            .rows[0]
+            .status,
+        "failed"
+    );
+    assert_eq!(
+        get_import_batch(&db, &batch.id).unwrap().rows[0].data,
+        old_data
+    );
+    let persisted_fp: String = db
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT fingerprint FROM import_batch_rows WHERE batch_id=?1",
+            [&batch.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted_fp, old_fp);
+}
+
+#[test]
+fn share_class_import_detects_legacy_manual_transactions_as_suspected_duplicates() {
+    let db = database();
+    let mut row = buy("1", 10.0);
+    row["data"]["symbol"] = json!("BRK B");
+    row["data"]["account_id"] = json!("a");
+    {
+        let mut conn = db.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        create_transaction_in(&tx, &serde_json::from_value(row["data"].clone()).unwrap()).unwrap();
+        tx.commit().unwrap();
+    }
+    row["data"]["symbol"] = json!("BRK-B");
+    let preview = preview_import_batch(&db, &request("reimport", vec![row])).unwrap();
+    assert_eq!(preview.rows[0].status, "suspected");
+}
+
+#[test]
+fn share_class_holding_import_rejects_a_second_snapshot_of_existing_position() {
+    let db = database();
+    let mut req = request(
+        "holding",
+        vec![json!({"key":"1","raw":"BRK-B,600,489.4","data":{
+            "symbol":"BRK-B","name":"Berkshire","market":"US","currency":"USD",
+            "shares":600.0,"avg_cost":489.4,"category_id":null
+        }})],
+    );
+    req.kind = "holdings".into();
+    let first = preview_import_batch(&db, &req).unwrap();
+    apply_all(&db, &first);
+    req.request_id = "duplicate-holding".into();
+    req.source_content = "different-file".into();
+    req.rows[0].data["symbol"] = json!("BRK B");
+    req.rows[0].data["shares"] = json!(700.0);
+    let p = preview_import_batch(&db, &req).unwrap();
+    assert_eq!(p.rows[0].data["symbol"], "BRK-B");
+    let applied = apply_all(&db, &p);
+    assert_eq!(applied.rows[0].status, "failed");
+    assert_eq!(shares(&db, "BRK-B"), 600.0);
+    assert_eq!(
+        state::capture(&db.conn.lock().unwrap(), "a")
+            .unwrap()
+            .holdings
+            .len(),
+        1
+    );
+}
+
 #[test]
 fn duplicate_request_and_file_cannot_double_book() {
     let db = database();

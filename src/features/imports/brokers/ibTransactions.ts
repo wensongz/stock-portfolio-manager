@@ -55,8 +55,12 @@ function parseTradeTable(lines: string[], headerIndex: number, market: Market, s
     const quantity = parseCsvNumber(fields[quantityIndex]);
     const price = parseCsvNumber(fields[priceIndex]);
     const tradedAt = parseDate(fields[dateIndex] ?? "");
+    const symbol = formatBrokerSymbol(rawSymbol, market);
     const errors: string[] = [];
-    if (!rawSymbol || !/^[A-Z0-9][A-Z0-9.\-/ ]*$/i.test(rawSymbol)) errors.push("证券代码缺失或无效");
+    const validSymbol = market === "US"
+      ? /^[A-Z0-9][A-Z0-9.\-/]*$/.test(symbol)
+      : /^[A-Z0-9][A-Z0-9.\-/ ]*$/i.test(rawSymbol);
+    if (!validSymbol) errors.push("证券代码缺失或无效");
     if (accountIndex !== -1 && !validAccountId(fields[accountIndex] ?? "")) errors.push("账户编号缺失或无效");
     if (!Number.isFinite(quantity) || quantity === 0) errors.push("成交数量缺失或无效（不能为 0）");
     if (!Number.isFinite(price) || price <= 0) errors.push("成交价格缺失或无效（需大于 0）");
@@ -84,7 +88,7 @@ function parseTradeTable(lines: string[], headerIndex: number, market: Market, s
     const externalId = (fields[externalIndex] ?? "").trim();
     rows.push({
       key: String(i), raw: lines[i], external_id: /^0*$/.test(externalId) ? null : externalId, selected: true, transaction_type: action, stock_name: rawSymbol,
-      symbol: formatBrokerSymbol(rawSymbol, market), traded_at: tradedAt,
+      symbol, traded_at: tradedAt,
       price: Math.abs(price), shares,
       total_amount: Math.abs(Number.isNaN(proceeds) ? price * shares : proceeds), commission,
     });
@@ -120,7 +124,9 @@ function parseDividends(lines: string[], headerIndex: number, market: Market, is
     const description = (fields[descriptionIndex] ?? "").trim();
     if (!description || isImportSummary(description)) continue;
     if (!/(dividend|股息|股利|分红|interest|利息)/i.test(description)) continue;
-    const match = description.match(/^([0-9A-Z.\-]+)\s*\(/);
+    const match = description.match(market === "US"
+      ? /^([A-Z][A-Z0-9]*(?:[._-]|\s+)[A-Z]|[0-9A-Z.\-]+)\s*\(/i
+      : /^([0-9A-Z.\-]+)\s*\(/);
     if (!match && /(interest|利息)/i.test(description)) continue;
     const symbol = match ? formatBrokerSymbol(match[1], market) : "";
     const amount = parseCsvNumber(fields.slice(amountIndex).join(","));

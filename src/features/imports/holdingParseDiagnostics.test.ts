@@ -57,9 +57,9 @@ for (const format of formats) {
   });
 }
 
-test("IB holdings preserve share-class symbols with a space", () => {
+test("IB holdings normalize share-class symbols with a space", () => {
   const result = parseIbHoldings("Symbol,Quantity,Cost Price\nBRK B,2,400", "US");
-  assert.equal(result.rows[0]?.symbol, "BRK B");
+  assert.equal(result.rows[0]?.symbol, "BRK-B");
   assert.equal(result.issues, undefined);
 });
 

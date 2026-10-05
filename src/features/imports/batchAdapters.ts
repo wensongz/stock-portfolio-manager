@@ -20,7 +20,7 @@ export function batchPreviewRequest<Row extends ImportRow>(options: {
   toData: (row: Row) => Record<string, unknown>;
 }): PreviewImportBatchRequest {
   return { request_id: options.requestId, account_id: options.accountId, source: options.source,
-    file_name: options.fileName, source_content: options.sourceContent, parser_version: '2',
+    file_name: options.fileName, source_content: options.sourceContent, parser_version: '3',
     kind: options.kind, rows: options.rows.filter(row => row.selected).map(row => ({
       key: row.key, raw: row.raw ?? row, external_id: row.external_id ?? null, data: options.toData(row),
     })) };

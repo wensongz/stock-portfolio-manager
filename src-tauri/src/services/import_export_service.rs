@@ -580,7 +580,7 @@ pub fn preview_csv_import_batch(
             source: "generic-csv".into(),
             file_name: file_name.into(),
             source_content: content.into(),
-            parser_version: "2".into(),
+            parser_version: "3".into(),
             kind: data_type.into(),
             rows,
         },

@@ -37,9 +37,10 @@ export function parseMoomooHoldings(text: string, accountMarket: Market): ParseR
       const market: Market = currency === "HKD" ? "HK"
         : currency === "CNY" ? "CN"
         : accountMarket === "HK" ? "US" : accountMarket;
+      const symbol = formatBrokerSymbol(raw, market);
       const messages: string[] = [];
       if (!raw) messages.push("缺少证券代码");
-      else if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(raw) || (market === "HK" && !/\d/.test(raw))) messages.push("证券代码格式无效");
+      else if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(market === "US" ? symbol : raw) || (market === "HK" && !/\d/.test(raw))) messages.push("证券代码格式无效");
       if (!Number.isFinite(shares)) messages.push("持仓数量缺失或不是有效数字");
       if (!Number.isFinite(avgCost)) messages.push("成本价缺失或不是有效数字");
       if (messages.length) {
@@ -47,7 +48,7 @@ export function parseMoomooHoldings(text: string, accountMarket: Market): ParseR
         continue;
       }
       rows.push({
-        key: String(rows.length), raw: lines[j], selected: true, symbol: formatBrokerSymbol(raw, market),
+        key: String(rows.length), raw: lines[j], selected: true, symbol,
         name: name || raw,
         shares, avgCost, currency, market,
       });

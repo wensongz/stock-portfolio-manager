@@ -1,6 +1,7 @@
 import dayjs from "dayjs";
 import { splitCsvLine, stripBom } from "../csv.ts";
 import type { ImportParseIssue, TransactionImportRow } from "../types.ts";
+import { formatBrokerSymbol } from "./symbol.ts";
 import { hasInvalidOptionalImportNumber, isImportSummary, isValidImportDate, parseImportNumber as parseCsvNumber, recordImportIssue } from "../parseDiagnostics.ts";
 
 function parseDate(raw: string): string {
@@ -42,7 +43,7 @@ export function parseFirstradeTransactions(text: string, issues?: ImportParseIss
     const fields = splitCsvLine(lines[i]);
     const action = (fields[actionIndex] ?? "").trim().toUpperCase();
     if (action && action !== "BUY" && action !== "SELL") continue;
-    const symbol = (fields[symbolIndex] ?? "").trim().toUpperCase();
+    const symbol = formatBrokerSymbol(fields[symbolIndex] ?? "", "US");
     if (isImportSummary(symbol)) continue;
     if (!action && ![quantityIndex, priceIndex, dateIndex].some(index => index !== -1 && (fields[index] ?? "").trim())) continue;
     const quantity = parseCsvNumber(fields[quantityIndex]);
@@ -50,7 +51,7 @@ export function parseFirstradeTransactions(text: string, issues?: ImportParseIss
     const tradedAt = parseDate(fields[dateIndex] ?? "");
     const errors: string[] = [];
     if (!action) errors.push("买卖方向缺失");
-    if (!symbol || !/^[A-Z][A-Z0-9.\-/ ]*$/i.test(symbol)) errors.push("证券代码缺失或无效");
+    if (!symbol || !/^[A-Z][A-Z0-9.\-/]*$/.test(symbol)) errors.push("证券代码缺失或无效");
     if (!Number.isFinite(quantity) || quantity === 0) errors.push("成交数量缺失或无效（不能为 0）");
     if (!Number.isFinite(price) || price <= 0) errors.push("成交价格缺失或无效（需大于 0）");
     if (!tradedAt) errors.push("成交日期缺失或无效");

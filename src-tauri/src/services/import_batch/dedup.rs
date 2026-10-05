@@ -6,6 +6,19 @@ use crate::services::portfolio_mutation::{
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use serde_json::{json, Value};
 
+fn canonical_symbol(symbol: &str, market: &str) -> String {
+    let normalized = symbol.trim().to_uppercase();
+    if market.trim().eq_ignore_ascii_case("US") {
+        static SHARE_CLASS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let pattern = SHARE_CLASS.get_or_init(|| {
+            regex::Regex::new(r"^([A-Z][A-Z0-9]*)(?:[._-]|\s+)([A-Z])$")
+                .expect("valid US share-class pattern")
+        });
+        return pattern.replace(&normalized, "$1-$2").into_owned();
+    }
+    normalized
+}
+
 pub(super) fn normalize(kind: &str, account: &str, value: &Value) -> Result<Value, String> {
     let mut data = value.clone();
     let object = data.as_object_mut().ok_or("导入行必须为对象")?;
@@ -14,6 +27,10 @@ pub(super) fn normalize(kind: &str, account: &str, value: &Value) -> Result<Valu
         if let Some(value) = object.get(field).and_then(Value::as_str) {
             object.insert(field.into(), json!(value.trim().to_uppercase()));
         }
+    }
+    if let Some(symbol) = object.get("symbol").and_then(Value::as_str) {
+        let market = object.get("market").and_then(Value::as_str).unwrap_or("");
+        object.insert("symbol".into(), json!(canonical_symbol(symbol, market)));
     }
     if object
         .get("symbol")
@@ -80,6 +97,11 @@ pub(super) fn fingerprint(kind: &str, data: &Value) -> String {
                     .as_str()
                     .and_then(|s| canonical_date(s).ok())
                     .unwrap_or_default())
+            } else if k == "symbol" {
+                json!(canonical_symbol(
+                    v.as_str().unwrap_or(""),
+                    data["market"].as_str().unwrap_or("")
+                ))
             } else if let Some(n) = v.as_f64() {
                 json!(if n == 0.0 { 0.0 } else { n })
             } else if let Some(s) = v.as_str() {
@@ -101,7 +123,7 @@ pub(super) fn classify(
     exclude_batch: &str,
 ) -> Result<(String, Option<String>), String> {
     let fp = fingerprint(&req.kind, data);
-    let mut stmt=conn.prepare("SELECT b.source,(b.source_content=?4),r.row_key,r.external_id,r.fingerprint,r.record_id FROM import_batch_rows r JOIN import_batches b ON b.id=r.batch_id WHERE b.account_id=?1 AND b.kind=?2 AND b.status!='undone' AND r.status='imported' AND b.id!=?3").map_err(|e|e.to_string())?;
+    let mut stmt=conn.prepare("SELECT b.source,(b.source_content=?4),r.row_key,r.external_id,r.data,r.record_id FROM import_batch_rows r JOIN import_batches b ON b.id=r.batch_id WHERE b.account_id=?1 AND b.kind=?2 AND b.status!='undone' AND r.status='imported' AND b.id!=?3").map_err(|e|e.to_string())?;
     let prior = stmt
         .query_map(
             rusqlite::params![req.account_id, req.kind, exclude_batch, req.source_content],
@@ -120,9 +142,12 @@ pub(super) fn classify(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     let mut suspected = false;
-    for (source, content, old_key, old_external, old_fp, _) in &prior {
+    for (source, content, old_key, old_external, old_data, _) in &prior {
+        // Compare old imports using today's symbol identity without rewriting
+        // their original audit data, fingerprints, or undo snapshots.
+        let old_fp = fingerprint(&req.kind, &decode::<Value>(old_data)?);
         if source == &req.source && external.is_some() && external == old_external.as_deref() {
-            return Ok(if old_fp == &fp {
+            return Ok(if old_fp == fp {
                 ("duplicate".into(), Some("成交编号已导入".into()))
             } else {
                 (
@@ -132,7 +157,7 @@ pub(super) fn classify(
             });
         }
         if source == &req.source && !req.source_content.is_empty() && *content && old_key == key {
-            return Ok(if old_fp == &fp {
+            return Ok(if old_fp == fp {
                 ("duplicate".into(), Some("同一文件行已导入".into()))
             } else {
                 (
@@ -141,7 +166,7 @@ pub(super) fn classify(
                 )
             });
         }
-        if old_fp == &fp
+        if old_fp == fp
             && !(source == &req.source
                 && external.is_some()
                 && old_external.is_some()

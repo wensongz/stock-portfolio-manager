@@ -10,7 +10,7 @@ import { useTablePageSize } from "../../hooks/tablePageSize";
 import { statisticsViewKey, useStatisticsStore } from "../../stores/statisticsStore";
 import AccountStockTransactionsModal from "./AccountStockTransactionsModal";
 import StatisticsAiReviewButton from "./StatisticsAiReviewButton";
-import { formatHoldingShares } from "../../lib/formatMoney";
+import { formatHoldingShares, formatMoney } from "../../lib/formatMoney";
 import { filterActiveOverviewHoldings } from "./categoryHoldings";
 
 const { Text } = Typography;
@@ -270,10 +270,8 @@ export default function OverviewTab({ baseCurrency }: Props) {
       dataIndex: "current_price",
       key: "current_price",
       sorter: (a, b) => a.current_price - b.current_price,
-      render: (price: number, record: AggregatedStock) => {
-        const sym = currencySymbol[record.currency] ?? "";
-        return `${sym}${price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-      },
+      render: (price: number, record: AggregatedStock) =>
+        formatMoney(price, record.currency),
       align: "right" as const,
       width: 100,
     },
@@ -283,10 +281,8 @@ export default function OverviewTab({ baseCurrency }: Props) {
       key: "market_value",
       sorter: (a, b) => a.market_value_usd - b.market_value_usd,
       defaultSortOrder: "descend" as const,
-      render: (value: number, record: AggregatedStock) => {
-        const sym = currencySymbol[record.currency] ?? "";
-        return `${sym}${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-      },
+      render: (value: number, record: AggregatedStock) =>
+        formatMoney(value, record.currency),
       align: "right" as const,
       width: 140,
     },
@@ -378,10 +374,8 @@ export default function OverviewTab({ baseCurrency }: Props) {
         key: "market_value",
         align: "right" as const,
         width: 140,
-        render: (value: number, record: AccountHoldingRow) => {
-          const sym = currencySymbol[record.currency] ?? "";
-          return `${sym}${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-        },
+        render: (value: number, record: AccountHoldingRow) =>
+          formatMoney(value, record.currency),
       },
       {
         title: "仓位",

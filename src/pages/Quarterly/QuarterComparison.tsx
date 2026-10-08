@@ -157,7 +157,7 @@ export default function QuarterComparisonPage() {
                   title={`市值变化 (${baseCurrency})`}
                   value={ov?.value_change ?? 0}
                   precision={2}
-                  formatter={(value) => `${Number(value) >= 0 ? "+" : ""}${formatQuarterlyMoney(Number(value), baseCurrency)}`}
+                  formatter={(value) => formatQuarterlyMoney(Number(value), baseCurrency, 2, { signDisplay: "always" })}
                   styles={{
                     content: {
                       color: pnlColorDark(ov?.value_change ?? 0),

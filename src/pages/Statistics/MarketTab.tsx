@@ -9,7 +9,7 @@ import { usePnlColor } from "../../hooks/usePnlColor";
 import { useTablePageSize } from "../../hooks/tablePageSize";
 import AccountStockTransactionsModal from "./AccountStockTransactionsModal";
 import StatisticsAiReviewButton from "./StatisticsAiReviewButton";
-import { formatHoldingShares } from "../../lib/formatMoney";
+import { formatHoldingShares, formatMoney } from "../../lib/formatMoney";
 
 const { Text } = Typography;
 
@@ -252,7 +252,7 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
       key: "current_price",
       sorter: (a, b) => a.current_price - b.current_price,
       render: (price: number) =>
-        `${currencySymbol}${price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+        formatMoney(price, currencySymbol),
       align: "right" as const,
       width: 100,
     },
@@ -263,7 +263,7 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
       sorter: (a, b) => a.market_value_usd - b.market_value_usd,
       defaultSortOrder: "descend" as const,
       render: (value: number) =>
-        `${currencySymbol}${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+        formatMoney(value, currencySymbol),
       align: "right" as const,
       width: 140,
     },
@@ -352,7 +352,7 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
         align: "right" as const,
         width: 140,
         render: (value: number) =>
-          `${currencySymbol}${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+          formatMoney(value, currencySymbol),
       },
       {
         title: "仓位",

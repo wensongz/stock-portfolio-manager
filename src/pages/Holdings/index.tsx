@@ -76,12 +76,6 @@ function isClearedPosition(holding: { symbol: string; shares: number }): boolean
   return !isCashSymbol(holding.symbol) && holding.shares === 0;
 }
 
-/** Shared formatting options for displaying currency amounts. */
-const CURRENCY_FORMAT_OPTIONS: Intl.NumberFormatOptions = {
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2,
-};
-
 const marketColors: Record<Market, string> = {
   US: "blue",
   CN: "red",
@@ -223,8 +217,6 @@ export default function HoldingsPage() {
     CN: "CNY",
     HK: "HKD",
   };
-
-  const currencySymbol: Record<string, string> = { USD: "$", CNY: "¥", HKD: "HK$" };
 
   const handleAccountChange = useCallback(
     (accountId: string) => {
@@ -643,7 +635,7 @@ export default function HoldingsPage() {
       ellipsis: true,
       render: (v: number, record: HoldingWithQuote) =>
         isCashSymbol(record.symbol)
-          ? `${currencySymbol[record.currency]}${v.toLocaleString(undefined, CURRENCY_FORMAT_OPTIONS)}`
+          ? formatMoney(v, record.currency)
           : v.toLocaleString(),
     },
     {
@@ -702,7 +694,7 @@ export default function HoldingsPage() {
       render: (_: unknown, record: HoldingWithQuote) => {
         if (record.market_value === null || record.market_value === undefined)
           return <span>—</span>;
-        return `${currencySymbol[record.currency]}${record.market_value.toFixed(0)}`;
+        return formatMoney(record.market_value, record.currency, 0, { useGrouping: false });
       },
     },
     {
@@ -1273,20 +1265,20 @@ export default function HoldingsPage() {
                 dataIndex: "price",
                 key: "price",
                 width: 100,
-                render: (v: number, record: Transaction) => `${currencySymbol[record.currency]}${v.toFixed(2)}`,
+                render: (v: number, record: Transaction) => formatMoney(v, record.currency, 2, { useGrouping: false }),
               },
               {
                 title: "总金额",
                 dataIndex: "total_amount",
                 key: "total_amount",
-                render: (v: number, record: Transaction) => `${currencySymbol[record.currency]}${v.toFixed(2)}`,
+                render: (v: number, record: Transaction) => formatMoney(v, record.currency, 2, { useGrouping: false }),
               },
               {
                 title: "手续费",
                 dataIndex: "commission",
                 key: "commission",
                 width: 90,
-                render: (v: number, record: Transaction) => `${currencySymbol[record.currency]}${v.toFixed(2)}`,
+                render: (v: number, record: Transaction) => formatMoney(v, record.currency, 2, { useGrouping: false }),
               },
               {
                 title: "备注",

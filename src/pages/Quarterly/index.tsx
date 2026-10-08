@@ -71,7 +71,7 @@ export default function QuarterlyPage() {
 
   const formatSnapshotAmount = (amount: number, snapshot: QuarterlySnapshot, signed = false) => {
     const value = convertSnapshotValue(amount, "USD", baseCurrency, parseSnapshotExchangeRates(snapshot.exchange_rates));
-    return value === null ? "无法折算（缺少有效快照汇率）" : `${signed && value >= 0 ? "+" : ""}${formatQuarterlyMoney(value, baseCurrency)}`;
+    return value === null ? "无法折算（缺少有效快照汇率）" : formatQuarterlyMoney(value, baseCurrency, 2, { signDisplay: signed ? "always" : "auto" });
   };
 
   const columns = [

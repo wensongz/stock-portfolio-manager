@@ -4,12 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import dayjs from "dayjs";
 import type { Transaction, TransactionType } from "../../types";
 import TransactionFormModal from "../Transactions/TransactionFormModal";
-
-const currencySymbol: Record<string, string> = {
-  USD: "$",
-  CNY: "¥",
-  HKD: "HK$",
-};
+import { formatMoney } from "../../lib/formatMoney";
 
 interface Props {
   open: boolean;
@@ -114,7 +109,7 @@ export default function AccountStockTransactionsModal({
               key: "price",
               width: 100,
               render: (v: number, record: Transaction) =>
-                `${currencySymbol[record.currency] ?? ""}${v.toFixed(2)}`,
+                formatMoney(v, record.currency, 2, { useGrouping: false }),
             },
             {
               title: "总金额",
@@ -122,7 +117,7 @@ export default function AccountStockTransactionsModal({
               key: "total_amount",
               width: 120,
               render: (v: number, record: Transaction) =>
-                `${currencySymbol[record.currency] ?? ""}${v.toFixed(2)}`,
+                formatMoney(v, record.currency, 2, { useGrouping: false }),
             },
             {
               title: "手续费",
@@ -130,7 +125,7 @@ export default function AccountStockTransactionsModal({
               key: "commission",
               width: 90,
               render: (v: number, record: Transaction) =>
-                `${currencySymbol[record.currency] ?? ""}${v.toFixed(2)}`,
+                formatMoney(v, record.currency, 2, { useGrouping: false }),
             },
             {
               title: "备注",

@@ -77,9 +77,9 @@ test("quarterly holdings renders actual cash currency and signed totals, includi
     process.stdout.write(JSON.stringify([render([stock, cash]), render([cash]), render([{ ...cash, shares: 0, market_value: 0, cost_value: 0 }])]));
   `;
   const [debit, cashOnly, zero] = JSON.parse(execFileSync("bun", ["--eval", probe], { cwd: projectRoot, encoding: "utf8" }));
-  assert.match(debit, /\$-200\.00/);
+  assert.match(debit, /-\$200\.00/);
   assert.match(debit, /合计市值 \(USD\)：\$800\.00/);
-  assert.match(cashOnly, /合计市值 \(USD\)：\$-200\.00/);
+  assert.match(cashOnly, /合计市值 \(USD\)：-\$200\.00/);
   assert.match(zero, /\$CASH-USD/);
   assert.match(zero, /合计市值 \(USD\)：\$0\.00/);
 });

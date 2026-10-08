@@ -11,7 +11,7 @@ import { usePnlColor } from "../../hooks/usePnlColor";
 import { useTablePageSize } from "../../hooks/tablePageSize";
 import AccountStockTransactionsModal from "./AccountStockTransactionsModal";
 import { filterActiveStockHoldings } from "./categoryHoldings";
-import { formatHoldingShares } from "../../lib/formatMoney";
+import { formatHoldingShares, formatMoney } from "../../lib/formatMoney";
 
 const { Text } = Typography;
 
@@ -96,11 +96,6 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
       .sort((a, b) => b.market_value_usd - a.market_value_usd);
   }, [stats]);
 
-  const formatMoney = useCallback((value: number, currency: string) => {
-    const prefix = currencySymbol[currency] ?? "";
-    return `${prefix}${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  }, []);
-
   const handleShowTransactions = useCallback((record: AccountHoldingRow) => {
     setTxnModal({
       accountId: record.account_id,
@@ -119,7 +114,7 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
     { title: "盈亏金额", dataIndex: "pnl", key: "pnl", align: "right", width: 140, render: (v: number, r) => <span style={{ color: pnlColor(v) }}>{v >= 0 ? "+" : "-"}{formatMoney(Math.abs(v), r.currency)}</span> },
     { title: "盈亏比例", dataIndex: "pnl_percent", key: "pnl_percent", align: "right", width: 80, render: (v: number | null) => v == null ? "-" : <span style={{ color: pnlColor(v) }}>{v >= 0 ? "+" : ""}{v.toFixed(2)}%</span> },
     { title: "交易", key: "transactions", align: "center", width: 80, render: (_, record) => <Button type="link" size="small" onClick={() => handleShowTransactions(record)}>明细</Button> },
-  ], [formatMoney, handleShowTransactions, pnlColor]);
+  ], [handleShowTransactions, pnlColor]);
 
   const stockColumns: ColumnsType<AggregatedStock> = useMemo(() => [
     { title: "代码", dataIndex: "symbol", key: "symbol", fixed: "left", width: 100, sorter: (a, b) => a.symbol.localeCompare(b.symbol), render: (v: string) => <Text strong>{v}</Text> },
@@ -132,7 +127,7 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
     { title: "仓位%", key: "position_pct", align: "right", width: 70, sorter: (a, b) => a.market_value_usd - b.market_value_usd, render: (_, r) => { const total = aggregatedStocks.reduce((sum, row) => sum + row.market_value_usd, 0); return `${(total > 0 ? r.market_value_usd / total * 100 : 0).toFixed(2)}%`; } },
     { title: "盈亏金额", dataIndex: "pnl", key: "pnl", align: "right", width: 140, sorter: (a, b) => a.pnl - b.pnl, render: (v: number, r) => <span style={{ color: pnlColor(v) }}>{v >= 0 ? "+" : "-"}{formatMoney(Math.abs(v), r.currency)}</span> },
     { title: "盈亏比例", dataIndex: "pnl_percent", key: "pnl_percent", align: "right", width: 80, render: (v: number | null) => v == null ? "-" : <span style={{ color: pnlColor(v) }}>{v >= 0 ? "+" : ""}{v.toFixed(2)}%</span> },
-  ], [aggregatedStocks, formatMoney, pnlColor]);
+  ], [aggregatedStocks, pnlColor]);
 
   return (
     <div>

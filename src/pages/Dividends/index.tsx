@@ -14,6 +14,7 @@ import StatCard from "../../components/charts/StatCard";
 import { invoke } from "@tauri-apps/api/core";
 import { GiftOutlined } from "@ant-design/icons";
 import { useExchangeRateStore } from "../../stores/exchangeRateStore";
+import { formatMoney as fmt, getCurrencySymbol } from "../../lib/formatMoney";
 import type { Currency, DividendAnalysis, MarketDividend } from "../../types";
 
 const { Title, Text } = Typography;
@@ -30,21 +31,7 @@ const currencyNames: Record<string, string> = {
   HKD: "港元",
 };
 
-/** Currency code → symbol (for the selected summary currency). */
-const currencySymbol: Record<string, string> = {
-  USD: "$",
-  CNY: "¥",
-  HKD: "HK$",
-};
-
 const CURRENCY_OPTIONS: Currency[] = ["CNY", "USD", "HKD"];
-
-function fmt(amount: number, symbol: string): string {
-  return `${symbol}${amount.toLocaleString("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-}
 
 export default function DividendsPage() {
   const { baseCurrency, setBaseCurrency, convertWithCachedRates, rates, fetchRates } =
@@ -112,7 +99,7 @@ export default function DividendsPage() {
     return analysis.markets.reduce((s, m) => s + convertMarketTotal(m), 0);
   }, [analysis, convertMarketTotal]);
 
-  const baseSymbol = currencySymbol[baseCurrency] ?? "$";
+  const baseSymbol = getCurrencySymbol(baseCurrency);
   const baseName = currencyNames[baseCurrency] ?? baseCurrency;
 
   return (

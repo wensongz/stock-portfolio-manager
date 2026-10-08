@@ -2,7 +2,25 @@
 // does not include @types/node in its browser-focused TypeScript config.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { formatHoldingShares } from "./formatMoney.ts";
+import { formatHoldingShares, formatMoney } from "./formatMoney.ts";
+
+test("formatMoney puts negative signs before currency symbols across currencies", () => {
+  assert.equal(formatMoney(-740_948.79, "USD"), "-$740,948.79");
+  assert.equal(formatMoney(-1234.56, "CNY"), "-¥1,234.56");
+  assert.equal(formatMoney(-1234.56, "HKD"), "-HK$1,234.56");
+  assert.equal(formatMoney(-1234.56, "EUR"), "-EUR1,234.56");
+});
+
+test("formatMoney preserves precision, grouping, and zero while supporting explicit signs", () => {
+  assert.equal(formatMoney(1_697_148.22, "USD", 2, { signDisplay: "always" }), "+$1,697,148.22");
+  assert.equal(formatMoney(-1234.56, "HK$", 2, { signDisplay: "always", useGrouping: false }), "-HK$1234.56");
+  assert.equal(formatMoney(1234.56, "USD"), "$1,234.56");
+  assert.equal(formatMoney(-1234.56, "USD", 0), "-$1,235");
+  assert.equal(formatMoney(-1.23456, "USD", 4), "-$1.2346");
+  assert.equal(formatMoney(0, "USD"), "$0.00");
+  assert.equal(formatMoney(-0, "USD"), "-$0.00");
+  assert.equal(formatMoney(-0.001, "USD"), "-$0.00");
+});
 
 test("formatHoldingShares renders the three cash balances as integers", () => {
   assert.equal(formatHoldingShares(1_234.56, "$CASH-USD"), "1,235");

@@ -530,7 +530,7 @@ export default function OptionsPage() {
       dataIndex: "strike_price",
       key: "strike_price",
       width: 85,
-      render: (v: number) => `$${v.toFixed(2)}`,
+      render: (v: number) => formatMoney(v, "USD", 2, { useGrouping: false }),
     },
     {
       title: "类型",
@@ -560,7 +560,7 @@ export default function OptionsPage() {
       dataIndex: "open_price",
       key: "open_price",
       width: 75,
-      render: (v: number) => `$${v.toFixed(2)}`,
+      render: (v: number) => formatMoney(v, "USD", 2, { useGrouping: false }),
     },
     {
       title: "开仓权利金",
@@ -932,7 +932,7 @@ export default function OptionsPage() {
                         title: "行权价",
                         dataIndex: "strike_price",
                         width: 100,
-                        render: (v: number) => `$${v.toFixed(2)}`,
+                        render: (v: number) => formatMoney(v, "USD", 2, { useGrouping: false }),
                       },
                       { title: "合约数", dataIndex: "contracts", width: 80 },
                       {
@@ -1010,7 +1010,7 @@ export default function OptionsPage() {
                         title: "行权价",
                         dataIndex: "strike_price",
                         width: 100,
-                        render: (v: number) => `$${v.toFixed(2)}`,
+                        render: (v: number) => formatMoney(v, "USD", 2, { useGrouping: false }),
                       },
                       { title: "合约数", dataIndex: "contracts", width: 80 },
                       {

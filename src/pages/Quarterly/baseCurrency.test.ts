@@ -42,9 +42,9 @@ function renderPages(currency, exchangeRates) {
 
 test("quarterly, dashboard and statistics use the same saved base currency", () => {
   for (const [currency, label, value, loss] of [
-    ["CNY", "CNY 人民币", "¥700.00", "¥-140.00"],
-    ["HKD", "HKD 港元", "HK$780.00", "HK$-156.00"],
-    ["USD", "USD 美元", "$100.00", "$-20.00"],
+    ["CNY", "CNY 人民币", "¥700.00", "-¥140.00"],
+    ["HKD", "HKD 港元", "HK$780.00", "-HK$156.00"],
+    ["USD", "USD 美元", "$100.00", "-$20.00"],
   ]) {
     const [quarterly, dashboard, statistics] = renderPages(currency, '{"usd_cny":7,"usd_hkd":7.8}');
     for (const page of [quarterly, dashboard, statistics]) {

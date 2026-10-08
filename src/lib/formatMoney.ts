@@ -4,11 +4,19 @@ export function getCurrencySymbol(currency: string): string {
   return CURRENCY_SYMBOLS[currency] ?? currency;
 }
 
-export function formatMoney(value: number, currency: string, precision = 2): string {
-  return `${getCurrencySymbol(currency)}${value.toLocaleString("en-US", {
+export function formatMoney(
+  value: number,
+  currency: string,
+  precision = 2,
+  options: Pick<Intl.NumberFormatOptions, "useGrouping" | "signDisplay"> = {},
+): string {
+  const formatted = value.toLocaleString("en-US", {
     minimumFractionDigits: precision,
     maximumFractionDigits: precision,
-  })}`;
+    ...options,
+  });
+  const sign = formatted.match(/^[+-]/)?.[0] ?? "";
+  return `${sign}${getCurrencySymbol(currency)}${formatted.slice(sign.length)}`;
 }
 
 const INTEGER_SHARE_SYMBOLS = new Set(["$CASH-USD", "$CASH-CNY", "$CASH-HKD"]);

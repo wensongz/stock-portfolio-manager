@@ -4,7 +4,7 @@ import type { ColumnsType, TableProps } from "antd/es/table";
 import type { HoldingDetail } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
 import { useTablePageSize } from "../../hooks/tablePageSize";
-import { formatHoldingShares } from "../../lib/formatMoney";
+import { formatHoldingShares, formatMoney as fmtMoney } from "../../lib/formatMoney";
 
 const { Text } = Typography;
 
@@ -20,15 +20,6 @@ const marketLabel: Record<string, string> = {
   CN: "🇨🇳 CN",
   HK: "🇭🇰 HK",
 };
-
-const currencySymbol: Record<string, string> = { USD: "$", CNY: "¥", HKD: "HK$" };
-
-function fmtMoney(value: number, currency: string) {
-  return `${currencySymbol[currency] ?? ""}${value.toLocaleString("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-}
 
 export default function HoldingsTable({ holdings, loading, hideAccountMarket = false, formatCashSharesAsInteger = false }: Props) {
   const { pnlColor } = usePnlColor();

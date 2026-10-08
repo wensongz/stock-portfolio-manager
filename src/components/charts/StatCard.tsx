@@ -31,13 +31,14 @@ export default function StatCard({
     && ["USD", "CNY", "HKD", "$", "¥", "HK$"].includes(prefix)
     ? getCurrencySymbol(prefix)
     : null;
+  const currencySign = currencyPrefix ? String(value).match(/^[+-]/)?.[0] ?? "" : "";
 
   return (
     <Card loading={loading} styles={{ body: { padding: "16px 20px" } }}>
       <Statistic
         title={title}
-        value={value}
-        prefix={currencyPrefix ?? prefix}
+        value={currencySign ? String(value).slice(1) : value}
+        prefix={currencyPrefix ? `${currencySign}${currencyPrefix}` : prefix}
         suffix={suffix}
         styles={{ content: valueStyle, prefix: currencyPrefix ? { marginInlineEnd: 0 } : undefined }}
       />

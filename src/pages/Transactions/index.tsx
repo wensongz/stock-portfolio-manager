@@ -25,6 +25,7 @@ import ImportFromMoomooCsvModal from "./ImportFromMoomooCsvModal";
 import ImportFromThsCsvModal from "./ImportFromThsCsvModal";
 import ImportFromFirstradeCsvModal from "./ImportFromFirstradeCsvModal";
 import { useTablePageSize } from "../../hooks/tablePageSize";
+import { formatMoney } from "../../lib/formatMoney";
 import TransactionFormModal from "./TransactionFormModal";
 
 const { Title, Text } = Typography;
@@ -34,8 +35,6 @@ const marketColors: Record<Market, string> = {
   CN: "red",
   HK: "green",
 };
-
-const currencySymbol: Record<string, string> = { USD: "$", CNY: "¥", HKD: "HK$" };
 
 export default function TransactionsPage() {
   const { transactions, loading, fetchTransactions, deleteTransaction } =
@@ -181,19 +180,19 @@ export default function TransactionsPage() {
       dataIndex: "price",
       key: "price",
       render: (v: number, record: Transaction) =>
-        record.symbol.startsWith(CASH_SYMBOL_PREFIX) || record.transaction_type === "STOCK_OUT" ? "—" : `${currencySymbol[record.currency]}${v.toFixed(2)}`,
+        record.symbol.startsWith(CASH_SYMBOL_PREFIX) || record.transaction_type === "STOCK_OUT" ? "—" : formatMoney(v, record.currency, 2, { useGrouping: false }),
     },
     {
       title: "总金额",
       dataIndex: "total_amount",
       key: "total_amount",
-      render: (v: number, record: Transaction) => record.transaction_type === "STOCK_OUT" ? "—" : `${currencySymbol[record.currency]}${v.toFixed(2)}`,
+      render: (v: number, record: Transaction) => record.transaction_type === "STOCK_OUT" ? "—" : formatMoney(v, record.currency, 2, { useGrouping: false }),
     },
     {
       title: "手续费",
       dataIndex: "commission",
       key: "commission",
-      render: (v: number, record: Transaction) => `${currencySymbol[record.currency]}${v.toFixed(2)}`,
+      render: (v: number, record: Transaction) => formatMoney(v, record.currency, 2, { useGrouping: false }),
     },
     {
       title: "操作",

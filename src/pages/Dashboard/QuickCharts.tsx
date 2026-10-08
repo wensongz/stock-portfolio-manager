@@ -1,5 +1,6 @@
 import { Row, Col, Card } from "antd";
 import PieChart from "../../components/charts/PieChart";
+import { formatMoney } from "../../lib/formatMoney";
 import type { DashboardSummary } from "../../types";
 
 interface Props {
@@ -17,9 +18,7 @@ export default function QuickCharts({ summary }: Props) {
 
   if (marketData.length === 0) return null;
 
-  const total = summary.total_market_value.toFixed(0);
   const currency = summary.base_currency;
-  const currencySymbol: Record<string, string> = { USD: "$", CNY: "¥", HKD: "HK$" };
 
   return (
     <Row gutter={[16, 16]} className="mt-4">
@@ -29,7 +28,7 @@ export default function QuickCharts({ summary }: Props) {
             data={marketData}
             height={280}
             currencyCode={currency}
-            centerText={`${currencySymbol[currency] ?? ""}${Number(total).toLocaleString()}`}
+            centerText={formatMoney(summary.total_market_value, currency, 0)}
           />
         </Card>
       </Col>

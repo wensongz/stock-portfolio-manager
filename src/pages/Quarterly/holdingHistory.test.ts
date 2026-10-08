@@ -71,7 +71,7 @@ test("operation presentation uses UTC quarter dates, finite precision and real s
   assert.equal(display.amount, "$3.04");
   assert.equal(display.commission, "$0.01");
   assert.equal(display.cashDelta, "-$3.05");
-  assert.equal(display.runningBalance, "$-0.30");
+  assert.equal(display.runningBalance, "-$0.30");
   assert.equal(display.notes, "Original note");
   assert.equal(formatQuarterlyOperation({ ...row, traded_at: "2026-03-31 23:30:00", transaction_type: "STOCK_IN" }).date, display.date);
   assert.equal(formatQuarterlyOperation({ ...row, symbol: "$CASH-USD", transaction_type: "OPEN", cash_delta: 0, running_balance: 0 }).type, "期初");

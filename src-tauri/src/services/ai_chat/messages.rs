@@ -105,21 +105,59 @@ pub(super) fn build_request_body(
     // its function tools with reasoning_effort=none. Keep tool access and
     // apply the same compatibility setting to tool-result/prefill rounds,
     // even when no new tools are advertised. Plain chat keeps its default.
+    if is_sol_model(cfg) {
+        disable_reasoning_for_functions(&mut body);
+    }
+    body
+}
+
+/// Sol models (`gpt-5.6-sol`, its alias `gpt-5.6`, and later `-sol` models
+/// such as `gpt-6-sol`) reject function tools under their default reasoning.
+fn is_sol_model(cfg: &AiConfig) -> bool {
     let model = cfg.model.strip_prefix("openai/").unwrap_or(&cfg.model);
-    if matches!(model, "gpt-5.6-sol" | "gpt-5.6") {
-        let has_functions = (with_tools && tools.iter().any(|tool| tool["type"] == "function"))
-            || messages.iter().any(|message| {
+    let model = model.to_ascii_lowercase();
+    model == "gpt-5.6" || (model.starts_with("gpt-") && model.split('-').any(|part| part == "sol"))
+}
+
+fn sends_functions(body: &Value) -> bool {
+    body["tools"]
+        .as_array()
+        .is_some_and(|tools| tools.iter().any(|tool| tool["type"] == "function"))
+        || body["messages"].as_array().is_some_and(|messages| {
+            messages.iter().any(|message| {
                 message["role"] == "tool"
                     || (message["role"] == "assistant"
                         && message["tool_calls"]
                             .as_array()
                             .is_some_and(|calls| !calls.is_empty()))
-            });
-        if has_functions {
-            body["reasoning_effort"] = json!("none");
-        }
+            })
+        })
+}
+
+/// Set `reasoning_effort: "none"` when the request carries function tools or
+/// tool-call history. Returns whether the body changed, so a caller retrying
+/// after [`rejects_functions_with_reasoning`] knows a retry can help.
+pub(super) fn disable_reasoning_for_functions(body: &mut Value) -> bool {
+    if !sends_functions(body) || body["reasoning_effort"] == "none" {
+        return false;
     }
-    body
+    body["reasoning_effort"] = json!("none");
+    true
+}
+
+/// Whether an HTTP 400 body is the Chat Completions rejection of function
+/// tools under the model's reasoning effort, e.g. "Function tools with
+/// reasoning_effort are not supported for gpt-6-sol in /v1/chat/completions".
+/// Covers models not recognized by [`is_sol_model`].
+pub(super) fn rejects_functions_with_reasoning(error_body: &str) -> bool {
+    let Ok(error) = serde_json::from_str::<Value>(error_body) else {
+        return false;
+    };
+    let error = &error["error"];
+    error["param"] == "reasoning_effort"
+        && error["message"]
+            .as_str()
+            .is_some_and(|message| message.to_ascii_lowercase().contains("function tools"))
 }
 
 #[cfg(test)]
@@ -155,6 +193,9 @@ mod tests {
             ("openai", "gpt-5.6-sol", Some("https://proxy.example/v1")),
             ("openrouter", "openai/gpt-5.6-sol", None),
             ("openrouter", "openai/gpt-5.6", None),
+            ("openai", "gpt-6-sol", None),
+            ("openai", "GPT-6-Sol", None),
+            ("openrouter", "openai/gpt-6-sol", None),
         ] {
             let cfg = AiConfig {
                 model: model.into(),
@@ -235,6 +276,52 @@ mod tests {
             assert!(body.get("reasoning_effort").is_none(), "{provider}/{model}");
             assert_eq!(body["tools"], json!(tools));
         }
+    }
+
+    #[test]
+    fn unrecognized_models_retry_function_requests_without_reasoning() {
+        let rejection = r#"{
+  "error": {
+    "message": "Function tools with reasoning_effort are not supported for gpt-6-sol in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+    "type": "invalid_request_error",
+    "param": "reasoning_effort",
+    "code": null
+  }
+}"#;
+        assert!(rejects_functions_with_reasoning(rejection));
+        for other in [
+            r#"{"error": {"message": "Invalid value for reasoning_effort", "param": "reasoning_effort"}}"#,
+            r#"{"error": {"message": "Function tools with reasoning_effort are not supported", "param": "tools"}}"#,
+            "Bad Request",
+            "",
+        ] {
+            assert!(!rejects_functions_with_reasoning(other), "{other}");
+        }
+
+        let cfg = AiConfig {
+            model: "gpt-7-unknown".into(),
+            ..config("openai")
+        };
+        let messages = vec![json!({"role": "user", "content": "我的持仓里哪些占比过高？"})];
+        let mut body = build_request_body(&cfg, &messages, &[portfolio_tool()], true);
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(disable_reasoning_for_functions(&mut body));
+        assert_eq!(body["reasoning_effort"], "none");
+        // Already disabled: a second rejection is not retried again.
+        assert!(!disable_reasoning_for_functions(&mut body));
+
+        // Requests without tools or tool history are left untouched.
+        let mut plain = build_request_body(&cfg, &messages, &[], true);
+        assert!(!disable_reasoning_for_functions(&mut plain));
+        assert!(plain.get("reasoning_effort").is_none());
+        let tool_history = vec![
+            json!({"role": "user", "content": "检查持仓"}),
+            assistant_message("", None, vec![json!({"id": "call1"})]),
+            json!({"role": "tool", "tool_call_id": "call1", "content": "持仓数据"}),
+        ];
+        let mut stripped = build_request_body(&cfg, &tool_history, &[portfolio_tool()], false);
+        assert!(disable_reasoning_for_functions(&mut stripped));
+        assert_eq!(stripped["reasoning_effort"], "none");
     }
 
     #[test]

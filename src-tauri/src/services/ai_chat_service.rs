@@ -44,7 +44,10 @@ mod title;
 
 use anthropic::chat_stream_anthropic;
 pub use context::build_portfolio_context;
-use messages::{assistant_message, build_request_body, history_message};
+use messages::{
+    assistant_message, build_request_body, disable_reasoning_for_functions, history_message,
+    rejects_functions_with_reasoning,
+};
 pub use title::generate_title;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1015,6 +1018,23 @@ struct RoundOutcome {
     stream_completed: bool,
 }
 
+/// Why a streaming round failed before producing an outcome.
+enum RoundError {
+    /// HTTP 400: Chat Completions rejected function tools under the model's
+    /// reasoning effort. The request can be retried with
+    /// `reasoning_effort: "none"`; nothing has been emitted yet.
+    FunctionsNeedReasoningOff(String),
+    Other(String),
+}
+
+impl RoundError {
+    fn into_message(self) -> String {
+        match self {
+            Self::FunctionsNeedReasoningOff(message) | Self::Other(message) => message,
+        }
+    }
+}
+
 /// Send one streaming request and drain its SSE stream.
 ///
 /// Text deltas are emitted to the frontend as they arrive (`ai-chat-delta`).
@@ -1026,7 +1046,7 @@ async fn stream_one_round(
     cfg: &crate::models::ai_config::AiConfig,
     url: &str,
     body: serde_json::Value,
-) -> Result<RoundOutcome, String> {
+) -> Result<RoundOutcome, RoundError> {
     let client = http_client::ai_client();
     let mut req = client.post(url).json(&body);
     if !cfg.api_key.is_empty() {
@@ -1036,17 +1056,22 @@ async fn stream_one_round(
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("请求 AI 服务失败：{e}"))?;
+        .map_err(|e| RoundError::Other(format!("请求 AI 服务失败：{e}")))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("AI 服务返回错误 (HTTP {status})：{body}"));
+        let message = format!("AI 服务返回错误 (HTTP {status})：{body}");
+        if status == reqwest::StatusCode::BAD_REQUEST && rejects_functions_with_reasoning(&body) {
+            return Err(RoundError::FunctionsNeedReasoningOff(message));
+        }
+        return Err(RoundError::Other(message));
     }
 
     read_stream_response(resp, |event, text| {
         let _ = app.emit(event, text);
     })
     .await
+    .map_err(RoundError::Other)
 }
 
 fn pop_sse_line(buffer: &mut Vec<u8>) -> Option<String> {
@@ -1410,8 +1435,16 @@ pub async fn chat_stream(
     // error with a clear diagnostic is more honest than silent looping.
     let mut tried_without_tools = false;
 
+    // Set once the provider rejects function tools under the model's default
+    // reasoning effort (e.g. `gpt-6-sol` on /chat/completions). Later rounds
+    // of this turn send `reasoning_effort: "none"` up front.
+    let mut functions_need_reasoning_off = false;
+
     for round in 0..crate::services::ai_tools::MAX_TOOL_ROUNDS {
-        let body = build_request_body(&cfg, &messages, &tools, !tried_without_tools);
+        let mut body = build_request_body(&cfg, &messages, &tools, !tried_without_tools);
+        if functions_need_reasoning_off {
+            disable_reasoning_for_functions(&mut body);
+        }
 
         // ── Stream with retry on truncation ────────────────────────────────
         // If the stream is truncated (no `[DONE]`, no clean EOF), we retry
@@ -1420,7 +1453,22 @@ pub async fn chat_stream(
         // fatal and abort the turn immediately.
         let mut outcome = None;
         for attempt in 0..=MAX_STREAM_RETRIES {
-            match stream_one_round(&app, &cfg, &url, body.clone()).await {
+            let mut result = stream_one_round(&app, &cfg, &url, body.clone()).await;
+            // The rejection arrives before any delta is emitted, so retrying
+            // with reasoning disabled cannot duplicate visible output.
+            if matches!(result, Err(RoundError::FunctionsNeedReasoningOff(_)))
+                && disable_reasoning_for_functions(&mut body)
+            {
+                functions_need_reasoning_off = true;
+                warn!(
+                    target: "ai_chat",
+                    round,
+                    model = %cfg.model,
+                    "function tools rejected with default reasoning — retrying with reasoning_effort=none"
+                );
+                result = stream_one_round(&app, &cfg, &url, body.clone()).await;
+            }
+            match result {
                 Ok(o) => {
                     if o.stream_completed || o.stopped || !o.tool_calls.is_empty() {
                         // Clean end, user stop, or tool calls — no retry needed.
@@ -1456,6 +1504,7 @@ pub async fn chat_stream(
                 }
                 Err(e) => {
                     // Network/HTTP errors are fatal — don't retry.
+                    let e = e.into_message();
                     warn!(target: "ai_chat", round, "stream error: {e}");
                     emit_usage(&app, &last_usage);
                     emit_error(&app, e.clone());

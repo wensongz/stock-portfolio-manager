@@ -43,14 +43,14 @@ import type {
   TransactionType,
   QuoteCommandResult,
   CashBalanceReconciliation,
-  CashBalanceReconciliationRow,
   CreateHoldingPayload,
 } from "../../types";
 import dayjs from "dayjs";
 import { canEditOpening } from "./holdingEditPolicy";
 import { normalizeHoldingSymbol } from "./holdingSymbol";
 import CashBalancePreview from "./CashBalancePreview";
-import { cashBalanceEditDecision, cashBalanceSaveCommand, createEditSession, createHoldingRequest, emptyHoldingRequest, formatCashDelta, mergeHoldingQuote } from "./cashBalanceEditing";
+import CashTransactionsTable from "./CashTransactionsTable";
+import { cashBalanceEditDecision, cashBalanceSaveCommand, createEditSession, createHoldingRequest, emptyHoldingRequest, mergeHoldingQuote } from "./cashBalanceEditing";
 import { formatMoney } from "../../lib/formatMoney";
 import TransactionFormModal from "../Transactions/TransactionFormModal";
 
@@ -1137,94 +1137,10 @@ export default function HoldingsPage() {
           style={{ marginBottom: 12 }}
         />}
         {detailHolding && isCashSymbol(detailHolding.symbol) ? (
-          <Table<CashBalanceReconciliationRow>
-            dataSource={detailCash?.rows ?? []}
-            rowKey="id"
+          <CashTransactionsTable
+            rows={detailCash?.rows ?? []}
             loading={detailLoading}
-            pagination={false}
-            scroll={{ x: "max-content", y: 400 }}
-            columns={[
-              {
-                title: "日期",
-                dataIndex: "traded_at",
-                key: "traded_at",
-                width: 160,
-                render: (date: string) => dayjs(date).format("YYYY-MM-DD HH:mm"),
-              },
-              {
-                title: "类型",
-                dataIndex: "transaction_type",
-                key: "transaction_type",
-                width: 80,
-                render: (type: TransactionType, record: CashBalanceReconciliationRow) => {
-                  if (type === "OPEN") return <Tag color="blue">期初</Tag>;
-                  if (isCashSymbol(record.symbol) && (type === "BUY" || type === "SELL")) {
-                    return record.transaction_type === "BUY"
-                      ? <Tag color="blue">存入</Tag>
-                      : <Tag color="red">提取</Tag>;
-                  }
-                  // In the cash flow view, colors reflect the cash impact:
-                  // BUY → red (cash decreases), SELL → green (cash increases).
-                  // This intentionally differs from the stock detail view where
-                  // colors reflect the stock position change (BUY=green, SELL=red).
-                  if (type === "BUY") return <Tag color="red">买入</Tag>;
-                  if (type === "SELL") return <Tag color="green">卖出</Tag>;
-                  if (type === "PAY") return <Tag color="orange">分红</Tag>;
-                  return <Tag>{type}</Tag>;
-                },
-              },
-              {
-                title: "股票",
-                key: "stock",
-                render: (_: unknown, record: CashBalanceReconciliationRow) => {
-                  if (isCashSymbol(record.symbol)) {
-                    return <span style={{ color: "var(--color-text-secondary)" }}>—</span>;
-                  }
-                  return (
-                    <Space>
-                      <strong>{record.symbol}</strong>
-                      <span className="text-sm" style={{ color: "var(--color-text-secondary)" }}>{record.name}</span>
-                    </Space>
-                  );
-                },
-              },
-              {
-                title: "现金变动",
-                key: "cashDelta",
-                width: 160,
-                align: "right" as const,
-                render: (_: unknown, record: CashBalanceReconciliationRow) => {
-                  const delta = record.cash_delta;
-                  const isPositive = delta >= 0;
-                  return (
-                    <span style={{ color: isPositive ? "#16a34a" : "#dc2626", fontWeight: 500 }}>
-                      {formatCashDelta(delta, record.currency)}
-                    </span>
-                  );
-                },
-              },
-              {
-                title: "余额",
-                key: "runningBalance",
-                width: 160,
-                align: "right" as const,
-                render: (_: unknown, record: CashBalanceReconciliationRow) => {
-                  return (
-                    <span style={{ fontWeight: 500 }}>
-                      {formatMoney(record.running_balance, record.currency)}
-                    </span>
-                  );
-                },
-              },
-              {
-                title: "备注",
-                dataIndex: "notes",
-                key: "notes",
-                ellipsis: true,
-                render: (v: string | null) => v || "—",
-              },
-              transactionActionColumn,
-            ]}
+            onEdit={setEditingTransaction}
           />
         ) : (
           /* Regular stock holding: show standard transaction details */

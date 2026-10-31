@@ -5,7 +5,7 @@ import { formatCashDelta } from "./cashBalanceEditing";
 import { formatMoney } from "../../lib/formatMoney";
 
 export default function CashBalancePreview({ holding, state, onRetry, onAdopt, onDetail, onEdit, disabled = false }: {
-  holding: Holding;
+  holding: Pick<Holding, "id" | "shares" | "currency">;
   state: HoldingRequestState<CashBalanceReconciliation>;
   onRetry: () => void;
   onAdopt?: (balance: number) => void;

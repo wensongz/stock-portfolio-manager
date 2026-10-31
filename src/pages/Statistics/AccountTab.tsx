@@ -128,6 +128,7 @@ export default function AccountTab({ selectedAccountId, onAccountChange }: Props
       {transactionHolding && (
         <AccountStockTransactionsModal
           open
+          holdingId={transactionHolding.id}
           accountId={transactionHolding.account_id}
           accountName={transactionHolding.account_name}
           symbol={transactionHolding.symbol}

@@ -335,6 +335,7 @@ export default function OverviewTab({ baseCurrency }: Props) {
 
   // State for the per-account transaction detail modal.
   const [txnModal, setTxnModal] = useState<{
+    holdingId: string;
     accountId: string;
     accountName: string;
     symbol: string;
@@ -342,13 +343,16 @@ export default function OverviewTab({ baseCurrency }: Props) {
   } | null>(null);
 
   const handleShowTransactions = useCallback((record: AccountHoldingRow) => {
+    const holding = overview?.holdings.find((item) => item.account_id === record.account_id && item.symbol === record.symbol);
+    if (!holding) return;
     setTxnModal({
+      holdingId: holding.id,
       accountId: record.account_id,
       accountName: record.accountName,
       symbol: record.symbol,
       stockName: record.symbol,
     });
-  }, []);
+  }, [overview]);
 
   // Sub-table columns: per-account breakdown of one stock.
   const accountDetailColumns: ColumnsType<AccountHoldingRow> = useMemo(
@@ -595,6 +599,7 @@ export default function OverviewTab({ baseCurrency }: Props) {
       {txnModal && (
         <AccountStockTransactionsModal
           open
+          holdingId={txnModal.holdingId}
           accountId={txnModal.accountId}
           accountName={txnModal.accountName}
           symbol={txnModal.symbol}

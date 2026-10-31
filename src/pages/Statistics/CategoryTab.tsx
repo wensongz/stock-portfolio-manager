@@ -43,6 +43,7 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
   const { categories } = useCategoryStore();
   const symbol = currencySymbol[baseCurrency] ?? "$";
   const [txnModal, setTxnModal] = useState<{
+    holdingId: string;
     accountId: string;
     accountName: string;
     symbol: string;
@@ -98,6 +99,7 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
 
   const handleShowTransactions = useCallback((record: AccountHoldingRow) => {
     setTxnModal({
+      holdingId: record.id,
       accountId: record.account_id,
       accountName: record.account_name,
       symbol: record.symbol,
@@ -227,6 +229,7 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
       {txnModal && (
         <AccountStockTransactionsModal
           open
+          holdingId={txnModal.holdingId}
           accountId={txnModal.accountId}
           accountName={txnModal.accountName}
           symbol={txnModal.symbol}

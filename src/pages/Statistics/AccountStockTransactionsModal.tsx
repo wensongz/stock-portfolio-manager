@@ -2,12 +2,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Button, Modal, Table, Tag, message } from "antd";
 import { invoke } from "@tauri-apps/api/core";
 import dayjs from "dayjs";
-import type { Transaction, TransactionType } from "../../types";
+import type { CashBalanceReconciliation, Transaction, TransactionType } from "../../types";
 import TransactionFormModal from "../Transactions/TransactionFormModal";
+import CashTransactionsTable from "../Holdings/CashTransactionsTable";
+import CashBalancePreview from "../Holdings/CashBalancePreview";
 import { formatMoney } from "../../lib/formatMoney";
 
 interface Props {
   open: boolean;
+  holdingId: string;
   accountName: string;
   symbol: string;
   stockName: string;
@@ -17,12 +20,11 @@ interface Props {
 }
 
 /**
- * Modal showing one account's transaction history for one stock.
- * Mirrors the holdings page "明细" popup (date, type, shares, price, total,
- * commission, notes).
+ * One account's transaction history, using the holdings cash ledger for cash.
  */
 export default function AccountStockTransactionsModal({
   open,
+  holdingId,
   accountName,
   symbol,
   stockName,
@@ -31,19 +33,26 @@ export default function AccountStockTransactionsModal({
   onUpdated,
 }: Props) {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [cashReconciliation, setCashReconciliation] = useState<CashBalanceReconciliation | null>(null);
   const [loading, setLoading] = useState(false);
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
   const loadRequest = useRef(0);
+  const isCash = symbol.startsWith("$CASH-");
+  const cash = cashReconciliation?.holding_id === holdingId ? cashReconciliation : null;
 
   const load = useCallback(async () => {
     const request = ++loadRequest.current;
     setLoading(true);
+    setTransactions([]);
+    setCashReconciliation(null);
     try {
-      const txns = await invoke<Transaction[]>("get_transactions", {
-        accountId,
-        symbol,
-      });
-      if (request === loadRequest.current) setTransactions(txns);
+      if (isCash) {
+        const result = await invoke<CashBalanceReconciliation>("get_cash_balance_reconciliation", { id: holdingId });
+        if (request === loadRequest.current) setCashReconciliation(result);
+      } else {
+        const txns = await invoke<Transaction[]>("get_transactions", { accountId, symbol });
+        if (request === loadRequest.current) setTransactions(txns);
+      }
     } catch (err) {
       if (request === loadRequest.current) {
         message.error(`获取交易记录失败: ${err}`);
@@ -52,9 +61,11 @@ export default function AccountStockTransactionsModal({
     } finally {
       if (request === loadRequest.current) setLoading(false);
     }
-  }, [accountId, symbol]);
+    return request;
+  }, [accountId, holdingId, isCash, symbol]);
 
   useEffect(() => {
+    setEditingTransaction(null);
     if (open) void load();
     return () => { loadRequest.current += 1; };
   }, [open, load]);
@@ -69,9 +80,18 @@ export default function AccountStockTransactionsModal({
           onClose();
         }}
         footer={null}
-        width={960}
+        width={isCash ? 1060 : 960}
       >
-        <Table<Transaction>
+        {isCash ? (
+          <>
+            {cash && <CashBalancePreview
+              holding={{ id: holdingId, shares: cash.current_balance, currency: cash.currency }}
+              state={{ holdingId, status: "ready", data: cash, error: null }}
+              onRetry={() => void load()}
+            />}
+            <CashTransactionsTable rows={cash?.rows ?? []} loading={loading} onEdit={setEditingTransaction} />
+          </>
+        ) : <Table<Transaction>
           dataSource={transactions}
           rowKey="id"
           loading={loading}
@@ -151,16 +171,21 @@ export default function AccountStockTransactionsModal({
               ),
             },
           ]}
-        />
+        />}
       </Modal>
       <TransactionFormModal
         open={open && editingTransaction !== null}
         transaction={editingTransaction}
         onClose={() => setEditingTransaction(null)}
         onSaved={async (saved) => {
-          await Promise.all([load(), onUpdated?.()]);
+          const [request] = await Promise.all([load(), onUpdated?.()]);
+          if (request !== loadRequest.current) return;
           // Keep the committed note when the list reload still contains the old text.
           setTransactions((rows) => rows.map((row) => row.id === saved.id ? { ...row, notes: saved.notes } : row));
+          setCashReconciliation((current) => current ? {
+            ...current,
+            rows: current.rows.map((row) => row.id === saved.id ? { ...row, notes: saved.notes } : row),
+          } : null);
         }}
       />
     </>

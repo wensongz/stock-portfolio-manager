@@ -206,6 +206,7 @@ export default function DashboardHoldingsTable({ holdings, loading }: Props) {
       {transactionHolding && (
         <AccountStockTransactionsModal
           open
+          holdingId={transactionHolding.id}
           accountId={transactionHolding.account_id}
           accountName={transactionHolding.account_name}
           symbol={transactionHolding.symbol}

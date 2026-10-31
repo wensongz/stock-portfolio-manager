@@ -250,7 +250,7 @@ AI skills are not stored in SQLite. They are Markdown files under `{app_data_dir
 | --- | --- | --- |
 | US / Hong Kong quotes | Xueqiu, East Money, Yahoo Finance | Selectable per market; Xueqiu failures fall back to East Money and then Yahoo Finance |
 | Mainland China quotes | Xueqiu, East Money | Selectable per market; Xueqiu failures fall back to East Money |
-| USD / CNY / HKD exchange rates | ExchangeRate-API (`open.er-api.com`) | In-memory and SQLite caches; stale data can be used when the network is unavailable |
+| USD / CNY / HKD exchange rates | ExchangeRate-API (`open.er-api.com`); fallback: [Exchange rates by AllRatesToday](https://allratestoday.com) (ECB reference rates) | In-memory and SQLite caches; stale data can be used when the network is unavailable |
 | Performance benchmarks | Yahoo Finance | S&P 500, NASDAQ, CSI 300, Shanghai Composite, and Hang Seng Index |
 | AI models | The user-configured AI provider | API keys are stored only in local SQLite; requests go directly to the selected service |
 

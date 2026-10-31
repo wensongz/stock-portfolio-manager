@@ -26,6 +26,7 @@ import { resolveAccountHoldingsCoverage } from "./statisticsAccountHoldings";
 const { Title, Text } = Typography;
 
 const MARKET_STORAGE_KEY = "statistics_selected_market";
+const ACCOUNT_STORAGE_KEY = "statistics_selected_account_id";
 const VALID_MARKETS = ["US", "CN", "HK"];
 
 function loadSelectedMarket(): string | null {
@@ -36,7 +37,9 @@ function loadSelectedMarket(): string | null {
 export default function StatisticsPage() {
   const [activeTab, setActiveTab] =
     useState<StatisticsSelection["activeTab"]>("overview");
-  const [selectedAccountId, setSelectedAccountId] = useState("");
+  const [selectedAccountId, setSelectedAccountId] = useState(
+    () => localStorage.getItem(ACCOUNT_STORAGE_KEY) ?? "",
+  );
   const [selectedCategoryId, setSelectedCategoryId] = useState("");
   const [selectedMarket, setSelectedMarket] = useState(
     () => loadSelectedMarket() ?? "CN",
@@ -131,8 +134,12 @@ export default function StatisticsPage() {
   }, [availableMarkets, selectedMarket, dispatcher]);
 
   useEffect(() => {
-    if (accounts.length > 0 && !selectedAccountId) {
+    if (
+      accounts.length > 0 &&
+      !accounts.some((account) => account.id === selectedAccountId)
+    ) {
       const accountId = accounts[0].id;
+      localStorage.setItem(ACCOUNT_STORAGE_KEY, accountId);
       void dispatcher.changeAccount(accountId);
     }
   }, [accounts, selectedAccountId, dispatcher]);
@@ -155,6 +162,7 @@ export default function StatisticsPage() {
   };
 
   const handleAccountChange = (accountId: string) => {
+    localStorage.setItem(ACCOUNT_STORAGE_KEY, accountId);
     void dispatcher.changeAccount(accountId);
   };
 

@@ -262,20 +262,31 @@ pub fn by_market(model: &PortfolioReadModel, market: &str) -> MarketStatistics {
     }
 }
 
-pub fn by_account(model: &PortfolioReadModel, account_id: &str) -> AccountStatistics {
+pub fn by_account(
+    model: &PortfolioReadModel,
+    rates: &ExchangeRates,
+    account_id: &str,
+    market: &str,
+) -> AccountStatistics {
+    let currency = match market {
+        "HK" => "HKD",
+        "CN" => "CNY",
+        _ => "USD",
+    };
     let details: Vec<_> = model
         .holdings()
         .iter()
         .filter(|detail| detail.account_id == account_id)
-        .cloned()
+        .map(|detail| {
+            let mut detail = detail.clone();
+            detail.market_value_usd =
+                convert_currency(detail.market_value, &detail.currency, "USD", rates);
+            detail
+        })
         .collect();
     let account_name = details
         .first()
         .map(|detail| detail.account_name.clone())
-        .unwrap_or_default();
-    let market = details
-        .first()
-        .map(|detail| detail.market.clone())
         .unwrap_or_default();
     let mut category_map: std::collections::HashMap<(String, Option<String>), f64> =
         std::collections::HashMap::new();
@@ -284,17 +295,19 @@ pub fn by_account(model: &PortfolioReadModel, account_id: &str) -> AccountStatis
     let mut total_cost = 0.0;
 
     for detail in &details {
+        let market_value = convert_currency(detail.market_value, &detail.currency, currency, rates);
+        let cost_value = convert_currency(detail.cost_value, &detail.currency, currency, rates);
         *category_map
             .entry((
                 detail.category_name.clone(),
                 Some(detail.category_color.clone()),
             ))
-            .or_insert(0.0) += detail.market_value;
+            .or_insert(0.0) += market_value;
         *stock_map
             .entry(format!("{} {}", detail.symbol, detail.name))
-            .or_insert(0.0) += detail.market_value;
-        total_market_value += detail.market_value;
-        total_cost += detail.cost_value;
+            .or_insert(0.0) += market_value;
+        total_market_value += market_value;
+        total_cost += cost_value;
     }
 
     let mut category_distribution: Vec<PieSlice> = category_map
@@ -329,7 +342,7 @@ pub fn by_account(model: &PortfolioReadModel, account_id: &str) -> AccountStatis
     AccountStatistics {
         account_id: account_id.to_string(),
         account_name,
-        market,
+        market: market.to_string(),
         total_market_value,
         total_cost,
         total_pnl,
@@ -574,8 +587,8 @@ mod tests {
 
     #[test]
     fn account_statistics_keep_identity_distributions_and_holdings() {
-        let (model, _rates) = fixture();
-        let result = by_account(&model, "acct-us");
+        let (model, rates) = fixture();
+        let result = by_account(&model, &rates, "acct-us", "US");
 
         assert_eq!(result.account_name, "US Broker");
         assert_eq!(result.market, "US");
@@ -585,6 +598,55 @@ mod tests {
         assert_close(result.category_distribution[0].value, 120.0);
         assert_eq!(result.stock_distribution[0].name, "AAPL AAPL");
         assert_eq!(result.holdings.len(), 1);
+    }
+
+    #[test]
+    fn account_statistics_convert_mixed_currencies_to_account_market_currency() {
+        let model = PortfolioReadModel::from_holdings_for_test(vec![
+            holding(
+                "h-us",
+                "acct-hk",
+                "HK Broker",
+                "AAPL",
+                "US",
+                2.0,
+                75.0,
+                100.0,
+                "USD",
+            ),
+            holding(
+                "h-hk",
+                "acct-hk",
+                "HK Broker",
+                "0700",
+                "HK",
+                10.0,
+                8.0,
+                10.0,
+                "HKD",
+            ),
+        ]);
+        let rates = ExchangeRates {
+            usd_cny: 5.0,
+            usd_hkd: 7.8,
+            cny_hkd: 1.56,
+            updated_at: "2026-09-02T09:30:00Z".to_string(),
+        };
+
+        let result = by_account(&model, &rates, "acct-hk", "HK");
+
+        assert_eq!(result.market, "HK");
+        assert_close(result.total_market_value, 1660.0);
+        assert_close(result.total_cost, 1250.0);
+        assert_close(result.total_pnl, 410.0);
+        assert_close(result.total_pnl_percent, 32.8);
+        assert_close(result.category_distribution[0].value, 1660.0);
+        assert_close(result.stock_distribution[0].value, 1560.0);
+        assert_close(result.stock_distribution[1].value, 100.0);
+        assert_close(result.holdings[0].market_value, 200.0);
+        assert_close(result.holdings[0].market_value_usd, 200.0);
+        assert_close(result.holdings[1].market_value, 100.0);
+        assert_close(result.holdings[1].market_value_usd, 100.0 / 7.8);
     }
 
     #[test]

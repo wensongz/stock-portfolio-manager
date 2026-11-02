@@ -63,12 +63,27 @@ pub async fn get_statistics_by_market(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_statistics_by_account(
     db: State<'_, Database>,
-    _cache: State<'_, ExchangeRateCache>,
+    cache: State<'_, ExchangeRateCache>,
     quote_cache: State<'_, QuoteCache>,
     account_id: String,
 ) -> Result<AccountStatistics, String> {
+    let market: String = {
+        let conn = db.conn.lock().map_err(|error| error.to_string())?;
+        conn.query_row(
+            "SELECT market FROM accounts WHERE id = ?1",
+            [&account_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?
+    };
+    let rates = get_cached_rates(&cache, &db).await?;
     let model = PortfolioReadModel::load(&db, &quote_cache, None, QuoteReadMode::CacheOnly).await?;
-    Ok(statistics_service::by_account(&model, &account_id))
+    Ok(statistics_service::by_account(
+        &model,
+        &rates,
+        &account_id,
+        &market,
+    ))
 }
 
 #[tauri::command(rename_all = "camelCase")]

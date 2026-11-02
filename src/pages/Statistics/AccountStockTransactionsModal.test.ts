@@ -11,7 +11,7 @@ function runScenario(scenario, currency = "HKD") {
     import { Window } from "happy-dom";
     import { mock } from "bun:test";
     const dom = new Window();
-    for (const key of ["window", "document", "navigator", "HTMLElement", "Element", "Node", "MutationObserver", "ResizeObserver", "ShadowRoot", "SVGElement", "getComputedStyle"]) {
+    for (const key of ["window", "document", "navigator", "localStorage", "HTMLElement", "Element", "Node", "MutationObserver", "ResizeObserver", "ShadowRoot", "SVGElement", "getComputedStyle"]) {
       Object.defineProperty(globalThis, key, { configurable: true, value: key === "window" ? dom : typeof dom[key] === "function" && key === "getComputedStyle" ? dom[key].bind(dom) : dom[key] });
     }
     globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -44,14 +44,23 @@ function runScenario(scenario, currency = "HKD") {
       { ...base, cash_delta: 1000, running_balance: 1000 },
       { ...base, id: "opening", transaction_type: "OPEN", shares: 0, total_amount: 0, cash_delta: 0, running_balance: 0 },
     ];
+    const stockRows = [
+      { ...rows[1], shares: 4, price: 30, total_amount: 120, traded_at: "2026-10-29T10:00:00" },
+      { ...rows[2], shares: 10, price: 20, total_amount: 200 },
+    ];
     const reconciliation = { holding_id: "cash-holding", account_id: "account-a", currency,
       current_balance: 1018, recommended_balance: 1018, difference: 0, revision: 1, opening_count: 1, rows };
     const calls = [];
     let releaseFirst;
     let cashReads = 0;
+    let stockReads = 0;
     dom.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
       calls.push({ command, args });
-      if (command === "get_transactions") return args.symbol.startsWith("$CASH-") ? [base] : [rows[2]];
+      if (command === "get_transactions") {
+        stockReads += 1;
+        if (scenario.startsWith("stock-")) return stockRows.map(row => row.id === "sell" && stockReads > 1 ? { ...row, shares: 2, total_amount: 60 } : row);
+        return args.symbol.startsWith("$CASH-") ? [base] : [rows[2]];
+      }
       if (command === "get_cash_balance_reconciliation") {
         cashReads += 1;
         if (scenario === "switch" && args.id === "cash-holding") await new Promise(resolve => { releaseFirst = resolve; });
@@ -60,11 +69,17 @@ function runScenario(scenario, currency = "HKD") {
       }
       throw new Error("Unexpected command: " + command);
     } };
+    const { useQuoteStore } = await import("./src/stores/quoteStore.ts");
+    const quoteHolding = { id: "cash-holding", account_id: "account-a", symbol: "700.HK", name: "腾讯控股", market: "HK", category_id: null,
+      shares: 6, avg_cost: 13.67, currency, created_at: base.created_at, updated_at: base.created_at,
+      quote: { symbol: "700.HK", name: "腾讯控股", market: "HK", current_price: 35, previous_close: 34, change: 1, change_percent: 2.94, high: 35, low: 34, volume: 100, updated_at: base.created_at },
+      market_value: 210, total_cost: 82, unrealized_pnl: 128, unrealized_pnl_percent: 156 };
+    useQuoteStore.setState({ holdingQuotes: scenario === "stock-no-quote" ? [] : [quoteHolding] });
     const { default: Modal } = await import("./src/pages/Statistics/AccountStockTransactionsModal.tsx");
     const container = document.createElement("div"); document.body.append(container);
     const root = createRoot(container);
     const props = { open: true, holdingId: "cash-holding", accountId: "account-a", accountName: "港股账户",
-      symbol: scenario === "stock" ? "700.HK" : cashSymbol, stockName: "现金", onClose() {}, onUpdated: async () => { updates += 1; } };
+      symbol: scenario.startsWith("stock") ? "700.HK" : cashSymbol, stockName: "现金", onClose() {}, onUpdated: async () => { updates += 1; } };
     let updates = 0;
     const render = async () => { await act(async () => root.render(h(Modal, { ...props }))); };
     await render();
@@ -74,17 +89,24 @@ function runScenario(scenario, currency = "HKD") {
       if (releaseFirst) await act(async () => releaseFirst());
     }
     const before = container.textContent;
+    const titleBefore = container.querySelector("h2")?.textContent;
     let editedSymbol;
-    if (scenario === "edit") {
-      const row = container.querySelector('[data-row-key="buy"]');
+    if (scenario === "edit" || scenario === "stock-edit") {
+      const row = container.querySelector(scenario === "edit" ? '[data-row-key="buy"]' : '[data-row-key="sell"]');
       const button = row?.querySelector("button");
       if (button) {
         await act(async () => button.click());
         editedSymbol = container.querySelector("[data-editor]")?.textContent;
-        await act(async () => editProps.onSaved({ ...rows[2], notes: "已保存的新备注" }));
+        await act(async () => editProps.onSaved({ ...(scenario === "edit" ? rows[2] : stockRows[0]), notes: "已保存的新备注" }));
       }
     }
+    if (scenario === "stock-quote") {
+      await act(async () => useQuoteStore.setState({ holdingQuotes: [{ ...quoteHolding, quote: { ...quoteHolding.quote, current_price: 40 } }] }));
+    }
+    const summary = container.querySelector('[aria-label="交易盈亏汇总"]');
     const result = { before, after: container.textContent, calls, errors, updates, editedSymbol, cashReads,
+      titleBefore, titleAfter: container.querySelector("h2")?.textContent,
+      summaryStyle: summary ? { textAlign: summary.style.textAlign, marginInlineStart: summary.style.marginInlineStart } : null,
       headers: [...container.querySelectorAll("thead th")].map(th => th.textContent),
       openingDisabled: container.querySelector('[data-row-key="opening"] button')?.disabled,
       rowTexts: Object.fromEntries([...container.querySelectorAll("tbody tr[data-row-key]")].map(row => [row.dataset.rowKey, row.textContent])) };
@@ -114,6 +136,7 @@ test("account cash details use the holdings cash ledger for every supported curr
     assert.ok(result.rowTexts.dividend.includes("+" + prefix + "20.00"));
     assert.equal(result.openingDisabled, true);
     assert.deepEqual(result.errors, []);
+    assert.doesNotMatch(result.titleBefore, /浮动盈亏|实现盈亏/);
   }
 });
 
@@ -144,4 +167,28 @@ test("ordinary stocks retain their standard transaction details", () => {
   assert.deepEqual(result.headers, ["日期", "类型", "股数", "价格", "总金额", "手续费", "备注", "操作"]);
   assert.match(result.rowTexts.buy, /买入/);
   assert.match(result.rowTexts.buy, /HK\$200\.00/);
+});
+
+test("stock detail title shows replayed floating and realized profit aligned right", () => {
+  const result = runScenario("stock-pnl");
+  assert.match(result.titleBefore, /浮动盈亏.*\+HK\$89\.40.*实现盈亏.*\+HK\$38\.60/);
+  assert.deepEqual(result.summaryStyle, { textAlign: "right", marginInlineStart: "auto" });
+  assert.deepEqual(Object.keys(result.rowTexts), ["sell", "buy"], "visible trades remain newest first");
+});
+
+test("saving a stock trade recalculates both amounts from the reloaded records", () => {
+  const result = runScenario("stock-edit");
+  assert.match(result.titleAfter, /浮动盈亏.*\+HK\$119\.20.*实现盈亏.*\+HK\$18\.80/);
+  assert.equal(result.updates, 1);
+});
+
+test("stock title updates with cached quotes without fetching transactions again", () => {
+  const result = runScenario("stock-quote");
+  assert.match(result.titleAfter, /浮动盈亏.*\+HK\$119\.40.*实现盈亏.*\+HK\$38\.60/);
+  assert.equal(result.calls.length, 1);
+});
+
+test("a stock without a cached quote still shows realized profit", () => {
+  const result = runScenario("stock-no-quote");
+  assert.match(result.titleAfter, /浮动盈亏.*—.*实现盈亏.*\+HK\$38\.60/);
 });

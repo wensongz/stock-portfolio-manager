@@ -53,6 +53,7 @@ import CashTransactionsTable from "./CashTransactionsTable";
 import { cashBalanceEditDecision, cashBalanceSaveCommand, createEditSession, createHoldingRequest, emptyHoldingRequest, mergeHoldingQuote } from "./cashBalanceEditing";
 import { formatMoney } from "../../lib/formatMoney";
 import TransactionFormModal from "../Transactions/TransactionFormModal";
+import StockTransactionDetailTitle from "../../components/StockTransactionDetailTitle";
 
 const { Title, Text } = Typography;
 
@@ -1119,7 +1120,13 @@ export default function HoldingsPage() {
 
       {/* Transaction Detail Modal */}
       <Modal
-        title={detailHolding ? `交易明细 — ${detailHolding.name} (${detailHolding.symbol})` : "交易明细"}
+        title={detailHolding && !isCashSymbol(detailHolding.symbol) ? <StockTransactionDetailTitle
+          title={`交易明细 — ${detailHolding.name} (${detailHolding.symbol})`}
+          accountId={detailHolding.account_id}
+          symbol={detailHolding.symbol}
+          transactions={detailTransactions}
+          loading={detailState.status !== "ready"}
+        /> : detailHolding ? `交易明细 — ${detailHolding.name} (${detailHolding.symbol})` : "交易明细"}
         open={detailModalOpen}
         onCancel={closeDetailModal}
         footer={null}

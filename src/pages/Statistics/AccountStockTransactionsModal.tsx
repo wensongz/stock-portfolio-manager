@@ -7,6 +7,7 @@ import TransactionFormModal from "../Transactions/TransactionFormModal";
 import CashTransactionsTable from "../Holdings/CashTransactionsTable";
 import CashBalancePreview from "../Holdings/CashBalancePreview";
 import { formatMoney } from "../../lib/formatMoney";
+import StockTransactionDetailTitle from "../../components/StockTransactionDetailTitle";
 
 interface Props {
   open: boolean;
@@ -73,7 +74,13 @@ export default function AccountStockTransactionsModal({
   return (
     <>
       <Modal
-        title={`交易明细 — ${stockName} (${symbol}) · ${accountName}`}
+        title={isCash ? `交易明细 — ${stockName} (${symbol}) · ${accountName}` : <StockTransactionDetailTitle
+          title={`交易明细 — ${stockName} (${symbol}) · ${accountName}`}
+          accountId={accountId}
+          symbol={symbol}
+          transactions={transactions}
+          loading={loading}
+        />}
         open={open}
         onCancel={() => {
           setEditingTransaction(null);

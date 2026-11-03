@@ -30,7 +30,8 @@ function addHolding(target: HoldingDetail, holding: HoldingDetail) {
 
 function totals(holding: HoldingDetail, totalUsd: number) {
   return {
-    avg_cost: holding.shares > 0 ? holding.cost_value / holding.shares : 0,
+    avg_cost: holding.symbol.startsWith("$CASH-") ? 1
+      : holding.shares > 0 ? holding.cost_value / holding.shares : 0,
     pnl_percent: holding.cost_value > 0 ? (holding.pnl / holding.cost_value) * 100 : null,
     position_pct: totalUsd > 0 ? (holding.market_value_usd / totalUsd) * 100 : 0,
   };
@@ -41,12 +42,13 @@ export function aggregateDashboardHoldings(holdings: readonly HoldingDetail[]): 
   let totalUsd = 0;
 
   for (const holding of holdings) {
-    if (holding.shares <= 0) continue;
     const symbol = holding.symbol.trim().toUpperCase();
+    const isCash = symbol.startsWith("$CASH-");
+    if (holding.shares <= 0 && (!isCash || holding.shares === 0)) continue;
     // Cash of the same currency can live in accounts from different markets.
     // Securities retain market/currency identity so native amounts stay comparable.
     const key = JSON.stringify([
-      symbol.startsWith("$CASH-") ? "CASH" : holding.market.trim().toUpperCase(),
+      isCash ? "CASH" : holding.market.trim().toUpperCase(),
       symbol, holding.currency,
     ]);
     totalUsd += holding.market_value_usd;

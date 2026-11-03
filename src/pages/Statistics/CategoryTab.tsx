@@ -81,7 +81,7 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
           ...first,
           id: first.symbol,
           shares,
-          avg_cost: shares > 0 ? costValue / shares : 0,
+          avg_cost: first.symbol.startsWith("$CASH-") ? 1 : shares > 0 ? costValue / shares : 0,
           market_value: marketValue,
           market_value_usd: marketValueUsd,
           cost_value: costValue,

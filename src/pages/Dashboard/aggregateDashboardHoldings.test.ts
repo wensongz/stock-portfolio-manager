@@ -110,3 +110,60 @@ test("先按账户和市场筛选再聚合，仓位分母仅包含所选持仓",
   assert.equal(rows[0].accountRows.length, 1);
   assert.equal(filterDashboardHoldings(holdings, [], []).length, 3);
 });
+
+function cash(currency: string, balance: number, accountId = "account-a"): HoldingDetail {
+  const usdRate = { USD: 1, CNY: 7, HKD: 7.8 }[currency];
+  return holding({
+    id: `${accountId}-${currency}`, account_id: accountId,
+    symbol: `$CASH-${currency}`, market: { USD: "US", CNY: "CN", HKD: "HK" }[currency], currency,
+    shares: balance, avg_cost: 1, current_price: 1,
+    cost_value: balance, market_value: balance, market_value_usd: balance / usdRate,
+    pnl: 0, pnl_percent: null, daily_pnl: 0,
+  });
+}
+
+test("负现金保留原币市值，组合和账户仓位按扣除透支后的净值计算", () => {
+  const rows = aggregateDashboardHoldings([
+    holding(), cash("CNY", 7000), cash("HKD", -1560),
+    holding({ id: "closed", symbol: "CLOSED", shares: 0 }),
+    holding({ id: "short", symbol: "SHORT", shares: -1 }),
+  ]);
+  // USD net assets: 1200 + 7000 / 7 - 1560 / 7.8 = 2000.
+  assert.equal(rows.length, 3);
+  assert.equal(rows.reduce((sum, row) => sum + row.market_value_usd, 0), 2000);
+  assert.deepEqual(rows.map((row) => [row.symbol, row.position_pct]), [
+    ["AAPL", 60], ["$CASH-CNY", 50], ["$CASH-HKD", -10],
+  ]);
+  const debit = rows[2];
+  assert.equal(debit.market_value, -1560);
+  assert.equal(debit.avg_cost, 1);
+  assert.equal(debit.pnl, 0);
+  assert.equal(debit.daily_change_percent, null);
+  assert.equal(debit.accountRows[0].avg_cost, 1);
+  assert.equal(debit.accountRows[0].position_pct, -10);
+});
+
+test("跨账户同币种现金相互抵扣，负数和零净余额的均价仍为一", () => {
+  for (const [credit, shares, netUsd] of [[780, -780, 1100], [1560, 0, 1200]]) {
+    const rows = aggregateDashboardHoldings([
+      holding(), cash("HKD", credit, "account-b"), cash("HKD", -1560),
+    ]);
+    const row = rows.find((row) => row.symbol === "$CASH-HKD")!;
+    assert.equal(rows.reduce((sum, row) => sum + row.market_value_usd, 0), netUsd);
+    assert.equal(row.shares, shares);
+    assert.equal(row.avg_cost, 1);
+    assert.equal(row.accountRows.length, 2);
+    assert.deepEqual(row.accountRows.map((account) => account.avg_cost), [1, 1]);
+    assert.ok(Math.abs(row.accountRows[1].position_pct - (-200 / netUsd * 100)) < 1e-8);
+    assert.equal(row.pnl, 0);
+  }
+});
+
+test("只有现金透支时仍显示余额并避免无效仓位和盈亏比例", () => {
+  const row = aggregateDashboardHoldings([cash("HKD", -1560)])[0];
+  assert.equal(row.market_value_usd, -200);
+  assert.equal(row.avg_cost, 1);
+  assert.equal(row.position_pct, 0);
+  assert.equal(row.pnl_percent, null);
+  assert.equal(row.accountRows[0].position_pct, 0);
+});

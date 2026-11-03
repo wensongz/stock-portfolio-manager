@@ -18,6 +18,22 @@ test("filterActiveOverviewHoldings keeps positive cash and stock details", () =>
   assert.deepEqual(filterActiveOverviewHoldings(holdings), holdings.slice(0, 2));
 });
 
+test("cash overdrafts remain active in overview and cash category but not stock categories", () => {
+  const holdings = [
+    { symbol: "$CASH-CNY", category_id: "cash", shares: 100000 },
+    { symbol: "$CASH-HKD", category_id: "growth", shares: -7800 },
+    { symbol: "700.HK", category_id: "growth", shares: 100 },
+    { symbol: "CLOSED", category_id: "growth", shares: 0 },
+    { symbol: "SHORT", category_id: "growth", shares: -10 },
+    { symbol: "$CASH-USD", category_id: "cash", shares: 0 },
+  ];
+
+  assert.deepEqual(filterActiveOverviewHoldings(holdings), holdings.slice(0, 3));
+  assert.deepEqual(filterActiveStockHoldings(holdings, true), holdings.slice(0, 3));
+  assert.deepEqual(filterActiveStockHoldings(holdings), [holdings[2]]);
+  assert.deepEqual(filterCategoryHoldings(holdings, "growth"), [holdings[2]]);
+});
+
 test("filterCategoryHoldings keeps only active stock positions in the selected category", () => {
   const holdings = [
     { symbol: "AAPL", category_id: "growth", shares: 2 },

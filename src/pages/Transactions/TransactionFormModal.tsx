@@ -6,6 +6,7 @@ import { useAccountStore } from "../../stores/accountStore";
 import { useTransactionStore } from "../../stores/transactionStore";
 import { useQuoteStore } from "../../stores/quoteStore";
 import { normalizeMainlandSymbolCase } from "../../lib/symbol.ts";
+import { cashMarketByCurrency } from "../../lib/cashCurrency";
 import type { Currency, Holding, Market, QuoteCommandResult, StockQuote, Transaction, TransactionType } from "../../types";
 
 interface Props {
@@ -72,10 +73,16 @@ export default function TransactionFormModal({
   const [form] = Form.useForm<TransactionFormValues>();
   const watchedType = Form.useWatch("transactionType", form);
   const selectedFormMarket = Form.useWatch("market", form) as Market | undefined;
+  const selectedFormCurrency = Form.useWatch("currency", form) as Currency | undefined;
   const isDividend = watchedType === "PAY";
   const isStockTransfer = watchedType === "STOCK_IN" || watchedType === "STOCK_OUT";
   const isStockOut = watchedType === "STOCK_OUT";
   const isCashTxn = watchedType === "CASH_IN" || watchedType === "CASH_OUT";
+  useEffect(() => {
+    if (isCashTxn && selectedFormCurrency) {
+      form.setFieldsValue({ market: cashMarketByCurrency[selectedFormCurrency] });
+    }
+  }, [isCashTxn, selectedFormCurrency, form]);
   const [accountHoldings, setAccountHoldings] = useState<Holding[]>([]);
   const [symbolSearching, setSymbolSearching] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -235,6 +242,7 @@ export default function TransactionFormModal({
       ...stockSubmitted,
       ...(isCash ? {
         transactionType: values.transactionType === "CASH_IN" ? "BUY" as const : "SELL" as const,
+        market: cashMarketByCurrency[values.currency],
         symbol: `${CASH_SYMBOL_PREFIX}${values.currency}`,
         name: `现金 (${values.currency})`,
         shares: 0,
@@ -390,7 +398,7 @@ export default function TransactionFormModal({
           <Col span={12}>
             <Form.Item name="market" label="市场" style={{ marginBottom: 12 }}
               rules={[{ required: true, message: "请选择市场" }]}>
-              <Select placeholder="选择市场">
+              <Select placeholder="选择市场" disabled={isCashTxn}>
                 <Select.Option value="US">🇺🇸 美股</Select.Option>
                 <Select.Option value="CN">🇨🇳 A股</Select.Option>
                 <Select.Option value="HK">🇭🇰 港股</Select.Option>

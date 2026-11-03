@@ -173,7 +173,7 @@ export interface HoldingDetail {
   pnl_percent: number | null;
   daily_pnl: number;
   currency: Currency;
-  /** Market value normalised to USD for cross-currency sorting. */
+  /** Common comparison basis: USD with FX, or native currency for a single-currency account view. */
   market_value_usd: number;
 }
 

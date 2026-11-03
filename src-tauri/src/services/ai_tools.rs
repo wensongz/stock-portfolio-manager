@@ -686,12 +686,12 @@ fn scope_for_trusted_rebalance_preview(
                 .account_id
                 .clone()
                 .ok_or_else(|| "账户范围配置缺少账户 ID".to_string())?;
-            let market = preview
+            preview
                 .account_market
-                .clone()
+                .as_deref()
                 .ok_or_else(|| "账户范围预览缺少已验证市场".to_string())?;
             Ok(PortfolioScope {
-                market: Some(market),
+                market: None,
                 account_id: Some(account_id),
                 authorized_rebalance_config_id,
             })
@@ -2223,6 +2223,82 @@ mod tests {
                 .unwrap();
             (config.0, config.1, breaches)
         }
+    }
+
+    #[tokio::test]
+    async fn account_rebalance_followup_keeps_hk_holdings_and_research_in_scope() {
+        let fixture = ready_breached_rebalance_fixture().await;
+        fixture.db.conn.lock().unwrap().execute_batch(
+            "UPDATE portfolio_alert_configs SET scope_kind='ACCOUNT',scope_key='account:acct-us',market=NULL,account_id='acct-us' WHERE id='config-us';
+             INSERT INTO holdings(id,account_id,symbol,name,market,category_id,shares,avg_cost,currency,created_at,updated_at)
+             VALUES('h-hk','acct-us','0700.HK','Tencent','HK','growth',1,400,'HKD','2026-09-06','2026-09-06'),
+                   ('h-hkd','acct-us','$CASH-HKD','HKD Cash','HK','bonds',800,1,'HKD','2026-09-06','2026-09-06');"
+        ).unwrap();
+        fixture.quote_cache.set(crate::models::StockQuote {
+            symbol: "0700.HK".into(),
+            market: "HK".into(),
+            current_price: 800.0,
+            ..Default::default()
+        });
+        let rates = crate::models::ExchangeRates {
+            usd_cny: 5.0,
+            usd_hkd: 8.0,
+            cny_hkd: 1.6,
+            updated_at: "2026-11-03".into(),
+        };
+        fixture.cache.set(rates.clone());
+        let scope = crate::services::ai_chat_service::validated_portfolio_scope(
+            &fixture.db,
+            Some(&crate::services::ai_chat_service::PrefilledToolContext {
+                name: "get_rebalance_context".into(),
+                arguments: json!({"config_id":fixture.config_id}),
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        let preview = portfolio_alert_service::preview_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&rates),
+            &fixture.config_id,
+            "2026-11-03T10:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scope,
+            scope_for_trusted_rebalance_preview(&preview).unwrap()
+        );
+        let ctx = ToolCtx::for_untrusted_model_turn(
+            &fixture.db,
+            &fixture.cache,
+            &fixture.quote_cache,
+            &fixture.quote_state,
+            "account followup",
+            Some(scope),
+        );
+        assert_eq!(
+            guarded_symbol_market(&ctx, &json!({"symbol":"0700.HK","market":"HK"})).unwrap(),
+            ("0700.HK".into(), "HK".into())
+        );
+        let holdings = execute_tool(&ctx, "get_holdings_detail", "{}").await;
+        assert!(holdings.ok, "{}", holdings.content);
+        let rows: Value = serde_json::from_str(&holdings.content).unwrap();
+        assert_eq!(rows["holdings"].as_array().unwrap().len(), 4);
+        assert!(rows["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == "h-hkd"));
+        let rebalance = execute_tool(
+            &ctx,
+            "get_rebalance_context",
+            &json!({"config_id":fixture.config_id}).to_string(),
+        )
+        .await;
+        assert!(rebalance.ok, "{}", rebalance.content);
+        let payload: Value = serde_json::from_str(&rebalance.content).unwrap();
+        assert_eq!(payload["positions"].as_array().unwrap().len(), 4);
     }
 
     #[tokio::test]

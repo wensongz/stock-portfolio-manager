@@ -364,7 +364,6 @@ fn evaluation_currency_and_account_market(
 
 fn scope_matches_holding(
     config: &PortfolioAlertConfig,
-    account_market: Option<&str>,
     holding: &crate::models::HoldingDetail,
 ) -> bool {
     match config.scope.kind {
@@ -374,14 +373,11 @@ fn scope_matches_holding(
             .market
             .as_deref()
             .is_some_and(|market| market.eq_ignore_ascii_case(&holding.market)),
-        PortfolioAlertScopeKind::Account => {
-            config
-                .scope
-                .account_id
-                .as_deref()
-                .is_some_and(|account_id| account_id == holding.account_id)
-                && account_market.is_none_or(|market| market.eq_ignore_ascii_case(&holding.market))
-        }
+        PortfolioAlertScopeKind::Account => config
+            .scope
+            .account_id
+            .as_deref()
+            .is_some_and(|account_id| account_id == holding.account_id),
     }
 }
 
@@ -661,13 +657,7 @@ fn preview_positions(
     read_model
         .holdings()
         .iter()
-        .filter(|holding| {
-            scope_matches_holding(
-                &calculation.guard.config,
-                calculation.account_market.as_deref(),
-                holding,
-            )
-        })
+        .filter(|holding| scope_matches_holding(&calculation.guard.config, holding))
         .map(|holding| {
             let symbol = normalize_stock_symbol(&holding.symbol)
                 .unwrap_or_else(|| holding.symbol.trim().to_ascii_uppercase());
@@ -1126,7 +1116,7 @@ where
     let scoped_holdings = read_model
         .holdings()
         .iter()
-        .filter(|holding| scope_matches_holding(&config, account_market.as_deref(), holding))
+        .filter(|holding| scope_matches_holding(&config, holding))
         .collect::<Vec<_>>();
 
     if scoped_holdings.is_empty() {
@@ -3312,6 +3302,70 @@ mod tests {
             crate::models::portfolio_alert::PortfolioAlertDataStatus::Ready
         );
         assert_eq!(result.snapshot.unwrap().total_market_value, 100.0);
+    }
+
+    #[tokio::test]
+    async fn account_scope_includes_all_markets_and_cash_currencies() {
+        let fixture = evaluation_fixture();
+        seed_holding!(
+            &fixture.db,
+            "hk-stock",
+            "acct-us",
+            "0700.HK",
+            "HK",
+            Some("growth"),
+            1.0,
+            "HKD"
+        );
+        seed_holding!(
+            &fixture.db,
+            "hkd-cash",
+            "acct-us",
+            "$CASH-HKD",
+            "HK",
+            Some("growth"),
+            1600.0,
+            "HKD"
+        );
+        seed_holding!(
+            &fixture.db,
+            "usd-cash",
+            "acct-us",
+            "$CASH-USD",
+            "US",
+            Some("growth"),
+            300.0,
+            "USD"
+        );
+        seed_account(&fixture.db, "other", "US");
+        seed_holding!(
+            &fixture.db,
+            "other-cash",
+            "other",
+            "$CASH-USD",
+            "US",
+            Some("growth"),
+            10000.0,
+            "USD"
+        );
+        fixture.quote_cache.set(quote("HK", "0700.HK", 800.0));
+        let config = save_portfolio_alert_config(
+            &fixture.db,
+            input(account_scope("acct-us"), 20.0, 100.0, [("growth", 100.0)]),
+        )
+        .unwrap();
+        let result = evaluate_portfolio_alert(
+            &fixture.db,
+            &fixture.quote_cache,
+            Some(&fixture.rates),
+            &config.id,
+            "2026-09-06T10:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, PortfolioAlertDataStatus::Ready);
+        // AAPL USD1000 + CNY500 / 5 + HKD800 / 8 + HKD1600 / 8 + USD300.
+        assert_eq!(result.snapshot.unwrap().total_market_value, 1700.0);
     }
 
     #[tokio::test]

@@ -3,7 +3,8 @@ use crate::models::{DashboardReport, DashboardSummary, ExchangeRates, HoldingDet
 use crate::services::exchange_rate_service::convert_currency;
 use crate::services::quote_provider_service;
 use crate::services::quote_service::{
-    fetch_quotes_batch_cached_with_providers, is_cash_symbol, QuoteCache, QuoteServiceState,
+    fetch_quotes_batch_cached_with_providers, holding_market, is_cash_symbol, QuoteCache,
+    QuoteServiceState,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -71,7 +72,7 @@ impl PortfolioReadModel {
             currency: String,
         }
 
-        let rows: Vec<Row> = {
+        let mut rows: Vec<Row> = {
             let conn = db.conn.lock().map_err(|error| error.to_string())?;
             let mut statement = conn
                 .prepare(
@@ -84,6 +85,7 @@ impl PortfolioReadModel {
                      LEFT JOIN accounts a ON h.account_id = a.id
                      LEFT JOIN categories c ON h.category_id = c.id
                      WHERE h.shares > 0
+                        OR (h.shares < 0 AND h.symbol GLOB '$CASH-*')
                      ORDER BY h.market, h.symbol",
                 )
                 .map_err(|error| error.to_string())?;
@@ -109,6 +111,11 @@ impl PortfolioReadModel {
                 .map_err(|error| error.to_string())?;
             result
         };
+
+        // Repair legacy cash classification in the read model without rewriting history.
+        for row in &mut rows {
+            row.market = holding_market(&row.symbol, &row.currency, &row.market).to_string();
+        }
 
         if rows.is_empty() {
             return Ok(Self {

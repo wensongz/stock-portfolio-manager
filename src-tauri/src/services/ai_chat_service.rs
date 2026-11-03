@@ -277,8 +277,7 @@ pub(crate) fn validated_portfolio_scope(
                     .scope
                     .account_id
                     .ok_or_else(|| "账户范围配置缺少账户 ID".to_string())?;
-                let market = db
-                    .conn
+                db.conn
                     .lock()
                     .map_err(|error| error.to_string())?
                     .query_row(
@@ -287,7 +286,9 @@ pub(crate) fn validated_portfolio_scope(
                         |row| row.get::<_, String>(0),
                     )
                     .map_err(|_| format!("account {account_id} not found"))?;
-                (Some(market), Some(account_id))
+                // The account market determines display currency, not which
+                // of this account's holdings the assistant may analyze.
+                (None, Some(account_id))
             }
         };
         return Ok(Some(PortfolioScope {
@@ -391,7 +392,10 @@ mod prefilled_tool_tests {
             .unwrap()
             .unwrap();
         assert_eq!(account.account_id.as_deref(), Some("acct-us"));
-        assert_eq!(account.market.as_deref(), Some("US"));
+        assert_eq!(
+            account.market, None,
+            "account scope must include every holding market"
+        );
         assert!(validated_portfolio_scope(&db, Some(&rebalance_prefill("missing"))).is_err());
         assert!(
             validated_portfolio_scope(&db, Some(&rebalance_prefill("config-inactive"))).is_err()

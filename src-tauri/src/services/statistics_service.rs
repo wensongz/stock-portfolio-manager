@@ -262,16 +262,53 @@ pub fn by_market(model: &PortfolioReadModel, market: &str) -> MarketStatistics {
     }
 }
 
-pub fn by_account(
-    model: &PortfolioReadModel,
-    rates: &ExchangeRates,
-    account_id: &str,
-    market: &str,
-) -> AccountStatistics {
-    let currency = match market {
+pub fn account_currency(market: &str) -> &'static str {
+    match market {
         "HK" => "HKD",
         "CN" => "CNY",
         _ => "USD",
+    }
+}
+
+pub fn by_account(
+    model: &PortfolioReadModel,
+    rates: Option<&ExchangeRates>,
+    account_id: &str,
+    market: &str,
+) -> Result<AccountStatistics, String> {
+    let currency = account_currency(market);
+    if rates.is_none()
+        && model
+            .holdings()
+            .iter()
+            .any(|detail| detail.account_id == account_id && detail.currency != currency)
+    {
+        return Err("跨币种账户统计需要汇率".to_string());
+    }
+    if let Some(rates) = rates {
+        let valid_usd_rate = |currency: &str| {
+            let rate = match currency {
+                "USD" => 1.0,
+                "CNY" => rates.usd_cny,
+                "HKD" => rates.usd_hkd,
+                _ => return false,
+            };
+            rate.is_finite() && rate > 0.0
+        };
+        if let Some(detail) = model.holdings().iter().find(|detail| {
+            detail.account_id == account_id
+                && (!valid_usd_rate(&detail.currency) || !valid_usd_rate(currency))
+        }) {
+            return Err(format!(
+                "账户统计所需的 {}/{currency} 汇率无效，必须为正有限数值",
+                detail.currency
+            ));
+        }
+    }
+    let account_value = |value: f64, from: &str| {
+        rates.map_or(value, |rates| {
+            convert_currency(value, from, currency, rates)
+        })
     };
     let details: Vec<_> = model
         .holdings()
@@ -279,8 +316,11 @@ pub fn by_account(
         .filter(|detail| detail.account_id == account_id)
         .map(|detail| {
             let mut detail = detail.clone();
-            detail.market_value_usd =
-                convert_currency(detail.market_value, &detail.currency, "USD", rates);
+            // Without FX all rows have the same currency. Native amounts preserve
+            // sorting and portfolio weights without inventing a USD exchange rate.
+            detail.market_value_usd = rates.map_or(detail.market_value, |rates| {
+                convert_currency(detail.market_value, &detail.currency, "USD", rates)
+            });
             detail
         })
         .collect();
@@ -295,8 +335,8 @@ pub fn by_account(
     let mut total_cost = 0.0;
 
     for detail in &details {
-        let market_value = convert_currency(detail.market_value, &detail.currency, currency, rates);
-        let cost_value = convert_currency(detail.cost_value, &detail.currency, currency, rates);
+        let market_value = account_value(detail.market_value, &detail.currency);
+        let cost_value = account_value(detail.cost_value, &detail.currency);
         *category_map
             .entry((
                 detail.category_name.clone(),
@@ -339,7 +379,7 @@ pub fn by_account(
         0.0
     };
 
-    AccountStatistics {
+    Ok(AccountStatistics {
         account_id: account_id.to_string(),
         account_name,
         market: market.to_string(),
@@ -350,7 +390,7 @@ pub fn by_account(
         category_distribution,
         stock_distribution,
         holdings: details,
-    }
+    })
 }
 
 pub fn by_category(
@@ -588,7 +628,7 @@ mod tests {
     #[test]
     fn account_statistics_keep_identity_distributions_and_holdings() {
         let (model, rates) = fixture();
-        let result = by_account(&model, &rates, "acct-us", "US");
+        let result = by_account(&model, Some(&rates), "acct-us", "US").unwrap();
 
         assert_eq!(result.account_name, "US Broker");
         assert_eq!(result.market, "US");
@@ -633,7 +673,7 @@ mod tests {
             updated_at: "2026-09-02T09:30:00Z".to_string(),
         };
 
-        let result = by_account(&model, &rates, "acct-hk", "HK");
+        let result = by_account(&model, Some(&rates), "acct-hk", "HK").unwrap();
 
         assert_eq!(result.market, "HK");
         assert_close(result.total_market_value, 1660.0);

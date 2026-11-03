@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const projectRoot = fileURLToPath(new URL("../../../", import.meta.url));
 
-function submitTransaction(saveFails = false, refreshFails = false, notes = "感觉低估aaaab", symbol = "TEST", transactionType = "BUY", market = "US") {
+function submitTransaction(saveFails = false, refreshFails = false, notes = "感觉低估aaaab", symbol = "TEST", transactionType = "BUY", market = "US", currency = "USD") {
   const probe = String.raw`
     const React = await import("react");
     const { renderToStaticMarkup } = await import("react-dom/server");
@@ -54,7 +54,7 @@ function submitTransaction(saveFails = false, refreshFails = false, notes = "感
         if (${refreshFails}) throw new Error("测试：刷新失败");
       },
     }));
-    const submitting = onFinish({ accountId: original.account_id, symbol: ${symbol === null ? "undefined" : JSON.stringify(symbol)}, name: original.name, market: ${JSON.stringify(market)}, transactionType: ${JSON.stringify(transactionType)}, shares: 2, price: 100, totalAmount: 200, commission: 0, currency: "USD", tradedAt: dayjs(original.traded_at), notes: ${JSON.stringify(notes)} });
+    const submitting = onFinish({ accountId: original.account_id, symbol: ${symbol === null ? "undefined" : JSON.stringify(symbol)}, name: original.name, market: ${JSON.stringify(market)}, transactionType: ${JSON.stringify(transactionType)}, shares: 2, price: 100, totalAmount: 200, commission: 0, currency: ${JSON.stringify(currency)}, tradedAt: dayjs(original.traded_at), notes: ${JSON.stringify(notes)} });
     if (${saveFails}) {
       await submitting;
       process.stdout.write(JSON.stringify({ closes, refreshedTransaction, errors, warnings, commands, submittedPayloads, transaction: useTransactionStore.getState().transactions[0] }));
@@ -140,4 +140,18 @@ test("US and HK transaction entry and submission preserve mainland-shaped symbol
 
 test("cash transaction submission generates its cash symbol without a stock field", () => {
   assert.equal(submitTransaction(false, false, "", null, "CASH_IN").submittedPayloads[0].symbol, "$CASH-USD");
+});
+
+test("cash deposits and withdrawals follow their currency instead of the account market", () => {
+  for (const transactionType of ["CASH_IN", "CASH_OUT"]) {
+    for (const [accountMarket, currency, expectedMarket] of [["US", "HKD", "HK"], ["HK", "USD", "US"], ["US", "CNY", "CN"]]) {
+      const result = submitTransaction(false, false, "", null, transactionType, accountMarket, currency);
+      const payload = result.submittedPayloads[0];
+      assert.equal(payload.market, expectedMarket);
+      assert.equal(payload.currency, currency);
+      assert.equal(payload.symbol, `$CASH-${currency}`);
+      assert.equal(payload.transactionType, transactionType === "CASH_IN" ? "BUY" : "SELL");
+      assert.deepEqual(result.errors, []);
+    }
+  }
 });

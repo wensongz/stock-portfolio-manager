@@ -1,6 +1,8 @@
 use crate::models::{Holding, Transaction};
 use crate::services::position_replay::{rebuild_position_group, PositionKey};
-use crate::services::quote_service::{cash_display_name, is_cash_symbol, CASH_SYMBOL_PREFIX};
+use crate::services::quote_service::{
+    cash_display_name, holding_market, is_cash_symbol, CASH_SYMBOL_PREFIX,
+};
 use crate::services::snapshot_cache_service::{invalidate_from, snapshot_date};
 use crate::symbols::normalize_cn_stock_symbol;
 use rusqlite::{Connection, OptionalExtension};
@@ -166,6 +168,7 @@ pub(crate) fn adjust_cash_holding(
     delta: f64,
 ) -> Result<(), String> {
     let cash_symbol = format!("{CASH_SYMBOL_PREFIX}{currency}");
+    let market = holding_market(&cash_symbol, currency, market);
     let existing: Option<(String, f64)> = conn
         .query_row(
             "SELECT id, shares FROM holdings WHERE account_id = ?1 AND symbol = ?2",
@@ -178,8 +181,8 @@ pub(crate) fn adjust_cash_holding(
 
     if let Some((cash_id, current_shares)) = existing {
         conn.execute(
-            "UPDATE holdings SET shares = ?2, updated_at = ?3 WHERE id = ?1",
-            rusqlite::params![cash_id, current_shares + delta, updated_at],
+            "UPDATE holdings SET shares = ?2, updated_at = ?3, market = ?4 WHERE id = ?1",
+            rusqlite::params![cash_id, current_shares + delta, updated_at, market],
         )
         .map_err(|error| error.to_string())?;
     } else {
@@ -234,6 +237,7 @@ pub(crate) fn validate_cash_withdrawal(
 pub fn create_holding_in(conn: &Connection, input: &CreateHoldingInput) -> Result<Holding, String> {
     let input = &CreateHoldingInput {
         symbol: normalize_cn_stock_symbol(&input.symbol, &input.market),
+        market: holding_market(&input.symbol, &input.currency, &input.market).to_string(),
         ..input.clone()
     };
     validate_holding_values(
@@ -359,6 +363,7 @@ pub fn create_transaction_in(
 ) -> Result<Transaction, String> {
     let input = &CreateTransactionInput {
         symbol: normalize_cn_stock_symbol(&input.symbol, &input.market),
+        market: holding_market(&input.symbol, &input.currency, &input.market).to_string(),
         ..input.clone()
     };
     require_caller_transaction(conn)?;
@@ -498,6 +503,7 @@ pub(crate) fn update_transaction_in(
 ) -> Result<Transaction, String> {
     let input = &CreateTransactionInput {
         symbol: normalize_cn_stock_symbol(&input.symbol, &input.market),
+        market: holding_market(&input.symbol, &input.currency, &input.market).to_string(),
         ..input.clone()
     };
     require_caller_transaction(conn)?;

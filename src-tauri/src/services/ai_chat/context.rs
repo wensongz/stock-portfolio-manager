@@ -467,7 +467,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn market_context_omits_unconverted_history_for_foreign_currency_cash() {
+    async fn market_context_reclassifies_legacy_cash_and_omits_unconverted_history() {
         let (db, quotes) = database_with_market_holdings();
         {
             let conn = db.conn.lock().unwrap();
@@ -492,10 +492,20 @@ mod tests {
             .await
             .unwrap();
         assert!(rendered.contains("账户总览（单位：HKD）"));
-        assert!(rendered.contains("总市值：4000.00"));
+        assert!(rendered.contains("总市值：2000.00"));
+        assert!(!rendered.contains("$CASH-USD"));
         assert!(!rendered.contains("期末市值："), "{rendered}");
         assert!(rendered.contains("历史绩效"));
         assert!(rendered.contains("币种"));
+        let us_scope = PortfolioScope {
+            market: Some("US".to_string()),
+            ..Default::default()
+        };
+        let us_context = build_portfolio_context(&db, &cache, &quotes, Some(&us_scope))
+            .await
+            .unwrap();
+        assert!(us_context.contains("总市值：2100.00"));
+        assert!(us_context.contains("$CASH-USD"));
     }
 
     #[test]

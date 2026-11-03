@@ -117,6 +117,20 @@ pub fn is_cash_symbol(symbol: &str) -> bool {
     symbol.starts_with(CASH_SYMBOL_PREFIX)
 }
 
+/// Cash follows its currency's market; stocks retain their listing market.
+pub fn holding_market<'a>(symbol: &str, currency: &str, market: &'a str) -> &'a str {
+    if is_cash_symbol(symbol) {
+        match currency {
+            "USD" => "US",
+            "CNY" => "CN",
+            "HKD" => "HK",
+            _ => market,
+        }
+    } else {
+        market
+    }
+}
+
 /// Return the display name for a cash symbol, e.g. "现金 (USD)".
 /// Panics if the symbol does not start with [`CASH_SYMBOL_PREFIX`].
 pub fn cash_display_name(symbol: &str) -> String {

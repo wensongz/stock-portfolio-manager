@@ -52,6 +52,7 @@ import CashBalancePreview from "./CashBalancePreview";
 import CashTransactionsTable from "./CashTransactionsTable";
 import { cashBalanceEditDecision, cashBalanceSaveCommand, createEditSession, createHoldingRequest, emptyHoldingRequest, mergeHoldingQuote } from "./cashBalanceEditing";
 import { formatMoney } from "../../lib/formatMoney";
+import { cashMarketByCurrency } from "../../lib/cashCurrency";
 import TransactionFormModal from "../Transactions/TransactionFormModal";
 import StockTransactionDetailTitle from "../../components/StockTransactionDetailTitle";
 
@@ -389,15 +390,15 @@ export default function HoldingsPage() {
   };
 
   /** Submit handler for the "Add Cash" modal. */
-  const handleCashSubmit = async (values: { accountId: string; amount: number }) => {
+  const handleCashSubmit = async (values: { accountId: string; amount: number; currency: Currency }) => {
     try {
       const account = accounts.find((a) => a.id === values.accountId);
       if (!account) {
         message.error("账户不存在");
         return;
       }
-      const market = account.market as Market;
-      const currency = marketToCurrency[market];
+      const currency = values.currency;
+      const market = cashMarketByCurrency[currency];
       const cashSymbol = MARKET_CASH_SYMBOL[market];
       // Find the "现金类" category if available
       const cashCategory = categories.find((c) => c.name === "现金类");
@@ -840,7 +841,11 @@ export default function HoldingsPage() {
             onClick={() => {
               cashForm.resetFields();
               if (filterAccountId) {
-                cashForm.setFieldsValue({ accountId: filterAccountId });
+                const account = accounts.find((a) => a.id === filterAccountId);
+                cashForm.setFieldsValue({
+                  accountId: filterAccountId,
+                  currency: account ? marketToCurrency[account.market] : "USD",
+                });
               }
               setCashModalOpen(true);
             }}
@@ -1094,18 +1099,32 @@ export default function HoldingsPage() {
         cancelText="取消"
         width={480}
       >
-        <Form form={cashForm} layout="vertical" onFinish={handleCashSubmit}>
+        <Form form={cashForm} layout="vertical" initialValues={{ currency: "USD" }} onFinish={handleCashSubmit}>
           <Form.Item
             name="accountId"
             label="所属账户"
             rules={[{ required: true, message: "请选择账户" }]}
           >
-            <Select placeholder="选择证券账户">
+            <Select placeholder="选择证券账户" onChange={(accountId: string) => {
+              const account = accounts.find((a) => a.id === accountId);
+              if (account) cashForm.setFieldsValue({ currency: marketToCurrency[account.market] });
+            }}>
               {accounts.map((a) => (
                 <Select.Option key={a.id} value={a.id}>
                   [{a.market}] {a.name}
                 </Select.Option>
               ))}
+            </Select>
+          </Form.Item>
+          <Form.Item
+            name="currency"
+            label="币种"
+            rules={[{ required: true, message: "请选择币种" }]}
+          >
+            <Select>
+              <Select.Option value="USD">USD 美元</Select.Option>
+              <Select.Option value="HKD">HKD 港元</Select.Option>
+              <Select.Option value="CNY">CNY 人民币</Select.Option>
             </Select>
           </Form.Item>
           <Form.Item

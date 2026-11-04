@@ -65,9 +65,31 @@ impl ExchangeRateCache {
     }
 }
 
-/// Fetch the latest exchange rates from open.er-api.com (USD base).
+const PRIMARY_RATES_URL: &str = "https://open.er-api.com/v6/latest/USD";
+/// Keyless fallback with the same response shape as open.er-api.com
+/// (ECB reference rates, updated daily). Only used when the primary fails.
+const FALLBACK_RATES_URL: &str = "https://allratestoday.com/api/open/latest/USD";
+
+/// Fetch the latest exchange rates from open.er-api.com (USD base), falling
+/// back to AllRatesToday when that request fails.
 pub async fn fetch_exchange_rates() -> Result<ExchangeRates, String> {
-    let url = "https://open.er-api.com/v6/latest/USD";
+    match fetch_exchange_rates_from(PRIMARY_RATES_URL).await {
+        Ok(rates) => Ok(rates),
+        Err(primary_error) => {
+            warn!(
+                "primary exchange rate source failed ({}), trying AllRatesToday",
+                primary_error
+            );
+            fetch_exchange_rates_from(FALLBACK_RATES_URL)
+                .await
+                .map_err(|fallback_error| {
+                    format!("{primary_error}; fallback source also failed: {fallback_error}")
+                })
+        }
+    }
+}
+
+async fn fetch_exchange_rates_from(url: &str) -> Result<ExchangeRates, String> {
     let response = http_client::general_client()
         .get(url)
         .send()

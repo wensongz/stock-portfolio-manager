@@ -72,6 +72,28 @@ test("不同市场或币种的同代码不相加，同市场代码忽略大小�
   assert.equal(new Set(rows.map((row) => row.key)).size, 3);
 });
 
+test("A 股按忽略大小写的代码合并，主表和分账户明细使用小写交易所前缀", () => {
+  for (const [symbol, mixedCase, expected] of [
+    ["sh600519", " SH600519 ", "sh600519"],
+    ["sz000001", " Sz000001 ", "sz000001"],
+    ["bj920001", " BJ920001 ", "bj920001"],
+  ]) {
+    const holdings = [
+      holding({ symbol, market: "CN", currency: "CNY" }),
+      holding({ id: "holding-b", account_id: "account-b", symbol: mixedCase,
+        market: "cn", currency: "CNY" }),
+    ];
+    for (const input of [holdings, [...holdings].reverse()]) {
+      const rows = aggregateDashboardHoldings(input);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].symbol, expected);
+      assert.equal(rows[0].shares, 20);
+      assert.deepEqual(rows[0].accountRows.map((row) => row.symbol), [expected, expected]);
+    }
+    assert.deepEqual(holdings.map((row) => row.symbol), [symbol, mixedCase]);
+  }
+});
+
 test("同币种现金跨市场合并且不显示行情涨跌幅，零持仓不进入概览", () => {
   const cash = holding({ symbol: "$CASH-USD", name: "美元现金", shares: 100.25,
     current_price: 1, avg_cost: 1, market_value: 100.25, market_value_usd: 100.25,

@@ -1,4 +1,5 @@
 import type { HoldingDetail } from "../../types/index.ts";
+import { normalizeMainlandSymbolCase } from "../../lib/symbol.ts";
 
 export interface DashboardAccountHolding extends HoldingDetail {
   key: string;
@@ -42,14 +43,16 @@ export function aggregateDashboardHoldings(holdings: readonly HoldingDetail[]): 
   let totalUsd = 0;
 
   for (const holding of holdings) {
-    const symbol = holding.symbol.trim().toUpperCase();
-    const isCash = symbol.startsWith("$CASH-");
+    const market = holding.market.trim().toUpperCase();
+    const symbolKey = holding.symbol.trim().toUpperCase();
+    const symbol = market === "CN" ? normalizeMainlandSymbolCase(symbolKey) : symbolKey;
+    const isCash = symbolKey.startsWith("$CASH-");
     if (holding.shares <= 0 && (!isCash || holding.shares === 0)) continue;
     // Cash of the same currency can live in accounts from different markets.
     // Securities retain market/currency identity so native amounts stay comparable.
     const key = JSON.stringify([
-      isCash ? "CASH" : holding.market.trim().toUpperCase(),
-      symbol, holding.currency,
+      isCash ? "CASH" : market,
+      symbolKey, holding.currency,
     ]);
     totalUsd += holding.market_value_usd;
     const existing = groups.get(key);

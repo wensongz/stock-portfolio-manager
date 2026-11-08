@@ -178,7 +178,7 @@ export default function TransactionFormModal({
   }, [accounts, form, loadAccountHoldings]);
 
   const symbolOptions = useMemo(() => accountHoldings
-    .filter((holding) => holding.shares > 0)
+    .filter((holding) => holding.shares > 0 || (holding.shares === 0 && !holding.symbol.startsWith(CASH_SYMBOL_PREFIX)))
     .map((holding) => ({ value: holding.symbol, label: `${holding.symbol} - ${holding.name} (持仓: ${holding.shares})` })), [accountHoldings]);
 
   const handleSymbolSelect = useCallback((value: string) => {

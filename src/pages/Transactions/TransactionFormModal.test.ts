@@ -1,4 +1,4 @@
-// @ts-nocheck -- Node drives a Bun SSR probe against the actual modal and stores.
+// @ts-nocheck -- Node drives Bun SSR and DOM probes against the actual modal and stores.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -154,4 +154,74 @@ test("cash deposits and withdrawals follow their currency instead of the account
       assert.deepEqual(result.errors, []);
     }
   }
+});
+
+test("a stock with zero shares can be selected when recording a dividend after liquidation", () => {
+  const probe = String.raw`
+    import { Window } from "happy-dom";
+    import { mock } from "bun:test";
+    import assert from "node:assert/strict";
+    const dom = new Window();
+    for (const key of ["window", "document", "navigator", "localStorage", "HTMLElement", "Element", "Node", "MutationObserver", "ResizeObserver", "ShadowRoot", "SVGElement", "getComputedStyle"]) {
+      Object.defineProperty(globalThis, key, { configurable: true, value: key === "window" ? dom : key === "getComputedStyle" ? dom[key].bind(dom) : dom[key] });
+    }
+    globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+    const { act, createElement: h } = await import("react");
+    const { createRoot } = await import("react-dom/client");
+    const antd = await import("antd");
+    mock.module("antd", () => ({ ...antd,
+      Modal: ({ children }) => children,
+      message: { success() {}, error: assert.fail },
+    }));
+    const timestamp = "2026-09-18T02:30:00.000Z";
+    const account = { id: "account-test", name: "Test Account", market: "US", description: null, created_at: timestamp, updated_at: timestamp };
+    const holding = { id: "holding-test", account_id: account.id, symbol: "700.HK", name: "腾讯控股", market: "HK", category_id: null, shares: 0, avg_cost: 0, currency: "HKD", created_at: timestamp, updated_at: timestamp };
+    let saved;
+    dom.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
+      if (command === "get_holdings" && args.accountId === account.id) return [holding];
+      if (command === "create_transaction") {
+        saved = args;
+        return { id: "dividend", holding_id: holding.id, account_id: args.accountId, symbol: args.symbol, name: args.name, market: args.market, transaction_type: args.transactionType, shares: args.shares, price: args.price, total_amount: args.totalAmount, commission: args.commission, currency: args.currency, traded_at: args.tradedAt, notes: null, created_at: timestamp };
+      }
+      throw new Error("Unexpected command: " + command);
+    } };
+    const { useAccountStore } = await import("./src/stores/accountStore.ts");
+    useAccountStore.setState({ accounts: [account] });
+    const { default: TransactionFormModal } = await import("./src/pages/Transactions/TransactionFormModal.tsx");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const choose = async (field, label) => {
+      await act(async () => {
+        const input = document.getElementById(field);
+        input.focus();
+        input.dispatchEvent(new dom.MouseEvent("mousedown", { bubbles: true }));
+      });
+      const option = [...document.querySelectorAll(".ant-select-item-option-content")].find(item => item.textContent.includes(label));
+      assert.ok(option, "Missing selectable option: " + label);
+      await act(async () => option.click());
+    };
+    try {
+      await act(async () => root.render(h(TransactionFormModal, { open: true, initialAccountId: account.id, onClose() {} })));
+      await choose("symbol", "700.HK");
+      assert.equal(document.getElementById("name").value, "腾讯控股");
+      await choose("transactionType", "分红");
+      await act(async () => {
+        const amount = document.getElementById("totalAmount");
+        Object.getOwnPropertyDescriptor(dom.HTMLInputElement.prototype, "value").set.call(amount, "32");
+        amount.dispatchEvent(new dom.Event("input", { bubbles: true }));
+      });
+      await act(async () => container.querySelector("form").dispatchEvent(new dom.Event("submit", { bubbles: true, cancelable: true })));
+      assert.deepEqual(
+        [saved?.symbol, saved?.name, saved?.market, saved?.currency, saved?.transactionType, saved?.shares, saved?.price, saved?.totalAmount],
+        ["700.HK", "腾讯控股", "HK", "HKD", "PAY", 0, 0, 32],
+      );
+    } finally {
+      await act(async () => root.unmount());
+      await dom.happyDOM.close();
+    }
+    // End the isolated DOM probe explicitly after assertions and teardown.
+    process.exit(0);
+  `;
+  execFileSync("bun", ["--eval", probe], { cwd: projectRoot, encoding: "utf8", timeout: 15_000 });
 });

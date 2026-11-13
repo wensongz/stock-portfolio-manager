@@ -155,6 +155,7 @@ export default function TransactionsPage() {
       render: (type: TransactionType, record: Transaction) => {
         const isCashRecord = record.symbol.startsWith(CASH_SYMBOL_PREFIX);
         if (isCashRecord) {
+          if (type === "OPEN") return <Tag color="blue">期初</Tag>;
           return (
             <Tag color={record.transaction_type === "BUY" ? "green" : "red"}>
               {record.transaction_type === "BUY" ? "存入" : "提取"}

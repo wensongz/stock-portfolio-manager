@@ -256,7 +256,7 @@ AI 技能不存储在 SQLite 中，而是保存在 `{app_data_dir}/skills/` 下�
 | --- | --- | --- |
 | 美股 / 港股行情 | 雪球、东方财富、Yahoo Finance | 可按市场选择；雪球失败时依次回退到东方财富、Yahoo Finance |
 | A 股行情 | 雪球、东方财富 | 可按市场选择；雪球失败时回退到东方财富 |
-| USD / CNY / HKD 汇率 | ExchangeRate-API（`open.er-api.com`） | 内存与 SQLite 双层缓存，网络失败时可使用旧缓存 |
+| USD / CNY / HKD 汇率 | ExchangeRate-API（`open.er-api.com`）；备用：[Exchange rates by AllRatesToday](https://allratestoday.com)（ECB 参考汇率） | 内存与 SQLite 双层缓存，网络失败时可使用旧缓存 |
 | 绩效基准指数 | Yahoo Finance | S&P 500、NASDAQ、沪深 300、上证指数、恒生指数 |
 | AI 模型 | 用户配置的 AI 提供商 | API Key 仅保存在本地 SQLite；请求直接发往所选服务 |
 

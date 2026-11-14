@@ -2,6 +2,29 @@ use super::*;
 use crate::services::http_client;
 
 #[test]
+fn xueqiu_verification_redirect_has_an_actionable_warning() {
+    let url = reqwest::Url::parse(
+        "https://check.xueqiu.com/captcha?ip=192.0.2.1&uri=/v5/stock/quote.json",
+    )
+    .unwrap();
+    let error = xueqiu::verification_redirect_error(&url)
+        .expect("verification redirect must be recognized");
+    assert_eq!(
+        quote_warning_for_error(&error).as_deref(),
+        Some("雪球触发了人机验证，请在相同网络或代理环境下打开雪球完成人机验证后重试。")
+    );
+    assert!(!error.contains("192.0.2.1"));
+    assert!(xueqiu::verification_redirect_error(
+        &reqwest::Url::parse("https://stock.xueqiu.com/v5/stock/quote.json").unwrap()
+    )
+    .is_none());
+    assert!(xueqiu::verification_redirect_error(
+        &reqwest::Url::parse("https://check.xueqiu.com.example/captcha").unwrap()
+    )
+    .is_none());
+}
+
+#[test]
 fn final_fresh_fallback_result_is_complete_only_when_every_requested_key_resolves() {
     // Simulate an initial provider omission followed by a successful network
     // fallback. Completeness is derived from the final fresh set, not a sticky

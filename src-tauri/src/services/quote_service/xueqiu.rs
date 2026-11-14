@@ -46,6 +46,25 @@ pub(super) const XUEQIU_COOKIE_EXPIRED_HINT: &str =
     "雪球 Cookie 已过期，请到 设置 → 通用设置 → 雪球 Cookie 设置 中设置 Cookie。";
 pub(super) const XUEQIU_API_FAILED_HINT: &str = "访问雪球行情服务失败，请检查网络连接或稍后重试。";
 
+pub(super) fn verification_redirect_error(url: &reqwest::Url) -> Option<String> {
+    (url.host_str() == Some("check.xueqiu.com"))
+        .then(|| "Xueqiu access verification required".to_string())
+}
+
+fn verification_response_error(response: &reqwest::Response) -> Option<String> {
+    verification_redirect_error(response.url()).or_else(|| {
+        if !response.status().is_redirection() {
+            return None;
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)?
+            .to_str()
+            .ok()?;
+        verification_redirect_error(&response.url().join(location).ok()?)
+    })
+}
+
 pub(super) fn is_xueqiu_request_error(err: &str) -> bool {
     err.contains("Xueqiu") || err.contains("xueqiu.com") || err.contains("stock.xueqiu.com")
 }
@@ -103,6 +122,14 @@ pub(super) fn quote_warning_for_error(err: &str) -> Option<String> {
     let err = err.split("; fallback failed:").next().unwrap_or(err);
     if !is_xueqiu_request_error(err) {
         return None;
+    }
+    if err == "Xueqiu access verification required" {
+        return Some(
+            "雪球触发了人机验证，请在相同网络或代理环境下打开雪球完成人机验证后重试。".to_string(),
+        );
+    }
+    if err.starts_with("Xueqiu system proxy resolution failed:") {
+        return Some("无法解析系统代理配置，请检查 VPN 或自动代理（PAC）设置后重试。".to_string());
     }
     let invalid_cn_symbol = err
         .strip_prefix("Invalid CN symbol for Xueqiu: ")
@@ -224,9 +251,8 @@ async fn ensure_xueqiu_token(state: &QuoteServiceState) -> Result<(), String> {
         return Ok(());
     }
 
-    let client = http_client::xueqiu_client();
-    let resp = client
-        .get("https://xueqiu.com")
+    let resp = http_client::xueqiu_get("https://xueqiu.com")
+        .await?
         .header(
             reqwest::header::ACCEPT,
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -234,6 +260,10 @@ async fn ensure_xueqiu_token(state: &QuoteServiceState) -> Result<(), String> {
         .send()
         .await
         .map_err(|e| format!("Failed to initialize Xueqiu token: {}", e))?;
+
+    if let Some(error) = verification_response_error(&resp) {
+        return Err(error);
+    }
 
     let status = resp.status();
 
@@ -359,11 +389,10 @@ async fn send_xueqiu_request(
 ) -> Result<reqwest::Response, String> {
     ensure_xueqiu_token(state).await?;
 
-    let client = http_client::xueqiu_client();
     let mut last_err = String::new();
 
     for attempt in 0..=XUEQIU_MAX_RETRIES {
-        let mut req = client.get(url);
+        let mut req = http_client::xueqiu_get(url).await?;
 
         if let Some(cookie) = build_xueqiu_cookie_header(state) {
             req = req.header(reqwest::header::COOKIE, cookie);
@@ -379,7 +408,12 @@ async fn send_xueqiu_request(
                 reset_xueqiu_token(state);
                 ensure_xueqiu_token(state).await?;
             }
-            Ok(resp) => return Ok(resp),
+            Ok(resp) => {
+                return match verification_response_error(&resp) {
+                    Some(error) => Err(error),
+                    None => Ok(resp),
+                }
+            }
             Err(e) => {
                 last_err = format!("Network error fetching {} from Xueqiu: {}", symbol, e);
                 if attempt < XUEQIU_MAX_RETRIES {

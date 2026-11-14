@@ -41,6 +41,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+hyper-util = { version = "0.1", features = ["client-proxy"] }
+reqwest = { version = "0.13", features = ["blocking", "socks"] }
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSMenu", "NSMenuItem"], default-features = false }
 objc2-foundation = { version = "0.3.2", features = ["NSString", "NSThread"], default-features = false }
 

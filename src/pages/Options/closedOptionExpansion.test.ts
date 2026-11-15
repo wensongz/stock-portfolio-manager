@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const projectRoot = fileURLToPath(new URL("../../../", import.meta.url));
 
-function runScenario(grouped = false) {
+function runScenario(grouped = false, terminalStatus = "closed") {
   const probe = String.raw`
     import { Window } from "happy-dom";
     import { mock } from "bun:test";
@@ -40,9 +40,23 @@ function runScenario(grouped = false) {
         { id: "baba-close", code: "C", quantity: 10, price: 5.2, amount: 5200, commission: 4.44, fee: 0, traded_at: "2024-12-04, 09:57:34" },
       ] },
     };
+    const terminalStatus = ${JSON.stringify(terminalStatus)};
+    if (terminalStatus !== "closed") Object.assign(contract, {
+      option_symbol: "BABA 16SEP22 170 C", expiry_date: "16SEP22", strike_price: 170,
+      contracts: -50, open_price: 2.53, open_amount: 12650, commission: -34.86,
+      traded_at: "2022-06-28", close_price: 0,
+      close_code: terminalStatus === "expired" ? "C;Ep" : "A;C", status: terminalStatus,
+      close_details: { close_cost: 600, fees: 82.40, realized_pnl: 11967.60, records: [
+        { id: "baba-buyback", code: "C;P", quantity: 40, price: 0.15, amount: 600, commission: 47.54, fee: 0, traded_at: "2022-07-28, 11:22:00" },
+        { id: "baba-terminal", code: terminalStatus === "expired" ? "C;Ep" : "A;C", quantity: 10, price: 0, amount: 0, commission: 0, fee: 0, traded_at: "2022/9/16" },
+      ] },
+    });
     const contracts = [contract, { ...contract, id: "expired", underlying: "MSFT", option_symbol: "MSFT 15JAN27 160 C", status: "expired", close_price: 0, close_code: "C;Ep", close_details: null }];
     if (${JSON.stringify(grouped)}) contracts.push({ ...contract, id: "baba-open-2", open_price: 12, open_amount: 12000,
       close_details: { ...contract.close_details, realized_pnl: 6790.66 } });
+    if (${JSON.stringify(grouped)} && terminalStatus !== "closed") contracts.unshift({
+      ...contract, id: "expiry-only", open_amount: 1000, commission: -1, close_details: null,
+    });
     dom.__TAURI_INTERNALS__ = { invoke: async command => {
       if (command === "get_option_contracts") return contracts;
       throw new Error(command);
@@ -68,9 +82,11 @@ function runScenario(grouped = false) {
     await act(async () => root.render(h(OptionsPage)));
     const tab = [...container.querySelectorAll('[role="tab"]')].find(node => node.textContent.includes("已到期"));
     await act(async () => tab.click());
-    const buttons = () => [...container.querySelectorAll("button")].filter(node => node.textContent.includes("已平仓"));
+    const buttons = () => [...container.querySelectorAll("button")].filter(node =>
+      node.textContent.includes("已平仓") || node.textContent.includes("含平仓"));
     let target = buttons()[0];
-    const before = { buttonCount: buttons().length, expanded: target?.getAttribute("aria-expanded") ?? null };
+    const before = { buttonCount: buttons().length, expanded: target?.getAttribute("aria-expanded") ?? null,
+      text: target?.textContent, tagClass: target?.querySelector(".ant-tag")?.className };
     let after = null, collapsed = null, returned = null, openingCopy = null;
     if (target) {
       await act(async () => target.click());
@@ -141,4 +157,32 @@ test("native document copy preserves expanded opening rows and closing details a
   assert.equal(closingRows[1][0], "2024-12-04, 09:57:34");
   assert.match(closingRows[2][3], /已实现净盈亏：\+\$6,090\.66/);
   assert.equal((result.after.copy.html.match(/<table>/g) ?? []).length, 1);
+});
+
+for (const [status, method] of [["expired", "到期"], ["assigned", "被执行"]]) {
+  test(`${status} completed records reveal earlier partial buybacks and copy every closing cash flow`, () => {
+    const result = runScenario(false, status);
+    assert.equal(result.before.buttonCount, 1);
+    assert.equal(result.before.text, "已平仓");
+    assert.match(result.before.tagClass, /ant-tag-blue/);
+    assert.equal(result.after?.expanded, "true");
+    assert.match(result.after.text, /\$600\.00/);
+    assert.match(result.after.text, /\$47\.54/);
+    assert.match(result.after.text, /总费用：\$82\.40/);
+    assert.match(result.after.text, /已实现净盈亏：\+\$11,967\.60/);
+    const rows = result.after.copy.plain.split("\r\n").map(row => row.split("\t"));
+    assert.deepEqual(rows[1], ["2022-07-28, 11:22:00", "40", "$0.15", "$600.00", "$47.54", "买入平仓"]);
+    assert.deepEqual(rows[2], ["2022-09-16", "10", "$0.00", "$0.00", "$0.00", method]);
+    assert.equal(result.collapsed.expanded, "false");
+    assert.equal(result.returned, "false");
+  });
+}
+
+test("a completed group exposes a later opening's buyback when its first opening only expired", () => {
+  const result = runScenario(true, "expired");
+  assert.equal(result.before.text, "已平仓");
+  assert.match(result.before.tagClass, /ant-tag-blue/);
+  assert.equal(result.after?.expanded, "true");
+  assert.match(result.after.text, /\$600\.00/);
+  assert.match(result.after.text, /\$47\.54/);
 });

@@ -39,8 +39,8 @@ pub struct OptionContract {
     pub traded_at: Option<String>, // trade date of the open record
     pub close_price: Option<f64>,
     pub close_code: Option<String>, // "C;Ep" (expired), "A;C" (assigned), "C;P" (closed)
-    pub close_details: Option<OptionCloseDetails>, // allocated closes for fully closed batches
-    pub status: String,             // "active", "expired", "assigned", "closed"
+    pub close_details: Option<OptionCloseDetails>, // completed batches with any buyback, including final expiry/assignment
+    pub status: String,                            // "active", "expired", "assigned", "closed"
     pub account_id: String,
 }
 

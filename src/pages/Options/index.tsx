@@ -632,9 +632,12 @@ export default function OptionsPage() {
       key: "result",
       width: 75,
       render: (v: string, record) => {
-        if (v === "assigned") return <Tag color="red">被执行</Tag>;
-        if (v === "expired") return <Tag color="green">已到期</Tag>;
-        if (v === "closed") {
+        const hasCloseDetails = v === "closed" || record.close_details != null
+          || record.children?.some(child => child.close_details != null || child.status === "closed");
+        const label = hasCloseDetails ? "已平仓" : v === "assigned" ? "被执行" : v === "expired" ? "已到期" : "未知";
+        const color = hasCloseDetails ? "blue" : v === "assigned" ? "red" : v === "expired" ? "green" : undefined;
+        const tag = <Tag color={color}>{label}</Tag>;
+        if (hasCloseDetails) {
           const expanded = expandedCompletedRowKeys.includes(getOptionContractRowKey(record));
           return (
             <Button
@@ -648,11 +651,11 @@ export default function OptionsPage() {
                 toggleCompletedRow(record);
               }}
             >
-              <Tag color="blue">已平仓</Tag>
+              {tag}
             </Button>
           );
         }
-        return <Tag>未知</Tag>;
+        return tag;
       },
     },
   ];
@@ -675,7 +678,7 @@ export default function OptionsPage() {
         childrenColumnName: "openingRecords",
         expandedRowKeys: expandedCompletedRowKeys,
         onExpandedRowsChange: (keys) => setExpandedCompletedRowKeys(keys.map(String)),
-        rowExpandable: (record) => !!record.children?.length || record.status === "closed",
+        rowExpandable: (record) => !!record.children?.length || record.status === "closed" || record.close_details != null,
         expandedRowRender: (record) => record.children?.length
           ? renderCompletedTable(record.children.map((child) => ({ ...child, key: child.id })))
           : (

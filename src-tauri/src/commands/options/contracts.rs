@@ -213,7 +213,14 @@ pub fn get_option_contracts_inner(
                 })
                 .unwrap_or("active")
                 .to_string();
-            let close_details = (status == "closed").then(|| {
+            let has_buyback = result.allocations.iter().any(|allocation| {
+                allocation.open_id == open.id
+                    && records_by_id
+                        .get(allocation.close_id.as_str())
+                        .is_some_and(|close| matches!(close.code.as_str(), "C" | "C;P"))
+            });
+            // Final expiry/assignment must not hide an earlier partial buyback.
+            let close_details = (is_complete && has_buyback).then(|| {
                 // The matcher already orders allocations chronologically and splits shared
                 // closing records across their opening batches using FIFO quantities.
                 let records: Vec<_> = result

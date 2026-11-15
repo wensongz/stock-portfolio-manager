@@ -419,6 +419,47 @@ fn test_closed_details_prorate_shared_fifo_closes_and_keep_chronological_records
 }
 
 #[test]
+fn test_completed_details_keep_partial_buyback_before_expiry_or_assignment() {
+    for (terminal_code, expected_status) in [("C;Ep", "expired"), ("A;C", "assigned")] {
+        let (db, account_id) = db_with_account();
+        let csv = format!(
+            "账户,股票,交易时间,操作,股票数量,价格,金额,佣金,费用,代码\n\
+             a,BABA 16SEP22 170 C,2022-06-28,卖出,-50,2.53,12650,-34.86,0,O\n\
+             a,BABA 16SEP22 170 C,2022-07-28,买入,40,0.15,-600,-47.54,0,C;P\n\
+             a,BABA 16SEP22 170 C,2022/9/16,买入,10,0,0,0,0,{terminal_code}\n"
+        );
+        let imported = import_options_csv_inner(&db, &account_id, &csv).unwrap();
+        assert_eq!(imported.imported, 3);
+        assert!(imported.errors.is_empty());
+        let contracts = get_option_contracts_inner(&db, &account_id).unwrap();
+        assert_eq!(contracts.len(), 1);
+        let contract = &contracts[0];
+        assert_eq!(contract.status, expected_status);
+        assert_eq!(contract.remaining_contracts, 0);
+        let details = contract
+            .close_details
+            .as_ref()
+            .expect("earlier buyback must remain visible after final expiry or assignment");
+        assert_eq!(details.records.len(), 2);
+        assert_eq!(details.records[0].code, "C;P");
+        assert_eq!(details.records[0].quantity, 40);
+        assert_eq!(details.records[0].amount, 600.0);
+        assert_eq!(details.records[0].commission, 47.54);
+        assert_eq!(details.records[1].code, terminal_code);
+        assert_eq!(details.records[1].quantity, 10);
+        assert_eq!(details.close_cost, 600.0);
+        assert!((details.fees - 82.40).abs() < 1e-9);
+        assert!((details.realized_pnl - 11_967.60).abs() < 1e-9);
+        let report =
+            crate::services::option_review_service::get_option_review(&db, &account_id, None)
+                .unwrap();
+        assert_eq!(report.summary.completed_campaigns, 1);
+        assert!((report.summary.completed_net_premium_pnl - 11_967.60).abs() < 1e-9);
+        assert!((report.summary.completed_net_premium_pnl - details.realized_pnl).abs() < 1e-9);
+    }
+}
+
+#[test]
 fn test_close_details_are_null_for_active_expired_and_assigned_contracts() {
     for (close_code, close_quantity, expected_status) in [
         ("C", 1, "active"),

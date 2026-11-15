@@ -1098,6 +1098,7 @@ export interface OptionContract {
   traded_at: string | null;
   close_price: number | null;
   close_code: string | null;
+  /** All closes for a completed opening containing any buyback, even if it finally expired or was assigned. */
   close_details: OptionCloseDetails | null;
   status: "active" | "expired" | "assigned" | "closed";
   account_id: string;

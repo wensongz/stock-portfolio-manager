@@ -10,6 +10,13 @@ interface ClosedOptionDetailsProps {
   currency: string;
 }
 
+function formatCloseTime(value: string | null): string {
+  if (!value) return "—";
+  // Normalize the recorded date without changing its time or inventing a missing time.
+  return value.replace(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?=$|[T,\s])/, (_, year: string, month: string, day: string) =>
+    `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`);
+}
+
 function closeMethod(code: string): string {
   const codes = code.split(";").map(value => value.trim());
   if (codes.includes("Ep")) return "到期";
@@ -30,7 +37,7 @@ export default function ClosedOptionDetails({ details, openAmount, currency }: C
   const columns: ColumnsType<OptionCloseRecord> = [
     {
       title: "平仓时间", dataIndex: "traded_at", key: "traded_at", width: 180,
-      render: (value: string | null) => value || "—",
+      render: formatCloseTime,
     },
     {
       title: "合约数", dataIndex: "quantity", key: "quantity", align: "right", width: 80,

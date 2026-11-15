@@ -116,7 +116,7 @@ test("keeps every closing record and identifies expiry and assignment", () => {
     ...closeDetails,
     records: [
       { ...closingRecord, id: "buyback", code: "C;P", quantity: 4, amount: 2080, commission: 1.776, fee: 0.224 },
-      { ...closingRecord, id: "expiry", code: "C;Ep", quantity: 3, price: 0, amount: 0, commission: 0, traded_at: "2024-12-20" },
+      { ...closingRecord, id: "expiry", code: "C;Ep", quantity: 3, price: 0, amount: 0, commission: 0, traded_at: "2024/12/20" },
       { ...closingRecord, id: "assignment", code: "A", quantity: 3, price: 0, amount: 0, commission: 0, traded_at: null },
     ],
   });

@@ -230,14 +230,15 @@ pub fn get_option_contracts_inner(
                             quantity: allocation.quantity,
                             price: close.price,
                             amount: close.amount.abs() * share,
-                            commission: close.commission.abs() * share,
+                            // Closing details expose expense: rebates are negative costs.
+                            commission: -close.commission * share,
                             fee: close.fee.abs() * share,
                             traded_at: close.traded_at.clone(),
                         })
                     })
                     .collect();
                 let close_cost = records.iter().map(|record| record.amount).sum::<f64>();
-                let fees = open.commission.abs()
+                let fees = -open.commission
                     + open.fee.abs()
                     + records
                         .iter()

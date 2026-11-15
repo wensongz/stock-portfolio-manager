@@ -705,6 +705,7 @@ export interface OptionCampaign {
   strategy_path: string[];
   gross_premium: number;
   close_cost: number;
+  /** Net expense; commission rebates reduce this and may make it negative. */
   fees: number;
   net_premium_pnl: number | null;
   secured_notional: number;
@@ -1063,8 +1064,9 @@ export interface OptionCloseRecord {
   code: string;
   quantity: number;
   price: number;
-  /** Buyback cost and fees allocated to this opening record, as positive amounts. */
+  /** Positive buyback cost allocated to this opening record. */
   amount: number;
+  /** Allocated expense: positive charge, negative rebate. */
   commission: number;
   fee: number;
   traded_at: string | null;
@@ -1073,7 +1075,7 @@ export interface OptionCloseRecord {
 export interface OptionCloseDetails {
   records: OptionCloseRecord[];
   close_cost: number;
-  /** All opening and allocated closing commissions and fees. */
+  /** Net expense across opening and closes; negative for a net rebate. */
   fees: number;
   realized_pnl: number;
 }
@@ -1091,6 +1093,7 @@ export interface OptionContract {
   remaining_contracts: number;
   open_price: number;
   open_amount: number;
+  /** Raw cash flow: negative charge, positive rebate. */
   commission: number;
   traded_at: string | null;
   close_price: number | null;

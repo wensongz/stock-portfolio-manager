@@ -35,7 +35,7 @@ pub struct OptionContract {
     pub remaining_contracts: i64,  // unmatched quantity with the same sign; zero when completed
     pub open_price: f64,           // sell to open price
     pub open_amount: f64,          // total premium received
-    pub commission: f64,           // commission paid on open
+    pub commission: f64,           // raw cash flow: negative charge, positive rebate
     pub traded_at: Option<String>, // trade date of the open record
     pub close_price: Option<f64>,
     pub close_code: Option<String>, // "C;Ep" (expired), "A;C" (assigned), "C;P" (closed)
@@ -48,7 +48,7 @@ pub struct OptionContract {
 pub struct OptionCloseDetails {
     pub records: Vec<OptionCloseRecord>,
     pub close_cost: f64,
-    pub fees: f64,
+    pub fees: f64, // net expense across opening and closes; negative for a net rebate
     pub realized_pnl: f64,
 }
 
@@ -58,8 +58,8 @@ pub struct OptionCloseRecord {
     pub code: String,
     pub quantity: i64, // positive quantity allocated to this opening batch
     pub price: f64,
-    pub amount: f64, // positive allocated closing cost
-    pub commission: f64,
+    pub amount: f64,     // positive allocated closing cost
+    pub commission: f64, // allocated expense: positive charge, negative rebate
     pub fee: f64,
     pub traded_at: Option<String>,
 }

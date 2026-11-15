@@ -229,9 +229,11 @@ fn cycle_from_match(
     let close_cost = close
         .map(|record| record.amount.abs() * close_fraction)
         .unwrap_or(0.0);
-    let fees = (open.commission.abs() + open.fee.abs()) * open_fraction
+    // Commission is signed IB cash flow; negate it to express net expense.
+    // Positive rebates reduce fees and can make the total expense negative.
+    let fees = (-open.commission + open.fee.abs()) * open_fraction
         + close
-            .map(|record| (record.commission.abs() + record.fee.abs()) * close_fraction)
+            .map(|record| (-record.commission + record.fee.abs()) * close_fraction)
             .unwrap_or(0.0);
     OptionCycle {
         open_record_id: open.id.clone(),
@@ -851,7 +853,7 @@ mod tests {
             "O",
             3,
             200.0,
-            1.0,
+            -1.0,
             0.2,
             Some("2026-01-15"),
         );
@@ -868,7 +870,7 @@ mod tests {
             "C;Ep",
             3,
             0.0,
-            0.5,
+            -0.5,
             0.1,
             Some("2026-02-20"),
         );
@@ -902,7 +904,7 @@ mod tests {
             "O",
             1,
             200.0,
-            0.7,
+            -0.7,
             0.3,
             Some("2026-01-01"),
         );
@@ -919,7 +921,7 @@ mod tests {
             "C;P",
             1,
             260.0,
-            0.6,
+            -0.6,
             0.4,
             Some("2026-01-10"),
         );
@@ -945,7 +947,7 @@ mod tests {
             "O",
             2,
             400.0,
-            2.0,
+            -2.0,
             0.4,
             Some("2026-01-01"),
         );
@@ -966,7 +968,7 @@ mod tests {
                 "C;P",
                 1,
                 amount,
-                0.5,
+                -0.5,
                 0.1,
                 Some(date),
             );
@@ -1163,7 +1165,7 @@ mod tests {
             "O",
             1,
             120.0,
-            1.0,
+            -1.0,
             0.0,
             Some("2026-01-17"),
         );
@@ -1858,7 +1860,7 @@ mod tests {
             "O",
             8,
             800.0,
-            8.0,
+            -8.0,
             0.8,
             Some("2024-10-14"),
         );
@@ -1875,7 +1877,7 @@ mod tests {
             "O",
             4,
             400.0,
-            4.0,
+            -4.0,
             0.4,
             Some("2025-01-02"),
         );
@@ -1892,7 +1894,7 @@ mod tests {
             "C;Ep",
             12,
             120.0,
-            12.0,
+            -12.0,
             1.2,
             Some("2025-06-27"),
         );
@@ -1960,7 +1962,7 @@ mod tests {
             "O",
             1,
             250.0,
-            1.0,
+            -1.0,
             0.2,
             Some("2023-05-01"),
         );
@@ -1977,7 +1979,7 @@ mod tests {
             "C;Ep",
             1,
             80.0,
-            0.8,
+            -0.8,
             0.2,
             Some("2023-06-16"),
         );
@@ -2026,7 +2028,7 @@ mod tests {
             "O",
             1,
             400.0,
-            2.0,
+            -2.0,
             0.4,
             Some("2026-05-01"),
         );
@@ -2043,7 +2045,7 @@ mod tests {
             "C;P",
             1,
             70.0,
-            0.5,
+            -0.5,
             0.1,
             Some("2026-06-16"),
         );
@@ -2092,7 +2094,7 @@ mod tests {
             "O",
             2,
             200.0,
-            2.0,
+            -2.0,
             0.0,
             Some("2026-05-01"),
         );
@@ -2109,7 +2111,7 @@ mod tests {
             "C;P",
             1,
             30.0,
-            0.5,
+            -0.5,
             0.0,
             Some("2026-06-16"),
         );
@@ -2161,7 +2163,7 @@ mod tests {
                 "O",
                 1,
                 250.0,
-                1.0,
+                -1.0,
                 0.0,
                 Some("2026-05-01"),
             );
@@ -2178,7 +2180,7 @@ mod tests {
                 "C;P",
                 1,
                 50.0,
-                0.5,
+                -0.5,
                 0.0,
                 Some("2026-06-01"),
             );

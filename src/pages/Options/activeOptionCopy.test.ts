@@ -28,7 +28,7 @@ test("native document copy preserves active option records as Excel cells, inclu
       open_price: 11.3, open_amount: 11300, commission: -4.9, traded_at: "2026-10-01, 10:01:41",
       close_price: null, close_code: null, close_details: null, status: "active",
     };
-    const contracts = [contract, { ...contract, id: "baba-open-2", traded_at: null },
+    const contracts = [contract, { ...contract, id: "baba-open-2", commission: 3.1, traded_at: null },
       { ...contract, id: "msft-open", underlying: "MSFT", option_symbol: "MSFT 15JAN27 160 C" }];
     dom.__TAURI_INTERNALS__ = { invoke: async command => {
       if (command === "get_accounts") return [account];
@@ -82,12 +82,12 @@ test("native document copy preserves active option records as Excel cells, inclu
 
   assert.equal(result.collapsed.prevented, true);
   const headers = ["期权标识", "股票", "到期日", "行权价", "类型", "开仓合约数", "未平仓合约数", "开仓价", "开仓权利金", "佣金", "交易时间"];
-  const summary = ["BABA 15JAN27 160 C", "BABA", "15JAN27", "$160.00", "Call", "-20", "-20", "$11.30", "$22,600", "$9.8", "2026-10-01"];
+  const summary = ["BABA 15JAN27 160 C", "BABA", "15JAN27", "$160.00", "Call", "-20", "-20", "$11.30", "$22,600", "$1.80", "2026-10-01"];
   assert.deepEqual(result.collapsed.plain.split("\r\n").map(row => row.split("\t")), [headers, summary]);
   assert.deepEqual(result.collapsed.htmlRows, [headers, summary]);
   assert.equal(result.expanded.prevented, true);
-  const opening = ["BABA 15JAN27 160 C", "BABA", "15JAN27", "$160.00", "Call", "-10", "-10", "$11.30", "$11,300", "$4.9", "2026-10-01"];
-  const expandedRows = [headers, summary, opening, [...opening.slice(0, -1), "-"]];
+  const opening = ["BABA 15JAN27 160 C", "BABA", "15JAN27", "$160.00", "Call", "-10", "-10", "$11.30", "$11,300", "$4.90", "2026-10-01"];
+  const expandedRows = [headers, summary, opening, [...opening.slice(0, -2), "-$3.10", "-"]];
   assert.deepEqual(result.expanded.plain.split("\r\n").map(row => row.split("\t")), expandedRows);
   assert.deepEqual(result.expanded.htmlRows, expandedRows);
   assert.equal(result.singleCell.prevented, false);

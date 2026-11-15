@@ -82,6 +82,183 @@ fn insert_close_detail_record(
 }
 
 #[test]
+fn test_tal_import_preserves_commission_rebates_in_completed_net_premium() {
+    let (db, account_id) = db_with_account();
+    let csv = "账户,股票,交易时间,交割时间,交易所,操作,股票数量,价格,金额,佣金,费用,类型,代码
+a,TAL 20FEB26 10 P,2025-08-21,,SMART,卖出,-11,0.81,891,-17.10,0,LMT,O
+a,TAL 20FEB26 10 P,2025-08-22,,SMART,卖出,-89,0.8,7120,41.45,0,LMT,O
+a,TAL 15MAY26 10 P,2025-11-13,,SMART,卖出,-100,0.82,8200,35.13,0,LMT,O
+a,TAL 21AUG26 10 P,2026-02-25,,SMART,卖出,-100,1.1,11000,-155.20,0,LMT,O;P
+a,TAL 20FEB26 10 P,2026/2/20,,SMART,买入,100,0,0,0,0,LMT,C;Ep
+a,TAL 15MAY26 10 P,2026/5/15,,SMART,买入,100,0,0,0,0,LMT,C;Ep
+a,TAL 21AUG26 10 P,2026/8/21,,SMART,买入,100,0,0,0,0,LMT,C;Ep
+";
+    let imported = import_options_csv_inner(&db, &account_id, csv).unwrap();
+    assert_eq!(imported.imported, 7);
+    assert!(imported.errors.is_empty());
+    let contracts = get_option_contracts_inner(&db, &account_id).unwrap();
+    assert_eq!(contracts.len(), 4);
+    assert!(contracts
+        .iter()
+        .all(|contract| contract.status == "expired"));
+    assert!(
+        (contracts
+            .iter()
+            .map(|contract| contract.commission)
+            .sum::<f64>()
+            + 95.72)
+            .abs()
+            < 1e-9
+    );
+    let report =
+        crate::services::option_review_service::get_option_review(&db, &account_id, None).unwrap();
+    assert_eq!(report.summary.completed_campaigns, 4);
+    assert!((report.summary.completed_gross_premium - 27_211.0).abs() < 1e-9);
+    assert!((report.summary.completed_net_premium_pnl - 27_115.28).abs() < 1e-9);
+    let tal = &report.underlyings[0];
+    assert!((tal.completed_net_premium_pnl - 27_115.28).abs() < 1e-9);
+    let february: Vec<_> = tal
+        .campaigns
+        .iter()
+        .filter(|campaign| campaign.option_symbol == "TAL 20FEB26 10 P")
+        .collect();
+    assert!((february.iter().map(|campaign| campaign.fees).sum::<f64>() + 24.35).abs() < 1e-9);
+    assert!(
+        (february
+            .iter()
+            .map(|campaign| campaign.net_premium_pnl.unwrap())
+            .sum::<f64>()
+            - 8_035.35)
+            .abs()
+            < 1e-9
+    );
+    assert!(
+        (tal.campaigns
+            .iter()
+            .map(|campaign| campaign.fees)
+            .sum::<f64>()
+            - 95.72)
+            .abs()
+            < 1e-9
+    );
+}
+
+#[test]
+fn test_close_details_and_review_prorate_shared_commission_rebates() {
+    let (db, account_id) = db_with_account();
+    for record in [
+        (
+            "open-old",
+            "SELL",
+            "O",
+            -6,
+            10.0,
+            6_000.0,
+            -3.0,
+            -1.0,
+            "2026-08-01",
+        ),
+        (
+            "open-new",
+            "SELL",
+            "O",
+            -4,
+            12.0,
+            4_800.0,
+            2.0,
+            -0.5,
+            "2026-08-02",
+        ),
+        (
+            "expire-part",
+            "BUY",
+            "C;Ep",
+            2,
+            0.0,
+            0.0,
+            -0.5,
+            -0.25,
+            "2026-08-03",
+        ),
+        (
+            "close-shared",
+            "BUY",
+            "C",
+            6,
+            4.0,
+            -2_400.0,
+            6.0,
+            -3.0,
+            "2026-08-04",
+        ),
+        (
+            "close-final",
+            "BUY",
+            "C;P",
+            2,
+            2.0,
+            -400.0,
+            -1.0,
+            -0.5,
+            "2026-08-05",
+        ),
+    ] {
+        insert_close_detail_record(&db, &account_id, record);
+    }
+    let contracts = get_option_contracts_inner(&db, &account_id).unwrap();
+    let report =
+        crate::services::option_review_service::get_option_review(&db, &account_id, None).unwrap();
+    for (id, expected_fees, expected_pnl, expected_closing_commissions) in [
+        ("open-old", 2.75, 4_397.25, vec![0.5, -4.0]),
+        ("open-new", -1.0, 3_601.0, vec![-2.0, 1.0]),
+    ] {
+        let contract = contracts.iter().find(|contract| contract.id == id).unwrap();
+        let details = contract.close_details.as_ref().unwrap();
+        assert!((details.fees - expected_fees).abs() < 1e-9);
+        assert!((details.realized_pnl - expected_pnl).abs() < 1e-9);
+        assert_eq!(
+            details
+                .records
+                .iter()
+                .map(|record| record.commission)
+                .collect::<Vec<_>>(),
+            expected_closing_commissions
+        );
+        let campaign = report.underlyings[0]
+            .campaigns
+            .iter()
+            .find(|campaign| campaign.id.ends_with(id))
+            .unwrap();
+        assert!((campaign.fees - expected_fees).abs() < 1e-9);
+        assert!((campaign.net_premium_pnl.unwrap() - expected_pnl).abs() < 1e-9);
+    }
+    assert!((report.summary.net_premium_pnl - 7_998.25).abs() < 1e-9);
+}
+
+#[test]
+fn test_partial_close_review_retains_rebates_on_active_opening() {
+    let (db, account_id) = db_with_account();
+    insert_close_detail_record(
+        &db,
+        &account_id,
+        ("open", "SELL", "O", -2, 2.0, 400.0, 2.0, 0.0, "2026-08-01"),
+    );
+    insert_close_detail_record(
+        &db,
+        &account_id,
+        ("close", "BUY", "C", 1, 0.5, -50.0, 0.5, 0.0, "2026-08-02"),
+    );
+    let report =
+        crate::services::option_review_service::get_option_review(&db, &account_id, None).unwrap();
+    let campaign = &report.underlyings[0].campaigns[0];
+    assert_eq!(campaign.status, "active");
+    assert!((campaign.fees + 2.5).abs() < 1e-9);
+    assert!((campaign.net_premium_pnl.unwrap() - 352.5).abs() < 1e-9);
+    assert!((report.summary.net_premium_pnl - 352.5).abs() < 1e-9);
+    assert_eq!(report.summary.completed_net_premium_pnl, 0.0);
+}
+
+#[test]
 fn test_closed_details_use_recorded_buyback_amount_for_baba_realized_pnl() {
     let (db, account_id) = db_with_account();
     insert_close_detail_record(

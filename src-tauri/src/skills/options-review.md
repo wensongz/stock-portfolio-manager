@@ -16,6 +16,7 @@ enabled: true
 - 当前持仓、到期风险、ITM/OTM、被行权准备使用 `get_option_positions`；需要现价时再调用 `get_stock_quote`。
 - 每条 SELL 开仓记录形成一个Campaign；同一开仓记录的部分平仓和剩余敞口留在该Campaign内，不按日期接近或策略路径合并不同开仓记录。
 - `gross_premium` 和 `net_premium_pnl` 是截至当前的累计现金口径，包含进行中Campaign；后者等于开仓权利金减去买回成本和费用。
+- 原始佣金为现金流：负数表示支出、正数表示返佣。`fees` 为净费用，返佣抵减费用，净返佣时可为负；不得将佣金取绝对值后全部当作支出。
 - `completed_gross_premium` 和 `completed_net_premium_pnl` 只含已完成Campaign。留存率由这两个字段计算；担保名义资本年化收益率和最差Campaign也只使用已完成Campaign。
 - 不将当前未平仓浮盈亏或风险敞口混入现金净权利金或已完成Campaign指标。
 

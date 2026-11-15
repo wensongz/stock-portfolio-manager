@@ -72,7 +72,7 @@ pub struct OptionCampaign {
     pub strategy_path: Vec<String>,
     pub gross_premium: f64,
     pub close_cost: f64,
-    pub fees: f64,
+    pub fees: f64, // net expense; commission rebates reduce this and may make it negative
     pub net_premium_pnl: Option<f64>,
     pub secured_notional: f64,
     pub capital_days: f64,

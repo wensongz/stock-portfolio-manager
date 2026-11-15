@@ -261,6 +261,7 @@ export default function OptionsPage() {
       const totalContracts = items.reduce((sum, c) => sum + c.contracts, 0);
       const remainingContracts = items.reduce((sum, c) => sum + c.remaining_contracts, 0);
       const totalAmount = items.reduce((sum, c) => sum + c.open_amount, 0);
+      // IB commission cash flow: negative is a charge, positive is a rebate.
       const totalCommission = items.reduce((sum, c) => sum + c.commission, 0);
       const first = items[0];
       return {
@@ -594,12 +595,14 @@ export default function OptionsPage() {
       ),
     },
     {
-      title: "佣金",
+      title: <span title="正数为佣金支出，负数为返佣；净权利金扣除净佣金支出。">佣金</span>,
       dataIndex: "commission",
       key: "commission",
-      width: 70,
+      width: 95,
       render: (v: number) => (
-        <Text type="secondary">${Math.abs(v).toLocaleString()}</Text>
+        <Text type="secondary">
+          {formatMoney(v === 0 ? 0 : -v, selectedAccountCurrency || "USD")}
+        </Text>
       ),
     },
     {

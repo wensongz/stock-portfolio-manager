@@ -105,12 +105,13 @@ export default function OptionsPage() {
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [confirmName, setConfirmName] = useState("");
   const [expandedCompletedRowKeys, setExpandedCompletedRowKeys] = useState<string[]>([]);
+  const activeRecordsRef = useRef<HTMLDivElement>(null);
   const completedRecordsRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const handleCopy = (event: ClipboardEvent) => {
-      if (completedRecordsRef.current) {
-        copyOptionTableSelection(event, completedRecordsRef.current);
+      for (const root of [activeRecordsRef.current, completedRecordsRef.current]) {
+        if (root) copyOptionTableSelection(event, root);
       }
     };
     document.addEventListener("copy", handleCopy);
@@ -939,35 +940,37 @@ export default function OptionsPage() {
           title={`${selectedActiveUnderlying} 进行中期权记录`}
           style={{ marginBottom: 24 }}
         >
-          <Table
-            className="active-option-table"
-            dataSource={selectedActiveContracts}
-            columns={activeColumns}
-            rowKey={getOptionContractRowKey}
-            size="small"
-            pagination={false}
-            expandable={{
-              childrenColumnName: "children",
-              expandIcon: ({ expanded, onExpand, record }) =>
-                record.children ? (
-                  expanded ? (
-                    <MinusOutlined
-                      onClick={(event) => onExpand(record, event)}
-                      style={{ cursor: "pointer", marginRight: 8 }}
-                    />
+          <div ref={activeRecordsRef}>
+            <Table
+              className="active-option-table"
+              dataSource={selectedActiveContracts}
+              columns={activeColumns}
+              rowKey={getOptionContractRowKey}
+              size="small"
+              pagination={false}
+              expandable={{
+                childrenColumnName: "children",
+                expandIcon: ({ expanded, onExpand, record }) =>
+                  record.children ? (
+                    expanded ? (
+                      <MinusOutlined
+                        onClick={(event) => onExpand(record, event)}
+                        style={{ cursor: "pointer", marginRight: 8 }}
+                      />
+                    ) : (
+                      <PlusOutlined
+                        onClick={(event) => onExpand(record, event)}
+                        style={{ cursor: "pointer", marginRight: 8 }}
+                      />
+                    )
                   ) : (
-                    <PlusOutlined
-                      onClick={(event) => onExpand(record, event)}
-                      style={{ cursor: "pointer", marginRight: 8 }}
+                    <span
+                      style={{ marginRight: 8, width: 14, display: "inline-block" }}
                     />
-                  )
-                ) : (
-                  <span
-                    style={{ marginRight: 8, width: 14, display: "inline-block" }}
-                  />
-                ),
-            }}
-          />
+                  ),
+              }}
+            />
+          </div>
         </Card>
       ) : null}
 

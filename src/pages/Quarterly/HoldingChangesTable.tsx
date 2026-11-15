@@ -1,6 +1,7 @@
 import { Card, Table, Tabs, Tag, Typography } from "antd";
 import type { HoldingChangeItem, HoldingChanges } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { formatQuarterlyMoney } from "./formatMoney";
 
 const { Text } = Typography;
 
@@ -11,8 +12,9 @@ interface Props {
   title?: string;
 }
 
-function fmt(v: number) {
-  return v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function formatMarketValue(value: number, market: string) {
+  const currency = market === "CN" ? "CNY" : market === "HK" ? "HKD" : "USD";
+  return formatQuarterlyMoney(value, currency);
 }
 
 const MARKET_LABELS: Record<string, string> = {
@@ -52,7 +54,7 @@ function buildColumns(quarter1: string, quarter2: string, type: string, colorFn:
         title: `${quarter2} 市值`,
         dataIndex: "q2_value",
         key: "q2_value",
-        render: (v: number | null) => (v != null ? fmt(v) : "—"),
+        render: (v: number | null, row: HoldingChangeItem) => (v != null ? formatMarketValue(v, row.market) : "—"),
       },
     ];
   }
@@ -70,7 +72,7 @@ function buildColumns(quarter1: string, quarter2: string, type: string, colorFn:
         title: `${quarter1} 市值`,
         dataIndex: "q1_value",
         key: "q1_value",
-        render: (v: number | null) => (v != null ? fmt(v) : "—"),
+        render: (v: number | null, row: HoldingChangeItem) => (v != null ? formatMarketValue(v, row.market) : "—"),
       },
     ];
   }
@@ -104,10 +106,10 @@ function buildColumns(quarter1: string, quarter2: string, type: string, colorFn:
       title: "市值变化",
       dataIndex: "value_change",
       key: "value_change",
-      render: (v: number) => (
+      render: (v: number, row: HoldingChangeItem) => (
         <Text style={{ color: v > 0 ? colorFn(v) : v < 0 ? colorFn(v) : undefined }}>
           {v > 0 ? "+" : ""}
-          {fmt(v)}
+          {formatMarketValue(v, row.market)}
         </Text>
       ),
     },

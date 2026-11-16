@@ -488,6 +488,7 @@ export default function OverviewTab({ baseCurrency }: Props) {
             title={`总市值 (${baseCurrency})`}
             value={overview.total_market_value.toFixed(2)}
             prefix={currency}
+            valueStyle={{ fontSize: 21 }}
           />
         </Col>
         <Col xs={24} sm={8}>
@@ -495,13 +496,15 @@ export default function OverviewTab({ baseCurrency }: Props) {
             title={`总成本 (${baseCurrency})`}
             value={overview.total_cost.toFixed(2)}
             prefix={currency}
+            valueStyle={{ fontSize: 21 }}
           />
         </Col>
         <Col xs={24} sm={8}>
           <StatCard
             title={`总盈亏 (${baseCurrency})`}
             value={overview.total_pnl.toFixed(2)}
-            valueStyle={{ color: pnlColor(overview.total_pnl) }}
+            prefix={currency}
+            valueStyle={{ color: pnlColor(overview.total_pnl), fontSize: 21 }}
             suffix={`(${totalPnlPos ? "+" : ""}${overview.total_pnl_percent.toFixed(2)}%)`}
           />
         </Col>

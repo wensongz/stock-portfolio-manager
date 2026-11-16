@@ -167,16 +167,17 @@ export default function CategoryTab({ selectedCategoryId, onCategoryChange, base
         <>
           <Row gutter={[16, 16]} className="mb-4">
             <Col xs={24} sm={8}>
-              <StatCard title={`类别总市值 (${baseCurrency})`} value={stats.total_market_value.toFixed(2)} prefix={symbol} />
+              <StatCard title={`类别总市值 (${baseCurrency})`} value={stats.total_market_value.toFixed(2)} prefix={symbol} valueStyle={{ fontSize: 21 }} />
             </Col>
             <Col xs={24} sm={8}>
-              <StatCard title={`类别总成本 (${baseCurrency})`} value={stats.total_cost.toFixed(2)} prefix={symbol} />
+              <StatCard title={`类别总成本 (${baseCurrency})`} value={stats.total_cost.toFixed(2)} prefix={symbol} valueStyle={{ fontSize: 21 }} />
             </Col>
             <Col xs={24} sm={8}>
               <StatCard
                 title={`类别总盈亏 (${baseCurrency})`}
                 value={stats.total_pnl.toFixed(2)}
-                valueStyle={{ color: pnlColor(stats.total_pnl) }}
+                prefix={symbol}
+                valueStyle={{ color: pnlColor(stats.total_pnl), fontSize: 21 }}
                 suffix={`(${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl_percent.toFixed(2)}%)`}
               />
             </Col>

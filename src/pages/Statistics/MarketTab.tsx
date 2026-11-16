@@ -455,16 +455,17 @@ export default function MarketTab({ selectedMarket, onMarketChange }: Props) {
         <>
           <Row gutter={[16, 16]}>
             <Col xs={24} sm={8}>
-              <StatCard title={`市场总市值 (${currencyCode})`} value={stats.total_market_value.toFixed(2)} prefix={currencySymbol} />
+              <StatCard title={`市场总市值 (${currencyCode})`} value={stats.total_market_value.toFixed(2)} prefix={currencySymbol} valueStyle={{ fontSize: 21 }} />
             </Col>
             <Col xs={24} sm={8}>
-              <StatCard title={`市场总成本 (${currencyCode})`} value={stats.total_cost.toFixed(2)} prefix={currencySymbol} />
+              <StatCard title={`市场总成本 (${currencyCode})`} value={stats.total_cost.toFixed(2)} prefix={currencySymbol} valueStyle={{ fontSize: 21 }} />
             </Col>
             <Col xs={24} sm={8}>
               <StatCard
                 title={`市场总盈亏 (${currencyCode})`}
                 value={stats.total_pnl.toFixed(2)}
-                valueStyle={{ color: pnlColor(stats.total_pnl) }}
+                prefix={currencySymbol}
+                valueStyle={{ color: pnlColor(stats.total_pnl), fontSize: 21 }}
                 suffix={`(${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl_percent.toFixed(2)}%)`}
               />
             </Col>

@@ -42,7 +42,7 @@ function PctStat({
       }
       value={Math.abs(value)}
       precision={2}
-      styles={{ content: {  color  } }}
+      styles={{ content: { color, fontSize: 20 } }}
       prefix={prefix}
       suffix={suffix}
     />
@@ -60,7 +60,7 @@ export default function PerformanceSummaryCards({ summary, loading, currency = "
             title="总盈亏"
             value={Math.abs(summary?.total_pnl ?? 0)}
             precision={2}
-            styles={{ content: {  color: pnlColorDark(summary?.total_pnl ?? 0)  } }}
+            styles={{ content: { color: pnlColorDark(summary?.total_pnl ?? 0), fontSize: 20 } }}
             prefix={(summary?.total_pnl ?? 0) >= 0 ? <ArrowUpOutlined /> : <ArrowDownOutlined />}
             formatter={(value) => formatMoney(Number(value), currency)}
           />
@@ -119,7 +119,7 @@ export default function PerformanceSummaryCards({ summary, loading, currency = "
             }
             value={sharpe ?? "—"}
             precision={2}
-            styles={{ content: { color: sharpe == null ? undefined : pnlColorDark(sharpe) } }}
+            styles={{ content: { color: sharpe == null ? undefined : pnlColorDark(sharpe), fontSize: 20 } }}
           />
         </Card>
       </Col>

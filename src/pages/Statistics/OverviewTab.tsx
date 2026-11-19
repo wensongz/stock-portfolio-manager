@@ -545,12 +545,12 @@ export default function OverviewTab({ baseCurrency }: Props) {
         <Row gutter={[16, 16]} className="mt-4">
           <Col xs={24} md={12}>
             <Card title="盈利 Top 5">
-              <BarChart data={gainersData} colorByValue height={220} />
+              <BarChart data={gainersData} colorByValue height={220} currencyCode={baseCurrency} />
             </Card>
           </Col>
           <Col xs={24} md={12}>
             <Card title="亏损 Top 5">
-              <BarChart data={losersData} colorByValue height={220} />
+              <BarChart data={losersData} colorByValue height={220} currencyCode={baseCurrency} />
             </Card>
           </Col>
         </Row>

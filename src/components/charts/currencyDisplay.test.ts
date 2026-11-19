@@ -32,3 +32,46 @@ test("dashboard and currency-prefix cards put signs before currency in rendered 
   assert.equal(result.positive, "余额+$1,234.50");
   assert.equal(result.ordinary, "比例-1.50%");
 });
+
+test("statistics profit and loss tooltips format amounts in the selected currency", () => {
+  const probe = String.raw`
+    import { mock } from "bun:test";
+    globalThis.localStorage = { getItem: () => null, setItem: () => {} };
+    const { createElement } = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const currencies = ["USD", "CNY", "HKD"];
+    const overview = {
+      total_market_value: 10000000, total_cost: 10000000, total_pnl: 0, total_pnl_percent: 0,
+      market_distribution: [], category_distribution: [], account_distribution: [],
+      stock_distribution: [], holdings: [],
+      top_gainers: [{ symbol: "DDOG", name: "Datadog, Inc.", pnl: 721850.46, pnl_percent: 1, market_value: 1000000 }],
+      top_losers: [{ symbol: "BABA", name: "Alibaba", pnl: -6098950, pnl_percent: -1, market_value: 1000000 }],
+    };
+    const store = await import("./src/stores/statisticsStore");
+    store.useStatisticsStore.setState({
+      overviewByCurrency: Object.fromEntries(currencies.map(currency => [currency, overview])),
+    });
+    const readState = store.useStatisticsStore.getState;
+    mock.module("./src/stores/statisticsStore", () => ({
+      ...store, useStatisticsStore: () => readState(),
+    }));
+    const tooltips = [];
+    mock.module("./src/components/charts/EChart", () => ({
+      default: ({ option }) => {
+        const [name] = option.xAxis.data;
+        const [{ value }] = option.series[0].data;
+        tooltips.push(option.tooltip.formatter([{ name, value, dataIndex: 0 }]));
+        return null;
+      },
+    }));
+    const { default: OverviewTab } = await import("./src/pages/Statistics/OverviewTab.tsx");
+    for (const baseCurrency of currencies) renderToStaticMarkup(createElement(OverviewTab, { baseCurrency }));
+    process.stdout.write(JSON.stringify(tooltips));
+  `;
+  const result = JSON.parse(execFileSync("bun", ["--eval", probe], { cwd: projectRoot, encoding: "utf8" }));
+  assert.deepEqual(result, [
+    "DDOG<br/>Datadog, Inc.<br/>+$721,850.46", "BABA<br/>Alibaba<br/>-$6,098,950.00",
+    "DDOG<br/>Datadog, Inc.<br/>+¥721,850.46", "BABA<br/>Alibaba<br/>-¥6,098,950.00",
+    "DDOG<br/>Datadog, Inc.<br/>+HK$721,850.46", "BABA<br/>Alibaba<br/>-HK$6,098,950.00",
+  ]);
+});

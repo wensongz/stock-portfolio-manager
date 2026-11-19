@@ -1,6 +1,8 @@
 import { format } from "echarts/core";
 import EChart from "./EChart";
 import { usePnlColor } from "../../hooks/usePnlColor";
+import { formatMoney } from "../../lib/formatMoney";
+import type { Currency } from "../../types";
 
 interface BarItem {
   name: string;
@@ -14,6 +16,7 @@ interface BarChartProps {
   height?: number;
   horizontal?: boolean;
   colorByValue?: boolean;
+  currencyCode?: Currency;
 }
 
 export default function BarChart({
@@ -22,6 +25,7 @@ export default function BarChart({
   height = 300,
   horizontal = false,
   colorByValue = false,
+  currencyCode,
 }: BarChartProps) {
   const { pnlColor } = usePnlColor();
   const names = data.map((d) => d.name);
@@ -42,7 +46,10 @@ export default function BarChart({
         const p = params[0];
         const stockName = data[p.dataIndex]?.stockName;
         const nameLine = stockName ? `${format.encodeHTML(stockName)}<br/>` : "";
-        return `${format.encodeHTML(p.name)}<br/>${nameLine}${p.value >= 0 ? "+" : ""}${p.value.toFixed(2)}`;
+        const amount = currencyCode
+          ? formatMoney(p.value, currencyCode, 2, { signDisplay: "always" })
+          : `${p.value >= 0 ? "+" : ""}${p.value.toFixed(2)}`;
+        return `${format.encodeHTML(p.name)}<br/>${nameLine}${amount}`;
       },
     },
     grid: { left: "3%", right: "4%", bottom: "10%", containLabel: true },

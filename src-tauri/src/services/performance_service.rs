@@ -2,22 +2,59 @@ use crate::db::Database;
 use crate::models::performance::PerformanceReport;
 use chrono::NaiveDate;
 
-// Transfers are external asset flows valued at the latest historical close on
-// or before the transfer date, never at their acquisition cost or zero proceeds.
-// Keep this expression shared by portfolio returns, attribution and rankings.
+// Stock openings and transfers use the latest available close as of the event.
+// The same quote must be shared by every account trading the same listing.
+// Prefer observations over legacy snapshot prices when both cover the same day.
 pub(super) const TRANSFER_VALUE_SQL: &str = "CASE
-    WHEN t.transaction_type IN ('STOCK_IN', 'STOCK_OUT') THEN t.shares * (
-        SELECT h.close_price FROM daily_holding_snapshots h
-        WHERE h.account_id = t.account_id AND UPPER(h.symbol) = UPPER(t.symbol)
-          AND h.market = t.market AND h.date <= DATE(t.traded_at)
-          AND h.close_price > 0
-        ORDER BY h.date DESC, h.id DESC LIMIT 1)
-    ELSE t.total_amount END";
+    WHEN t.transaction_type IN ('STOCK_IN', 'STOCK_OUT')
+      OR (t.transaction_type = 'OPEN' AND UPPER(t.symbol) NOT LIKE '$CASH-%')
+    THEN t.shares * (
+        SELECT close_price FROM (
+            SELECT date, close_price, priority FROM (
+                SELECT h.date, h.close_price,
+                       CASE WHEN h.has_market_close = 1 THEN 2 ELSE 0 END AS priority
+                FROM daily_holding_snapshots h
+                WHERE UPPER(h.symbol) = UPPER(t.symbol) AND h.market = t.market
+                  AND h.date <= DATE(t.traded_at)
+                  AND h.close_price > 0 AND COALESCE(h.has_market_close, 1) = 1
+                ORDER BY h.date DESC, priority DESC, h.id DESC LIMIT 1
+            )
+            UNION ALL
+            SELECT date, close_price, 1 AS priority FROM (
+                SELECT p.date, p.close AS close_price
+                FROM stock_daily_prices p
+                WHERE p.symbol = t.symbol AND p.market = t.market
+                  AND p.date <= DATE(t.traded_at)
+                  AND p.close > 0
+                  AND NOT (
+                      p.market IN ('CN', 'HK') AND LOWER(p.source) = 'xueqiu'
+                      AND (p.open IS NOT NULL OR p.high IS NOT NULL OR p.low IS NOT NULL OR p.volume IS NOT NULL)
+                  )
+                ORDER BY p.date DESC LIMIT 1
+            )
+        )
+        ORDER BY date DESC, priority DESC LIMIT 1)
+    END";
 
-pub(super) fn require_flow_value(value: Option<f64>) -> Result<f64, String> {
-    value
-        .filter(|value| value.is_finite())
-        .ok_or_else(|| "缺少股票存入或提取时的历史估值，请先补齐发生日或此前的持仓快照".to_string())
+pub(super) fn resolve_transaction_value<'a>(
+    transaction_type: &str,
+    recorded_amount: f64,
+    recorded_currency: &'a str,
+    market: &str,
+    market_value: Option<f64>,
+) -> Result<(f64, &'a str), String> {
+    if matches!(transaction_type, "STOCK_IN" | "STOCK_OUT") || market_value.is_some() {
+        let value = market_value
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| "股票入账或转仓缺少发生日或此前可用的市场收盘价".to_string())?;
+        return Ok((value, calculation::market_currency(market)));
+    }
+    if !recorded_amount.is_finite() {
+        return Err("交易金额必须为有限数值".into());
+    }
+
+    // Old in-kind openings can predate market data for the listing.
+    Ok((recorded_amount, recorded_currency))
 }
 
 pub(super) const RISK_FREE_RATE: f64 = 0.045; // 4.5% US 10-year treasury default

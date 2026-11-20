@@ -205,16 +205,20 @@ pub async fn build_portfolio_context(
         .unwrap_or_default();
     match performance_service::get_performance_summary(db, start, end, &filter) {
         Ok(p) if p.end_value > 0.0 || !p.return_series.is_empty() => {
+            let annualized = p
+                .annualized_return
+                .map(|value| format!("{value:.2}%"))
+                .unwrap_or_else(|| "—".to_string());
             let sharpe = p
                 .sharpe_ratio
                 .map(|value| format!("{:.2}", value))
                 .unwrap_or_else(|| "—".to_string());
             out.push_str(&format!(
-                "- 期初市值：{:.2}\n- 期末市值：{:.2}\n- 累计收益率：{:.2}%\n- 年化收益率：{:.2}%\n- 累计盈亏：{:.2}\n- 最大回撤：{:.2}%\n- 波动率：{:.2}%\n- 夏普比率：{}\n\n",
+                "- 期初市值：{:.2}\n- 期末市值：{:.2}\n- 累计收益率：{:.2}%\n- 年化收益率：{}\n- 累计盈亏：{:.2}\n- 最大回撤：{:.2}%\n- 波动率：{:.2}%\n- 夏普比率：{}\n\n",
                 p.start_value,
                 p.end_value,
                 p.total_return,
-                p.annualized_return,
+                annualized,
                 p.total_pnl,
                 p.max_drawdown,
                 p.volatility,

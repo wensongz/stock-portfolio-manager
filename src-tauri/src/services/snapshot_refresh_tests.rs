@@ -86,6 +86,251 @@ fn insert_cash_ledger(db: &Database, current_balance: f64, events: &[(&str, f64,
 }
 
 #[tokio::test]
+async fn historical_backfill_uses_dated_fx_and_preserves_saved_rates_before_history() {
+    let (db, cache) = refresh_fixture();
+    let rates = |day: &str, usd_cny: f64| crate::models::ExchangeRates {
+        usd_cny,
+        usd_hkd: 7.8,
+        cny_hkd: 7.8 / usd_cny,
+        updated_at: day.into(),
+    };
+    for (day, rate) in [("2024-01-03", 7.0), ("2024-01-05", 5.0)] {
+        crate::services::exchange_rate_service::save_exchange_rates_to_db(&db, &rates(day, rate))
+            .unwrap();
+    }
+    {
+        let conn = db.conn.lock().unwrap();
+        conn.execute_batch(
+            "INSERT INTO holdings (id, account_id, symbol, name, market, shares, avg_cost,
+                currency, created_at, updated_at)
+             VALUES ('cn-cash', 'account', '$CASH-CNY', 'Cash', 'CN', 700, 1, 'CNY',
+                '2024-01-01', '2024-01-01');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO daily_portfolio_values (date, exchange_rates) VALUES ('2024-01-01', ?1)",
+            [serde_json::to_string(&rates("2024-02-01", 8.75)).unwrap()],
+        )
+        .unwrap();
+    }
+    cache.set(rates("2024-02-01", 10.0));
+
+    backfill_snapshots_with_fetcher(&db, &cache, date(1), date(5), true, |_, _, _, _, _| async {
+        panic!("cash needs no market history")
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        get_daily_values(&db, date(1), date(5))
+            .unwrap()
+            .into_iter()
+            .map(|row| row.total_value)
+            .collect::<Vec<_>>(),
+        vec![80.0, 100.0, 100.0, 100.0, 140.0],
+    );
+}
+
+#[tokio::test]
+async fn historical_backfill_repairs_legacy_foreign_cash_market_in_cached_values() {
+    let (db, cache) = refresh_fixture();
+    db.conn
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO holdings (id, account_id, symbol, name, market, shares, avg_cost,
+             currency, created_at, updated_at)
+         VALUES ('hk-cash', 'account', '$CASH-HKD', 'Cash', 'US', 780, 1, 'HKD',
+             '2024-01-01', '2024-01-01');",
+        )
+        .unwrap();
+    seed_cached_day(&db, "2024-01-02", "$CASH-HKD");
+
+    let count = backfill_snapshots_with_fetcher(
+        &db,
+        &cache,
+        date(2),
+        date(2),
+        false,
+        |_, _, _, _, _| async { panic!("cash needs no market history") },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(count, 1);
+    let conn = db.conn.lock().unwrap();
+    let (market, value): (String, f64) = conn
+        .query_row(
+            "SELECT h.market, d.total_value FROM daily_holding_snapshots h
+         JOIN daily_portfolio_values d USING (date) WHERE h.date = '2024-01-02'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(market, "HK");
+    assert_eq!(value, 100.0);
+}
+
+#[tokio::test]
+async fn historical_backfill_keeps_same_symbol_prices_separate_by_market() {
+    let (db, cache) = refresh_fixture();
+    insert_holding_and_opening(&db, "SHARED", 10.0);
+    db.conn
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO accounts (id, name, market, created_at, updated_at)
+         VALUES ('other', 'HK account', 'HK', '2024-01-01', '2024-01-01');
+         INSERT INTO holdings (id, account_id, symbol, name, market, shares, avg_cost,
+             currency, created_at, updated_at)
+         VALUES ('hk-position', 'other', 'SHARED', 'Shared', 'HK', 10, 5, 'HKD',
+             '2024-01-01', '2024-01-01');",
+        )
+        .unwrap();
+
+    backfill_snapshots_with_fetcher(&db, &cache, date(2), date(2), false, |_, market, _, _, _| async move {
+        Ok(vec![(date(2), if market == "US" { 20.0 } else { 4.0 })])
+    }).await.unwrap();
+
+    let conn = db.conn.lock().unwrap();
+    let mut stmt = conn
+        .prepare("SELECT market, close_price FROM daily_holding_snapshots ORDER BY market")
+        .unwrap();
+    let closes = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(closes, vec![("HK".into(), 4.0), ("US".into(), 20.0)]);
+}
+
+#[tokio::test]
+async fn historical_backfill_values_full_stock_exit_at_transfer_day_close() {
+    let (db, cache) = refresh_fixture();
+    insert_holding_and_opening(&db, "AAPL", 10.0);
+    db.conn.lock().unwrap().execute_batch(
+        "UPDATE holdings SET shares = 0 WHERE id = 'holding';
+         INSERT INTO transactions (id, holding_id, account_id, symbol, name, market,
+             transaction_type, shares, price, total_amount, commission, currency, traded_at, created_at)
+         VALUES ('transfer', 'holding', 'account', 'AAPL', 'AAPL', 'US', 'STOCK_OUT',
+             10, 0, 0, 0, 'USD', '2024-01-03T12:00:00Z', '2024-01-03T12:00:00Z');",
+    ).unwrap();
+    // Older portfolios cached the day without a holding close after a full
+    // transfer out. A normal load must replace that legacy valuation too.
+    seed_cached_day(&db, "2024-01-03", "$CASH-USD");
+
+    backfill_snapshots_with_fetcher(
+        &db,
+        &cache,
+        date(2),
+        date(3),
+        false,
+        |_, _, start, end, _| async move {
+            Ok(vec![(date(2), 10.0), (date(3), 12.0)]
+                .into_iter()
+                .filter(|(day, _)| (start..=end).contains(day))
+                .collect())
+        },
+    )
+    .await
+    .unwrap();
+
+    let conn = db.conn.lock().unwrap();
+    let snapshot: (f64, f64, f64) = conn
+        .query_row(
+            "SELECT shares, close_price, market_value FROM daily_holding_snapshots
+         WHERE date = '2024-01-03' AND symbol = 'AAPL'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(snapshot, (0.0, 12.0, 0.0));
+}
+
+#[tokio::test]
+async fn historical_backfill_waits_for_us_close_and_replaces_a_premature_cached_day() {
+    let (db, cache) = refresh_fixture();
+    insert_holding_and_opening(&db, "AAPL", 10.0);
+    seed_cached_day(&db, "2024-01-03", "AAPL");
+    let before_ny_close = "2024-01-03T09:00:00Z".parse::<DateTime<Utc>>().unwrap();
+    let after_ny_close = "2024-01-03T22:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+    backfill_snapshots_as_of(
+        &db,
+        &cache,
+        date(3),
+        date(3),
+        false,
+        before_ny_close,
+        |_, _, _, _, _| async { Ok(vec![(date(2), 10.0)]) },
+    )
+    .await
+    .unwrap();
+    assert!(get_daily_values(&db, date(3), date(3)).unwrap().is_empty());
+
+    backfill_snapshots_as_of(
+        &db,
+        &cache,
+        date(3),
+        date(3),
+        false,
+        after_ny_close,
+        |_, _, _, _, _| async { Ok(vec![(date(3), 12.0)]) },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        get_daily_values(&db, date(3), date(3)).unwrap()[0].total_value,
+        120.0
+    );
+}
+
+#[tokio::test]
+async fn historical_backfill_records_exact_market_closes_only() {
+    let (db, cache) = refresh_fixture();
+    insert_holding_and_opening(&db, "AAPL", 10.0);
+    insert_cash_ledger(&db, 200.0, &[]);
+    seed_cached_day(&db, "2024-01-01", "AAPL");
+
+    backfill_snapshots_with_fetcher(
+        &db,
+        &cache,
+        date(2),
+        date(3),
+        false,
+        |_, _, _, _, _| async { Ok(vec![(date(2), 12.0)]) },
+    )
+    .await
+    .unwrap();
+
+    let conn = db.conn.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT symbol, has_market_close FROM daily_holding_snapshots ORDER BY date, symbol",
+        )
+        .unwrap();
+    let observations = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<bool>>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        observations,
+        vec![
+            ("AAPL".into(), None),
+            ("$CASH-USD".into(), Some(false)),
+            ("AAPL".into(), Some(true)),
+            ("$CASH-USD".into(), Some(false)),
+            ("AAPL".into(), Some(false)),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn cash_opening_correction_starts_on_its_date_without_creating_performance() {
     let (db, cache) = refresh_fixture();
     insert_cash_ledger(&db, 9000.0, &[("BUY", 500.0, "2024-01-04T09:00:00Z")]);
@@ -526,7 +771,10 @@ async fn ordinary_refresh_rebuilds_values_after_a_real_historical_buy_edit() {
     .await
     .unwrap();
 
-    assert_eq!(created, 2);
+    assert_eq!(created, 3);
+    let history =
+        get_daily_values(&db, NaiveDate::from_ymd_opt(2023, 12, 20).unwrap(), date(3)).unwrap();
+    assert_eq!(history[0].date, "2024-01-01");
     let after = get_daily_values(&db, date(2), date(3)).unwrap();
     assert_eq!(
         after

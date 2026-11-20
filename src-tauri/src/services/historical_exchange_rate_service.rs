@@ -2,6 +2,7 @@ use crate::db::Database;
 use crate::models::ExchangeRates;
 use chrono::NaiveDate;
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::BTreeMap;
 
 pub(crate) fn parse_rates(json: &str, label: &str) -> Result<ExchangeRates, String> {
     let rates: ExchangeRates = serde_json::from_str(json)
@@ -55,6 +56,70 @@ fn archived_rates_in(conn: &Connection, date: &str) -> Result<Option<String>, St
     )
     .optional()
     .map_err(|error| error.to_string())
+}
+
+pub(crate) struct DailySnapshotRates {
+    historical: BTreeMap<String, ExchangeRates>,
+    saved: BTreeMap<String, ExchangeRates>,
+}
+
+impl DailySnapshotRates {
+    pub(crate) fn for_date(&self, date: &str) -> Option<&ExchangeRates> {
+        self.historical
+            .range::<str, _>((std::ops::Bound::Unbounded, std::ops::Bound::Included(date)))
+            .next_back()
+            .map(|(_, rates)| rates)
+            .or_else(|| self.saved.get(date))
+            .or_else(|| self.historical.first_key_value().map(|(_, rates)| rates))
+            .or_else(|| self.saved.first_key_value().map(|(_, rates)| rates))
+    }
+}
+
+pub(crate) fn load_daily_snapshot_rates(
+    db: &Database,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Result<DailySnapshotRates, String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT rate_date, exchange_rates FROM historical_exchange_rates
+             WHERE rate_date <= ?1 OR rate_date = (SELECT MIN(rate_date) FROM historical_exchange_rates)
+             ORDER BY rate_date, observed_at, CASE source WHEN 'observed' THEN 3
+               WHEN 'quarterly_snapshot' THEN 2 WHEN 'legacy_quarterly_snapshot' THEN 1 ELSE 0 END",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut historical = BTreeMap::new();
+    let rows = stmt
+        .query_map([end.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let (date, json) = row.map_err(|error| error.to_string())?;
+        historical.insert(date, parse_rates(&json, "historical")?);
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT date, exchange_rates FROM daily_portfolio_values WHERE date BETWEEN ?1 AND ?2",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([start.to_string(), end.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut saved = BTreeMap::new();
+    for row in rows {
+        let (date, json) = row.map_err(|error| error.to_string())?;
+        if let Ok(rates) = parse_rates(&json, "saved daily") {
+            if !rates.updated_at.is_empty() {
+                saved.insert(date, rates);
+            }
+        }
+    }
+    Ok(DailySnapshotRates { historical, saved })
 }
 
 pub(crate) fn load_for_snapshot(

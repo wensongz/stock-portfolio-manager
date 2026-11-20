@@ -20,8 +20,17 @@ export default function DrawdownChart({ drawdown, height = 280 }: Props) {
     );
   }
 
-  const dates = drawdown.drawdown_series.map((d) => d.date);
-  const values = drawdown.drawdown_series.map((d) => parseFloat(d.drawdown.toFixed(2)));
+  const hasDrawdown = drawdown.max_drawdown < 0;
+  const firstDate = drawdown.drawdown_series[0].date;
+  const points = hasDrawdown && drawdown.peak_date && drawdown.peak_date < firstDate
+    ? [{ date: drawdown.peak_date, drawdown: 0 }, ...drawdown.drawdown_series]
+    : drawdown.drawdown_series;
+  const dates = points.map((point) => point.date);
+  const values = points.map((point) => point.drawdown);
+  const markArea = hasDrawdown ? {
+    data: [[{ xAxis: drawdown.peak_date }, { xAxis: drawdown.trough_date }]],
+    itemStyle: { color: "rgba(207,19,34,0.08)" },
+  } : undefined;
 
   const option = {
     tooltip: {
@@ -50,19 +59,10 @@ export default function DrawdownChart({ drawdown, height = 280 }: Props) {
         name: "回撤",
         type: "line",
         data: values,
-        smooth: true,
         symbol: "none",
         lineStyle: { width: 1, color: lossColor },
         areaStyle: { color: lossColor, opacity: 0.3 },
-        markArea: {
-          data: [
-            [
-              { xAxis: drawdown.peak_date },
-              { xAxis: drawdown.trough_date },
-            ],
-          ],
-          itemStyle: { color: "rgba(207,19,34,0.08)" },
-        },
+        markArea,
       },
     ],
   };
@@ -79,16 +79,16 @@ export default function DrawdownChart({ drawdown, height = 280 }: Props) {
         <Descriptions.Item label="最大回撤">
           <Text type="danger">{drawdown.max_drawdown.toFixed(2)}%</Text>
         </Descriptions.Item>
-        <Descriptions.Item label="峰值日期">{drawdown.peak_date}</Descriptions.Item>
-        <Descriptions.Item label="谷值日期">{drawdown.trough_date}</Descriptions.Item>
+        <Descriptions.Item label="峰值日期">{hasDrawdown ? drawdown.peak_date : "—"}</Descriptions.Item>
+        <Descriptions.Item label="谷值日期">{hasDrawdown ? drawdown.trough_date : "—"}</Descriptions.Item>
         <Descriptions.Item label="回撤持续">
-          {drawdown.drawdown_duration} 天
+          {hasDrawdown ? `${drawdown.drawdown_duration} 天` : "—"}
         </Descriptions.Item>
         <Descriptions.Item label="恢复日期">
-          {drawdown.recovery_date ?? "未恢复"}
+          {hasDrawdown ? (drawdown.recovery_date ?? "未恢复") : "—"}
         </Descriptions.Item>
         <Descriptions.Item label="恢复持续">
-          {drawdown.recovery_duration != null ? `${drawdown.recovery_duration} 天` : "-"}
+          {hasDrawdown && drawdown.recovery_duration != null ? `${drawdown.recovery_duration} 天` : "—"}
         </Descriptions.Item>
       </Descriptions>
     </div>

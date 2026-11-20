@@ -27,10 +27,12 @@ function makeWaterfallOption(items: AttributionItem[], title: string, colorFn: (
       formatter: (params: { name: string; value: number; dataIndex: number }[]) => {
         const p = params[0];
         const item = sorted[p.dataIndex];
+        const contribution = item.contribution_percent;
+        const formattedContribution = contribution == null ? "—" : `${contribution.toFixed(1)}%`;
         return (
           `${p.name}<br/>` +
           `盈亏: <b>${formatSignedMoney(p.value, 2)}</b><br/>` +
-          `贡献: ${item.contribution_percent.toFixed(1)}%`
+          `贡献: ${formattedContribution}`
         );
       },
     },
@@ -81,10 +83,10 @@ export default function AttributionChart({ attribution, height = 300, currency =
     },
     {
       key: "holding",
-      label: "按个股",
+      label: "按持仓",
       children: (
         <EChart
-          option={makeWaterfallOption(attribution.by_holding.slice(0, 20), "个股收益贡献 (Top 20)", pnlColorDark, currency)}
+          option={makeWaterfallOption(attribution.by_holding.slice(0, 20), "持仓收益贡献 (Top 20)", pnlColorDark, currency)}
           style={{ height, width: "100%" }}
           opts={{ renderer: "canvas" }}
         />

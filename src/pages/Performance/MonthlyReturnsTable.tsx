@@ -24,13 +24,13 @@ export default function MonthlyReturnsTable({ data }: Props) {
     byYear[d.year][d.month] = d;
   }
 
-  // Annual return per year
-  const annualReturn: Record<number, number> = {};
+  // Compound the selected portion of each year.
+  const selectedPeriodReturn: Record<number, number> = {};
   for (const year of years) {
     const months = Object.values(byYear[year]);
     if (months.length === 0) continue;
     const product = months.reduce((acc, m) => acc * (1 + m.return_rate / 100), 1);
-    annualReturn[year] = (product - 1) * 100;
+    selectedPeriodReturn[year] = (product - 1) * 100;
   }
 
   return (
@@ -46,7 +46,7 @@ export default function MonthlyReturnsTable({ data }: Props) {
                   {m}
                 </th>
               ))}
-              <th style={{ padding: "4px 8px", textAlign: "center" }}>全年</th>
+              <th title="各月份及区间合计按所选日期范围复合计算" style={{ padding: "4px 8px", textAlign: "center" }}>区间合计</th>
             </tr>
           </thead>
           <tbody>
@@ -77,13 +77,13 @@ export default function MonthlyReturnsTable({ data }: Props) {
                     padding: "4px 8px",
                     textAlign: "center",
                     fontWeight: "bold",
-                    backgroundColor: cellColor(annualReturn[year] ?? 0),
-                    color: (annualReturn[year] ?? 0) >= 0 ? pnlColorDeep(1) : pnlColorDeep(-1),
+                    backgroundColor: cellColor(selectedPeriodReturn[year] ?? 0),
+                    color: (selectedPeriodReturn[year] ?? 0) >= 0 ? pnlColorDeep(1) : pnlColorDeep(-1),
                     borderRadius: 4,
                   }}
                 >
-                  {annualReturn[year] != null
-                    ? `${annualReturn[year] >= 0 ? "+" : ""}${annualReturn[year].toFixed(1)}%`
+                  {selectedPeriodReturn[year] != null
+                    ? `${selectedPeriodReturn[year] >= 0 ? "+" : ""}${selectedPeriodReturn[year].toFixed(1)}%`
                     : "-"}
                 </td>
               </tr>

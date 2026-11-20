@@ -18,14 +18,14 @@ function PctStat({
   colorFor,
 }: {
   title: string;
-  value: number;
+  value: number | null;
   suffix?: string;
   tooltip?: string;
   colorFor: (v: number) => string;
 }) {
-  const color = colorFor(value);
-  const prefix =
-    value >= 0 ? <ArrowUpOutlined /> : <ArrowDownOutlined />;
+  const color = value == null ? undefined : colorFor(value);
+  const prefix = value == null ? undefined
+    : value >= 0 ? <ArrowUpOutlined /> : <ArrowDownOutlined />;
   return (
     <Statistic
       title={
@@ -40,11 +40,11 @@ function PctStat({
           title
         )
       }
-      value={Math.abs(value)}
+      value={value == null ? "—" : Math.abs(value)}
       precision={2}
       styles={{ content: { color, fontSize: 20 } }}
       prefix={prefix}
-      suffix={suffix}
+      suffix={value == null ? undefined : suffix}
     />
   );
 }
@@ -80,7 +80,7 @@ export default function PerformanceSummaryCards({ summary, loading, currency = "
         <Card loading={loading} size="small">
           <PctStat
             title="年化收益率"
-            value={summary?.annualized_return ?? 0}
+            value={summary?.annualized_return ?? null}
             tooltip="基于 TWR 年化到 365 天的收益率"
             colorFor={pnlColorDark}
           />

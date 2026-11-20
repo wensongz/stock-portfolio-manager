@@ -1,4 +1,6 @@
-use super::calculation::{parse_required_exchange_rates, PerformanceCalculation};
+use super::calculation::{
+    convert_performance_amount, market_currency, valuation_rates, PerformanceCalculation,
+};
 use super::PerformanceFilter;
 use crate::db::Database;
 use crate::models::performance::{AttributionItem, ReturnAttribution};
@@ -32,37 +34,9 @@ pub(super) fn return_attribution_from(
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let start_str = actual_start_date.format("%Y-%m-%d").to_string();
     let end_str = actual_end_date.format("%Y-%m-%d").to_string();
-    let normalize_to_usd = !filter.is_active();
-
-    let rates_for_date = |date: &str| -> Result<crate::models::ExchangeRates, String> {
-        let json = conn
-            .query_row(
-                "SELECT exchange_rates FROM daily_portfolio_values WHERE date = ?1",
-                rusqlite::params![date],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|e| format!("missing exchange rates for valuation {}: {}", date, e))?;
-        serde_json::from_str::<crate::models::ExchangeRates>(&json)
-            .map_err(|e| format!("invalid exchange rates for valuation {}: {}", date, e))
-    };
-    let start_rates = normalize_to_usd
-        .then(|| rates_for_date(&start_str))
-        .transpose()?;
-    let end_rates = normalize_to_usd
-        .then(|| rates_for_date(&end_str))
-        .transpose()?;
-    let normalize_value =
-        |value: f64, market: &str, rates: Option<&crate::models::ExchangeRates>| -> f64 {
-            let Some(rates) = rates else {
-                return value;
-            };
-            let currency = match market {
-                "CN" => "CNY",
-                "HK" => "HKD",
-                _ => "USD",
-            };
-            crate::services::exchange_rate_service::convert_currency(value, currency, "USD", rates)
-        };
+    let start_rates = valuation_rates(&conn, &start_str)?;
+    let end_rates = valuation_rates(&conn, &end_str)?;
+    let currency = calculation.currency;
 
     type PositionKey = (String, String, String, String); // account, symbol, market, category
     type AccountSymbol = (String, String);
@@ -120,17 +94,14 @@ pub(super) fn return_attribution_from(
         std::collections::HashMap::new();
 
     {
-        // Build start query with filters applied to both subquery and outer query
+        // Read the exact opening valuation date from the shared report window.
         let mut sql = String::from(
             "SELECT account_id, symbol, market, COALESCE(category_name, '未分类'),
                     SUM(market_value)
              FROM daily_holding_snapshots
-             WHERE date = (
-                 SELECT MAX(date) FROM daily_holding_snapshots WHERE date <= ?1",
+             WHERE date = ?1 AND UPPER(symbol) NOT LIKE '$CASH-%'",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(start_str.clone())];
-        filter.append_where_clauses(&mut sql, &mut params);
-        sql.push(')');
         filter.append_where_clauses(&mut sql, &mut params);
         sql.push_str(" GROUP BY account_id, symbol, market, category_name");
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -151,23 +122,26 @@ pub(super) fn return_attribution_from(
             .map_err(|e| e.to_string())?;
         for (account_id, symbol, market, category, val) in rows {
             let key = position_key(&account_id, &symbol, &market, &category);
-            let val = normalize_value(val, &market, start_rates.as_ref());
+            let val = convert_performance_amount(
+                val,
+                market_currency(&market),
+                currency,
+                start_rates.as_deref(),
+                &start_str,
+            )?;
             *start_vals.entry(key).or_insert(0.0) += val;
         }
     }
 
     {
-        // Build end query with filters applied to both subquery and outer query
+        // A position absent at the final valuation is worth zero.
         let mut sql = String::from(
             "SELECT account_id, symbol, market, COALESCE(category_name, '未分类'),
                     SUM(market_value)
              FROM daily_holding_snapshots
-             WHERE date = (
-                 SELECT MAX(date) FROM daily_holding_snapshots WHERE date <= ?1",
+             WHERE date = ?1 AND UPPER(symbol) NOT LIKE '$CASH-%'",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(end_str.clone())];
-        filter.append_where_clauses(&mut sql, &mut params);
-        sql.push(')');
         filter.append_where_clauses(&mut sql, &mut params);
         sql.push_str(" GROUP BY account_id, symbol, market, category_name");
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -188,7 +162,13 @@ pub(super) fn return_attribution_from(
             .map_err(|e| e.to_string())?;
         for (account_id, symbol, market, category, val) in rows {
             let key = position_key(&account_id, &symbol, &market, &category);
-            let val = normalize_value(val, &market, end_rates.as_ref());
+            let val = convert_performance_amount(
+                val,
+                market_currency(&market),
+                currency,
+                end_rates.as_deref(),
+                &end_str,
+            )?;
             *end_vals.entry(key).or_insert(0.0) += val;
         }
     }
@@ -199,15 +179,17 @@ pub(super) fn return_attribution_from(
     let mut net_cash_flows: std::collections::HashMap<PositionKey, f64> =
         std::collections::HashMap::new();
     {
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT t.account_id, t.symbol, t.market, t.transaction_type,
-                    t.total_amount, t.commission, t.currency,
+                    t.total_amount, t.commission, t.currency, {},
                     (SELECT d.exchange_rates
                        FROM daily_portfolio_values d
                       WHERE d.date >= DATE(t.traded_at) AND d.date <= ?2
                       ORDER BY d.date ASC LIMIT 1)
              FROM transactions t
-             WHERE DATE(t.traded_at) > ?1 AND DATE(t.traded_at) <= ?2",
+             WHERE DATE(t.traded_at) > ?1 AND DATE(t.traded_at) <= ?2
+               AND UPPER(t.symbol) NOT LIKE '$CASH-%'",
+            super::TRANSFER_VALUE_SQL,
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
             vec![Box::new(start_str.clone()), Box::new(end_str.clone())];
@@ -219,10 +201,6 @@ pub(super) fn return_attribution_from(
             sql.push_str(&format!(" AND t.market = ?{}", params.len() + 1));
             params.push(Box::new(market.clone()));
         }
-        sql = sql.replace(
-            "t.total_amount,",
-            &format!("{},", super::TRANSFER_VALUE_SQL),
-        );
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -233,18 +211,35 @@ pub(super) fn return_attribution_from(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, Option<f64>>(4)?,
+                    row.get::<_, f64>(4)?,
                     row.get::<_, f64>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<f64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        for (account_id, symbol, market, tx_type, amount, commission, currency, rates_json) in rows
+        for (
+            account_id,
+            symbol,
+            market,
+            tx_type,
+            amount,
+            commission,
+            native_currency,
+            market_value,
+            rates_json,
+        ) in rows
         {
-            let amount = super::require_flow_value(amount)?;
+            let (amount, native_currency) = super::resolve_transaction_value(
+                &tx_type,
+                amount,
+                &native_currency,
+                &market,
+                market_value,
+            )?;
             let native_flow = match tx_type.as_str() {
                 "BUY" => amount + commission,
                 "SELL" | "PAY" => -(amount - commission),
@@ -252,18 +247,13 @@ pub(super) fn return_attribution_from(
                 "STOCK_OUT" => -amount,
                 _ => continue,
             };
-            let flow = if normalize_to_usd && currency != "USD" {
-                let context = format!("{} transaction", currency);
-                let rates = parse_required_exchange_rates(rates_json.as_deref(), &context)?;
-                crate::services::exchange_rate_service::convert_currency(
-                    native_flow,
-                    &currency,
-                    "USD",
-                    &rates,
-                )
-            } else {
-                native_flow
-            };
+            let flow = convert_performance_amount(
+                native_flow,
+                native_currency,
+                currency,
+                rates_json.as_deref(),
+                &format!("{native_currency} transaction for {symbol}"),
+            )?;
             let mut key = position_key(&account_id, &symbol, &market, "未分类");
             if !start_vals.contains_key(&key) && !end_vals.contains_key(&key) {
                 if let Some(endpoint_key) = start_vals.keys().chain(end_vals.keys()).find(
@@ -296,15 +286,6 @@ pub(super) fn return_attribution_from(
 
     for position in &all_positions {
         let (account_id, symbol, market, category) = position;
-        // Skip cash symbols ($CASH-CNY, $CASH-USD, $CASH-HKD) from attribution.
-        // Cash holdings don't have entries in the transactions table, so their
-        // PnL = ev − sv reflects the cash flow from buying/selling stocks, NOT
-        // actual investment returns. Including them double-counts the trade
-        // amounts that are already subtracted from individual stock PnLs.
-        if crate::services::quote_service::is_cash_symbol(symbol) {
-            continue;
-        }
-
         let sv = start_vals.get(position).copied().unwrap_or(0.0);
         let ev = end_vals.get(position).copied().unwrap_or(0.0);
         // Actual PnL = (end_value - start_value) - net_cash_flow
@@ -331,15 +312,27 @@ pub(super) fn return_attribution_from(
             .or_insert((display_name, pnl, sv));
     }
 
+    for (market, pnl) in cash_exchange_pnl(&conn, &start_str, &end_str, filter, currency)? {
+        total_pnl += pnl;
+        *market_pnl.entry(market.clone()).or_insert(0.0) += pnl;
+        *category_pnl.entry("现金类".into()).or_insert(0.0) += pnl;
+        let cash_currency = market_currency(&market);
+        let symbol = format!("$CASH-{cash_currency}");
+        holding_pnl.insert(
+            (symbol, market),
+            (format!("{cash_currency} 现金汇兑"), pnl, 0.0),
+        );
+    }
+    let pnl_magnitude: f64 = holding_pnl.values().map(|(_, pnl, _)| pnl.abs()).sum();
+    let contribution = |pnl| {
+        (total_pnl.abs() > f64::EPSILON * pnl_magnitude * 16.0)
+            .then(|| pnl / total_pnl.abs() * 100.0)
+    };
+
     let make_items = |map: std::collections::HashMap<String, f64>| -> Vec<AttributionItem> {
         let mut items: Vec<AttributionItem> = map
             .into_iter()
             .map(|(name, pnl)| {
-                let contribution_percent = if total_pnl != 0.0 {
-                    pnl / total_pnl.abs() * 100.0
-                } else {
-                    0.0
-                };
                 let weight = if total_start_val != 0.0 {
                     pnl / total_start_val * 100.0
                 } else {
@@ -348,7 +341,7 @@ pub(super) fn return_attribution_from(
                 AttributionItem {
                     name,
                     pnl,
-                    contribution_percent,
+                    contribution_percent: contribution(pnl),
                     weight,
                 }
             })
@@ -378,11 +371,6 @@ pub(super) fn return_attribution_from(
     let mut by_holding: Vec<AttributionItem> = holding_pnl
         .into_iter()
         .map(|((_symbol, _market), (display_name, pnl, sv))| {
-            let contribution_percent = if total_pnl != 0.0 {
-                pnl / total_pnl.abs() * 100.0
-            } else {
-                0.0
-            };
             let weight = if total_start_val != 0.0 {
                 sv / total_start_val * 100.0
             } else {
@@ -391,7 +379,7 @@ pub(super) fn return_attribution_from(
             AttributionItem {
                 name: display_name,
                 pnl,
-                contribution_percent,
+                contribution_percent: contribution(pnl),
                 weight,
             }
         })
@@ -408,4 +396,68 @@ pub(super) fn return_attribution_from(
         by_category,
         by_holding,
     })
+}
+
+/// With end-of-day flows, FX gains on cash come from the opening native balance
+/// and the change in the exchange rate. Deposits, withdrawals and security
+/// settlements do not generate cash FX gains at the time they are booked.
+fn cash_exchange_pnl(
+    conn: &rusqlite::Connection,
+    start: &str,
+    end: &str,
+    filter: &PerformanceFilter,
+    target: &str,
+) -> Result<std::collections::HashMap<String, f64>, String> {
+    use super::calculation::{append_snapshot_filters, SNAPSHOT_MARKET_SQL};
+
+    let mut sql = format!(
+        "SELECT h.date, {SNAPSHOT_MARKET_SQL} AS cash_market, SUM(h.market_value), v.exchange_rates
+         FROM daily_holding_snapshots h
+         LEFT JOIN daily_portfolio_values v ON v.date = h.date
+         WHERE h.date BETWEEN ?1 AND ?2 AND UPPER(h.symbol) LIKE '$CASH-%'",
+    );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(start.to_string()), Box::new(end.to_string())];
+    append_snapshot_filters(filter, &mut sql, &mut params);
+    sql.push_str(" GROUP BY h.date, cash_market ORDER BY h.date");
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let mut rows = stmt
+        .query(param_refs.as_slice())
+        .map_err(|error| error.to_string())?;
+    let mut cash_by_market = std::collections::HashMap::<String, (f64, Option<String>)>::new();
+    let mut pnl_by_market = std::collections::HashMap::new();
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let date: String = row.get(0).map_err(|error| error.to_string())?;
+        let market: String = row.get(1).map_err(|error| error.to_string())?;
+        let source = market_currency(&market);
+        if source == target {
+            continue;
+        }
+        let balance: f64 = row.get(2).map_err(|error| error.to_string())?;
+        let rates: Option<String> = row.get(3).map_err(|error| error.to_string())?;
+        if let Some((previous_balance, previous_rates)) =
+            cash_by_market.insert(market.clone(), (balance, rates.clone()))
+        {
+            let context = format!("{source} cash valuation through {date}");
+            let before = convert_performance_amount(
+                previous_balance,
+                source,
+                target,
+                previous_rates.as_deref(),
+                &context,
+            )?;
+            let after = convert_performance_amount(
+                previous_balance,
+                source,
+                target,
+                rates.as_deref(),
+                &context,
+            )?;
+            if after != before {
+                *pnl_by_market.entry(market).or_insert(0.0) += after - before;
+            }
+        }
+    }
+    Ok(pnl_by_market)
 }

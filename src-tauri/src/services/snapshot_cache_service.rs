@@ -1,17 +1,12 @@
-use chrono::{Datelike, NaiveDate, Weekday};
+use chrono::{Days, NaiveDate};
 use rusqlite::Connection;
 
-/// Returns the prior valuation weekday used as the selected period's opening
-/// value. Without rebuilding it, invalidation can expose a much older baseline.
+/// Backfill enough prior days to recover the period's opening valuation across
+/// a weekend or an extended exchange holiday. The report keeps its own start.
 pub(crate) fn backfill_start_with_baseline(start: NaiveDate) -> NaiveDate {
-    let mut date = start;
-    while let Some(previous) = date.pred_opt() {
-        date = previous;
-        if !matches!(date.weekday(), Weekday::Sat | Weekday::Sun) {
-            return date;
-        }
-    }
     start
+        .checked_sub_days(Days::new(14))
+        .unwrap_or(NaiveDate::MIN)
 }
 
 /// Use SQLite's UTC date conversion, just like historical transaction queries.

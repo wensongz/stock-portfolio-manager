@@ -216,15 +216,15 @@ fn import_and_undo_expire_from_the_utc_trade_date() {
 }
 
 #[test]
-fn performance_backfill_includes_the_previous_weekday_baseline() {
+fn performance_backfill_keeps_a_baseline_window_across_holidays() {
     use crate::services::snapshot_cache_service::backfill_start_with_baseline;
     use chrono::NaiveDate;
     for (start, baseline) in [
-        ("2026-02-02", "2026-01-30"),
-        ("2026-02-01", "2026-01-30"),
-        ("2026-01-31", "2026-01-30"),
-        ("2026-01-30", "2026-01-29"),
-        ("2026-01-01", "2025-12-31"),
+        ("2026-02-02", "2026-01-19"),
+        ("2026-02-01", "2026-01-18"),
+        ("2026-01-31", "2026-01-17"),
+        ("2026-01-30", "2026-01-16"),
+        ("2026-01-01", "2025-12-18"),
     ] {
         let parsed = NaiveDate::parse_from_str(start, "%Y-%m-%d").unwrap();
         assert_eq!(backfill_start_with_baseline(parsed).to_string(), baseline);

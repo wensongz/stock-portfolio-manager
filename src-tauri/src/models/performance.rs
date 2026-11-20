@@ -3,12 +3,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PerformanceSummary {
+    pub valuation_currency: String,
     pub start_date: String,
     pub end_date: String,
     pub start_value: f64,
     pub end_value: f64,
     pub total_return: f64,
-    pub annualized_return: f64,
+    pub annualized_return: Option<f64>,
     pub total_pnl: f64,
     pub max_drawdown: f64,
     pub volatility: f64,
@@ -50,7 +51,7 @@ pub struct DrawdownAnalysis {
 pub struct AttributionItem {
     pub name: String,
     pub pnl: f64,
-    pub contribution_percent: f64,
+    pub contribution_percent: Option<f64>,
     pub weight: f64,
 }
 

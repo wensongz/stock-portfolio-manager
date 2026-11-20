@@ -1,5 +1,15 @@
 use rusqlite::{Connection, Result};
 
+pub(super) fn migrate_v12(conn: &Connection) -> Result<()> {
+    if !super::migrations::column_exists(conn, "daily_holding_snapshots", "has_market_close")? {
+        conn.execute_batch(
+            "ALTER TABLE daily_holding_snapshots ADD COLUMN has_market_close INTEGER
+             CHECK (has_market_close IN (0, 1));",
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn migrate_v7(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS snapshot_cache_state (
@@ -52,4 +62,28 @@ pub(super) fn migrate_v7(conn: &Connection) -> Result<()> {
          DELETE FROM daily_holding_snapshots;
          DELETE FROM daily_portfolio_values;",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn v12_preserves_legacy_snapshots_with_unknown_close_status() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::schema::create_current_schema(&conn).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 11;
+             INSERT INTO daily_holding_snapshots(date, account_id, symbol, market, close_price)
+               VALUES ('2024-01-02', 'account', 'AAPL', 'US', 20);",
+        )
+        .unwrap();
+        super::super::migrations::run_migrations(&mut conn).unwrap();
+        let legacy: (f64, Option<bool>) = conn
+            .query_row(
+                "SELECT close_price, has_market_close FROM daily_holding_snapshots",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, (20.0, None));
+    }
 }

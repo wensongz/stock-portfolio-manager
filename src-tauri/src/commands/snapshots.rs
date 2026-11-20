@@ -5,7 +5,7 @@ use chrono::NaiveDate;
 use tauri::State;
 
 /// Backfill missing daily snapshots for the given date range using historical
-/// closing prices, including the preceding weekday as the performance baseline.
+/// closing prices, including a lookback for the opening performance valuation.
 /// Returns the number of snapshots created.
 ///
 /// When `force` is true, all completed dates in the range are recalculated,

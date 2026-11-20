@@ -302,12 +302,13 @@ export interface UpdateHoldingPayload {
 
 // Phase 4: Performance types
 export interface PerformanceSummary {
+  valuation_currency?: Currency;
   start_date: string;
   end_date: string;
   start_value: number;
   end_value: number;
   total_return: number;
-  annualized_return: number;
+  annualized_return: number | null;
   total_pnl: number;
   max_drawdown: number;
   volatility: number;
@@ -342,7 +343,7 @@ export interface DrawdownAnalysis {
 export interface AttributionItem {
   name: string;
   pnl: number;
-  contribution_percent: number;
+  contribution_percent: number | null;
   weight: number;
 }
 

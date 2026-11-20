@@ -1538,8 +1538,9 @@ async fn tool_return_attribution(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult 
             let mut holdings = attr.by_holding.clone();
             holdings.sort_by(|a, b| {
                 b.contribution_percent
+                    .unwrap_or(0.0)
                     .abs()
-                    .partial_cmp(&a.contribution_percent.abs())
+                    .partial_cmp(&a.contribution_percent.unwrap_or(0.0).abs())
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             holdings.truncate(15);

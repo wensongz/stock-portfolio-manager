@@ -23,16 +23,96 @@ pub(super) fn parse_required_exchange_rates(
     }
 }
 
+/// Legacy cash snapshots could inherit the account's market instead of the
+/// market corresponding to their settlement currency.
+pub(super) const SNAPSHOT_MARKET_SQL: &str = "
+    CASE UPPER(symbol)
+      WHEN '$CASH-USD' THEN 'US'
+      WHEN '$CASH-CNY' THEN 'CN'
+      WHEN '$CASH-HKD' THEN 'HK'
+      ELSE market
+    END";
+
+pub(super) fn append_snapshot_filters(
+    filter: &PerformanceFilter,
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+) {
+    if let Some(ref market) = filter.market {
+        sql.push_str(&format!(
+            " AND ({SNAPSHOT_MARKET_SQL}) = ?{}",
+            params.len() + 1
+        ));
+        params.push(Box::new(market.clone()));
+    }
+    if let Some(ref account_id) = filter.account_id {
+        sql.push_str(&format!(" AND account_id = ?{}", params.len() + 1));
+        params.push(Box::new(account_id.clone()));
+    }
+}
+
+pub(super) fn market_currency(market: &str) -> &'static str {
+    match market {
+        "CN" => "CNY",
+        "HK" => "HKD",
+        _ => "USD",
+    }
+}
+
+fn report_currency(db: &Database, filter: &PerformanceFilter) -> Result<&'static str, String> {
+    if let Some(ref market) = filter.market {
+        return Ok(market_currency(market));
+    }
+    let Some(ref account_id) = filter.account_id else {
+        return Ok("USD");
+    };
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let market = conn
+        .query_row(
+            "SELECT market FROM accounts WHERE id = ?1",
+            [account_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    Ok(market_currency(market.as_deref().unwrap_or("US")))
+}
+
+pub(super) fn convert_performance_amount(
+    value: f64,
+    source: &str,
+    target: &str,
+    rates_json: Option<&str>,
+    context: &str,
+) -> Result<f64, String> {
+    if value == 0.0 || source == target {
+        return Ok(value);
+    }
+    let rates = parse_required_exchange_rates(rates_json, context)?;
+    Ok(crate::services::exchange_rate_service::convert_currency(
+        value, source, target, &rates,
+    ))
+}
+
+pub(super) fn valuation_rates(
+    conn: &rusqlite::Connection,
+    date: &str,
+) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT exchange_rates FROM daily_portfolio_values WHERE date = ?1",
+        [date],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
 /// Fetch daily portfolio values (total_value, daily_pnl) for the date range.
 fn fetch_daily_values(
     db: &Database,
     start: NaiveDate,
     end: NaiveDate,
-    filter: &PerformanceFilter,
 ) -> Result<Vec<(NaiveDate, f64, f64)>, String> {
-    if filter.is_active() {
-        return fetch_filtered_daily_values(db, start, end, filter);
-    }
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let start_str = start.format("%Y-%m-%d").to_string();
     let end_str = end.format("%Y-%m-%d").to_string();
@@ -66,91 +146,94 @@ fn fetch_daily_values(
         .collect()
 }
 
-/// Fetch daily values from `daily_holding_snapshots` aggregated by date,
-/// filtered by market and/or account_id. Derives daily_pnl from consecutive
-/// day value differences.
+/// Use the portfolio valuation calendar after this scope's first snapshot.
+/// A valuation with no matching positions then represents a zero balance.
 fn fetch_filtered_daily_values(
     db: &Database,
     start: NaiveDate,
     end: NaiveDate,
     filter: &PerformanceFilter,
+    currency: &str,
+    include_end: bool,
 ) -> Result<Vec<(NaiveDate, f64, f64)>, String> {
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
-    let start_str = start.format("%Y-%m-%d").to_string();
-    let end_str = end.format("%Y-%m-%d").to_string();
-
-    let mut sql = String::from(
-        "SELECT date, SUM(market_value) as total_value
-         FROM daily_holding_snapshots
-         WHERE date BETWEEN ?1 AND ?2",
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let (comparison, limit) = if include_end {
+        ("<=", -1_i64)
+    } else {
+        ("<", 1_i64)
+    };
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+        Box::new(start.to_string()),
+        Box::new(end.to_string()),
+        Box::new(limit),
+    ];
+    let mut predicate = String::new();
+    append_snapshot_filters(filter, &mut predicate, &mut params);
+    let sql = format!(
+        "WITH positions AS (
+            SELECT date, {SNAPSHOT_MARKET_SQL} AS position_market, SUM(market_value) AS value
+            FROM daily_holding_snapshots WHERE date {comparison} ?2 {predicate}
+            GROUP BY date, position_market
+        ), valuation_dates AS (
+            SELECT date FROM (
+                SELECT date FROM positions WHERE date >= ?1
+                UNION
+                SELECT date FROM daily_portfolio_values
+                WHERE date >= ?1 AND date {comparison} ?2 AND date >= (SELECT MIN(date) FROM positions)
+            ) ORDER BY date DESC LIMIT ?3
+        )
+        SELECT d.date, h.position_market, COALESCE(h.value, 0), v.exchange_rates
+        FROM valuation_dates d LEFT JOIN positions h ON h.date = d.date
+        LEFT JOIN daily_portfolio_values v ON v.date = d.date
+        ORDER BY d.date ASC, h.position_market ASC"
     );
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-        vec![Box::new(start_str), Box::new(end_str)];
 
-    filter.append_where_clauses(&mut sql, &mut params);
-
-    sql.push_str(" GROUP BY date ORDER BY date ASC");
-
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let rows = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            let date_str: String = row.get(0)?;
-            let value: f64 = row.get(1)?;
-            Ok((date_str, value))
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-
-    let mut result = Vec::with_capacity(rows.len());
-    let mut prev_value: Option<f64> = None;
-    for (ds, v) in rows {
-        let date = NaiveDate::parse_from_str(&ds, "%Y-%m-%d")
-            .map_err(|e| format!("bad date '{}': {}", ds, e))?;
-        let dpnl = prev_value.map(|pv| v - pv).unwrap_or(0.0);
-        result.push((date, v, dpnl));
-        prev_value = Some(v);
+    let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let mut rows = stmt
+        .query(param_refs.as_slice())
+        .map_err(|error| error.to_string())?;
+    let mut result: Vec<(NaiveDate, f64, f64)> = Vec::new();
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let date_str: String = row.get(0).map_err(|error| error.to_string())?;
+        let market: Option<String> = row.get(1).map_err(|error| error.to_string())?;
+        let value: f64 = row.get(2).map_err(|error| error.to_string())?;
+        let rates: Option<String> = row.get(3).map_err(|error| error.to_string())?;
+        let date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
+            .map_err(|error| format!("bad date '{date_str}': {error}"))?;
+        let value = convert_performance_amount(
+            value,
+            market_currency(market.as_deref().unwrap_or("US")),
+            currency,
+            rates.as_deref(),
+            &format!("valuation on {date}"),
+        )?;
+        if let Some(last) = result.last_mut().filter(|last| last.0 == date) {
+            last.1 += value;
+        } else {
+            result.push((date, value, 0.0));
+        }
     }
     Ok(result)
 }
 
-/// Fetch the portfolio value on the latest day strictly before `date`.
-/// Used as the baseline for cumulative-return curves so that the first
-/// visible day already shows a non-zero return.
+/// Fetch the latest closing valuation strictly before the visible date range.
 pub(super) fn fetch_previous_day_value(
     db: &Database,
     date: NaiveDate,
     filter: &PerformanceFilter,
+    currency: &str,
 ) -> Result<Option<(NaiveDate, f64)>, String> {
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
-    let date_str = date.format("%Y-%m-%d").to_string();
     if filter.is_active() {
-        let mut sql = String::from(
-            "SELECT date, SUM(market_value) FROM daily_holding_snapshots WHERE date = (SELECT MAX(date) FROM daily_holding_snapshots WHERE date < ?1",
+        return Ok(
+            fetch_filtered_daily_values(db, NaiveDate::MIN, date, filter, currency, false)?
+                .into_iter()
+                .next()
+                .map(|(date, value, _)| (date, value)),
         );
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(date_str.clone())];
-        filter.append_where_clauses(&mut sql, &mut params);
-        sql.push(')');
-        // Apply same filters to outer WHERE
-        filter.append_where_clauses(&mut sql, &mut params);
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        sql.push_str(" GROUP BY date");
-        let result = conn
-            .query_row(&sql, param_refs.as_slice(), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-            })
-            .optional()
-            .map_err(|error| error.to_string())?;
-        return result
-            .map(|(date, value)| {
-                NaiveDate::parse_from_str(&date, "%Y-%m-%d")
-                    .map(|parsed| (parsed, value))
-                    .map_err(|error| format!("bad date '{date}': {error}"))
-            })
-            .transpose();
     }
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let date_str = date.to_string();
     let result = conn
         .query_row(
             "SELECT date, total_value FROM daily_portfolio_values WHERE date < ?1 ORDER BY date DESC LIMIT 1",
@@ -170,35 +253,49 @@ pub(super) fn fetch_previous_day_value(
 
 /// Fetch external contributions/withdrawals between two valuations.
 /// Cash-symbol BUY records are contributions; SELL records are withdrawals.
-/// OPEN records are in-kind position contributions with no account cash impact.
-/// Unfiltered portfolio valuations are stored in USD, so their flows are
-/// converted with the exchange rates attached to the first valuation on or
-/// after each flow date. Filtered valuations remain in their market currency.
+/// Cash OPEN records reset a ledger balance. Stock OPEN records are in-kind
+/// contributions. A market slice treats stock settlement in another market's
+/// currency as an external flow between those slices. Use the first valuation
+/// on or after the flow date for FX.
 fn fetch_external_cash_flows(
     db: &Database,
     start_exclusive: NaiveDate,
     end_inclusive: NaiveDate,
     filter: &PerformanceFilter,
+    report_currency: &str,
 ) -> Result<Vec<(NaiveDate, f64)>, String> {
+    use crate::services::cash_reconciliation_service::{load_cash_ledger, CashLedger};
+    use std::collections::hash_map::Entry;
+    use std::collections::{BTreeMap, HashMap};
+
+    struct ExternalFlow {
+        date: String,
+        id: String,
+        account_id: String,
+        is_cash: bool,
+        market: String,
+        transaction_type: String,
+        recorded_amount: f64,
+        commission: f64,
+        currency: String,
+        market_value: Option<f64>,
+        rates_json: Option<String>,
+    }
+
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let start_str = start_exclusive.format("%Y-%m-%d").to_string();
     let end_str = end_inclusive.format("%Y-%m-%d").to_string();
-    let mut sql = String::from(
-        "SELECT DATE(t.traded_at), t.transaction_type, t.total_amount,
-                t.commission, t.currency,
+    let cash_symbol = "UPPER(t.symbol) LIKE '$CASH-%'";
+    let mut sql = format!(
+        "SELECT DATE(t.traded_at), t.id, t.account_id, {cash_symbol},
+                t.market, t.transaction_type, t.total_amount, t.commission, t.currency, {},
                 (SELECT d.exchange_rates
                    FROM daily_portfolio_values d
                   WHERE d.date >= DATE(t.traded_at) AND d.date <= ?2
                   ORDER BY d.date ASC LIMIT 1)
            FROM transactions t
-          WHERE DATE(t.traded_at) > ?1 AND DATE(t.traded_at) <= ?2
-            AND ((UPPER(t.symbol) LIKE '$CASH-%'
-                  AND t.transaction_type IN ('BUY', 'SELL'))
-                 OR t.transaction_type IN ('OPEN', 'STOCK_IN', 'STOCK_OUT'))",
-    );
-    sql = sql.replace(
-        "t.total_amount,",
-        &format!("{},", super::TRANSFER_VALUE_SQL),
+          WHERE DATE(t.traded_at) > ?1 AND DATE(t.traded_at) <= ?2",
+        super::TRANSFER_VALUE_SQL,
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
         vec![Box::new(start_str), Box::new(end_str)];
@@ -206,9 +303,27 @@ fn fetch_external_cash_flows(
         sql.push_str(&format!(" AND t.account_id = ?{}", params.len() + 1));
         params.push(Box::new(account_id.clone()));
     }
+    let external_transaction = format!(
+        "(({cash_symbol} AND t.transaction_type IN ('BUY', 'SELL'))
+          OR t.transaction_type IN ('OPEN', 'STOCK_IN', 'STOCK_OUT'))"
+    );
     if let Some(ref market) = filter.market {
-        sql.push_str(&format!(" AND t.market = ?{}", params.len() + 1));
+        let market_param = params.len() + 1;
+        let currency_param = market_param + 1;
+        sql.push_str(&format!(
+            " AND (({external_transaction}
+                    AND CASE WHEN {cash_symbol} THEN t.currency = ?{currency_param}
+                             ELSE t.market = ?{market_param} END)
+                   OR (NOT ({cash_symbol})
+                       AND t.transaction_type IN ('BUY', 'SELL', 'PAY')
+                       AND ((t.market = ?{market_param} AND t.currency <> ?{currency_param})
+                            OR (t.market <> ?{market_param} AND t.currency = ?{currency_param}))))"
+        ));
         params.push(Box::new(market.clone()));
+        params.push(Box::new(report_currency.to_string()));
+    } else {
+        sql.push_str(" AND ");
+        sql.push_str(&external_transaction);
     }
     sql.push_str(" ORDER BY DATE(t.traded_at) ASC");
 
@@ -217,54 +332,117 @@ fn fetch_external_cash_flows(
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(param_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<f64>>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
+            Ok(ExternalFlow {
+                date: row.get(0)?,
+                id: row.get(1)?,
+                account_id: row.get(2)?,
+                is_cash: row.get(3)?,
+                market: row.get(4)?,
+                transaction_type: row.get(5)?,
+                recorded_amount: row.get(6)?,
+                commission: row.get(7)?,
+                currency: row.get(8)?,
+                market_value: row.get(9)?,
+                rates_json: row.get(10)?,
+            })
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
 
-    let mut grouped = std::collections::BTreeMap::<NaiveDate, f64>::new();
-    for (date_str, transaction_type, total_amount, commission, currency, rates_json) in rows {
-        let date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
-            .map_err(|e| format!("bad cash-flow date '{}': {}", date_str, e))?;
-        let total_amount = super::require_flow_value(total_amount)?;
-        let signed_amount = match transaction_type.as_str() {
-            "BUY" => total_amount + commission,
-            "SELL" => -(total_amount + commission),
-            "OPEN" | "STOCK_IN" => total_amount + commission,
-            "STOCK_OUT" => -total_amount,
-            _ => continue,
-        };
-        let amount = if filter.is_active() || currency == "USD" {
-            signed_amount
+    let mut grouped = BTreeMap::<NaiveDate, f64>::new();
+    let mut cash_ledgers = HashMap::<(String, String), CashLedger>::new();
+    for flow in rows {
+        let date = NaiveDate::parse_from_str(&flow.date, "%Y-%m-%d")
+            .map_err(|e| format!("bad cash-flow date '{}': {}", flow.date, e))?;
+        let (signed_amount, currency) = if flow.is_cash && flow.transaction_type == "OPEN" {
+            let key = (flow.account_id.clone(), flow.currency.clone());
+            let ledger = match cash_ledgers.entry(key) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    entry.insert(load_cash_ledger(&conn, &flow.account_id, &flow.currency)?)
+                }
+            };
+            let delta = ledger
+                .rows
+                .iter()
+                .find(|row| row.transaction.id == flow.id)
+                .map(|row| row.cash_delta)
+                .ok_or_else(|| format!("现金流水缺少期初记录：{}", flow.id))?;
+            (delta, flow.currency.as_str())
         } else {
-            let context = format!("{} cash flow on {}", currency, date_str);
-            let rates = parse_required_exchange_rates(rates_json.as_deref(), &context)?;
-            crate::services::exchange_rate_service::convert_currency(
-                signed_amount,
-                &currency,
-                "USD",
-                &rates,
-            )
+            let (total_amount, currency) = super::resolve_transaction_value(
+                &flow.transaction_type,
+                flow.recorded_amount,
+                &flow.currency,
+                &flow.market,
+                flow.market_value,
+            )?;
+            let signed_amount = match flow.transaction_type.as_str() {
+                "BUY" | "OPEN" | "STOCK_IN" => total_amount + flow.commission,
+                "SELL" if flow.is_cash => -(total_amount + flow.commission),
+                "SELL" | "PAY" => -(total_amount - flow.commission),
+                "STOCK_OUT" => -total_amount,
+                _ => continue,
+            };
+            let is_settlement_market = !flow.is_cash
+                && filter
+                    .market
+                    .as_deref()
+                    .is_some_and(|market| market != flow.market);
+            let amount = if is_settlement_market {
+                -signed_amount
+            } else {
+                signed_amount
+            };
+            (amount, currency)
         };
+        let amount = convert_performance_amount(
+            signed_amount,
+            currency,
+            report_currency,
+            flow.rates_json.as_deref(),
+            &format!("{currency} cash flow on {}", flow.date),
+        )?;
         *grouped.entry(date).or_insert(0.0) += amount;
     }
 
     Ok(grouped.into_iter().collect())
 }
 
+fn dates_without_market_closes(
+    db: &Database,
+    start: NaiveDate,
+    end: NaiveDate,
+    filter: &PerformanceFilter,
+) -> Result<std::collections::HashSet<String>, String> {
+    let conn = db.conn.lock().map_err(|error| error.to_string())?;
+    let mut sql =
+        String::from("SELECT date FROM daily_holding_snapshots WHERE date BETWEEN ?1 AND ?2");
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(start.to_string()), Box::new(end.to_string())];
+    append_snapshot_filters(filter, &mut sql, &mut params);
+    sql.push_str(
+        " GROUP BY date HAVING MAX(has_market_close) = 0
+                   AND COUNT(has_market_close) = COUNT(*)",
+    );
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let dates = stmt
+        .query_map(param_refs.as_slice(), |row| row.get(0))
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|error| error.to_string())?;
+    Ok(dates)
+}
+
 pub(super) struct PerformanceCalculation {
+    pub(super) currency: &'static str,
     pub(super) daily_values: Vec<(NaiveDate, f64, f64)>,
     pub(super) baseline: Option<(NaiveDate, f64)>,
     pub(super) external_cash_flows: Vec<(NaiveDate, f64)>,
     pub(super) return_series: Vec<ReturnDataPoint>,
+    dates_without_market_closes: std::collections::HashSet<String>,
 }
 
 #[cfg(test)]
@@ -292,28 +470,39 @@ impl PerformanceCalculation {
         #[cfg(test)]
         PERFORMANCE_LOAD_COUNT.with(|count| count.set(count.get() + 1));
 
-        let daily_values = fetch_daily_values(db, start_date, end_date, filter)?;
+        let currency = report_currency(db, filter)?;
+        let daily_values = if filter.is_active() {
+            fetch_filtered_daily_values(db, start_date, end_date, filter, currency, true)?
+        } else {
+            fetch_daily_values(db, start_date, end_date)?
+        };
         if daily_values.is_empty() {
             return Ok(Self {
+                currency,
                 daily_values,
                 baseline: None,
                 external_cash_flows: vec![],
                 return_series: vec![],
+                dates_without_market_closes: Default::default(),
             });
         }
 
-        let baseline = fetch_previous_day_value(db, start_date, filter)?;
+        let baseline = fetch_previous_day_value(db, start_date, filter, currency)?;
         let cash_flow_start = baseline.map(|(date, _)| date).unwrap_or(daily_values[0].0);
         let actual_end = daily_values.last().map(|row| row.0).unwrap_or(end_date);
         let external_cash_flows =
-            fetch_external_cash_flows(db, cash_flow_start, actual_end, filter)?;
+            fetch_external_cash_flows(db, cash_flow_start, actual_end, filter, currency)?;
         let return_series = build_twr_return_series(&daily_values, baseline, &external_cash_flows);
+        let dates_without_market_closes =
+            dates_without_market_closes(db, start_date, end_date, filter)?;
 
         Ok(Self {
+            currency,
             daily_values,
             baseline,
             external_cash_flows,
             return_series,
+            dates_without_market_closes,
         })
     }
 
@@ -363,12 +552,32 @@ impl PerformanceCalculation {
         }
     }
 
+    fn annualized_return_percent(&self) -> Option<f64> {
+        let total_return = self.total_return();
+        let days = self.calendar_days();
+        if days <= 0 || total_return < -1.0 {
+            return None;
+        }
+        let percent = annualise_return(total_return, days) * 100.0;
+        percent.is_finite().then_some(percent)
+    }
+
     pub(super) fn daily_returns(&self) -> Vec<f64> {
-        let skip = usize::from(self.baseline.is_none());
+        let prior_values = self
+            .baseline
+            .iter()
+            .map(|(_, value)| *value)
+            .chain(self.daily_values.iter().map(|(_, value, _)| *value));
         self.return_series
             .iter()
-            .skip(skip)
-            .map(|point| point.daily_return / 100.0)
+            .skip(usize::from(self.baseline.is_none()))
+            .zip(prior_values)
+            .filter(|(point, previous_value)| {
+                *previous_value > 0.0
+                    && (point.daily_return.abs() > 1e-10
+                        || !self.dates_without_market_closes.contains(&point.date))
+            })
+            .map(|(point, _)| point.daily_return / 100.0)
             .collect()
     }
 }
@@ -465,6 +674,7 @@ pub(super) fn calculate_max_drawdown(
     // Cumulative TWR is measured from a wealth index of 1.0 immediately
     // before the first visible observation, so an initial loss is itself a
     // drawdown and must not become the starting peak.
+    const WEALTH_INDEX_TOLERANCE: f64 = 1e-12;
     let mut peak = 1.0f64;
     let mut peak_idx: Option<usize> = None;
     let mut max_drawdown = 0.0f64;
@@ -481,7 +691,12 @@ pub(super) fn calculate_max_drawdown(
             peak = v;
             peak_idx = Some(i);
         }
-        let dd = if peak > 0.0 { (v - peak) / peak } else { 0.0 };
+        let dd = ((v - peak) / peak).min(0.0);
+        let dd = if dd.abs() <= WEALTH_INDEX_TOLERANCE {
+            0.0
+        } else {
+            dd
+        };
         drawdown_series.push(DrawdownPoint {
             date: dates[i].to_string(),
             drawdown: dd * 100.0,
@@ -502,7 +717,7 @@ pub(super) fn calculate_max_drawdown(
         .then(|| {
             values[md_trough_idx..]
                 .iter()
-                .position(|&v| v >= md_peak_value)
+                .position(|&v| v >= md_peak_value * (1.0 - WEALTH_INDEX_TOLERANCE))
                 .map(|offset| md_trough_idx + offset)
         })
         .flatten();
@@ -617,12 +832,13 @@ pub(super) fn performance_summary_from(
 ) -> PerformanceSummary {
     if calculation.daily_values.is_empty() {
         return PerformanceSummary {
+            valuation_currency: calculation.currency.to_string(),
             start_date: requested_start_date.format("%Y-%m-%d").to_string(),
             end_date: requested_end_date.format("%Y-%m-%d").to_string(),
             start_value: 0.0,
             end_value: 0.0,
             total_return: 0.0,
-            annualized_return: 0.0,
+            annualized_return: None,
             total_pnl: 0.0,
             max_drawdown: 0.0,
             volatility: 0.0,
@@ -636,10 +852,8 @@ pub(super) fn performance_summary_from(
     let total_pnl = calculation.total_pnl();
     let total_return = calculation.total_return();
     let total_return_pct = total_return * 100.0;
-    let days = calculation.calendar_days();
     let actual_start_date = calculation.start_date().unwrap();
     let actual_end_date = calculation.end_date().unwrap();
-    let annualised = annualise_return(total_return, days);
     let dd_analysis = calculate_max_drawdown(
         &calculation.return_series,
         calculation.baseline.map(|(date, _)| date),
@@ -649,12 +863,13 @@ pub(super) fn performance_summary_from(
     let sharpe = calculate_sharpe_from_daily_returns(&daily_returns, RISK_FREE_RATE);
 
     PerformanceSummary {
+        valuation_currency: calculation.currency.to_string(),
         start_date: actual_start_date.format("%Y-%m-%d").to_string(),
         end_date: actual_end_date.format("%Y-%m-%d").to_string(),
         start_value,
         end_value,
         total_return: total_return_pct,
-        annualized_return: annualised * 100.0,
+        annualized_return: calculation.annualized_return_percent(),
         total_pnl,
         max_drawdown: dd_analysis.max_drawdown,
         volatility: ann_vol * 100.0,
@@ -685,9 +900,6 @@ pub(super) fn risk_metrics_from(calculation: &PerformanceCalculation) -> RiskMet
         };
     }
 
-    let total_return = calculation.total_return();
-    let days = calculation.calendar_days();
-    let annualised = annualise_return(total_return, days);
     let daily_returns = calculation.daily_returns();
     let (daily_vol, ann_vol) = calculate_volatility(&daily_returns);
     let sharpe = calculate_sharpe_from_daily_returns(&daily_returns, RISK_FREE_RATE);
@@ -695,9 +907,11 @@ pub(super) fn risk_metrics_from(calculation: &PerformanceCalculation) -> RiskMet
         &calculation.return_series,
         calculation.baseline.map(|(date, _)| date),
     );
-    let max_dd = dd_analysis.max_drawdown.abs() / 100.0;
+    let max_dd = dd_analysis.max_drawdown.abs();
     let calmar = if max_dd > 0.0 {
-        Some(annualised / max_dd)
+        calculation
+            .annualized_return_percent()
+            .map(|annualized| annualized / max_dd)
     } else {
         None
     };

@@ -58,6 +58,12 @@ function report(label: string) {
   };
 }
 
+function seedBenchmarkComparison(store) {
+  const { summary } = report("2025-02-21");
+  summary.start_date = "2025-02-03";
+  store.setState({ summary, returnSeries: summary.return_series });
+}
+
 test("a stale performance response cannot overwrite the newest filters", async () => {
   const oldResponse = deferred();
   const newResponse = deferred();
@@ -299,6 +305,7 @@ test("the latest request for one benchmark wins when responses arrive out of ord
     return benchmarkAttempt === 1 ? oldResponse.promise : newResponse.promise;
   };
   const store = createPerformanceStore(invoke);
+  seedBenchmarkComparison(store);
 
   const oldFetch = store.getState().fetchBenchmark("^GSPC");
   const newFetch = store.getState().fetchBenchmark("^GSPC");
@@ -317,6 +324,7 @@ test("changing the time range clears benchmark series immediately", async () => 
     return [{ date: "saved", cumulative_return: 1 }];
   };
   const store = createPerformanceStore(invoke);
+  seedBenchmarkComparison(store);
 
   await store.getState().fetchBenchmark("^GSPC");
   store.getState().setTimeRange("CUSTOM", "2025-02-01", "2025-02-28");
@@ -331,6 +339,7 @@ test("changing the time range invalidates an in-flight benchmark response", asyn
     return oldResponse.promise;
   };
   const store = createPerformanceStore(invoke);
+  seedBenchmarkComparison(store);
 
   const oldFetch = store.getState().fetchBenchmark("^GSPC");
   store.getState().setTimeRange("CUSTOM", "2025-02-01", "2025-02-28");
@@ -348,6 +357,7 @@ test("different benchmark symbols can finish independently", async () => {
     return args.symbol === "^GSPC" ? sp500Response.promise : nasdaqResponse.promise;
   };
   const store = createPerformanceStore(invoke);
+  seedBenchmarkComparison(store);
 
   const sp500Fetch = store.getState().fetchBenchmark("^GSPC");
   const nasdaqFetch = store.getState().fetchBenchmark("^IXIC");
@@ -359,4 +369,35 @@ test("different benchmark symbols can finish independently", async () => {
 
   assert.equal(store.getState().benchmarkSeries["^GSPC"]?.[0]?.date, "sp500");
   assert.equal(store.getState().benchmarkSeries["^IXIC"]?.[0]?.date, "nasdaq");
+});
+
+test("selected benchmarks use the portfolio valuation window after a report loads", async () => {
+  const calls = [];
+  const saved = report("2025-02-21");
+  saved.summary.start_date = "2025-02-03";
+  const store = createPerformanceStore(async (command, args) => {
+    if (command === "backfill_snapshots") return 0;
+    if (command === "get_performance_report") return saved;
+    calls.push(args);
+    return [{ date: "2025-02-03", cumulative_return: 0 }];
+  });
+  store.getState().setTimeRange("CUSTOM", "2025-01-01", "2025-02-28");
+  store.getState().setBenchmarks(["^GSPC"]);
+  await store.getState().fetchAll();
+
+  assert.deepEqual(calls, [{ symbol: "^GSPC", startDate: "2025-02-03", endDate: "2025-02-21" }]);
+});
+
+test("a failed benchmark refresh cannot leave a stale comparison visible", async () => {
+  let attempt = 0;
+  const store = createPerformanceStore(async () => {
+    if (++attempt === 1) return [{ date: "2025-02-03", cumulative_return: 0 }];
+    throw new Error("price history unavailable");
+  });
+  seedBenchmarkComparison(store);
+  await store.getState().fetchBenchmark("^GSPC");
+  await store.getState().fetchBenchmark("^GSPC");
+
+  assert.deepEqual(store.getState().benchmarkSeries["^GSPC"], []);
+  assert.match(store.getState().benchmarkErrors["^GSPC"], /price history unavailable/);
 });

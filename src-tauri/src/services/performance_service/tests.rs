@@ -11,7 +11,7 @@ fn previous_value_lookup_distinguishes_missing_from_bad_dates() {
     let db = Database::new(":memory:").unwrap();
     let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     assert!(
-        fetch_previous_day_value(&db, cutoff, &PerformanceFilter::default())
+        fetch_previous_day_value(&db, cutoff, &PerformanceFilter::default(), "USD")
             .unwrap()
             .is_none()
     );
@@ -25,7 +25,8 @@ fn previous_value_lookup_distinguishes_missing_from_bad_dates() {
     .unwrap();
     drop(conn);
 
-    let error = fetch_previous_day_value(&db, cutoff, &PerformanceFilter::default()).unwrap_err();
+    let error =
+        fetch_previous_day_value(&db, cutoff, &PerformanceFilter::default(), "USD").unwrap_err();
     assert!(error.contains("bad date '2025-bad-date'"));
 }
 
@@ -46,9 +47,13 @@ fn filtered_previous_value_lookup_propagates_bad_dates() {
         account_id: None,
     };
 
-    let error =
-        fetch_previous_day_value(&db, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), &filter)
-            .unwrap_err();
+    let error = fetch_previous_day_value(
+        &db,
+        NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        &filter,
+        "USD",
+    )
+    .unwrap_err();
 
     assert!(error.contains("bad date '2025-bad-date'"));
 }
@@ -1094,4 +1099,397 @@ fn stock_transfers_do_not_become_performance_gains_or_losses() {
         );
         assert!((summary.total_return - 15.0).abs() < 1e-9);
     }
+}
+
+#[test]
+fn same_day_stock_transfer_uses_the_same_close_in_both_accounts() {
+    let db = cash_flow_performance_db();
+    db.conn.lock().unwrap().execute_batch(
+        "INSERT INTO accounts (id, name, market, created_at, updated_at)
+             VALUES ('destination', 'Other US account', 'US', '2024-01-01', '2024-01-01');
+         UPDATE daily_portfolio_values SET total_value = 120, us_value = 120 WHERE date = '2024-01-02';
+         INSERT INTO daily_holding_snapshots (date, account_id, symbol, market, shares, close_price, market_value) VALUES
+             ('2024-01-01', 'acct-us', 'AAPL', 'US', 1, 100, 100),
+             ('2024-01-02', 'destination', 'AAPL', 'US', 1, 120, 120);
+         INSERT INTO transactions (id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, currency, traded_at, created_at) VALUES
+             ('out', 'acct-us', 'AAPL', 'Apple', 'US', 'STOCK_OUT', 1, 0, 0, 'USD', '2024-01-02', '2024-01-02'),
+             ('in', 'destination', 'AAPL', 'Apple', 'US', 'STOCK_IN', 1, 85, 85, 'USD', '2024-01-02', '2024-01-02');",
+    ).unwrap();
+    let date = parse_date("2024-01-02").unwrap();
+    let report =
+        get_performance_report(&db, date, date, "pnl", 10, &PerformanceFilter::default()).unwrap();
+    assert_eq!(report.summary.total_pnl, 20.0);
+    assert_eq!(report.attribution.total_pnl, 20.0);
+    assert_eq!(report.holding_performances[0].pnl, 20.0);
+}
+
+#[test]
+fn stock_open_uses_market_value_when_a_close_is_available() {
+    let db = cash_flow_performance_db();
+    db.conn.lock().unwrap().execute_batch(
+        "UPDATE daily_portfolio_values SET total_value = 220, us_value = 220 WHERE date = '2024-01-02';
+         INSERT INTO daily_holding_snapshots (date, account_id, symbol, market, shares, close_price, market_value) VALUES
+             ('2024-01-01', 'acct-us', '$CASH-USD', 'US', 100, 1, 100),
+             ('2024-01-02', 'acct-us', '$CASH-USD', 'US', 100, 1, 100),
+             ('2024-01-02', 'acct-us', 'AAPL', 'US', 1, 120, 120);
+         INSERT INTO transactions (id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, currency, traded_at, created_at) VALUES
+             ('open-stock', 'acct-us', 'AAPL', 'Apple', 'US', 'OPEN', 1, 80, 80, 'USD', '2024-01-02', '2024-01-02');",
+    ).unwrap();
+    let date = parse_date("2024-01-02").unwrap();
+    let report =
+        get_performance_report(&db, date, date, "pnl", 10, &PerformanceFilter::default()).unwrap();
+    assert_eq!(report.summary.total_pnl, 0.0);
+    assert_eq!(report.attribution.total_pnl, 0.0);
+    assert_eq!(report.holding_performances[0].pnl, 0.0);
+}
+
+#[test]
+fn stock_open_on_a_non_trading_day_uses_the_preceding_close() {
+    let db = cash_flow_performance_db();
+    db.conn.lock().unwrap().execute_batch(
+        "INSERT INTO daily_portfolio_values (date, total_value) VALUES ('2024-01-05', 100), ('2024-01-08', 220);
+         INSERT INTO daily_holding_snapshots (date, account_id, symbol, market, shares, close_price, market_value) VALUES
+             ('2024-01-05', 'acct-us', '$CASH-USD', 'US', 100, 1, 100),
+             ('2024-01-08', 'acct-us', '$CASH-USD', 'US', 100, 1, 100),
+             ('2024-01-08', 'acct-us', 'AAPL', 'US', 1, 120, 120);
+         INSERT INTO stock_daily_prices (symbol, market, date, close, source, updated_at) VALUES
+             ('AAPL', 'US', '2024-01-05', 110, 'yahoo', '2024-01-05'),
+             ('AAPL', 'US', '2024-01-08', 120, 'yahoo', '2024-01-08');
+         INSERT INTO transactions (id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, currency, traded_at, created_at) VALUES
+             ('open-stock', 'acct-us', 'AAPL', 'Apple', 'US', 'OPEN', 1, 80, 80, 'USD', '2024-01-07', '2024-01-07');",
+    ).unwrap();
+    let date = parse_date("2024-01-08").unwrap();
+    let report =
+        get_performance_report(&db, date, date, "pnl", 10, &PerformanceFilter::default()).unwrap();
+    assert_eq!(report.summary.total_pnl, 10.0);
+    assert_eq!(report.attribution.total_pnl, 10.0);
+    assert_eq!(report.holding_performances[0].pnl, 10.0);
+}
+
+#[test]
+fn cash_open_removes_the_change_from_prior_ledger_balance() {
+    let db = cash_flow_performance_db();
+    db.conn.lock().unwrap().execute_batch(
+        "DELETE FROM transactions;
+         UPDATE daily_portfolio_values SET total_value = 60, us_value = 60 WHERE date = '2024-01-02';
+         INSERT INTO daily_holding_snapshots (date, account_id, symbol, market, shares, close_price, market_value) VALUES
+             ('2024-01-01', 'acct-us', '$CASH-USD', 'US', 100, 1, 100),
+             ('2024-01-02', 'acct-us', '$CASH-USD', 'US', 60, 1, 60);
+         INSERT INTO transactions (id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, currency, traded_at, created_at) VALUES
+             ('previous-deposit', 'acct-us', '$CASH-USD', 'Cash', 'US', 'BUY', 100, 1, 100, 'USD', '2024-01-01', '2024-01-01'),
+             ('adjustment', 'acct-us', '$CASH-USD', 'Cash', 'US', 'OPEN', 60, 1, 60, 'USD', '2024-01-02', '2024-01-02');",
+    ).unwrap();
+    let date = parse_date("2024-01-02").unwrap();
+    let summary = get_performance_summary(&db, date, date, &PerformanceFilter::default()).unwrap();
+    assert_eq!(summary.total_pnl, 0.0);
+    assert_eq!(summary.total_return, 0.0);
+}
+
+#[test]
+fn same_day_stock_deposit_and_sale_uses_cached_market_close_without_a_held_position() {
+    let db = cash_flow_performance_db();
+    db.conn.lock().unwrap().execute_batch(
+        "UPDATE daily_portfolio_values SET total_value = 220, us_value = 220 WHERE date = '2024-01-02';
+         INSERT INTO daily_holding_snapshots (date, account_id, symbol, market, shares, close_price, market_value, has_market_close) VALUES
+             ('2024-01-01', 'acct-us', '$CASH-USD', 'US', 100, 1, 100, 0),
+             ('2024-01-02', 'acct-us', '$CASH-USD', 'US', 220, 1, 220, 0),
+             ('2024-01-02', 'acct-us', 'AAPL', 'US', 0, 80, 0, 0);
+         INSERT INTO stock_daily_prices (symbol, market, date, close, source, updated_at) VALUES
+             ('AAPL', 'US', '2024-01-02', 110, 'yahoo', '2024-01-02'),
+             ('AAPL', 'US', '2024-01-03', 150, 'yahoo', '2024-01-03');
+         INSERT INTO transactions (id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, currency, traded_at, created_at) VALUES
+             ('deposit-stock', 'acct-us', 'AAPL', 'Apple', 'US', 'STOCK_IN', 1, 80, 80, 'USD', '2024-01-02T15:00:00Z', '2024-01-02'),
+             ('sell-stock', 'acct-us', 'AAPL', 'Apple', 'US', 'SELL', 1, 120, 120, 'USD', '2024-01-02T16:00:00Z', '2024-01-02');",
+    ).unwrap();
+    let date = parse_date("2024-01-02").unwrap();
+    let report =
+        get_performance_report(&db, date, date, "pnl", 10, &PerformanceFilter::default()).unwrap();
+    assert_eq!(report.summary.total_pnl, 10.0);
+    assert_eq!(report.attribution.total_pnl, 10.0);
+    assert_eq!(report.holding_performances[0].pnl, 10.0);
+}
+
+#[test]
+fn market_scopes_remove_both_legs_of_foreign_currency_stock_settlement() {
+    let db = cash_flow_performance_db();
+    db.conn.lock().unwrap().execute_batch(
+        "DELETE FROM transactions;
+         INSERT INTO daily_holding_snapshots (date, account_id, symbol, market, shares, close_price, market_value) VALUES
+             ('2024-01-01', 'acct-us', 'AAPL', 'US', 1, 100, 100),
+             ('2024-01-02', 'acct-us', 'AAPL', 'US', 2, 100, 200),
+             ('2024-01-03', 'acct-us', 'AAPL', 'US', 1, 110, 110),
+             ('2024-01-01', 'acct-us', '$CASH-USD', 'US', 100, 1, 100),
+             ('2024-01-02', 'acct-us', '$CASH-USD', 'US', 100, 1, 100),
+             ('2024-01-03', 'acct-us', '$CASH-USD', 'US', 100, 1, 100),
+             ('2024-01-01', 'acct-us', '$CASH-HKD', 'HK', 1560, 1, 1560),
+             ('2024-01-02', 'acct-us', '$CASH-HKD', 'HK', 772.2, 1, 772.2),
+             ('2024-01-03', 'acct-us', '$CASH-HKD', 'HK', 1692.6, 1, 1692.6);
+         INSERT INTO transactions (id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, created_at) VALUES
+             ('foreign-buy', 'acct-us', 'AAPL', 'Apple', 'US', 'BUY', 1, 780, 780, 7.8, 'HKD', '2024-01-02', '2024-01-02'),
+             ('foreign-sell', 'acct-us', 'AAPL', 'Apple', 'US', 'SELL', 1, 858, 858, 7.8, 'HKD', '2024-01-03', '2024-01-03'),
+             ('foreign-dividend', 'acct-us', 'AAPL', 'Apple', 'US', 'PAY', 0, 0, 78, 7.8, 'HKD', '2024-01-03', '2024-01-03');",
+    ).unwrap();
+    let start = parse_date("2024-01-02").unwrap();
+    let end = parse_date("2024-01-03").unwrap();
+    for (market, first_day_pnl, full_period_pnl) in [("US", -1.0, 27.0), ("HK", 0.0, 0.0)] {
+        let filter = PerformanceFilter {
+            market: Some(market.into()),
+            account_id: None,
+        };
+        let summary = get_performance_summary(&db, start, end, &filter).unwrap();
+        assert!((summary.return_series[0].daily_pnl - first_day_pnl).abs() < 1e-9);
+        assert!((summary.total_pnl - full_period_pnl).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn market_scope_classifies_existing_cash_transactions_by_currency() {
+    let db = cash_flow_performance_db();
+    db.conn.lock().unwrap().execute_batch(
+        "DELETE FROM transactions;
+         INSERT INTO daily_holding_snapshots (date, account_id, symbol, market, shares, close_price, market_value) VALUES
+             ('2024-01-01', 'acct-us', '$CASH-USD', 'US', 100, 1, 100),
+             ('2024-01-02', 'acct-us', '$CASH-USD', 'US', 100, 1, 100),
+             ('2024-01-01', 'acct-us', '$CASH-HKD', 'HK', 0, 1, 0),
+             ('2024-01-02', 'acct-us', '$CASH-HKD', 'HK', 780, 1, 780);
+         INSERT INTO transactions (id, account_id, symbol, name, market, transaction_type, shares, price, total_amount, commission, currency, traded_at, created_at) VALUES
+             ('legacy-deposit', 'acct-us', '$CASH-HKD', 'Cash', 'US', 'BUY', 780, 1, 780, 0, 'HKD', '2024-01-02', '2024-01-02');",
+    ).unwrap();
+    let date = parse_date("2024-01-02").unwrap();
+    for market in ["US", "HK"] {
+        let filter = PerformanceFilter {
+            market: Some(market.into()),
+            account_id: None,
+        };
+        let summary = get_performance_summary(&db, date, date, &filter).unwrap();
+        assert_eq!(summary.total_pnl, 0.0, "{market}");
+    }
+}
+
+#[test]
+fn performance_regression_normalizes_account_positions_and_cash_flows() {
+    let db = cash_flow_performance_db();
+    db.conn
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO daily_holding_snapshots
+            (date, account_id, symbol, market, shares, close_price, market_value) VALUES
+            ('2024-01-01', 'acct-us', 'US-STOCK', 'US', 1, 100, 100),
+            ('2024-01-01', 'acct-us', 'HK-STOCK', 'HK', 1, 780, 780),
+            ('2024-01-02', 'acct-us', 'US-STOCK', 'US', 1, 100, 100),
+            ('2024-01-02', 'acct-us', 'HK-STOCK', 'HK', 1, 780, 780),
+            ('2024-01-03', 'acct-us', 'US-STOCK', 'US', 1, 110, 110),
+            ('2024-01-03', 'acct-us', 'HK-STOCK', 'HK', 1, 858, 858),
+            ('2024-01-03', 'acct-us', '$CASH-HKD', 'HK', 78, 1, 78);
+         UPDATE transactions
+            SET symbol = '$CASH-HKD', market = 'HK', total_amount = 78, currency = 'HKD'
+            WHERE id = 'cash-in';",
+        )
+        .unwrap();
+
+    let report = get_performance_report(
+        &db,
+        parse_date("2024-01-02").unwrap(),
+        parse_date("2024-01-03").unwrap(),
+        "pnl",
+        10,
+        &PerformanceFilter {
+            market: None,
+            account_id: Some("acct-us".into()),
+        },
+    )
+    .unwrap();
+    assert!((report.summary.start_value - 200.0).abs() < 1e-9);
+    assert!((report.summary.end_value - 230.0).abs() < 1e-9);
+    assert!((report.summary.total_pnl - 20.0).abs() < 1e-9);
+    assert!((report.summary.total_return - 10.0).abs() < 1e-9);
+    assert!((report.attribution.total_pnl - 20.0).abs() < 1e-9);
+    assert_eq!(report.holding_performances.len(), 2);
+    assert!(report
+        .holding_performances
+        .iter()
+        .all(|holding| (holding.pnl - 10.0).abs() < 1e-9));
+}
+
+#[test]
+fn performance_regression_filtered_value_is_zero_after_the_last_position_exits() {
+    let db = cash_flow_performance_db();
+    db.conn
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM transactions;
+         INSERT INTO daily_holding_snapshots
+            (date, account_id, symbol, market, shares, close_price, market_value) VALUES
+            ('2024-01-01', 'acct-us', 'AAPL', 'US', 1, 100, 100),
+            ('2024-01-03', 'other', '0700', 'HK', 1, 780, 780);
+         INSERT INTO transactions
+            (id, account_id, symbol, name, market, transaction_type,
+             shares, price, total_amount, currency, traded_at, created_at)
+         VALUES ('transfer', 'acct-us', 'AAPL', 'Apple', 'US', 'STOCK_OUT',
+                 1, 0, 0, 'USD', '2024-01-02T09:00:00Z', '2024-01-02');",
+        )
+        .unwrap();
+
+    let report = get_performance_report(
+        &db,
+        parse_date("2024-01-02").unwrap(),
+        parse_date("2024-01-03").unwrap(),
+        "pnl",
+        10,
+        &PerformanceFilter {
+            market: Some("US".into()),
+            account_id: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.summary.start_value, 100.0);
+    assert_eq!(report.summary.end_value, 0.0);
+    assert_eq!(report.summary.end_date, "2024-01-03");
+    assert_eq!(report.summary.total_pnl, 0.0);
+    assert_eq!(report.holding_performances[0].end_value, 0.0);
+}
+
+#[test]
+fn performance_regression_cash_fx_is_included_in_attribution() {
+    let db = multicurrency_attribution_db();
+    db.conn
+        .lock()
+        .unwrap()
+        .execute_batch(
+            r#"DELETE FROM daily_holding_snapshots;
+         INSERT INTO daily_holding_snapshots
+            (date, account_id, symbol, market, shares, close_price, market_value)
+         SELECT date, 'acct-cn', '$CASH-CNY', 'CN', 720, 1, 720 FROM daily_portfolio_values;
+         UPDATE daily_portfolio_values SET total_value = 100 WHERE date < '2024-01-03';
+         UPDATE daily_portfolio_values
+            SET total_value = 90, exchange_rates =
+                '{"usd_cny":8,"usd_hkd":7.8,"cny_hkd":0.975,"updated_at":"2024-01-03"}'
+            WHERE date = '2024-01-03';"#,
+        )
+        .unwrap();
+    let report = get_performance_report(
+        &db,
+        parse_date("2024-01-02").unwrap(),
+        parse_date("2024-01-03").unwrap(),
+        "pnl",
+        10,
+        &PerformanceFilter::default(),
+    )
+    .unwrap();
+    assert_eq!(report.summary.total_pnl, -10.0);
+    assert!((report.attribution.total_pnl + 10.0).abs() < 1e-9);
+    assert_eq!(report.attribution.by_category[0].name, "现金类");
+    assert!(report.holding_performances.is_empty());
+}
+
+#[test]
+fn performance_regression_drawdown_recovers_at_an_equal_wealth_index() {
+    let dates = ["2024-01-01", "2024-01-02", "2024-01-03"].map(|date| parse_date(date).unwrap());
+    let values = [(dates[1], 10.0, 0.0), (dates[2], 100.0, 0.0)];
+    let series = build_twr_return_series(&values, Some((dates[0], 100.0)), &[]);
+    let drawdown = calculate_max_drawdown(&series, Some(dates[0]));
+
+    assert_eq!(drawdown.max_drawdown, -90.0);
+    assert_eq!(drawdown.recovery_date.as_deref(), Some("2024-01-03"));
+    assert_eq!(drawdown.recovery_duration, Some(1));
+}
+
+#[test]
+fn performance_regression_risk_excludes_a_carried_zero_without_excluding_a_flat_market_session() {
+    let db = cash_flow_performance_db();
+    db.conn
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM transactions;
+         UPDATE daily_portfolio_values SET total_value = 101 WHERE date >= '2024-01-02';
+         INSERT INTO daily_portfolio_values (date, total_value) VALUES ('2024-01-04', 99.99);
+         INSERT INTO daily_holding_snapshots
+            (date, account_id, symbol, market, has_market_close) VALUES
+            ('2024-01-02', 'acct-us', 'AAPL', 'US', 1),
+            ('2024-01-03', 'acct-us', 'AAPL', 'US', 0),
+            ('2024-01-04', 'acct-us', 'AAPL', 'US', 1);",
+        )
+        .unwrap();
+    let risk = || {
+        get_risk_metrics(
+            &db,
+            parse_date("2024-01-02").unwrap(),
+            parse_date("2024-01-04").unwrap(),
+            &PerformanceFilter::default(),
+        )
+        .unwrap()
+    };
+    assert!((risk().annualized_volatility - (2.0_f64 * 252.0).sqrt()).abs() < 1e-9);
+
+    db.conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE daily_holding_snapshots SET has_market_close = 1 WHERE date = '2024-01-03'",
+            [],
+        )
+        .unwrap();
+    assert!((risk().annualized_volatility - 252.0_f64.sqrt()).abs() < 1e-9);
+}
+
+#[test]
+fn performance_regression_offsetting_pnl_has_no_percent_contribution() {
+    let db = cash_flow_performance_db();
+    db.conn
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM transactions;
+         INSERT INTO daily_holding_snapshots
+            (date, account_id, symbol, market, market_value) VALUES
+            ('2024-01-01', 'acct-us', 'GAIN', 'US', 100),
+            ('2024-01-01', 'acct-us', 'LOSS', 'US', 200),
+            ('2024-01-03', 'acct-us', 'GAIN', 'US', 200),
+            ('2024-01-03', 'acct-us', 'LOSS', 'US', 100);",
+        )
+        .unwrap();
+    let attribution = get_return_attribution(
+        &db,
+        parse_date("2024-01-02").unwrap(),
+        parse_date("2024-01-03").unwrap(),
+        &PerformanceFilter::default(),
+    )
+    .unwrap();
+    assert_eq!(attribution.total_pnl, 0.0);
+    assert_eq!(
+        attribution
+            .by_holding
+            .iter()
+            .map(|item| (item.pnl, item.contribution_percent))
+            .collect::<Vec<_>>(),
+        vec![(100.0, None), (-100.0, None)],
+    );
+}
+
+#[test]
+fn performance_regression_yearly_compounding_is_undefined_after_negative_equity() {
+    let db = cash_flow_performance_db();
+    db.conn
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM transactions;
+         UPDATE daily_portfolio_values SET total_value = -20 WHERE date = '2024-01-03';",
+        )
+        .unwrap();
+    let report = get_performance_report(
+        &db,
+        parse_date("2024-01-02").unwrap(),
+        parse_date("2024-01-03").unwrap(),
+        "pnl",
+        10,
+        &PerformanceFilter::default(),
+    )
+    .unwrap();
+    assert!((report.summary.total_return + 120.0).abs() < 1e-9);
+    assert!(report.summary.annualized_return.is_none());
+    assert!(report.risk_metrics.calmar_ratio.is_none());
 }

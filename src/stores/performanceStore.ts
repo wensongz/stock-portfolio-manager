@@ -79,6 +79,7 @@ interface PerformanceState {
   summary: PerformanceSummary | null;
   returnSeries: ReturnDataPoint[];
   benchmarkSeries: Record<string, ReturnDataPoint[]>;
+  benchmarkErrors: Record<string, string>;
   drawdown: DrawdownAnalysis | null;
   attribution: ReturnAttribution | null;
   monthlyReturns: MonthlyReturn[];
@@ -118,6 +119,7 @@ export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
   summary: null,
   returnSeries: [],
   benchmarkSeries: {},
+  benchmarkErrors: {},
   drawdown: null,
   attribution: null,
   monthlyReturns: [],
@@ -143,7 +145,7 @@ export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
       timeRange: range,
       customStart: nextCustomStart,
       customEnd: nextCustomEnd,
-      ...(rangeChanged ? { benchmarkSeries: {} } : {}),
+      ...(rangeChanged ? { benchmarkSeries: {}, benchmarkErrors: {} } : {}),
     });
   },
 
@@ -188,14 +190,18 @@ export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
       const reportScope = JSON.stringify([
         startDate, endDate, filterParams.market ?? null, filterParams.accountId ?? null,
       ]);
+      const scopeChanged = reportScope !== successfulReportScope;
+      if (scopeChanged) latestBenchmarkRequestIds.clear();
       // Retained values are only meaningful under the filters and dates that
       // produced them; a changed scope can also change the displayed currency.
       set({
         loading: true,
         error: null,
-        ...(reportScope !== successfulReportScope ? {
+        ...(scopeChanged ? {
           summary: null,
           returnSeries: [],
+          benchmarkSeries: {},
+          benchmarkErrors: {},
           drawdown: null,
           attribution: null,
           monthlyReturns: [],
@@ -225,10 +231,15 @@ export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
 
       if (requestId !== latestRequestId) return;
 
+      const previousSummary = get().summary;
+      const comparisonChanged = previousSummary?.start_date !== report.summary.start_date ||
+        previousSummary?.end_date !== report.summary.end_date || !report.summary.return_series.length;
+      if (comparisonChanged) latestBenchmarkRequestIds.clear();
       successfulReportScope = reportScope;
       set({
         summary: report.summary,
         returnSeries: report.summary.return_series,
+        ...(comparisonChanged ? { benchmarkSeries: {}, benchmarkErrors: {} } : {}),
         drawdown: report.drawdown,
         attribution: report.attribution,
         monthlyReturns: report.monthly_returns,
@@ -250,32 +261,28 @@ export function createPerformanceStore(invokeFn: PerformanceInvoke = invoke) {
   },
 
   fetchBenchmark: async (symbol) => {
+    const { summary, loading } = get();
+    if (loading || !summary?.return_series.length) return;
+
     const requestId = ++nextBenchmarkRequestId;
     latestBenchmarkRequestIds.set(symbol, requestId);
-    const state = get();
-    let startDate: string;
-    let endDate: string;
-    if (state.timeRange === "CUSTOM" && state.customStart && state.customEnd) {
-      startDate = state.customStart;
-      endDate = state.customEnd;
-    } else {
-      const range = getDateRange(state.timeRange);
-      startDate = range.start;
-      endDate = range.end;
-    }
     try {
       const series = await invokeFn<ReturnDataPoint[]>("get_benchmark_return_series", {
         symbol,
-        startDate,
-        endDate,
+        startDate: summary.start_date,
+        endDate: summary.end_date,
       });
       if (latestBenchmarkRequestIds.get(symbol) !== requestId) return;
       set((s) => ({
         benchmarkSeries: { ...s.benchmarkSeries, [symbol]: series },
+        benchmarkErrors: { ...s.benchmarkErrors, [symbol]: "" },
       }));
     } catch (err) {
       if (latestBenchmarkRequestIds.get(symbol) === requestId) {
-        console.error("fetchBenchmark error:", err);
+        set((s) => ({
+          benchmarkSeries: { ...s.benchmarkSeries, [symbol]: [] },
+          benchmarkErrors: { ...s.benchmarkErrors, [symbol]: String(err) },
+        }));
       }
     }
   },

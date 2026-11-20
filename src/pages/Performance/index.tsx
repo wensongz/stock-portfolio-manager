@@ -22,7 +22,7 @@ const MARKETS = [
   { value: "HK", label: "🇭🇰 港股" },
 ];
 
-const MARKET_CURRENCY: Record<Market, string> = {
+const MARKET_CURRENCY: Record<Market, Currency> = {
   US: "USD",
   CN: "CNY",
   HK: "HKD",
@@ -39,6 +39,7 @@ export default function PerformancePage() {
     summary,
     returnSeries,
     benchmarkSeries,
+    benchmarkErrors,
     drawdown,
     attribution,
     monthlyReturns,
@@ -56,28 +57,20 @@ export default function PerformancePage() {
   const { accounts, fetchAccounts } = useAccountStore();
   const { baseCurrency, convertWithCachedRates, rates, fetchRates } = useExchangeRateStore();
 
-  // Derive currency from the selected account or market filter, falling
-  // back to the dashboard's base currency setting (not hardcoded "USD").
-  const currency = useMemo(() => {
-    if (selectedAccountId) {
-      const account = accounts.find((a) => a.id === selectedAccountId);
-      if (account) return MARKET_CURRENCY[account.market] ?? baseCurrency;
-    }
-    if (selectedMarket) {
-      return MARKET_CURRENCY[selectedMarket as Market] ?? baseCurrency;
-    }
-    return baseCurrency;
-  }, [selectedAccountId, selectedMarket, accounts, baseCurrency]);
+  const sourceCurrency = summary?.valuation_currency
+    ?? MARKET_CURRENCY[(selectedMarket ?? accounts.find((a) => a.id === selectedAccountId)?.market ?? "US") as Market]
+    ?? "USD";
+  const canConvert = rates != null && [rates.usd_cny, rates.usd_hkd].every(
+    (rate) => Number.isFinite(rate) && rate > 0,
+  );
+  const currency = selectedMarket || selectedAccountId || !canConvert ? sourceCurrency : baseCurrency;
 
   // Convert each holding's PnL to the display currency, then rank.
   const { topGainers, topLosers } = useMemo(() => {
-    const converted = holdingPerformances.map((h) => {
-      const fromCurrency = (selectedMarket || selectedAccountId
-        ? MARKET_CURRENCY[h.market as Market] ?? "USD"
-        : "USD") as Currency;
-      const convertedPnl = convertWithCachedRates(h.pnl, fromCurrency, currency as Currency);
-      return { ...h, pnl: convertedPnl };
-    });
+    const converted = holdingPerformances.map((holding) => ({
+      ...holding,
+      pnl: convertWithCachedRates(holding.pnl, sourceCurrency, currency),
+    }));
     return {
       topGainers: converted
         .filter((h) => h.pnl >= 0)
@@ -88,43 +81,33 @@ export default function PerformancePage() {
         .sort((a, b) => a.pnl - b.pnl)
         .slice(0, 10),
     };
-  }, [holdingPerformances, selectedMarket, selectedAccountId, convertWithCachedRates, currency, rates]);
+  }, [holdingPerformances, sourceCurrency, currency, convertWithCachedRates, rates]);
 
-  // Portfolio-wide values are persisted in USD; filtered values remain in the
-  // selected market/account currency. Convert monetary summary fields before
-  // adding the display-currency suffix.
   const displaySummary = useMemo(() => {
     if (!summary) return null;
-    const sourceCurrency = (selectedMarket || selectedAccountId ? currency : "USD") as Currency;
-    const targetCurrency = currency as Currency;
     return {
       ...summary,
-      start_value: convertWithCachedRates(summary.start_value, sourceCurrency, targetCurrency),
-      end_value: convertWithCachedRates(summary.end_value, sourceCurrency, targetCurrency),
-      total_pnl: convertWithCachedRates(summary.total_pnl, sourceCurrency, targetCurrency),
+      start_value: convertWithCachedRates(summary.start_value, sourceCurrency, currency),
+      end_value: convertWithCachedRates(summary.end_value, sourceCurrency, currency),
+      total_pnl: convertWithCachedRates(summary.total_pnl, sourceCurrency, currency),
     };
-  }, [summary, selectedMarket, selectedAccountId, currency, convertWithCachedRates, rates]);
+  }, [summary, sourceCurrency, currency, convertWithCachedRates, rates]);
 
-  // Unfiltered attribution is normalised to USD by the backend before market
-  // and category aggregation. Filtered attribution stays in that market's
-  // native currency. Convert the final amounts to the selected display unit.
   const displayAttribution = useMemo(() => {
     if (!attribution) return null;
-    const sourceCurrency = (selectedMarket || selectedAccountId ? currency : "USD") as Currency;
-    const targetCurrency = currency as Currency;
     const convertItems = (items: typeof attribution.by_market) =>
       items.map((item) => ({
         ...item,
-        pnl: convertWithCachedRates(item.pnl, sourceCurrency, targetCurrency),
+        pnl: convertWithCachedRates(item.pnl, sourceCurrency, currency),
       }));
     return {
       ...attribution,
-      total_pnl: convertWithCachedRates(attribution.total_pnl, sourceCurrency, targetCurrency),
+      total_pnl: convertWithCachedRates(attribution.total_pnl, sourceCurrency, currency),
       by_market: convertItems(attribution.by_market),
       by_category: convertItems(attribution.by_category),
       by_holding: convertItems(attribution.by_holding),
     };
-  }, [attribution, selectedMarket, selectedAccountId, currency, convertWithCachedRates, rates]);
+  }, [attribution, sourceCurrency, currency, convertWithCachedRates, rates]);
 
   useEffect(() => {
     fetchAccounts();
@@ -237,6 +220,8 @@ export default function PerformancePage() {
             <ReturnChart
               returnSeries={returnSeries}
               benchmarkSeries={benchmarkSeries}
+              benchmarkErrors={benchmarkErrors}
+              startDate={summary?.start_date}
               selectedBenchmarks={selectedBenchmarks}
               onBenchmarkChange={handleBenchmarkChange}
             />

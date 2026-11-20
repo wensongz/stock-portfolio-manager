@@ -1,5 +1,7 @@
 import EChart from "../../components/charts/EChart";
 import { Typography } from "antd";
+import { format, type ECharts } from "echarts/core";
+import { useRef } from "react";
 import type { HoldingPerformance } from "../../types";
 import { usePnlColor } from "../../hooks/usePnlColor";
 
@@ -13,9 +15,18 @@ interface Props {
 }
 
 const CURRENCY_SYMBOL: Record<string, string> = { USD: "$", CNY: "¥", HKD: "HK$" };
+const AXIS_LABEL_FONT = { fontSize: 12, fontFamily: "sans-serif" };
+const AXIS_LABEL_GAP = 6;
+
+interface AxisLabelLayout {
+  ticks: number[][];
+  formatter: (value: number) => string;
+  steps?: number[];
+}
 
 export default function RankingChart({ gainers, losers, height = 340, currency = "USD" }: Props) {
   const { profitColor, lossColor } = usePnlColor();
+  const activeLayout = useRef<AxisLabelLayout | null>(null);
   const cSym = CURRENCY_SYMBOL[currency] ?? "";
   // ECharts horizontal bar charts render categories bottom-to-top,
   // so reverse the arrays to show highest pnl at the top.
@@ -54,6 +65,37 @@ export default function RankingChart({ gainers, losers, height = 340, currency =
     return `${sign}${cSym}${formatted}`;
   };
 
+  // Capture the native ticks before selecting which grid lines get labels.
+  const layout: AxisLabelLayout = { ticks: [[], []], formatter: fmtPnl };
+  const updateTickLabels = (chart: ECharts) => {
+    const current = activeLayout.current;
+    if (!current) return;
+
+    const font = `${AXIS_LABEL_FONT.fontSize}px ${AXIS_LABEL_FONT.fontFamily}`;
+    const steps = current.ticks.map((ticks, xAxisIndex) => {
+      let previousRight = -Infinity;
+      const fits = ticks.every((tick) => {
+        const center = chart.convertToPixel({ xAxisIndex }, tick);
+        const halfWidth = format.getTextRect(current.formatter(tick), font).width / 2;
+        const left = center - halfWidth;
+        const fitsNextToPrevious = left - previousRight >= AXIS_LABEL_GAP;
+        previousRight = center + halfWidth;
+        return fitsNextToPrevious;
+      });
+      return fits ? 1 : 2;
+    });
+    if (steps.every((step, index) => step === current.steps?.[index])) return;
+    current.steps = steps;
+    chart.setOption({
+      xAxis: current.ticks.map((ticks, index) => ({
+        axisLabel: {
+          formatter: current.formatter,
+          customValues: ticks.filter((_, tickIndex) => tickIndex % steps[index] === 0),
+        },
+      })),
+    }, { silent: true });
+  };
+
   const option = {
     tooltip: {
       trigger: "axis",
@@ -71,10 +113,21 @@ export default function RankingChart({ gainers, losers, height = 340, currency =
       { left: "4%", right: "52%", top: "10%", bottom: "12%", containLabel: true },
       { left: "52%", right: "4%", top: "10%", bottom: "12%", containLabel: true },
     ],
-    xAxis: [
-      { gridIndex: 0, type: "value", axisLabel: { formatter: (v: number) => fmtPnl(v) } },
-      { gridIndex: 1, type: "value", axisLabel: { formatter: (v: number) => fmtPnl(v) } },
-    ],
+    xAxis: layout.ticks.map((ticks, gridIndex) => ({
+      gridIndex,
+      type: "value",
+      axisLabel: {
+        ...AXIS_LABEL_FONT,
+        hideOverlap: false,
+        customValues: null,
+        formatter: (value: number, index: number) => {
+          activeLayout.current = layout;
+          if (index === 0) ticks.length = 0;
+          ticks[index] = value;
+          return fmtPnl(value);
+        },
+      },
+    })),
     yAxis: [
       { gridIndex: 0, type: "category", data: gainNames, axisLabel: { fontSize: 11 } },
       { gridIndex: 1, type: "category", data: lossNames, axisLabel: { fontSize: 11 } },
@@ -126,6 +179,8 @@ export default function RankingChart({ gainers, losers, height = 340, currency =
       </div>
       <EChart
         option={option}
+        onChartReady={updateTickLabels}
+        onEvents={{ updated: (_event: unknown, chart: ECharts) => updateTickLabels(chart) }}
         style={{ height, width: "100%" }}
         opts={{ renderer: "canvas" }}
       />

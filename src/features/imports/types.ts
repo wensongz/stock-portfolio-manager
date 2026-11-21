@@ -11,6 +11,7 @@ export interface ImportRow {
 }
 
 export interface TransactionImportRow extends ImportRow {
+  isCash?: boolean;
   transaction_type: string;
   stock_name: string;
   symbol: string;

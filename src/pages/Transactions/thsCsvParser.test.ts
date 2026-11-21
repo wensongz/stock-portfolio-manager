@@ -109,3 +109,45 @@ test("falls back to trade amount when a dividend has no cash-flow column", () =>
   assert.equal(rows[0].transaction_type, "PAY");
   assert.equal(rows[0].total_amount, 2362.8);
 });
+
+test("uses the cash-flow amount for bank transfers and preserves existing trade row keys", () => {
+  const csv = `成交日期,证券代码,操作,发生金额,本次金额,成交数量,成交均价,成交金额,成交编号
+20260901,,银证转入,1250.50,100,0,0,0,
+20260902,600000,买入,-50,,1,50,50,1
+20260903,,银证转出,-120.25,500,0,0,0,
+20260904,,银行转账,10,10,0,0,0,`;
+  const issues = [];
+
+  const rows = parseThsCsv(csv, issues);
+
+  assert.deepEqual(issues, []);
+  assert.deepEqual(rows.map(({ key, symbol, transaction_type, total_amount }) => ({ key, symbol, transaction_type, total_amount })), [
+    { key: "cash-2", symbol: "$CASH-CNY", transaction_type: "BUY", total_amount: 1250.5 },
+    { key: "0", symbol: "sh600000", transaction_type: "BUY", total_amount: 50 },
+    { key: "cash-4", symbol: "$CASH-CNY", transaction_type: "SELL", total_amount: 120.25 },
+  ]);
+  for (const row of [rows[0], rows[2]]) {
+    assert.equal(row.isCash, true);
+    assert.equal(row.shares, 0);
+    assert.equal(row.price, 0);
+    assert.equal(row.commission, 0);
+    assert.equal(row.external_id, null);
+  }
+});
+
+test("reports bank transfers with an invalid date or cash-flow amount", () => {
+  const csv = `成交日期,证券代码,操作,清算金额,本次金额
+20260901,,银证转入,0,100
+20260901,,银证转出,invalid,100
+20260230,,银证转入,100,100
+20260903,,银证转入,120,500`;
+  const issues = [];
+
+  const rows = parseThsCsv(csv, issues);
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].total_amount, 120);
+  assert.deepEqual(issues.map(({ line }) => line), [2, 3, 4]);
+  assert.match(issues[0].message, /金额/);
+  assert.match(issues[2].message, /日期/);
+});

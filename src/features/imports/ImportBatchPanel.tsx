@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Alert, Button, Input, InputNumber, Modal, Space, Table, Tag, Typography, message } from "antd";
 import { invoke } from "@tauri-apps/api/core";
 import type { ImportBatch, ImportBatchRow } from "./batchTypes";
+import { cashTransferLabel } from "./cashTransferLabel.ts";
 import { addExpectedBalance, normalizeReconciliationSymbol, reconciliationDisplayRows, reconciliationMatches, batchReconciliationArgs, batchApplyArgs, initialBatchSelection, selectableBatchRow, selectionAfterBatchResponse } from "./batchPanelState";
 
 interface Props {
@@ -22,6 +23,7 @@ interface FailureChoice {
 const failedRowsSignature = (batch: ImportBatch) => JSON.stringify([batch.id, batch.conflict, batch.rows.filter((row) => row.status === "failed")]);
 const rawContent = (raw: unknown) => typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
 const statusLabels: Record<string, string> = {ready:"待导入", suspected:"疑似重复", duplicate:"明确重复", failed:"失败", imported:"已导入"};
+const cashLabel = (row: ImportBatchRow) => cashTransferLabel(row.data.symbol, row.data.transaction_type);
 const importResultSummary = (rows: ImportBatchRow[]) => {
   const count = (status: string) => rows.filter((row) => row.status === status).length;
   return [`已成功导入 ${count("imported")} 条`,
@@ -184,11 +186,14 @@ export default function ImportBatchPanel({batch, onChange, onImported, onBusyCha
       columns={[
         {title:"证券", key:"symbol", render:(_, row)=>String(row.data.symbol ?? "")},
         {title:"名称", key:"name", render:(_, row)=>String(row.data.name ?? "")},
-        {title:"日期 / 操作", key:"operation", render:(_, row)=>[row.data.traded_at,row.data.transaction_type].filter(Boolean).join(" / ")},
-        {title:"数量", key:"shares", render:(_, row)=>String(row.data.shares ?? "")},
+        {title:"日期 / 操作", key:"operation", render:(_, row)=>[row.data.traded_at,cashLabel(row) ?? row.data.transaction_type].filter(Boolean).join(" / ")},
+        {title:"数量", key:"shares", render:(_, row)=>cashLabel(row) ? "—" : String(row.data.shares ?? "")},
+        ...(batch.rows.some(cashLabel) ? [{
+          title: "金额", key: "total_amount", render: (_: unknown, row: ImportBatchRow) => String(row.data.total_amount ?? ""),
+        }] : []),
         {title:"币种", key:"currency", render:(_, row)=>String(row.data.currency ?? "")},
         {title:"成交编号", dataIndex:"external_id"},
-        {title:"价格 / 成本", key:"price", render:(_, row)=>String(row.data.price ?? row.data.avg_cost ?? "")},
+        {title:"价格 / 成本", key:"price", render:(_, row)=>cashLabel(row) ? "—" : String(row.data.price ?? row.data.avg_cost ?? "")},
         {title:"状态", dataIndex:"status", render:(status:string)=><Tag color={status === "failed" ? "red" : status === "imported" ? "green" : status === "suspected" ? "orange" : "default"}>{statusLabels[status] || status}</Tag>},
         {title:"说明", dataIndex:"error"},
       ]} />

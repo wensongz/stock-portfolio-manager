@@ -29,11 +29,14 @@ function runPanelScenario(scenario) {
       Space: passthrough, Typography: { Text: passthrough, Title: passthrough, Paragraph: passthrough }, Tag: passthrough,
       Alert: ({ type, title, description }) => h("div", { role: "alert", "data-type": type }, title, description),
       Input: () => null, InputNumber: () => null,
-      Table: ({ dataSource, rowSelection }) => h("div", null, dataSource.map(row => h("div", { key: row.key ?? row.symbol },
+      Table: ({ dataSource, rowSelection, columns }) => h("div", null, dataSource.map(row => h("div", { key: row.key ?? row.symbol },
         rowSelection && h("input", { type: "checkbox", "data-key": row.key,
           checked: rowSelection.selectedRowKeys.includes(row.key), disabled: rowSelection.getCheckboxProps(row).disabled,
           onChange: event => rowSelection.onChange(event.target.checked ? [...rowSelection.selectedRowKeys, row.key] : rowSelection.selectedRowKeys.filter(key => key !== row.key)) }),
-        row.data?.symbol, row.status, row.error))),
+        row.data?.symbol, row.status, row.error,
+        scenario === "cash-review" && row.data && h("div", { "data-review": row.key },
+          columns.filter(column => ["operation", "total_amount"].includes(column.key))
+            .map(column => h("span", { key: column.key }, column.render(undefined, row))))))),
       message: { success(text) { notifications.push(text); }, warning() {}, error() {} },
     }));
     const { default: ImportBatchPanel } = await import("./src/features/imports/ImportBatchPanel.tsx");
@@ -44,6 +47,11 @@ function runPanelScenario(scenario) {
     let batch = { id: "batch", account_id: "account", source: "CSV", file_name: "trades.csv", parser_version: "2",
       kind: "transactions", status: "preview", created_at: "2026-09-25T00:00:00Z",
       rows: [row("a"), row("b"), row("c")], reconciliation: [], can_undo: false, conflict: null };
+    if (scenario === "cash-review") batch.rows = [
+      { ...row("deposit"), data: { symbol: "$CASH-CNY", traded_at: "2026-09-25", transaction_type: "BUY", total_amount: 150.25 } },
+      { ...row("withdrawal"), data: { symbol: "$CASH-CNY", traded_at: "2026-09-26", transaction_type: "SELL", total_amount: 75.5 } },
+      { ...row("stock"), data: { symbol: "sh600036", traded_at: "2026-09-25", transaction_type: "BUY", total_amount: 950 } },
+    ];
     if (["initial", "initial-skip", "revise"].includes(scenario)) batch.rows = [row("ready"), ...Array.from({ length: 12 }, (_, index) => row("failed-" + index, "failed"))];
     if (scenario === "history-conflict") batch = { ...batch, status: "applied", rows: batch.rows.map(item => row(item.key, "imported")), conflict: "账户已有后续变更，不能继续导入或撤销" };
     if (scenario === "rejected-conflict") batch = { ...batch, status: "applied", rows: [row("a", "imported"), row("b"), row("c", "imported")] };
@@ -97,7 +105,9 @@ function runPanelScenario(scenario) {
     };
     await act(async () => render());
     let result;
-    if (scenario === "history-conflict") result = { before: snapshot(), requests };
+    if (scenario === "cash-review") result = Object.fromEntries([...container.querySelectorAll("[data-review]")]
+      .map(item => [item.dataset.review, [...item.children].map(cell => cell.textContent)]));
+    else if (scenario === "history-conflict") result = { before: snapshot(), requests };
     else if (["initial", "initial-skip", "revise"].includes(scenario)) {
       const before = snapshot();
       await click(scenario === "revise" ? "返回修改" : scenario === "initial-skip" ? "暂时跳过" : "查看并重试");
@@ -140,6 +150,13 @@ function runPanelScenario(scenario) {
   `;
   return JSON.parse(execFileSync("bun", ["--eval", probe], { cwd: projectRoot, encoding: "utf8" }));
 }
+
+test("the saved batch review shows the direction and amount of both cash transfers", () => {
+  const result = runPanelScenario("cash-review");
+  assert.deepEqual(result.deposit, ["2026-09-25 / 存入现金", "150.25"]);
+  assert.deepEqual(result.withdrawal, ["2026-09-26 / 提取现金", "75.5"]);
+  assert.equal(result.stock[0], "2026-09-25 / BUY");
+});
 
 test("partial failures remain open until the user retries only failed rows, including repeated failures", () => {
   const result = runPanelScenario("retry");

@@ -50,7 +50,9 @@ export default function BrokerTransactionImportModal({
       return diagnosed ?? { rows: [], warnings: [`未从 CSV 中识别到 ${brokerName} 交易记录，请确认导出格式是否正确。`], sourceContent: texts[0] };
     },
     prepareRows: async (rows) => {
-      const names = await resolveStockNames(rows.map((row) => row.symbol), invoke as InvokeFunction);
+      const stockSymbols = rows.filter((row) => !row.isCash).map((row) => row.symbol);
+      if (stockSymbols.length === 0) return rows;
+      const names = await resolveStockNames(stockSymbols, invoke as InvokeFunction);
       return rows.map((row) => {
         const symbol = row.symbol.toUpperCase();
         const resolved = names.get(symbol);

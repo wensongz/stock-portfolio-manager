@@ -1,22 +1,11 @@
-import type { ImportParseIssue } from "../../features/imports/types.ts";
+import type { ImportParseIssue, TransactionImportRow } from "../../features/imports/types.ts";
 import { hasInvalidOptionalImportNumber, isImportSummary, isValidImportDate, parseImportNumber, recordImportIssue } from "../../features/imports/parseDiagnostics.ts";
 
 export type ThsTransactionType = "BUY" | "SELL" | "PAY";
 
-export interface ThsCsvRow {
-  key: string;
+export interface ThsCsvRow extends TransactionImportRow {
   raw?: string;
-  external_id?: string | null;
-  selected: boolean;
   transaction_type: ThsTransactionType;
-  symbol: string;
-  stock_name: string;
-  traded_at: string;
-  price: number;
-  shares: number;
-  total_amount: number;
-  commission: number;
-  notes?: string;
 }
 
 function splitCsvLine(line: string): string[] {
@@ -122,7 +111,7 @@ export function parseThsCsv(text: string, issues?: ImportParseIssue[]): ThsCsvRo
   const iExtra = col("附加费");
   const iTransfer = col("过户费");
 
-  if (iCode === -1 || iShares === -1) return [];
+  if (iCode === -1) return [];
 
   const rows: ThsCsvRow[] = [];
   let idx = 0;
@@ -137,7 +126,42 @@ export function parseThsCsv(text: string, issues?: ImportParseIssue[]): ThsCsvRo
     if (isImportSummary(code) || code === "证券代码") continue;
 
     const operation = iOp !== -1 ? get(iOp).trim() : "";
-    if (/(服务费|转账|转入|转出|利息|银行|配号)/.test(operation)) continue;
+    const cashType = operation === "银证转入" ? "BUY" : operation === "银证转出" ? "SELL" : null;
+    if (!cashType && /(服务费|转账|转入|转出|利息|银行|配号)/.test(operation)) continue;
+
+    const tradedAt = buildDateTime(get(iDate), get(iTime));
+    const happenAmt = parseNum(get(iHappen));
+    const external = get(iExternal).trim();
+    const externalId = /^0*$/.test(external) ? null : external;
+    if (cashType) {
+      const errors: string[] = [];
+      if (!isValidImportDate(tradedAt)) errors.push("成交日期或时间缺失或无效");
+      if (!Number.isFinite(happenAmt) || happenAmt === 0) errors.push("发生金额或清算金额缺失或无效（不能为 0）");
+      if (errors.length) {
+        recordImportIssue(issues, i + 1, line, errors);
+        continue;
+      }
+      rows.push({
+        // Keep the keys of previously imported trades and dividends stable.
+        key: `cash-${i + 1}`,
+        raw: line,
+        external_id: externalId,
+        selected: true,
+        isCash: true,
+        transaction_type: cashType,
+        symbol: "$CASH-CNY",
+        stock_name: "现金 (CNY)",
+        traded_at: tradedAt,
+        price: 0,
+        shares: 0,
+        total_amount: Math.abs(happenAmt),
+        commission: 0,
+        notes: operation,
+      });
+      continue;
+    }
+
+    if (iShares === -1) continue;
     const isDividend = operation === "红股派息"
       || operation === "股息入账"
       || operation === "红利";
@@ -147,9 +171,6 @@ export function parseThsCsv(text: string, issues?: ImportParseIssue[]): ThsCsvRo
 
     const price = parseNum(get(iPrice));
     const tradeAmount = parseNum(get(iAmount));
-    const happenAmt = parseNum(get(iHappen));
-
-    const tradedAt = buildDateTime(get(iDate), get(iTime));
     const errors: string[] = [];
     if (!/^\d{6}$/.test(code)) errors.push("证券代码缺失或无效");
     if (!isValidImportDate(tradedAt)) errors.push("成交日期或时间缺失或无效");
@@ -196,7 +217,7 @@ export function parseThsCsv(text: string, issues?: ImportParseIssue[]): ThsCsvRo
     rows.push({
       key: String(idx++),
       raw: line,
-      external_id: /^0*$/.test(get(iExternal).trim()) ? null : get(iExternal).trim(),
+      external_id: externalId,
       selected: true,
       transaction_type,
       symbol,

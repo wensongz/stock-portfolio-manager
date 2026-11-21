@@ -61,6 +61,48 @@ fn cn_import_normalizes_mainland_prefixes_without_changing_other_markets() {
 }
 
 #[test]
+fn cn_cash_transfers_import_in_date_order_alongside_previously_imported_trades() {
+    let db = database();
+    db.conn
+        .lock()
+        .unwrap()
+        .execute("UPDATE accounts SET market='CN' WHERE id='a'", [])
+        .unwrap();
+    let mut stock = buy("0", 2.0);
+    stock["data"]["symbol"] = json!("sh600036");
+    stock["data"]["market"] = json!("CN");
+    stock["data"]["currency"] = json!("CNY");
+    let earlier = request("earlier", vec![stock.clone()]);
+    let preview = preview_import_batch(&db, &earlier).unwrap();
+    assert_eq!(apply_all(&db, &preview).rows[0].status, "imported");
+
+    let cash = |key: &str, kind: &str, date: &str, amount: f64| {
+        json!({
+            "key": key,
+            "raw": "bank transfer",
+            "external_id": null,
+            "data": {
+                "symbol": "$CASH-CNY", "name": "现金 (CNY)", "market": "CN", "currency": "CNY",
+                "transaction_type": kind, "shares": 0, "price": 0, "commission": 0,
+                "traded_at": date, "total_amount": amount, "notes": null,
+            },
+        })
+    };
+    let withdrawal = cash("cash-2", "SELL", "2026-01-03", 50.75);
+    let deposit = cash("cash-4", "BUY", "2026-01-02", 150.25);
+    let mut reimport = request("reimport", vec![withdrawal, stock, deposit]);
+    reimport.source_content = earlier.source_content;
+
+    let preview = preview_import_batch(&db, &reimport).unwrap();
+    assert_eq!(preview.rows[1].status, "duplicate");
+    let applied = apply_all(&db, &preview);
+    assert_eq!(applied.rows[0].status, "imported");
+    assert_eq!(applied.rows[2].status, "imported");
+    assert_eq!(shares(&db, "sh600036"), 2.0);
+    assert_eq!(shares(&db, "$CASH-CNY"), 78.5);
+}
+
+#[test]
 fn cn_reconciliation_uses_account_market_for_broker_only_balances() {
     let empty = AccountState {
         holdings: vec![],
